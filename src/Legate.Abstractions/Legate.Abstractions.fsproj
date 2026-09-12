@@ -2,17 +2,19 @@
 
   <PropertyGroup>
     <RootNamespace>Legate</RootNamespace>
-    <Description>Contracts for the Legate agent harness: domain types, store, tool, workspace, and policy interfaces. No runtime dependencies beyond Microsoft.Extensions.AI.Abstractions.</Description>
+    <Description>Contracts for the Legate agent harness: domain types, store, tool, workspace, and policy interfaces. Depends on Microsoft.Extensions.AI.Abstractions and Ulid.</Description>
   </PropertyGroup>
 
   <!-- Compile order is explicit: register every new file here, in dependency order. -->
   <ItemGroup>
     <Compile Include="Tenancy.fs" />
+    <Compile Include="Identifiers.fs" />
   </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="FSharp.Core" />
     <PackageReference Include="Microsoft.Extensions.AI.Abstractions" />
+    <PackageReference Include="Ulid" />
   </ItemGroup>
 
 </Project>
