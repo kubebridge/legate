@@ -39,8 +39,8 @@ published to NuGet yet. `Docs/ARCHITECTURE.md` is the normative target.
   reference packages without a `Version` attribute.
 - **Solution**: `Legate.slnx` at the repo root.
 - **`src/Legate.Abstractions/`**: contracts (domain types, store, tool,
-  workspace, and policy interfaces). Depends only on `FSharp.Core` and
-  `Microsoft.Extensions.AI.Abstractions`; never on Akka.
+  workspace, and policy interfaces). Depends only on `FSharp.Core`,
+  `Microsoft.Extensions.AI.Abstractions`, and `Ulid`; never on Akka.
 - **`src/Legate/`**: the runtime (actors, dispatcher, ReAct loop, built-in
   tools, LLM coordinator, hosted services, `AddLegate`). References
   `Legate.Abstractions`. Grants `InternalsVisibleTo` to `Legate.Tests` only.

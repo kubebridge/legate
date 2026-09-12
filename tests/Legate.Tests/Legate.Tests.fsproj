@@ -9,6 +9,7 @@
   <!-- Compile order is explicit: register every new file here, in dependency order. -->
   <ItemGroup>
     <Compile Include="TenancyTests.fs" />
+    <Compile Include="IdentifiersTests.fs" />
   </ItemGroup>
 
   <ItemGroup>
