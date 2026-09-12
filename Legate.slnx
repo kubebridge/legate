@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Legate.Abstractions/Legate.Abstractions.fsproj" />
+    <Project Path="src/Legate/Legate.fsproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Legate.Tests/Legate.Tests.fsproj" />
+  </Folder>
+</Solution>

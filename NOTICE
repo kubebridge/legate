@@ -1,0 +1,10 @@
+Legate
+Copyright (c) KubeBridge contributors
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+This product originated as the agent execution runtime of BridgeMCP
+(https://bridgemcp.io) and was extracted into a standalone library.
+
+This product depends on Akka.NET (https://getakka.net), licensed under the
+Apache License, Version 2.0, Copyright (c) Akka.NET Team and Petabridge, LLC.
