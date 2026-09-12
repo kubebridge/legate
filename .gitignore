@@ -55,3 +55,22 @@ CodeCoverage/
 *.VisualState.xml
 TestResult.xml
 nunit-*.xml
+
+# IDE
+.vs/
+.idea/
+.vscode/
+*.user
+*.suo
+.ionide/
+
+# Local config and secrets
+appsettings.user.*
+*.local.json
+
+# Agent harness (metaskills): worktrees and GitHub body staging files
+.worktrees/
+.tmp-*
+
+# Agent tooling node modules
+.opencode/node_modules/

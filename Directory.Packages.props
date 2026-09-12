@@ -1,0 +1,22 @@
+<Project>
+
+  <!-- Central package versions. Projects reference packages without a Version
+       attribute; bump versions here only. -->
+  <ItemGroup>
+    <PackageVersion Include="FSharp.Core" Version="10.0.101" />
+    <PackageVersion Include="Microsoft.Extensions.AI.Abstractions" Version="10.6.0" />
+    <PackageVersion Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.3" />
+    <PackageVersion Include="Microsoft.Extensions.Hosting.Abstractions" Version="10.0.3" />
+    <PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.3" />
+    <PackageVersion Include="Microsoft.Extensions.Options" Version="10.0.3" />
+  </ItemGroup>
+
+  <!-- Test-only packages. -->
+  <ItemGroup>
+    <PackageVersion Include="FsUnit.xUnit" Version="6.0.1" />
+    <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageVersion Include="xunit" Version="2.9.3" />
+    <PackageVersion Include="xunit.runner.visualstudio" Version="3.1.4" />
+  </ItemGroup>
+
+</Project>

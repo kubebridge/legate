@@ -1,0 +1,68 @@
+root = true
+
+[*]
+indent_style = space
+indent_size = 4
+charset = utf-8
+trim_trailing_whitespace = true
+insert_final_newline = true
+
+[*.{fs,fsx,fsi}]
+# Fantomas 7.0 configuration
+# https://fsprojects.github.io/fantomas/docs/end-users/Configuration.html
+
+max_line_length = 120
+indent_size = 4
+
+# Bracket style: aligned puts opening/closing braces on their own lines
+fsharp_multiline_bracket_style = aligned
+
+# Record formatting
+fsharp_max_record_width = 40
+fsharp_max_record_number_of_items = 3
+fsharp_record_multiline_formatter = character_width
+
+# Array/list formatting
+fsharp_max_array_or_list_width = 40
+fsharp_max_array_or_list_number_of_items = 1
+fsharp_array_or_list_multiline_formatter = character_width
+
+# Expression width thresholds
+fsharp_max_if_then_else_short_width = 60
+fsharp_max_infix_operator_expression = 80
+fsharp_max_value_binding_width = 80
+fsharp_max_function_binding_width = 40
+fsharp_max_dot_get_expression_width = 80
+
+# Spacing
+fsharp_space_before_parameter = true
+fsharp_space_before_lowercase_invocation = true
+fsharp_space_before_uppercase_invocation = false
+fsharp_space_before_class_constructor = false
+fsharp_space_before_member = false
+fsharp_space_before_colon = false
+fsharp_space_after_comma = true
+fsharp_space_before_semicolon = false
+fsharp_space_after_semicolon = true
+fsharp_space_around_delimiter = true
+
+# Multiline formatting
+fsharp_newline_before_multiline_computation_expression = true
+fsharp_multi_line_lambda_closing_newline = false
+fsharp_keep_max_number_of_blank_lines = 1
+
+# Type definitions
+fsharp_newline_between_type_definition_and_members = true
+fsharp_bar_before_discriminated_union_declaration = false
+fsharp_align_function_signature_to_indentation = false
+fsharp_alternative_long_member_definitions = false
+
+fsharp_strict_mode = false
+
+[*.json]
+indent_size = 2
+
+[*.{md,yml,yaml}]
+indent_size = 2
+
+
