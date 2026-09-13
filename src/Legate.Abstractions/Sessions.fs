@@ -58,13 +58,6 @@ type SessionOutcomeMode =
     /// session completes.
     | Structured = 1
 
-/// Placeholder for the session permission policy contract (issue 19): an
-/// empty marker giving <see cref="P:Legate.SessionOptions.Permissions" />
-/// a stable type identity today. Issue 19 relocates and extends this
-/// interface (Evaluate plus the PermissionVerdict and PermissionRequest
-/// shapes) without renaming it, so property types never change identity.
-type IPermissionPolicy = interface end
-
 /// Placeholder for the session completion sink contract (issue 22): an
 /// empty marker giving
 /// <see cref="P:Legate.SessionOptions.CompletionSink" /> a stable type
@@ -98,7 +91,7 @@ type SessionOptions() =
 
     /// The permission policy the session's tool calls are evaluated
     /// against, or null to use the runtime default. The policy contract is
-    /// refined by issue 19.
+    /// <see cref="T:Legate.IPermissionPolicy" />.
     member val Permissions: IPermissionPolicy | null = null with get, set
 
     /// The sink notified when a headless session completes, or null when
