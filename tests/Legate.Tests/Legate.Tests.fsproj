@@ -10,6 +10,7 @@
   <ItemGroup>
     <Compile Include="TenancyTests.fs" />
     <Compile Include="IdentifiersTests.fs" />
+    <Compile Include="ExceptionsTests.fs" />
   </ItemGroup>
 
   <ItemGroup>
