@@ -15,6 +15,10 @@ open Xunit
 let deserialize<'T> (json: string) : 'T =
     JsonSerializer.Deserialize(json, typeof<'T>) |> unbox
 
+// Unchecked.defaultof<string> rather than a bare null literal: under
+// Nullable=enable the literal trips F# nullness checking on string-typed
+// parameters. Deliberate: this is the null string value for the
+// "segment is null" rejection cases.
 let nullString = Unchecked.defaultof<string>
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -60,6 +64,27 @@ let ``Parse throws LegateIdentifierException on invalid input`` () =
 
     (fun () -> ModelReference.Parse "   " |> ignore)
     |> should throw typeof<LegateIdentifierException>
+
+[<Fact>]
+let ``Parse rejects the full Unicode whitespace class in either segment`` () =
+    // Tab, carriage return, and line feed are the machine-whitespace shapes
+    // that motivated the shared segment rule; NBSP covers the non-ASCII arm.
+    let whitespace = [ "\t"; "\r"; "\n"; "\u00A0" ]
+
+    for ws in whitespace do
+        (fun () -> ModelReference.Parse(sprintf "anthropic%sb/claude" ws) |> ignore)
+        |> should throw typeof<LegateIdentifierException>
+
+        (fun () -> ModelReference.Parse(sprintf "anthropic/claude%sx" ws) |> ignore)
+        |> should throw typeof<LegateIdentifierException>
+
+        let mutable reference = Unchecked.defaultof<ModelReference>
+
+        ModelReference.TryParse(sprintf "anthropic%sb/claude" ws, &reference)
+        |> should equal false
+
+        ModelReference.TryParse(sprintf "anthropic/claude%sx" ws, &reference)
+        |> should equal false
 
 [<Fact>]
 let ``Parse throws ArgumentNullException on null input`` () =
@@ -164,6 +189,15 @@ let ``Segment constructor rejects invalid segments`` () =
 
     (fun () -> ModelReference("openai", "has space", 0) |> ignore)
     |> should throw typeof<ArgumentException>
+
+[<Fact>]
+let ``Segment constructor rejects the full Unicode whitespace class`` () =
+    for ws in [ "\t"; "\r"; "\n"; "\u00A0" ] do
+        (fun () -> ModelReference(sprintf "anthropic%sb" ws, "gpt-4o", 0) |> ignore)
+        |> should throw typeof<ArgumentException>
+
+        (fun () -> ModelReference("anthropic", sprintf "claude%sx" ws, 0) |> ignore)
+        |> should throw typeof<ArgumentException>
 
 // ───────────────────────────────────────────────────────────────────────────
 // ModelReferenceInference (compatibility helper)

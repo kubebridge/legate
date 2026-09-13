@@ -19,19 +19,35 @@ open Microsoft.Extensions.AI
 /// provider segment is canonicalised to lowercase; the model segment keeps
 /// its case and may itself contain slashes (only the first slash separates
 /// the segments). Both segments are non-empty, trimmed, and contain no
-/// whitespace or slashes. A value type like the other Legate identifiers;
-/// invalid input throws <see cref="T:Legate.LegateIdentifierException" />.
+/// Unicode whitespace (tabs and line breaks included); the provider segment
+/// additionally contains no slashes. A value type like the other Legate
+/// identifiers; invalid input throws
+/// <see cref="T:Legate.LegateIdentifierException" />.
 [<Struct; CustomEquality; NoComparison>]
 [<JsonConverter(typeof<ModelReferenceJsonConverter>)>]
 type ModelReference private (provider: string, model: string) =
 
+    /// The one segment rule, shared by the validating constructor and
+    /// TryParse so the contract lives in a single place: a segment is
+    /// non-null, non-empty, trimmed, and contains no Unicode whitespace
+    /// (tabs and line breaks included). The provider segment may not
+    /// contain a slash; the model segment may (first-slash split).
+    /// <param name="segment">The segment to validate.</param>
+    /// <param name="allowSlash">true for the model segment, which may contain slashes.</param>
+    /// <returns>true when the segment is valid; otherwise false.</returns>
+    static member private SegmentIsValid(segment: string, allowSlash: bool) =
+        not (String.IsNullOrWhiteSpace segment)
+        && segment.Trim() = segment
+        && not (segment |> Seq.exists Char.IsWhiteSpace)
+        && (allowSlash || segment.IndexOf('/') < 0)
+
     /// Creates a reference from validated segments. Prefer
     /// <see cref="M:Legate.ModelReference.Parse(System.String)" /> over raw
     /// strings.
-    /// <param name="provider">The provider id; non-empty, no whitespace or slashes.</param>
-    /// <param name="model">The model id; non-empty, no whitespace or slashes.</param>
+    /// <param name="provider">The provider id; non-empty, no Unicode whitespace or slashes.</param>
+    /// <param name="model">The model id; non-empty, no Unicode whitespace; slashes allowed.</param>
     /// <exception cref="T:System.ArgumentNullException">A segment is null.</exception>
-    /// <exception cref="T:System.ArgumentException">A segment is empty, untrimmed, or contains whitespace or slashes.</exception>
+    /// <exception cref="T:System.ArgumentException">A segment is empty, untrimmed, or contains whitespace (or the provider segment a slash).</exception>
     new(provider: string, model: string, _dummy: int) =
         if isNull (box provider) then
             raise (ArgumentNullException(nameof provider))
@@ -40,13 +56,8 @@ type ModelReference private (provider: string, model: string) =
             raise (ArgumentNullException(nameof model))
 
         if
-            String.IsNullOrWhiteSpace provider
-            || provider.Trim() <> provider
-            || provider.IndexOf(' ') >= 0
-            || provider.IndexOf('/') >= 0
-            || String.IsNullOrWhiteSpace model
-            || model.Trim() <> model
-            || model.IndexOf(' ') >= 0
+            not (ModelReference.SegmentIsValid(provider, false))
+            || not (ModelReference.SegmentIsValid(model, true))
         then
             raise (
                 ArgumentException(
@@ -74,7 +85,9 @@ type ModelReference private (provider: string, model: string) =
             raise (LegateIdentifierException(sprintf "'%s' is not a valid model reference." value))
 
     /// Attempts to parse a model reference in <c>provider/model</c> form;
-    /// returns false for null, blank, or otherwise invalid input.
+    /// returns false for null, blank, or otherwise invalid input. The
+    /// segment rule is the validating constructor's; TryParse only splits
+    /// and delegates.
     /// <param name="value">The string to parse.</param>
     /// <param name="result">Receives the parsed reference when parsing succeeds.</param>
     /// <returns>true when <paramref name="value" /> parsed; otherwise false.</returns>
@@ -92,8 +105,16 @@ type ModelReference private (provider: string, model: string) =
             else
                 let provider = trimmed.Substring(0, first).ToLowerInvariant()
                 let model = trimmed.Substring(first + 1)
-                result <- ModelReference(provider, model, 0)
-                true
+
+                if
+                    ModelReference.SegmentIsValid(provider, false)
+                    && ModelReference.SegmentIsValid(model, true)
+                then
+                    result <- ModelReference(provider, model)
+                    true
+                else
+                    result <- Unchecked.defaultof<ModelReference>
+                    false
 
     /// The canonical lowercase provider id, for example "anthropic".
     member _.Provider = provider
