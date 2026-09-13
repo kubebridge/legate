@@ -207,3 +207,122 @@ let ``JSON deserialisation rejects invalid and non-string payloads`` () =
 
     (fun () -> deserialize<AgentId> "12345" |> ignore)
     |> should throw typeof<JsonException>
+
+// ───────────────────────────────────────────────────────────────────────────
+// CellId
+
+[<Fact>]
+let ``CellId New produces a canonical 26 character uppercase ULID`` () =
+    let cell = CellId.New()
+    cell.ToString().Length |> should equal 26
+    cell.ToString() |> should equal (cell.ToString().ToUpperInvariant())
+    cell.Value |> should equal (cell.ToString())
+
+[<Fact>]
+let ``CellId New values are distinct`` () =
+    CellId.New() |> should not' (equal (CellId.New()))
+
+[<Fact>]
+let ``CellId Parse canonicalises lowercase input to uppercase`` () =
+    CellId.Parse(validA.ToLowerInvariant()).Value |> should equal validA
+
+[<Fact>]
+let ``CellId Parse round-trips through ToString`` () =
+    CellId.Parse(validA.ToLowerInvariant()).ToString() |> should equal validA
+
+    let fresh = CellId.New()
+    CellId.Parse(fresh.ToString()) |> should equal fresh
+
+[<Fact>]
+let ``CellId equality and hashing are ordinal`` () =
+    let a = CellId.Parse validA
+    let b = CellId.Parse validA
+    let c = CellId.Parse validB
+
+    a |> should equal b
+    a.GetHashCode() |> should equal (b.GetHashCode())
+    a.Value |> should equal (b.Value)
+    a |> should not' (equal c)
+    a.GetHashCode() |> should not' (equal (c.GetHashCode()))
+
+[<Fact>]
+let ``CellId never compares equal to other identifier types`` () =
+    let session = SessionId.Parse validA :> obj
+    let turn = TurnId.Parse validA :> obj
+    let agent = AgentId.Parse validA :> obj
+    let cell = CellId.Parse validA :> obj
+
+    cell |> should not' (equal session)
+    cell |> should not' (equal turn)
+    cell |> should not' (equal agent)
+
+[<Fact>]
+let ``CellId Parse throws LegateIdentifierException on invalid input`` () =
+    (fun () -> CellId.Parse "not-a-ulid" |> ignore)
+    |> should throw typeof<LegateIdentifierException>
+
+    (fun () -> CellId.Parse "" |> ignore)
+    |> should throw typeof<LegateIdentifierException>
+
+    (fun () -> CellId.Parse "01ARZ3NDEKTSV4RRFFQ69G5FA" |> ignore)
+    |> should throw typeof<LegateIdentifierException>
+
+[<Fact>]
+let ``CellId Parse throws ArgumentNullException on null input`` () =
+    (fun () -> CellId.Parse nullString |> ignore)
+    |> should throw typeof<ArgumentNullException>
+
+[<Fact>]
+let ``CellId TryParse mirrors the out parameter form`` () =
+    let mutable cell = Unchecked.defaultof<CellId>
+
+    CellId.TryParse(validA, &cell) |> should equal true
+    cell.Value |> should equal validA
+    CellId.TryParse(validA.ToLowerInvariant(), &cell) |> should equal true
+    cell.Value |> should equal validA
+
+[<Fact>]
+let ``CellId TryParse returns false for invalid input without throwing`` () =
+    let mutable cell = Unchecked.defaultof<CellId>
+
+    CellId.TryParse("not-a-ulid", &cell) |> should equal false
+    CellId.TryParse("", &cell) |> should equal false
+    CellId.TryParse("   ", &cell) |> should equal false
+    CellId.TryParse(nullString, &cell) |> should equal false
+    CellId.TryParse("01ARZ3NDEKTSV4RRFFQ69G5FA", &cell) |> should equal false
+
+[<Fact>]
+let ``CellId default is the unstamped state and stays equal to itself`` () =
+    // The store stamps the id on persist, so an unstamped cell carries the
+    // default struct. Its null string must be safe to hash, compare, and
+    // round-trip until then.
+    let unstamped = Unchecked.defaultof<CellId>
+
+    unstamped.Value |> should equal null
+    unstamped.GetHashCode() |> should equal 0
+    unstamped |> should equal (Unchecked.defaultof<CellId>)
+    (unstamped :> obj).Equals(null) |> should equal false
+    unstamped.ToString() |> should equal null
+
+[<Fact>]
+let ``CellId serialises and deserialises as a plain string`` () =
+    let cell = CellId.Parse validA
+
+    JsonSerializer.Serialize cell |> should equal ("\"" + validA + "\"")
+    deserialize<CellId> ("\"" + validA + "\"") |> should equal cell
+
+    deserialize<CellId> ("\"" + validA.ToLowerInvariant() + "\"")
+    |> should equal cell
+
+[<Fact>]
+let ``CellId JSON deserialisation rejects invalid payloads and accepts the unstamped null`` () =
+    (fun () -> deserialize<CellId> "\"not-a-ulid\"" |> ignore)
+    |> should throw typeof<JsonException>
+
+    (fun () -> deserialize<CellId> "12345" |> ignore)
+    |> should throw typeof<JsonException>
+
+    // Null is the unstamped id: the store stamps the cell id on persist,
+    // so a derived cell serialises null until then (mirroring an
+    // in-flight event's empty Sequence).
+    deserialize<CellId> "null" |> should equal (Unchecked.defaultof<CellId>)

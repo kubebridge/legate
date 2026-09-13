@@ -21,6 +21,7 @@
     <Compile Include="AgentsTests.fs" />
     <Compile Include="ToolSourcesTests.fs" />
     <Compile Include="EventsTests.fs" />
+    <Compile Include="CellsTests.fs" />
   </ItemGroup>
 
   <ItemGroup>
