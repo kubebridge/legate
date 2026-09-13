@@ -33,12 +33,21 @@ type RecordingDelay() =
 let ``SystemLlmDelay waits at least the requested real duration`` () =
     let delay = SystemLlmDelay() :> ILlmDelay
     let requested = TimeSpan.FromMilliseconds 150.
+
+    // CI runners can schedule the stopwatch start and the timer callback
+    // with sub-millisecond skew in either direction, so Task.Delay can
+    // observe its deadline just before the stopwatch's: a bare
+    // `>= requested` flaked in CI with a 152 ms measurement against a
+    // 150 ms request. Assert the at-least semantics with a small
+    // scheduling grace instead.
+    let schedulingGrace = TimeSpan.FromMilliseconds 10.
+
     let stopwatch = Stopwatch.StartNew()
 
     delay.Delay(requested, CancellationToken.None).GetAwaiter().GetResult()
     stopwatch.Stop()
 
-    stopwatch.Elapsed >= requested |> should equal true
+    stopwatch.Elapsed >= requested - schedulingGrace |> should equal true
 
 [<Fact>]
 let ``SystemLlmDelay over a fake clock completes with zero real wall time`` () =
