@@ -20,6 +20,7 @@
     <Compile Include="WorkspaceRuntimeTests.fs" />
     <Compile Include="LlmTests.fs" />
     <Compile Include="PoliciesTests.fs" />
+    <Compile Include="HostHooksTests.fs" />
     <Compile Include="AgentsTests.fs" />
     <Compile Include="ToolSourcesTests.fs" />
     <Compile Include="EventsTests.fs" />

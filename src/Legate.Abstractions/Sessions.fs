@@ -58,14 +58,6 @@ type SessionOutcomeMode =
     /// session completes.
     | Structured = 1
 
-/// Placeholder for the session completion sink contract (issue 22): an
-/// empty marker giving
-/// <see cref="P:Legate.SessionOptions.CompletionSink" /> a stable type
-/// identity today. Issue 22 relocates and extends this interface (Notify
-/// plus the at-least-once idempotency-key contract) without renaming it,
-/// so property types never change identity.
-type ISessionCompletionSink = interface end
-
 /// How a session is opened: display title, headless behaviour (AutoClose
 /// and the outcome mode), the permission policy selection, the completion
 /// sink, per-turn limits, and host metadata. A reference type with mutable
@@ -96,7 +88,7 @@ type SessionOptions() =
 
     /// The sink notified when a headless session completes, or null when
     /// the host observes completion another way. The sink contract is
-    /// refined by issue 22.
+    /// <see cref="T:Legate.ISessionCompletionSink" />.
     member val CompletionSink: ISessionCompletionSink | null = null with get, set
 
     /// The most model iterations a single turn may spend. 0 means the

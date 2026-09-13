@@ -15,11 +15,12 @@
     <Compile Include="Messages.fs" />
     <Compile Include="Permissions.fs" />
     <Compile Include="Turns.fs" />
+    <Compile Include="Llm.fs" />
+    <Compile Include="Agents.fs" />
+    <Compile Include="HostHooks.fs" />
     <Compile Include="Sessions.fs" />
     <Compile Include="WorkspaceRuntime.fs" />
-    <Compile Include="Llm.fs" />
     <Compile Include="Policies.fs" />
-    <Compile Include="Agents.fs" />
     <Compile Include="ToolSources.fs" />
     <Compile Include="Events.fs" />
     <Compile Include="Cells.fs" />
