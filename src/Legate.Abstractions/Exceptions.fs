@@ -128,3 +128,29 @@ type InvalidBlobKeyException(key: string, message: string) =
 
     /// The offending key or prefix exactly as passed.
     member _.Key = key
+
+/// Raised when an event-journal write breaches one of the runtime's
+/// configured limits: the per-event byte limit, the per-session event-count
+/// limit, the per-session byte limit, or the append batch-size limit. The
+/// store reports the breach before any part of the batch lands, so a
+/// rejected append never leaves a partial write. The limit values
+/// themselves are runtime options the host configures; only the reporting
+/// shape is contractual.
+/// <param name="limitKind">Which limit was breached: "perEventBytes", "perSessionCount", "perSessionBytes", or "batchSize".</param>
+/// <param name="limit">The configured limit that was breached.</param>
+/// <param name="observed">The observed size or count that breached the limit.</param>
+/// <param name="message">The exception message, without secrets or tool arguments.</param>
+[<Sealed>]
+type EventLimitExceededException(limitKind: string, limit: int64, observed: int64, message: string) =
+    inherit LegateException(message)
+
+    /// Which limit was breached: "perEventBytes", "perSessionCount",
+    /// "perSessionBytes", or "batchSize". Never contains secrets or tool
+    /// arguments.
+    member _.LimitKind = limitKind
+
+    /// The configured limit that was breached.
+    member _.Limit = limit
+
+    /// The observed size or count that breached the limit.
+    member _.Observed = observed
