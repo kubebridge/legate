@@ -14,6 +14,7 @@
     <Compile Include="SeamsTests.fs" />
     <Compile Include="BlobsTests.fs" />
     <Compile Include="MessagesTests.fs" />
+    <Compile Include="TurnTests.fs" />
     <Compile Include="SessionTests.fs" />
     <Compile Include="LlmTests.fs" />
     <Compile Include="AgentsTests.fs" />
