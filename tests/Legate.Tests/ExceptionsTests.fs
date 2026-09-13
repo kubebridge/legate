@@ -2,6 +2,7 @@
 module Legate.Tests.ExceptionsTests
 
 open System
+open System.Collections.Generic
 open FsUnit.Xunit
 open Legate
 open Xunit
@@ -20,6 +21,7 @@ let ``Every subtype derives from LegateException`` () =
     assertDerived typeof<DeadlineExceededException>
     assertDerived typeof<WorkspaceException>
     assertDerived typeof<ToolException>
+    assertDerived typeof<ProviderNotRegisteredException>
 
 [<Fact>]
 let ``SessionNotFoundException carries the session id and message`` () =
@@ -88,6 +90,17 @@ let ``ToolException carries the tool name`` () =
     ex.Message |> should equal "MCP server failed to start."
 
 [<Fact>]
+let ``ProviderNotRegisteredException carries the provider id and registered list`` () =
+    let registered = [ "anthropic"; "openai" ] :> IReadOnlyList<string>
+
+    let ex =
+        ProviderNotRegisteredException("google", registered, "No LLM provider is registered under 'google'.")
+
+    ex.ProviderId |> should equal "google"
+    ex.RegisteredProviders |> should equal registered
+    ex.Message |> should equal "No LLM provider is registered under 'google'."
+
+[<Fact>]
 let ``Messages are returned exactly as given without appended data`` () =
     let exs: exn list =
         [
@@ -98,6 +111,11 @@ let ``Messages are returned exactly as given without appended data`` () =
             DeadlineExceededException("PromptAndWait", "msg-e")
             WorkspaceException("/workspaces/abc", "msg-f")
             ToolException("mcp:github", "msg-g")
+            ProviderNotRegisteredException(
+                "google",
+                ([ "anthropic" ] :> System.Collections.Generic.IReadOnlyList<string>),
+                "msg-h"
+            )
         ]
 
     exs
@@ -112,6 +130,7 @@ let ``Messages are returned exactly as given without appended data`` () =
             "msg-e"
             "msg-f"
             "msg-g"
+            "msg-h"
         ]
 
 [<Fact>]

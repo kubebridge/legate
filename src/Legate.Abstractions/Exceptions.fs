@@ -2,6 +2,7 @@
 namespace Legate
 
 open System
+open System.Collections.Generic
 
 // The typed exception family the public API throws. Control-plane
 // precondition failures throw these; anything after a turn is accepted is a
@@ -97,3 +98,20 @@ type ToolException(toolName: string, message: string) =
 
     /// The name of the tool that failed.
     member _.ToolName = toolName
+
+/// Raised when a call resolves a model through a provider that no
+/// <see cref="T:Legate.ILlmProviderRegistry" /> has registered. Control-plane
+/// precondition failure: nothing was sent to the provider. The message lists
+/// the registered provider ids; it never embeds secrets.
+/// <param name="providerId">The id of the provider that was not registered.</param>
+/// <param name="registeredProviders">The ids of the registered providers.</param>
+/// <param name="message">The exception message, without secrets or tool arguments.</param>
+[<Sealed>]
+type ProviderNotRegisteredException(providerId: string, registeredProviders: IReadOnlyList<string>, message: string) =
+    inherit LegateException(message)
+
+    /// The id of the provider that was not registered.
+    member _.ProviderId = providerId
+
+    /// The ids of the providers the registry knows about.
+    member _.RegisteredProviders: IReadOnlyList<string> = registeredProviders
