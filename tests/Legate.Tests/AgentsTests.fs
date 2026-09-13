@@ -41,7 +41,35 @@ let sampleAgent () =
             selection
         PackageReference = "package.zip"
         Enabled = false
+        Schedule =
+            {
+                Cron = "0 9 * * 1-5"
+                TimeZone = "Europe/Berlin"
+                Message = "Standup summary"
+                Enabled = true
+            }
         RowVersion = 7UL
+        CreatedAt = DateTimeOffset(2024, 1, 2, 3, 4, 5, TimeSpan.Zero)
+        UpdatedAt = DateTimeOffset(2024, 6, 7, 8, 9, 10, TimeSpan.Zero)
+    }
+
+/// Builds a custom tool with every field set, the common shape for
+/// construction and round-trip tests.
+let sampleCustomTool () =
+    {
+        Tenant = TenantId.Create "acme"
+        AgentId = AgentId.Parse "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+        Name = "lookup_order"
+        Description = "Looks up an order by id"
+        Endpoint = Uri "https://orders.internal.example/api/orders"
+        InputSchema = """{"type":"object","properties":{"orderId":{"type":"string"}}}"""
+        Headers =
+            let table = Dictionary<string, string>()
+            table["X-Trace-Source"] <- "legate"
+            table :> IReadOnlyDictionary<string, string>
+        SigningSecret = [| 1uy; 2uy; 3uy; 4uy |]
+        Enabled = true
+        RowVersion = 3UL
         CreatedAt = DateTimeOffset(2024, 1, 2, 3, 4, 5, TimeSpan.Zero)
         UpdatedAt = DateTimeOffset(2024, 6, 7, 8, 9, 10, TimeSpan.Zero)
     }
@@ -235,6 +263,11 @@ let ``Agent JSON round-trip preserves every field with default options`` () =
 
     roundTripped.PackageReference |> should equal agent.PackageReference
     roundTripped.Enabled |> should equal agent.Enabled
+
+    let schedule = roundTripped.Schedule |> Option.ofObj
+    schedule.Value |> should equal agent.Schedule |> ignore
+    roundTripped.Schedule |> should equal agent.Schedule
+
     roundTripped.RowVersion |> should equal agent.RowVersion
     roundTripped.CreatedAt |> should equal agent.CreatedAt
     roundTripped.UpdatedAt |> should equal agent.UpdatedAt
@@ -260,6 +293,7 @@ let ``Agent JSON deserialises absent optional properties as null`` () =
     agent.PermissionDefaults |> should equal null
     agent.ToolSelection |> should equal null
     agent.PackageReference |> should equal null
+    agent.Schedule |> should equal null
     agent.RowVersion |> should equal 0UL
     agent.Tenant.Value |> should equal "acme"
     agent.Model.Value |> should equal "anthropic/claude-sonnet"
@@ -295,3 +329,115 @@ let ``Agent JSON rejects invalid tenant and model payloads`` () =
 
     (fun () -> deserialize<Agent> invalidModel |> ignore)
     |> should throw typeof<LegateIdentifierException>
+
+// ───────────────────────────────────────────────────────────────────────────
+// AgentSchedule and AgentCustomTool
+
+[<Fact>]
+let ``AgentSchedule carries the opaque strings and the enabled flag`` () =
+    let schedule =
+        {
+            Cron = "30 2 * * *"
+            TimeZone = "America/New_York"
+            Message = "Nightly report"
+            Enabled = false
+        }
+
+    schedule.Cron |> should equal "30 2 * * *"
+    schedule.TimeZone |> should equal "America/New_York"
+    schedule.Message |> should equal "Nightly report"
+    schedule.Enabled |> should equal false
+
+[<Fact>]
+let ``AgentSchedule JSON round-trip preserves every field`` () =
+    let schedule =
+        {
+            Cron = "0 9 * * 1-5"
+            TimeZone = "Europe/Berlin"
+            Message = "Standup summary"
+            Enabled = true
+        }
+
+    let json = JsonSerializer.Serialize schedule
+    let roundTripped = deserialize<AgentSchedule> json
+
+    roundTripped |> should equal schedule
+
+[<Fact>]
+let ``Agent JSON deserialises a configured schedule`` () =
+    let json =
+        """{"Id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","Tenant":"acme","Name":"checkout","Model":"openai/gpt-4o","SystemPrompt":"You help.","Enabled":true,"Schedule":{"Cron":"0 9 * * 1-5","TimeZone":"Europe/Berlin","Message":"Standup summary","Enabled":true},"RowVersion":1,"CreatedAt":"2024-01-02T03:04:05+00:00","UpdatedAt":"2024-01-02T03:04:05+00:00"}"""
+
+    let agent = deserialize<Agent> json
+
+    let schedule = agent.Schedule |> Option.ofObj
+    schedule.Value.Cron |> should equal "0 9 * * 1-5"
+    schedule.Value.TimeZone |> should equal "Europe/Berlin"
+    schedule.Value.Message |> should equal "Standup summary"
+    schedule.Value.Enabled |> should equal true
+
+[<Fact>]
+let ``AgentCustomTool record constructs with F# syntax and compares structurally`` () =
+    let tool = sampleCustomTool ()
+
+    let changed = { tool with Name = "lookup_invoice" }
+
+    changed |> should not' (equal tool)
+
+    let copy = { tool with Name = "lookup_order" }
+
+    copy |> should equal tool
+
+[<Fact>]
+let ``AgentCustomTool CLIMutable setters drive property access`` () =
+    let tool = sampleCustomTool ()
+
+    tool.Name |> should equal "lookup_order"
+    tool.Enabled |> should equal true
+    tool.RowVersion |> should equal 3UL
+    tool.Endpoint |> should equal (Uri "https://orders.internal.example/api/orders")
+    tool.SigningSecret |> should equal [| 1uy; 2uy; 3uy; 4uy |]
+
+    let headers = tool.Headers |> Option.ofObj
+    headers.Value["X-Trace-Source"] |> should equal "legate"
+
+[<Fact>]
+let ``AgentCustomTool JSON round-trip preserves every field`` () =
+    let tool = sampleCustomTool ()
+
+    let json = JsonSerializer.Serialize tool
+    let roundTripped = deserialize<AgentCustomTool> json
+
+    roundTripped.Tenant |> should equal tool.Tenant
+    roundTripped.AgentId |> should equal tool.AgentId
+    roundTripped.Name |> should equal tool.Name
+    roundTripped.Description |> should equal tool.Description
+    roundTripped.Endpoint |> should equal tool.Endpoint
+    roundTripped.InputSchema |> should equal tool.InputSchema
+
+    // Deserialisation builds a fresh dictionary, so the header table is
+    // compared by content, not by record equality.
+    let roundTrippedHeaders = roundTripped.Headers |> Option.ofObj
+    let originalHeaders = tool.Headers |> Option.ofObj
+    roundTrippedHeaders.Value.Count |> should equal originalHeaders.Value.Count
+
+    roundTrippedHeaders.Value["X-Trace-Source"]
+    |> should equal originalHeaders.Value["X-Trace-Source"]
+
+    roundTripped.SigningSecret |> should equal tool.SigningSecret
+    roundTripped.Enabled |> should equal tool.Enabled
+    roundTripped.RowVersion |> should equal tool.RowVersion
+    roundTripped.CreatedAt |> should equal tool.CreatedAt
+    roundTripped.UpdatedAt |> should equal tool.UpdatedAt
+
+[<Fact>]
+let ``AgentCustomTool JSON deserialises absent optional properties as null`` () =
+    let json =
+        """{"Tenant":"acme","AgentId":"01ARZ3NDEKTSV4RRFFQ69G5FAV","Name":"lookup_order","Endpoint":"https://orders.internal.example/api/orders","SigningSecret":"AQIDBA==","Enabled":true,"RowVersion":1,"CreatedAt":"2024-01-02T03:04:05+00:00","UpdatedAt":"2024-01-02T03:04:05+00:00"}"""
+
+    let tool = deserialize<AgentCustomTool> json
+
+    tool.Description |> should equal null
+    tool.InputSchema |> should equal null
+    tool.Headers |> should equal null
+    tool.SigningSecret |> should equal [| 1uy; 2uy; 3uy; 4uy |]

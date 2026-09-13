@@ -111,6 +111,27 @@ throws `EventLimitExceededException` with structured properties before any
 part of the batch lands. Sanitisation is a runtime concern applied before
 the append; the store persists what it is given and validates only bounds.
 
+`IAgentStore` and `IAgentCustomToolStore` are the durable store contracts
+for agent definitions and the custom HTTP tools enabled per agent. Every
+method is tenant-scoped; isolation is enforced in the stores, not only in
+the host. The agent upsert is checked: `UpdateIfUnchanged` applies when the
+stored row version matches the expected one (0 inserts when absent) and
+returns an `AgentUpdateOutcome` result object otherwise, with the conflict
+branch carrying the current row to retry against; a conflict is an expected
+branch of a concurrently edited definition, never an exception. The
+custom-tool upsert is plain last-write-wins with a store-stamped row
+version, and the tool name is validated against `ToolNameRules.Pattern` at
+upsert; name sanitisation and first-claimant collisions stay with the
+invocation epic. A missing agent is a control-plane precondition and throws
+`AgentNotFoundException`. Both contracts are safe to implement read-only: a
+read-only store serves every read and throws `ReadOnlyAgentStoreException`
+from every write (the file-based store relies on this). Schedules ride on
+the agent definition as a nullable `Agent.Schedule` field, so saving a
+schedule is the store's one write path and `ListAgentsWithEnabledSchedules`
+is the query the dispatcher polls; cron and time-zone semantics stay with
+the dispatcher epic. Signing secrets are opaque bytes the host has already
+protected and must never be logged.
+
 ## Package layout
 
 ```
