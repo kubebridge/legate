@@ -49,7 +49,12 @@ let sampleSession () =
             options.AutoClose <- true
             options.Outcome <- SessionOutcomeMode.Structured
             options.Permissions <- FakePermissionPolicy() :> IPermissionPolicy
-            options.CompletionSink <- { new ISessionCompletionSink }
+
+            options.CompletionSink <-
+                { new ISessionCompletionSink with
+                    member _.Notify(_completion: SessionCompletion) = ()
+                }
+
             options.MaxIterations <- 24
             options.Timeout <- Nullable(TimeSpan.FromMinutes 30.)
 
@@ -123,7 +128,11 @@ let ``SessionOptions defaults to an interactive session`` () =
 [<Fact>]
 let ``SessionOptions accepts every option through the object initialiser`` () =
     let permissions = FakePermissionPolicy() :> IPermissionPolicy
-    let sink = { new ISessionCompletionSink }
+
+    let sink =
+        { new ISessionCompletionSink with
+            member _.Notify(_completion: SessionCompletion) = ()
+        }
 
     let metadata =
         Dictionary<string, string>(dict [ ("source", "headless") ]) :> IReadOnlyDictionary<string, string>
@@ -156,7 +165,12 @@ let ``SessionOptions mutates in place like a C# host would`` () =
     options.AutoClose <- true
     options.Outcome <- SessionOutcomeMode.Structured
     options.Permissions <- FakePermissionPolicy() :> IPermissionPolicy
-    options.CompletionSink <- { new ISessionCompletionSink }
+
+    options.CompletionSink <-
+        { new ISessionCompletionSink with
+            member _.Notify(_completion: SessionCompletion) = ()
+        }
+
     options.MaxIterations <- 64
     options.Timeout <- Nullable(TimeSpan.FromHours 1.)
     options.Metadata <- Dictionary<string, string>() :> IReadOnlyDictionary<string, string>
