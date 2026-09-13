@@ -16,6 +16,7 @@
     <Compile Include="Permissions.fs" />
     <Compile Include="Turns.fs" />
     <Compile Include="Sessions.fs" />
+    <Compile Include="WorkspaceRuntime.fs" />
     <Compile Include="Llm.fs" />
     <Compile Include="Policies.fs" />
     <Compile Include="Agents.fs" />
