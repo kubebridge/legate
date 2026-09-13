@@ -14,6 +14,7 @@
     <Compile Include="Blobs.fs" />
     <Compile Include="Messages.fs" />
     <Compile Include="Llm.fs" />
+    <Compile Include="Agents.fs" />
   </ItemGroup>
 
   <ItemGroup>

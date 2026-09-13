@@ -15,6 +15,7 @@
     <Compile Include="BlobsTests.fs" />
     <Compile Include="MessagesTests.fs" />
     <Compile Include="LlmTests.fs" />
+    <Compile Include="AgentsTests.fs" />
   </ItemGroup>
 
   <ItemGroup>
