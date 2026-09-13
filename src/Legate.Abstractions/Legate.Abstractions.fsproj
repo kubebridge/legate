@@ -11,6 +11,7 @@
     <Compile Include="Identifiers.fs" />
     <Compile Include="Exceptions.fs" />
     <Compile Include="Seams.fs" />
+    <Compile Include="Blobs.fs" />
     <Compile Include="Messages.fs" />
     <Compile Include="Llm.fs" />
   </ItemGroup>
