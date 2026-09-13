@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <RootNamespace>Legate</RootNamespace>
@@ -13,6 +13,7 @@
     <Compile Include="Seams.fs" />
     <Compile Include="Blobs.fs" />
     <Compile Include="Messages.fs" />
+    <Compile Include="Sessions.fs" />
     <Compile Include="Llm.fs" />
     <Compile Include="Agents.fs" />
   </ItemGroup>
