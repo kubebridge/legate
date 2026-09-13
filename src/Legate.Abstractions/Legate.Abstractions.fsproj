@@ -24,6 +24,7 @@
     <Compile Include="SessionsStore.fs" />
     <Compile Include="SessionEventStore.fs" />
     <Compile Include="AgentStore.fs" />
+    <Compile Include="AgentPackages.fs" />
   </ItemGroup>
 
   <ItemGroup>
