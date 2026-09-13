@@ -64,8 +64,9 @@ so the public boundary follows these rules; internal code stays idiomatic F#.
 - The throw family lives in `src/Legate.Abstractions/Exceptions.fs`:
   `SessionNotFoundException`, `InvalidSessionStateException`,
   `AdmissionRejectedException`, `ProviderException`, `DeadlineExceededException`,
-  `WorkspaceException`, and `ToolException`. Each carries structured context
-  (ids, provider id, HTTP status, retry-after) on properties; hosts never
+  `WorkspaceException`, `ToolException`, and `InvalidBlobKeyException`. Each carries
+  structured context (ids, provider id, HTTP status, retry-after, offending blob
+  key) on properties; hosts never
   parse exception messages, and messages never embed secrets or tool
   arguments.
 - Throw-versus-result rule for client methods: control-plane precondition

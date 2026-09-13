@@ -115,3 +115,16 @@ type ProviderNotRegisteredException(providerId: string, registeredProviders: IRe
 
     /// The ids of the providers the registry knows about.
     member _.RegisteredProviders: IReadOnlyList<string> = registeredProviders
+
+/// Raised when a blob key or prefix fails contract validation, such as a
+/// rooted path, a <c>..</c> segment, a backslash, or a NUL character. The
+/// offending key travels on a property so hosts can report it without
+/// parsing messages.
+/// <param name="key">The offending key or prefix exactly as passed.</param>
+/// <param name="message">The exception message, without secrets or tool arguments.</param>
+[<Sealed>]
+type InvalidBlobKeyException(key: string, message: string) =
+    inherit LegateException(message)
+
+    /// The offending key or prefix exactly as passed.
+    member _.Key = key

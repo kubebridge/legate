@@ -22,6 +22,7 @@ let ``Every subtype derives from LegateException`` () =
     assertDerived typeof<WorkspaceException>
     assertDerived typeof<ToolException>
     assertDerived typeof<ProviderNotRegisteredException>
+    assertDerived typeof<InvalidBlobKeyException>
 
 [<Fact>]
 let ``SessionNotFoundException carries the session id and message`` () =
@@ -101,6 +102,14 @@ let ``ProviderNotRegisteredException carries the provider id and registered list
     ex.Message |> should equal "No LLM provider is registered under 'google'."
 
 [<Fact>]
+let ``InvalidBlobKeyException carries the offending key`` () =
+    let ex =
+        InvalidBlobKeyException("../escape", "A blob key may not contain '..' segments.")
+
+    ex.Key |> should equal "../escape"
+    ex.Message |> should equal "A blob key may not contain '..' segments."
+
+[<Fact>]
 let ``Messages are returned exactly as given without appended data`` () =
     let exs: exn list =
         [
@@ -116,6 +125,7 @@ let ``Messages are returned exactly as given without appended data`` () =
                 ([ "anthropic" ] :> System.Collections.Generic.IReadOnlyList<string>),
                 "msg-h"
             )
+            InvalidBlobKeyException("../escape", "msg-i")
         ]
 
     exs
@@ -131,6 +141,7 @@ let ``Messages are returned exactly as given without appended data`` () =
             "msg-f"
             "msg-g"
             "msg-h"
+            "msg-i"
         ]
 
 [<Fact>]
