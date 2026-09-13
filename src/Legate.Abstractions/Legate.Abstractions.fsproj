@@ -17,6 +17,7 @@
     <Compile Include="Sessions.fs" />
     <Compile Include="Llm.fs" />
     <Compile Include="Agents.fs" />
+    <Compile Include="Events.fs" />
   </ItemGroup>
 
   <ItemGroup>
