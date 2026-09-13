@@ -88,12 +88,28 @@ host.
   discriminators on the wire like `Reply` and `TurnOutcome`. Control-plane
   preconditions (an unknown session, a disallowed state) throw the
   `Exceptions.fs` family.
-- **Capacity.** The dispatcher (issue 13) enforces per-agent, per-tenant,
-  and per-process limits with three count queries
+- **Capacity.** The dispatcher enforces per-agent, per-tenant, and
+  per-process limits with three count queries
   (`CountSessionsByAgent`, `CountSessionsByTenant`,
   `CountRunningSessions`) and wakes sessions with pending work through
   `GetDispatchCandidates`, a tenant-scoped bounded batch
   (`DispatchBatch`).
+
+`ISessionEventStore` is the durable store contract for the ordered
+per-session event journal, kept separate from `ISessionStore`: the journal
+is the system-facing audit trail and the source of `Subscribe`. It appends
+`SessionEvent` batches under the turn's claim token (the store assigns
+per-session monotonic, gap-free 1-based sequences and stamps them on the
+returned events; a stale token rejects the whole batch with zero writes),
+replays bounded pages by an exclusive int64 cursor (`EventReplayOutcome`:
+page with `NextCursor`, end of stream, unknown session, expired journal),
+and leases journal cleanup to a background worker
+(`TryClaimCleanup` / `CompleteCleanup` / `DeferCleanup` over an opaque
+`EventCleanupClaim` token). Limit values (per-event bytes, per-session
+count and bytes, batch size) are host-configured runtime options; a breach
+throws `EventLimitExceededException` with structured properties before any
+part of the batch lands. Sanitisation is a runtime concern applied before
+the append; the store persists what it is given and validates only bounds.
 
 ## Package layout
 

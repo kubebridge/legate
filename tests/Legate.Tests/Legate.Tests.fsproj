@@ -23,6 +23,7 @@
     <Compile Include="EventsTests.fs" />
     <Compile Include="CellsTests.fs" />
     <Compile Include="SessionsStoreTests.fs" />
+    <Compile Include="SessionEventStoreTests.fs" />
   </ItemGroup>
 
   <ItemGroup>

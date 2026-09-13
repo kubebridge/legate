@@ -10,8 +10,8 @@ open System.Threading.Tasks
 // Session store contracts. ISessionStore is the durable store contract the
 // Postgres, SQLite, and in-memory implementations implement: session CRUD,
 // the session inbox in front of the turn queue, turn claims under a lease,
-// dispatch candidates, and the capacity count queries the dispatcher (issue
-// 13) enforces per-agent, per-tenant, and per-process limits with. The claim
+// dispatch candidates, and the capacity count queries the dispatcher
+// enforces per-agent, per-tenant, and per-process limits with. The claim
 // token and its owner live here, on the claim type, and never on Turn or the
 // client surface: the boundary issue 7 drew. Lease states and settlement
 // outcomes are result objects (the host must branch on them), control-plane
