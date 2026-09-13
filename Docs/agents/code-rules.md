@@ -61,6 +61,29 @@ so the public boundary follows these rules; internal code stays idiomatic F#.
 - Public APIs surface expected failures as typed exceptions derived from
   `LegateException`, or as a result object when the host must branch on the
   outcome (`TurnResult`). Do not leak `Result` on the public surface.
+- The throw family lives in `src/Legate.Abstractions/Exceptions.fs`:
+  `SessionNotFoundException`, `InvalidSessionStateException`,
+  `AdmissionRejectedException`, `ProviderException`, `DeadlineExceededException`,
+  `WorkspaceException`, and `ToolException`. Each carries structured context
+  (ids, provider id, HTTP status, retry-after) on properties; hosts never
+  parse exception messages, and messages never embed secrets or tool
+  arguments.
+- Throw-versus-result rule for client methods: control-plane precondition
+  failures throw. Unknown session ids throw `SessionNotFoundException`
+  (`OpenSession` with an unknown agent, `ResumeSession`, `GetSession`,
+  `SetAgent` on a missing session), a session in a disallowed state throws
+  `InvalidSessionStateException` (prompting, replying, forking, aborting, or
+  compacting a closed session; `SetAgent` while a turn is running), admission
+  rejection throws `AdmissionRejectedException`, provider failures outside a
+  turn outcome throw `ProviderException`, bounded operations that outrun their
+  deadline throw `DeadlineExceededException`, workspace binding or teardown
+  failures throw `WorkspaceException`, and tool infrastructure failures (an
+  MCP server that will not start, a tool source that fails to load) throw
+  `ToolException`. Anything after a turn is accepted is a turn outcome
+  returned through `TurnResult` (`Prompt`, `Reply`), whether the turn
+  completes, aborts, suspends, exhausts budget, or fails inside the turn.
+  `PromptAndWait`'s own wait deadline throws `DeadlineExceededException` even
+  though the turn keeps running.
 - Raw `task { }` without `Result` only for genuine fire-and-forget or
   fallback work.
 - Guard clauses over nested `match`: `Result.requireSome`, `Result.requireNone`,
