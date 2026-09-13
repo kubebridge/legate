@@ -55,6 +55,46 @@ an `AllowAll` permission policy, an optional completion sink, and optionally
    or `WaitingForInput`; `AutoClose` sessions close and notify the completion
    sink with at-least-once delivery.
 
+### Store contracts
+
+`ISessionStore` is the durable store contract the Postgres, SQLite, and
+in-memory implementations implement: session CRUD with tenant-scoped list
+paging (`SessionPage`), the session inbox in front of the turn queue
+(`AppendInboxMessage`, `ReadPendingInbox`, `MarkInboxConsumed`, with the
+`InboxEntry` envelope carrying a `UserMessage` or a `Reply` plus its
+`DeliveryMode`), turn claims under a lease, dispatch candidates, and the
+capacity count queries. Every method takes the `TenantId` the data belongs
+to; isolation across tenants is enforced in the stores, not only in the
+host.
+
+- **Atomicity.** Inbox append, `ClaimNextTurn`, `RenewClaim` /
+  `ObserveAndRenewClaim`, `CheckpointUsage`, `SettleTurn`, and
+  `UpdateSessionState` must be atomic: each lands in one transaction, so a
+  reader never observes a half-applied step. `ClaimNextTurn` in particular
+  hands a turn to exactly one caller; a loser observes no claimable turn,
+  never a double claim.
+- **Fencing.** The claim token lives on `TurnClaim` (with its owner, expiry,
+  and attempt) and nowhere else; it is opaque: stores mint it, callers carry
+  it verbatim, nothing parses it. Every side effect on behalf of a turn
+  (checkpoint, settle, abort, and every tool call or journal write the
+  runtime performs after claiming) verifies the token at the last moment. A
+  correlation id is evidence, not authority. A stale token must never
+  produce an effect: `CheckpointUsage`, `SettleTurn`, and `AbortTurn`
+  return the lost/rejected outcomes instead of acting.
+- **Results, not exceptions, for lease states.** Lease states
+  (`TurnLeaseState`: held, renewed, lost, expiring, missing) and settlement
+  outcomes (`TurnSettlement`: settled, already settled, rejected stale) are
+  result objects the caller branches on; they carry stable `$type`
+  discriminators on the wire like `Reply` and `TurnOutcome`. Control-plane
+  preconditions (an unknown session, a disallowed state) throw the
+  `Exceptions.fs` family.
+- **Capacity.** The dispatcher (issue 13) enforces per-agent, per-tenant,
+  and per-process limits with three count queries
+  (`CountSessionsByAgent`, `CountSessionsByTenant`,
+  `CountRunningSessions`) and wakes sessions with pending work through
+  `GetDispatchCandidates`, a tenant-scoped bounded batch
+  (`DispatchBatch`).
+
 ## Package layout
 
 ```
