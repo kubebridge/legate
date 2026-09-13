@@ -23,6 +23,7 @@
     <Compile Include="Cells.fs" />
     <Compile Include="SessionsStore.fs" />
     <Compile Include="SessionEventStore.fs" />
+    <Compile Include="AgentStore.fs" />
   </ItemGroup>
 
   <ItemGroup>

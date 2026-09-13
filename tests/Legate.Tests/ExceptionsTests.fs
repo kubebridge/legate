@@ -23,6 +23,8 @@ let ``Every subtype derives from LegateException`` () =
     assertDerived typeof<ToolException>
     assertDerived typeof<ProviderNotRegisteredException>
     assertDerived typeof<InvalidBlobKeyException>
+    assertDerived typeof<AgentNotFoundException>
+    assertDerived typeof<ReadOnlyAgentStoreException>
 
 [<Fact>]
 let ``SessionNotFoundException carries the session id and message`` () =
@@ -110,6 +112,22 @@ let ``InvalidBlobKeyException carries the offending key`` () =
     ex.Message |> should equal "A blob key may not contain '..' segments."
 
 [<Fact>]
+let ``AgentNotFoundException carries the agent id`` () =
+    let agent = AgentId.New()
+
+    let ex = AgentNotFoundException(agent, "Agent 01ABCD not found.")
+
+    ex.AgentId |> should equal agent
+    ex.Message |> should equal "Agent 01ABCD not found."
+
+[<Fact>]
+let ``ReadOnlyAgentStoreException carries the refused operation`` () =
+    let ex = ReadOnlyAgentStoreException("UpsertCustomTool", "The store is read-only.")
+
+    ex.Operation |> should equal "UpsertCustomTool"
+    ex.Message |> should equal "The store is read-only."
+
+[<Fact>]
 let ``Messages are returned exactly as given without appended data`` () =
     let exs: exn list =
         [
@@ -126,6 +144,8 @@ let ``Messages are returned exactly as given without appended data`` () =
                 "msg-h"
             )
             InvalidBlobKeyException("../escape", "msg-i")
+            AgentNotFoundException(AgentId.New(), "msg-j")
+            ReadOnlyAgentStoreException("DeleteAgent", "msg-k")
         ]
 
     exs
@@ -142,6 +162,8 @@ let ``Messages are returned exactly as given without appended data`` () =
             "msg-g"
             "msg-h"
             "msg-i"
+            "msg-j"
+            "msg-k"
         ]
 
 [<Fact>]

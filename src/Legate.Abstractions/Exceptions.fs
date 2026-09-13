@@ -154,3 +154,29 @@ type EventLimitExceededException(limitKind: string, limit: int64, observed: int6
 
     /// The observed size or count that breached the limit.
     member _.Observed = observed
+
+/// Raised when a call references an agent that does not exist, such as
+/// upserting a custom tool onto a missing agent.
+/// <param name="agentId">The id of the agent that could not be found.</param>
+/// <param name="message">The exception message, without secrets or tool arguments.</param>
+[<Sealed>]
+type AgentNotFoundException(agentId: AgentId, message: string) =
+    inherit LegateException(message)
+
+    /// The id of the agent that could not be found.
+    member _.AgentId = agentId
+
+/// Raised when a write is attempted on an agent store that only implements
+/// reads, such as a file-based store that loads agents and custom tools
+/// from a directory it never writes to. Read-only implementations are
+/// documented and supported for both agent store contracts; every write
+/// method throws this instead of failing some other way.
+/// <param name="operation">The name of the store operation the store refused.</param>
+/// <param name="message">The exception message, without secrets or tool arguments.</param>
+[<Sealed>]
+type ReadOnlyAgentStoreException(operation: string, message: string) =
+    inherit LegateException(message)
+
+    /// The name of the store operation the store refused. Never contains
+    /// secrets or tool arguments.
+    member _.Operation = operation

@@ -7,11 +7,13 @@ open System.Text.RegularExpressions
 
 // Agent definition contracts. An Agent is what a host stores and what the
 // runtime reads to run a session: identity, tenant, model configuration,
-// prompt, environment variables, permission defaults, tool selection, and
-// persistence bookkeeping. The runtime-relevant shape only; host-specific
-// references stay with the host, and schedules are modelled in the
-// dispatcher epic and intentionally absent. All types serialise with
-// System.Text.Json and are constructible from C# through property setters.
+// prompt, environment variables, permission defaults, tool selection, the
+// optional schedule, and persistence bookkeeping. The runtime-relevant
+// shape only; host-specific references stay with the host, and a schedule
+// rides on the agent as a nullable field the store persists with it while
+// its cron and time-zone semantics stay with the dispatcher epic. All
+// types serialise with System.Text.Json and are constructible from C#
+// through property setters.
 
 // The pattern const and its compiled matcher, shared by Validate and
 // TryValidate, live in an internal module so the single regex instance is
@@ -118,15 +120,89 @@ type ToolSelection() =
     /// agent; empty means every registered source applies.
     member val ToolSources: IReadOnlyList<string> = ResizeArray<string>() :> IReadOnlyList<string> with get, set
 
+/// One scheduled prompt an agent's definition carries: a cron expression,
+/// the time zone it fires in, and the message each firing prompts the agent
+/// with. Opaque strings to the store and the runtime: the dispatcher epic
+/// (scheduling) owns the cron and IANA time-zone formats and rejects
+/// invalid values when the agent is saved with a schedule. Constructible
+/// from C# through property setters and serialises with System.Text.Json.
+[<CLIMutable; NoComparison>]
+type AgentSchedule =
+    {
+        /// The cron expression describing when the prompt fires. Format and
+        /// validation stay with the dispatcher epic; the store persists the
+        /// string verbatim.
+        Cron: string
+        /// The IANA time-zone id the cron fires in, for example
+        /// "Europe/Berlin". Format and validation stay with the dispatcher
+        /// epic; the store persists the string verbatim.
+        TimeZone: string
+        /// The message each firing prompts the agent with.
+        Message: string
+        /// Whether the schedule is active. Disabled schedules stay stored
+        /// and skipped.
+        Enabled: bool
+    }
+
+/// One custom HTTP tool an agent may call: a model-facing name, the HTTP
+/// endpoint to invoke, and the signing secret that authenticates each call.
+/// The store keys tools by <see cref="P:Legate.AgentCustomTool.Name" /> per
+/// agent and validates the name against
+/// <see cref="P:Legate.ToolNameRules.Pattern" /> on upsert; name
+/// sanitisation and cross-source collisions stay with the invocation epic.
+/// <see cref="P:Legate.AgentCustomTool.SigningSecret" /> is opaque bytes the
+/// host has already protected; the record is sensitive as a whole and must
+/// never be logged. Constructible from C# through property setters and
+/// serialises with System.Text.Json.
+[<CLIMutable; NoComparison>]
+type AgentCustomTool =
+    {
+        /// The tenant the tool belongs to.
+        Tenant: TenantId
+        /// The agent the tool is enabled for.
+        AgentId: AgentId
+        /// The model-facing tool name the runtime invokes the tool by.
+        /// Validated against <see cref="P:Legate.ToolNameRules.Pattern" />
+        /// when the store upserts the tool.
+        Name: string
+        /// What the tool does, or null when the host supplies none.
+        Description: string | null
+        /// The absolute HTTP endpoint each invocation calls.
+        Endpoint: Uri
+        /// The JSON Schema text of the tool's input, or null to use the
+        /// permissive-schema fallback the invocation epic defines.
+        InputSchema: string | null
+        /// Headers each invocation sends, or null when the tool sends none.
+        /// Values are host data and never logged.
+        Headers: IReadOnlyDictionary<string, string> | null
+        /// The opaque signing secret each invocation authenticates with:
+        /// non-empty bytes the host has already protected. Treated as
+        /// sensitive; never logged, never embedded in exception messages.
+        SigningSecret: byte[]
+        /// Whether the tool is callable. Disabled tools stay stored and
+        /// unlisted.
+        Enabled: bool
+        /// The optimistic-concurrency row version; 0 means the tool has
+        /// never been persisted. The store stamps it: previous plus one on
+        /// upsert, one on insert.
+        RowVersion: uint64
+        /// When the tool was created.
+        CreatedAt: DateTimeOffset
+        /// When the tool was last updated.
+        UpdatedAt: DateTimeOffset
+    }
+
 /// The durable definition of an agent: what a host stores and what the
 /// runtime reads to run a session. PackageReference is opaque to the
 /// runtime; RowVersion is the optimistic-concurrency token whose increment
-/// semantics the store epic owns (0 means never persisted). Constructible
-/// from C# through property setters and serialises with System.Text.Json;
-/// absent optional properties deserialise as null and mean the runtime
-/// default. Hosts validate invariants (non-empty Name, well-formed
-/// SystemPrompt, environment keys) through the runtime when the agent is
-/// loaded; this record carries the stored shape.
+/// semantics the store epic owns (0 means never persisted). Schedule is the
+/// agent's optional dispatcher schedule, carried on the definition so the
+/// store's one write path saves it with the agent. Constructible from C#
+/// through property setters and serialises with System.Text.Json; absent
+/// optional properties deserialise as null and mean the runtime default.
+/// Hosts validate invariants (non-empty Name, well-formed SystemPrompt,
+/// environment keys) through the runtime when the agent is loaded; this
+/// record carries the stored shape.
 [<CLIMutable; NoComparison>]
 type Agent =
     {
@@ -163,6 +239,11 @@ type Agent =
         /// Whether the runtime accepts new sessions for the agent. Disabled
         /// agents keep existing sessions runnable.
         Enabled: bool
+        /// The agent's schedule, or null when the agent runs on demand
+        /// only. The store persists it with the agent; the dispatcher epic
+        /// owns the schedule's cron and time-zone semantics and validates
+        /// them when the agent is saved with a schedule.
+        Schedule: AgentSchedule | null
         /// The optimistic-concurrency row version; 0 means the agent has
         /// never been persisted. The store epic owns the increment
         /// semantics.
