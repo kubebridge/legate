@@ -18,6 +18,7 @@
     <Compile Include="TurnTests.fs" />
     <Compile Include="SessionTests.fs" />
     <Compile Include="LlmTests.fs" />
+    <Compile Include="PoliciesTests.fs" />
     <Compile Include="AgentsTests.fs" />
     <Compile Include="ToolSourcesTests.fs" />
     <Compile Include="EventsTests.fs" />
