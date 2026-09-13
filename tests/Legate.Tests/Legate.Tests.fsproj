@@ -18,6 +18,7 @@
     <Compile Include="SessionTests.fs" />
     <Compile Include="LlmTests.fs" />
     <Compile Include="AgentsTests.fs" />
+    <Compile Include="EventsTests.fs" />
   </ItemGroup>
 
   <ItemGroup>
