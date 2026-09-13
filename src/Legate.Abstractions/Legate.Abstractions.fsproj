@@ -16,6 +16,7 @@
     <Compile Include="Permissions.fs" />
     <Compile Include="Turns.fs" />
     <Compile Include="Llm.fs" />
+    <Compile Include="ModelCatalog.fs" />
     <Compile Include="Agents.fs" />
     <Compile Include="HostHooks.fs" />
     <Compile Include="Sessions.fs" />

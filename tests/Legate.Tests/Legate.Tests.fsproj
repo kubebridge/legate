@@ -19,6 +19,7 @@
     <Compile Include="SessionTests.fs" />
     <Compile Include="WorkspaceRuntimeTests.fs" />
     <Compile Include="LlmTests.fs" />
+    <Compile Include="ModelCatalogTests.fs" />
     <Compile Include="PoliciesTests.fs" />
     <Compile Include="HostHooksTests.fs" />
     <Compile Include="AgentsTests.fs" />
