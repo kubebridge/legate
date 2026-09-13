@@ -51,7 +51,7 @@ let sampleAgent () =
 
 [<Fact>]
 let ``Pattern matches the documented shape`` () =
-    AgentEnvironmentKeys.Pattern |> should equal "^[A-Z_][A-Z0-9_]{0,63}$"
+    AgentEnvironmentKeys.Pattern |> should equal @"\A[A-Z_][A-Z0-9_]{0,63}\z"
 
 [<Fact>]
 let ``Validate accepts the documented shapes`` () =
@@ -96,6 +96,14 @@ let ``Validate rejects malformed keys`` () =
     (fun () -> AgentEnvironmentKeys.Validate "KEY\u00E9" |> ignore)
     |> should throw typeof<ArgumentException>
 
+    // $ without \z also matches immediately before a trailing line feed,
+    // which would admit a newline-suffixed key and contradict the doc.
+    (fun () -> AgentEnvironmentKeys.Validate "KEY\n" |> ignore)
+    |> should throw typeof<ArgumentException>
+
+    (fun () -> AgentEnvironmentKeys.Validate "KEY\n " |> ignore)
+    |> should throw typeof<ArgumentException>
+
 [<Fact>]
 let ``TryValidate returns false for malformed keys without throwing`` () =
     AgentEnvironmentKeys.TryValidate nullString |> should equal false
@@ -108,6 +116,8 @@ let ``TryValidate returns false for malformed keys without throwing`` () =
     AgentEnvironmentKeys.TryValidate "A-B" |> should equal false
     AgentEnvironmentKeys.TryValidate "HAS SPACE" |> should equal false
     AgentEnvironmentKeys.TryValidate "KEY\u00E9" |> should equal false
+    AgentEnvironmentKeys.TryValidate "KEY\n" |> should equal false
+    AgentEnvironmentKeys.TryValidate "KEY\n " |> should equal false
 
 [<Fact>]
 let ``Validate performs no trimming`` () =

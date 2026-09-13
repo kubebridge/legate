@@ -15,10 +15,12 @@ open System.Text.RegularExpressions
 
 // The pattern const and its compiled matcher, shared by Validate and
 // TryValidate, live in an internal module so the single regex instance is
-// built once and the rule is defined in one place.
+// built once and the rule is defined in one place. Anchors are \A and \z,
+// not ^ and $: .NET $ also matches immediately before a trailing line feed,
+// so ^...$ would admit a newline-suffixed key.
 module internal AgentEnvironmentKeysInternals =
 
-    let Pattern = "^[A-Z_][A-Z0-9_]{0,63}$"
+    let Pattern = @"\A[A-Z_][A-Z0-9_]{0,63}\z"
 
     let PatternRegex = Regex(Pattern, RegexOptions.CultureInvariant)
 
@@ -31,8 +33,10 @@ type AgentEnvironmentKeys() =
     /// The single key rule, shared by Validate and TryValidate so the
     /// contract lives in one place: an uppercase letter or underscore
     /// followed by up to 63 more uppercase letters, digits, or underscores
-    /// (<c>[A-Z_][A-Z0-9_]{0,63}</c>). Matched ordinally: no trimming, no
-    /// culture, no normalisation; the key is used exactly as given.
+    /// (<c>[A-Z_][A-Z0-9_]{0,63}</c>), anchored with <c>\A</c> and <c>\z</c>
+    /// so the whole key, including its last character, must match. Matched
+    /// ordinally: no trimming, no culture, no normalisation; the key is
+    /// used exactly as given.
     static member Pattern: string = AgentEnvironmentKeysInternals.Pattern
 
     /// The one key rule shared by Validate and TryValidate: matched
@@ -47,7 +51,7 @@ type AgentEnvironmentKeys() =
     /// <param name="key">The key to validate, for example "MY_KEY_1".</param>
     /// <returns>The validated key, unchanged.</returns>
     /// <exception cref="T:System.ArgumentNullException">The key is null.</exception>
-    /// <exception cref="T:System.ArgumentException">The key is empty, contains lowercase letters, starts with a digit, exceeds 64 characters, or contains any character outside [A-Z0-9_] (dashes, whitespace, or non-ASCII included).</exception>
+    /// <exception cref="T:System.ArgumentException">The key is empty, contains lowercase letters, starts with a digit, exceeds 64 characters, or contains any character outside [A-Z0-9_] (dashes, whitespace, trailing line feeds, or non-ASCII included).</exception>
     static member Validate(key: string) : string =
         if isNull (box key) then
             raise (ArgumentNullException(nameof key))
