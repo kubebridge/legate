@@ -107,8 +107,12 @@ so the public boundary follows these rules; internal code stays idiomatic F#.
 
 - xUnit + FsUnit.xUnit in `tests/Legate.Tests`. One test module per source
   module, `<Name>Tests.fs`.
-- Deterministic: inject `ILlmClock`, `ILlmDelay`, `ILlmRandom` (from
-  `Legate.Testing` once it exists) rather than sleeping.
+- Deterministic: the clock is BCL `TimeProvider` (use `FakeTimeProvider` from
+  `Microsoft.Extensions.TimeProvider.Testing`), and waits and jitter go
+  through the injected `ILlmDelay` and `ILlmRandom` seams. The dedicated
+  fakes (`FakeLlmDelay`, `FakeLlmRandom`) come from `Legate.Testing` once
+  that package exists; until then tests define small local fakes. Never
+  sleep to exercise a timeout, backoff, or cooldown.
 - Tests that touch a store run against the in-memory implementation and, for
   relational stores, SQLite; never assume Postgres or Docker on the machine.
 

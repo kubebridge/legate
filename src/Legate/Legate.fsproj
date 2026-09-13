@@ -8,6 +8,8 @@
   <!-- Compile order is explicit: register every new file here, in dependency order. -->
   <ItemGroup>
     <Compile Include="AssemblyInfo.fs" />
+    <Compile Include="Seams.fs" />
+    <Compile Include="AddLegate.fs" />
   </ItemGroup>
 
   <ItemGroup>

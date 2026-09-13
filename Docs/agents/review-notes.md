@@ -27,8 +27,16 @@ architecture in `Docs/ARCHITECTURE.md`.
   claim token at the last moment. A correlation id is evidence, not authority.
   Any claim of stale-attempt suppression needs a takeover race test proving
   zero effects from the loser.
-- **Leases.** Renewal, expiry, and crash recovery must be exercised through the
-  real timer bounds and a deterministic clock seam, not by sleeping.
+- **Time, delay, and randomness seams.** Runtime code (`src/Legate`) never
+  calls `Task.Delay`, `DateTime.UtcNow`, `Stopwatch`, or
+  `Environment.TickCount` directly; it goes through the injected
+  `TimeProvider` (the clock), `ILlmDelay` (waits), and `ILlmRandom` (jitter)
+  seams. Reject a diff that reaches for the direct calls, including wrapper
+  helpers that dodge the seams. The system-backed defaults live in
+  `src/Legate/Seams.fs` and are registered by `AddLegate`.
+- **Leases.** Renewal, expiry, and crash recovery must be exercised through
+  the real timer bounds and the deterministic clock seams (`TimeProvider`,
+  `ILlmDelay`, `ILlmRandom`) under virtual time, not by sleeping in tests.
 - **Cancellation.** Inventory every awaited call inside a turn; each receives
   the turn token or is explicitly bounded. Caller-side `WaitAsync(token)` does
   not prove the provider request was cancelled.

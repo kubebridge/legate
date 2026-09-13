@@ -10,6 +10,7 @@
     <Compile Include="Tenancy.fs" />
     <Compile Include="Identifiers.fs" />
     <Compile Include="Exceptions.fs" />
+    <Compile Include="Seams.fs" />
   </ItemGroup>
 
   <ItemGroup>

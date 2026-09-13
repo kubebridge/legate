@@ -11,6 +11,7 @@
     <Compile Include="TenancyTests.fs" />
     <Compile Include="IdentifiersTests.fs" />
     <Compile Include="ExceptionsTests.fs" />
+    <Compile Include="SeamsTests.fs" />
   </ItemGroup>
 
   <ItemGroup>
@@ -21,6 +22,8 @@
   <ItemGroup>
     <PackageReference Include="FSharp.Core" />
     <PackageReference Include="FsUnit.xUnit" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection" />
+    <PackageReference Include="Microsoft.Extensions.TimeProvider.Testing" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" />
     <PackageReference Include="xunit" />
     <PackageReference Include="xunit.runner.visualstudio" />
