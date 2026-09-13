@@ -22,6 +22,13 @@ let nullString = Unchecked.defaultof<string>
 let noTurnId = Unchecked.defaultof<Nullable<TurnId>>
 let noStamp = Unchecked.defaultof<Nullable<DateTimeOffset>>
 
+/// A permission policy fake that allows every call: enough to put a
+/// non-null, interface-typed value into SessionOptions.Permissions.
+type FakePermissionPolicy() =
+
+    interface IPermissionPolicy with
+        member _.Evaluate(_request: PermissionRequest) = PermissionVerdict.Allow
+
 /// Builds a session with every field set and non-null option values, the
 /// common shape for construction and serialisation-shape tests.
 let sampleSession () =
@@ -41,7 +48,7 @@ let sampleSession () =
             options.Title <- "checkout"
             options.AutoClose <- true
             options.Outcome <- SessionOutcomeMode.Structured
-            options.Permissions <- { new IPermissionPolicy }
+            options.Permissions <- FakePermissionPolicy() :> IPermissionPolicy
             options.CompletionSink <- { new ISessionCompletionSink }
             options.MaxIterations <- 24
             options.Timeout <- Nullable(TimeSpan.FromMinutes 30.)
@@ -115,7 +122,7 @@ let ``SessionOptions defaults to an interactive session`` () =
 
 [<Fact>]
 let ``SessionOptions accepts every option through the object initialiser`` () =
-    let permissions = { new IPermissionPolicy }
+    let permissions = FakePermissionPolicy() :> IPermissionPolicy
     let sink = { new ISessionCompletionSink }
 
     let metadata =
@@ -148,7 +155,7 @@ let ``SessionOptions mutates in place like a C# host would`` () =
     options.Title <- "renamed"
     options.AutoClose <- true
     options.Outcome <- SessionOutcomeMode.Structured
-    options.Permissions <- { new IPermissionPolicy }
+    options.Permissions <- FakePermissionPolicy() :> IPermissionPolicy
     options.CompletionSink <- { new ISessionCompletionSink }
     options.MaxIterations <- 64
     options.Timeout <- Nullable(TimeSpan.FromHours 1.)
