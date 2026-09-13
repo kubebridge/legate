@@ -25,6 +25,8 @@ let ``Every subtype derives from LegateException`` () =
     assertDerived typeof<InvalidBlobKeyException>
     assertDerived typeof<AgentNotFoundException>
     assertDerived typeof<ReadOnlyAgentStoreException>
+    assertDerived typeof<InvalidPackagePathException>
+    assertDerived typeof<PackageLeaseException>
 
 [<Fact>]
 let ``SessionNotFoundException carries the session id and message`` () =
@@ -128,6 +130,26 @@ let ``ReadOnlyAgentStoreException carries the refused operation`` () =
     ex.Message |> should equal "The store is read-only."
 
 [<Fact>]
+let ``InvalidPackagePathException carries the offending path`` () =
+    let ex =
+        InvalidPackagePathException("..\\escape", "A package path must not contain '..' segments.")
+
+    ex.Path |> should equal "..\\escape"
+    ex.Message |> should equal "A package path must not contain '..' segments."
+
+[<Fact>]
+let ``PackageLeaseException carries the agent id, owner, and operation`` () =
+    let agent = AgentId.New()
+
+    let ex =
+        PackageLeaseException(agent, "sync-worker-1", "renew", "The lease was lost.")
+
+    ex.AgentId |> should equal agent
+    ex.Owner |> should equal "sync-worker-1"
+    ex.Operation |> should equal "renew"
+    ex.Message |> should equal "The lease was lost."
+
+[<Fact>]
 let ``Messages are returned exactly as given without appended data`` () =
     let exs: exn list =
         [
@@ -146,6 +168,8 @@ let ``Messages are returned exactly as given without appended data`` () =
             InvalidBlobKeyException("../escape", "msg-i")
             AgentNotFoundException(AgentId.New(), "msg-j")
             ReadOnlyAgentStoreException("DeleteAgent", "msg-k")
+            InvalidPackagePathException("../escape", "msg-l")
+            PackageLeaseException(AgentId.New(), "sync-worker-1", "acquire", "msg-m")
         ]
 
     exs
@@ -164,6 +188,8 @@ let ``Messages are returned exactly as given without appended data`` () =
             "msg-i"
             "msg-j"
             "msg-k"
+            "msg-l"
+            "msg-m"
         ]
 
 [<Fact>]

@@ -180,3 +180,42 @@ type ReadOnlyAgentStoreException(operation: string, message: string) =
     /// The name of the store operation the store refused. Never contains
     /// secrets or tool arguments.
     member _.Operation = operation
+
+/// Raised when a package entry path fails the
+/// <see cref="T:Legate.AgentPackagePaths" /> normalisation rules, such as a
+/// rooted path, a <c>..</c> segment, or an empty result. The offending path
+/// travels on a property so hosts can report it without parsing messages.
+/// <param name="path">The offending path exactly as passed.</param>
+/// <param name="message">The exception message, without secrets or tool arguments.</param>
+[<Sealed>]
+type InvalidPackagePathException(path: string, message: string) =
+    inherit LegateException(message)
+
+    /// The offending path exactly as passed, before normalisation.
+    member _.Path = path
+
+/// Raised when a <see cref="M:Legate.IAgentPackageLeaseService.WithLease*" />
+/// precondition fails: the lease could not be acquired, a renewal was lost
+/// or timed out, or the lease was lost during the work. The operation
+/// context travels on properties so hosts can report it without parsing
+/// messages; it never embeds secrets.
+/// <param name="agentId">The agent whose package lease failed.</param>
+/// <param name="owner">The owner identity that held or wanted the lease.</param>
+/// <param name="operation">The lease operation that failed: "acquire", "renew", or "hold".</param>
+/// <param name="message">The exception message, without secrets or tool arguments.</param>
+[<Sealed>]
+type PackageLeaseException(agentId: AgentId, owner: string, operation: string, message: string) =
+    inherit LegateException(message)
+
+    /// The agent whose package lease failed.
+    member _.AgentId = agentId
+
+    /// The owner identity that held or wanted the lease. Never contains
+    /// secrets.
+    member _.Owner = owner
+
+    /// The lease operation that failed: "acquire" when the lease could not
+    /// be acquired, "renew" when a renewal was lost or timed out, or
+    /// "hold" when the lease was lost during the work. Never contains
+    /// secrets or tool arguments.
+    member _.Operation = operation
