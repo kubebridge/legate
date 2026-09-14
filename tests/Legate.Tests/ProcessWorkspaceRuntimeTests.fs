@@ -157,3 +157,94 @@ module ProcessWorkspaceRuntimeTests =
                 |> ignore)
             |> ignore
         }
+
+module ProcessWorkspaceRuntimeWarningTests =
+
+    open Microsoft.Extensions.FileProviders
+    open Microsoft.Extensions.Hosting
+    open Microsoft.Extensions.Primitives
+    open Microsoft.Extensions.Logging
+
+    /// A logger that counts the warnings it received.
+    type WarningCountingLogger() =
+        let mutable warnings = 0
+
+        member _.Warnings = warnings
+
+        interface ILogger with
+            member _.BeginScope<'TState when 'TState: not null>(_: 'TState) : System.IDisposable =
+                new NopDisposable() :> System.IDisposable
+
+            member _.IsEnabled(logLevel: LogLevel) : bool = logLevel = LogLevel.Warning
+
+            member _.Log<'TState>
+                (
+                    logLevel: LogLevel,
+                    _eventId: EventId,
+                    _state: 'TState,
+                    _ex: exn,
+                    _formatter: Func<'TState, exn, string>
+                ) : unit =
+                if logLevel = LogLevel.Warning then
+                    warnings <- warnings + 1
+
+    and NopDisposable() =
+        interface System.IDisposable with
+            member _.Dispose() = ()
+
+    /// An empty file provider the fake environment hands out.
+    type NopFileProvider() =
+        interface IFileProvider with
+            member _.GetFileInfo(_subpath: string) : IFileInfo = Unchecked.defaultof<IFileInfo>
+
+            member _.GetDirectoryContents(_subpath: string) : IDirectoryContents =
+                Unchecked.defaultof<IDirectoryContents>
+
+            member _.Watch(_filter: string) : IChangeToken = Unchecked.defaultof<IChangeToken>
+
+    /// A host environment fixture carrying its environment name.
+    type FakeHostEnvironment(name: string) =
+        interface IHostEnvironment with
+            member _.ApplicationName = name
+
+            member _.ApplicationName
+                with set (_value: string) = ()
+
+            member _.ContentRootPath = "/"
+
+            member _.ContentRootPath
+                with set (_value: string) = ()
+
+            member _.ContentRootFileProvider = NopFileProvider() :> IFileProvider
+
+            member _.ContentRootFileProvider
+                with set (_value: IFileProvider) = ()
+
+            member _.EnvironmentName = name
+
+            member _.EnvironmentName
+                with set (_value: string) = ()
+
+    [<Fact>]
+    let ``The runtime logs the unsafe label outside Development`` () =
+        let options = ProcessWorkspaceRuntimeOptions(Root = Path.GetTempPath())
+
+        // Construction runs the warning leg outside Development and skips
+        // it inside Development; both paths must complete without throwing
+        // and the warning leg must invoke the logger.
+        let productionLogger = WarningCountingLogger()
+
+        let production =
+            ProcessWorkspaceRuntime(options, FakeHostEnvironment("Production"), productionLogger :> ILogger)
+
+        Assert.Equal(1, productionLogger.Warnings)
+
+        let developmentLogger = WarningCountingLogger()
+
+        let development =
+            ProcessWorkspaceRuntime(options, FakeHostEnvironment("Development"), developmentLogger :> ILogger)
+
+        Assert.Equal(0, developmentLogger.Warnings)
+
+        Assert.NotNull(box production)
+        Assert.NotNull(box development)

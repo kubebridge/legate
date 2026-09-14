@@ -198,3 +198,74 @@ module ProcessWorkspaceTests =
                 |> ignore)
             |> ignore
         }
+
+    [<Fact>]
+    let ``Cancellation abandons the exec and kills the process`` () =
+        task {
+            use workspace = workspace ()
+
+            use cts = new CancellationTokenSource()
+
+            let command =
+                if OperatingSystem.IsWindows() then
+                    "ping -n 30 127.0.0.1 > nul"
+                else
+                    "sleep 30"
+
+            let run = workspace.Exec(command, Nullable(), null, cts.Token)
+
+            // Let the shell start, then cancel: the result carries the
+            // killed process's OS exit value and TimedOut stays false
+            // (the caller, not the timeout, did the cancelling).
+            do! Task.Delay(300)
+            cts.Cancel()
+
+            let! result = run
+
+            Assert.False(result.TimedOut)
+        }
+
+    [<Fact>]
+    let ``The runtime default timeout kills unbounded execs`` () =
+        task {
+            let root =
+                Path.Combine(Path.GetTempPath(), "legate-ws-tests", Ulid.NewUlid().ToString())
+
+            Directory.CreateDirectory root |> ignore
+
+            let runtime =
+                ProcessWorkspaceRuntime(
+                    ProcessWorkspaceRuntimeOptions(Root = root, DefaultExecTimeout = Nullable(TimeSpan.FromSeconds 2.)),
+                    null,
+                    null
+                )
+                :> IWorkspaceRuntime
+
+            let session =
+                {
+                    Id = SessionId.New()
+                    Tenant = TenantId.Create "workspace-tests"
+                    AgentId = AgentId.New()
+                    Title = "workspace"
+                    State = SessionState.Idle
+                    CurrentTurnId = Nullable()
+                    CreatedAt = DateTimeOffset.MinValue
+                    UpdatedAt = DateTimeOffset.MinValue
+                    ClosedAt = Nullable()
+                    WorkspaceBinding = null
+                    Options = SessionOptions()
+                }
+
+            let! bound = runtime.Bind(session, null, CancellationToken.None)
+            use workspace = bound
+
+            let command =
+                if OperatingSystem.IsWindows() then
+                    "ping -n 30 127.0.0.1 > nul"
+                else
+                    "sleep 30"
+
+            let! result = workspace.Exec(command, Nullable(), null, CancellationToken.None)
+
+            Assert.True(result.TimedOut)
+        }

@@ -180,11 +180,12 @@ type ProcessWorkspace internal (runtimeId: string, rootDirectory: string, defaul
     /// Starts the shell with the workspace as its working directory and both
     /// streams redirected. The shell inherits the process's environment; the
     /// caller's injected variables are added on top, overriding on name
-    /// collisions. Values may carry secrets and are never logged. The
-    /// command line is passed argument-by-argument, so the POSIX shell
-    /// receives the payload as one verbatim <c>-c</c> argument with no
-    /// quoting, and cmd.exe re-parses after <c>/c</c> exactly as a user
-    /// shell would.
+    /// collisions. Values may carry secrets and are never logged. The two
+    /// platforms need different transports: cmd.exe re-parses the raw
+    /// command line after <c>/c</c>, so the Windows branch builds
+    /// <c>Arguments</c> verbatim; <c>/bin/sh -c</c> must receive the payload
+    /// as one argv element, so the POSIX branch uses
+    /// <see cref="P:System.Diagnostics.ProcessStartInfo.ArgumentList" />.
     let startShell (command: string) (env: IReadOnlyDictionary<string, string> | null) : Process =
         let startInfo = ProcessStartInfo()
 
@@ -196,10 +197,7 @@ type ProcessWorkspace internal (runtimeId: string, rootDirectory: string, defaul
                  | null -> "cmd.exe"
                  | value -> value)
 
-            startInfo.ArgumentList.Add "/d"
-            startInfo.ArgumentList.Add "/s"
-            startInfo.ArgumentList.Add "/c"
-            startInfo.ArgumentList.Add command
+            startInfo.Arguments <- sprintf "/d /s /c %s" command
         else
             startInfo.FileName <- "/bin/sh"
             startInfo.ArgumentList.Add "-c"
@@ -274,10 +272,12 @@ type ProcessWorkspace internal (runtimeId: string, rootDirectory: string, defaul
 
             let mutable timedOut = false
 
-            // One CTS carries both arms: CancelAfter arms the effective
-            // timeout (the caller's span, or the runtime's configured
-            // default, or unbounded), and the caller's cancellation flows
-            // through the linked token.
+            // One linked source carries both kill arms: CancelAfter arms
+            // the effective timeout (the caller's span, or the runtime's
+            // configured default, or unbounded) and the caller's
+            // cancellation flows straight through. After the wait, the
+            // timeout did the cancelling exactly when the linked token is
+            // cancelled and the caller's is not.
             use linked = CancellationTokenSource.CreateLinkedTokenSource cancellationToken
 
             let effectiveTimeout =
@@ -289,13 +289,6 @@ type ProcessWorkspace internal (runtimeId: string, rootDirectory: string, defaul
             if effectiveTimeout.HasValue then
                 linked.CancelAfter effectiveTimeout.Value
 
-            // The timeout arm marks the result when the effective timeout
-            // fires; with no effective timeout the callback is a no-op.
-            use _timeoutMark =
-                linked.Token.Register(fun () ->
-                    if effectiveTimeout.HasValue then
-                        timedOut <- true)
-
             use _killRegistration = linked.Token.Register(fun () -> killTree shell)
 
             try
@@ -305,6 +298,8 @@ type ProcessWorkspace internal (runtimeId: string, rootDirectory: string, defaul
                 // cancellation; the exit code below is the OS-reported
                 // value of the killed process.
                 ()
+
+            timedOut <- linked.IsCancellationRequested && not cancellationToken.IsCancellationRequested
 
             // Belt and braces: the tree is down whatever the exit path.
             killTree shell
@@ -382,28 +377,7 @@ type ProcessWorkspace internal (runtimeId: string, rootDirectory: string, defaul
 
                 let fullPath = ProcessWorkspacePaths.resolve root path
 
-                // Directories first so the atomic replace below never races
-                // a missing parent.
-                match Path.GetDirectoryName fullPath with
-                | null -> ()
-                | directory when not (Directory.Exists directory) -> Directory.CreateDirectory directory |> ignore
-                | _ -> ()
-
-                // Atomic replace: write to a sibling temp file, close it,
-                // then swap over the destination, so readers never see a
-                // partial file and an existing file is always overwritten.
-                let tempPath = sprintf "%s.legate-tmp-%s" fullPath (Ulid.NewUlid().ToString())
-
-                do!
-                    task {
-                        use stream =
-                            new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None)
-
-                        do! stream.WriteAsync(content, 0, content.Length, cancellationToken)
-                        do! stream.FlushAsync(cancellationToken)
-                    }
-
-                File.Move(tempPath, fullPath, overwrite = true)
+                do! ProcessWorkspaceWrite.atomically path fullPath content cancellationToken
             }
 
         member workspace.DeleteFile(path, cancellationToken) =
