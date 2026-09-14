@@ -800,7 +800,10 @@ let ``The fold classifies a bare event of every kind per the mapped rule`` () =
             | "usage" -> fun () -> UsageEvent(sessionId, turnId, noSequence, stamp, 1L, 2L) :> SessionEvent
             | "compacted" -> fun () -> CompactedEvent(sessionId, turnId, noSequence, stamp, 10L, 2L) :> SessionEvent
             | "turnCompleted" -> fun () -> TurnCompletedEvent(sessionId, turnId, noSequence, stamp) :> SessionEvent
-            | "turnAborted" -> fun () -> TurnAbortedEvent(sessionId, turnId, noSequence, stamp) :> SessionEvent
+            | "turnAborted" ->
+                fun () ->
+                    TurnAbortedEvent(sessionId, turnId, noSequence, stamp, StopCause.ExplicitAbort, "host stop")
+                    :> SessionEvent
             | "turnFailed" -> fun () -> TurnFailedEvent(sessionId, turnId, noSequence, stamp, "reason") :> SessionEvent
             | "sessionClosed" -> fun () -> SessionClosedEvent(sessionId, turnId, noSequence, stamp) :> SessionEvent
             | _ -> failwith (sprintf "unmapped discriminator '%s' in the pin table" discriminator)

@@ -10,6 +10,7 @@ open FsUnit.Xunit
 open Legate
 open Legate.Tests.LlmStreamingTests
 open Microsoft.Extensions.AI
+open Microsoft.Extensions.Time.Testing
 open Xunit
 
 // MEAI interop surfaces nulls (queued responses, result payloads); the
@@ -17,6 +18,24 @@ open Xunit
 
 // ───────────────────────────────────────────────────────────────────────────
 // Doubles
+
+/// An ILlmDelay that never elapses unless its token fires: the loop's hard
+/// deadline stays pending, so tests that do not exercise the deadline run
+/// without one. The deadline tests pass a clock-backed delay instead.
+type NeverDelay() =
+    interface ILlmDelay with
+        member _.Delay(_, cancellationToken) =
+            Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken)
+
+/// An ILlmDelay that records every requested delay and waits on the given
+/// clock: under a FakeTimeProvider the wait completes when the test
+/// advances past it, so the deadline fires deterministically without
+/// sleeping.
+type RecordingClockDelay(clock: TimeProvider, recorded: ResizeArray<TimeSpan>) =
+    interface ILlmDelay with
+        member _.Delay(delay, cancellationToken) =
+            recorded.Add(delay)
+            Task.Delay(delay, clock, cancellationToken)
 
 /// Scripted IChatClient: returns queued responses in order and records how
 /// many provider calls ran. No Akka, no network.
@@ -107,6 +126,31 @@ type DeadlineObservingClient() =
 
     member _.Calls = calls
 
+/// IChatClient double that waits asynchronously for its token to fire: the
+/// test thread stays free to advance the virtual seam clock while the
+/// provider call is in flight, so a seam deadline surfaces as
+/// OperationCanceledException from in-flight provider work. Unlike
+/// DeadlineObservingClient (which blocks the calling thread in WaitOne and
+/// suits real-clock deadlines), this client never blocks the test thread.
+type AsyncDeadlineClient() =
+    let mutable calls = 0
+
+    interface IChatClient with
+        member _.GetResponseAsync(_, _, ct) =
+            calls <- calls + 1
+
+            task {
+                do! Task.Delay(Timeout.InfiniteTimeSpan, ct)
+                return textResponse "never"
+            }
+
+        member _.GetStreamingResponseAsync(_, _, _) = raise (NotImplementedException())
+
+        member _.GetService(_, _) = null
+        member _.Dispose() = ()
+
+    member _.Calls = calls
+
 let makeTools (pairs: (string * AIFunction) list) : IReadOnlyDictionary<string, AITool> =
     let table = Dictionary<string, AITool>()
 
@@ -136,7 +180,7 @@ let private runLoop
     (token: CancellationToken)
     (isLeased: unit -> bool)
     : TurnResult =
-    TurnLoop.runAsync (client :> IChatClient) history tools options token isLeased
+    TurnLoop.runAsync (client :> IChatClient) history tools options (NeverDelay() :> ILlmDelay) token isLeased
     |> fun task -> task.GetAwaiter().GetResult()
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -465,6 +509,7 @@ let private runLoopWithDeltas
             history
             tools
             options
+            (NeverDelay() :> ILlmDelay)
             token
             isLeased
             (fun text -> texts.Add(text))
@@ -637,7 +682,23 @@ let ``Streaming respects the iteration deadline`` () =
         }
 
     let result, texts, _ =
-        runLoopWithDeltas (client :> IChatClient) history (makeTools []) options CancellationToken.None alwaysLeased
+        let texts = ResizeArray<string>()
+        let reasonings = ResizeArray<string>()
+
+        let result =
+            TurnLoop.runAsyncWithDeltas
+                (client :> IChatClient)
+                history
+                (makeTools [])
+                options
+                (SystemLlmDelay() :> ILlmDelay)
+                CancellationToken.None
+                alwaysLeased
+                (fun text -> texts.Add(text))
+                (fun text -> reasonings.Add(text))
+            |> fun task -> task.GetAwaiter().GetResult()
+
+        result, List.ofSeq texts, List.ofSeq reasonings
 
     result.Status |> should equal TurnStatus.Failed
     result.AssistantText |> should equal ""
@@ -800,7 +861,14 @@ let ``Deadline expiry settles Failed as the hard-deadline stop and cancels in-fl
         }
 
     let result =
-        TurnLoop.runAsync (client :> IChatClient) history (makeTools []) options CancellationToken.None alwaysLeased
+        TurnLoop.runAsync
+            (client :> IChatClient)
+            history
+            (makeTools [])
+            options
+            (SystemLlmDelay() :> ILlmDelay)
+            CancellationToken.None
+            alwaysLeased
         |> fun task -> task.GetAwaiter().GetResult()
 
     result.Status |> should equal TurnStatus.Failed
@@ -810,6 +878,113 @@ let ``Deadline expiry settles Failed as the hard-deadline stop and cancels in-fl
     match result.Outcome with
     | :? TurnFailed as failed -> failed.Reason |> should equal TurnLoop.TimeoutExceededMessage
     | _ -> failwith "Expected a TurnFailed outcome."
+
+// ───────────────────────────────────────────────────────────────────────────
+// Issue 35: hard deadline off the injected delay seam
+
+/// Spins until the condition holds or the bound lapses. Sleeps are the poll
+/// cadence only: the deadline fires off the virtual clock, never a sleep.
+let private waitForSeam (timeout: TimeSpan) (condition: unit -> bool) : bool =
+    let deadline = DateTime.UtcNow + timeout
+    let mutable holds = condition ()
+
+    while not holds && DateTime.UtcNow < deadline do
+        Thread.Sleep(10)
+        holds <- condition ()
+
+    holds
+
+[<Fact>]
+let ``Seam deadline fires only when the injected clock advances past the timeout`` () =
+    let clock = FakeTimeProvider()
+    let requested = ResizeArray<TimeSpan>()
+    let delay = RecordingClockDelay(clock, requested) :> ILlmDelay
+    let client = new AsyncDeadlineClient()
+    let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+
+    let options: TurnLoop.TurnLoopOptions =
+        { TurnLoop.TurnLoopOptions.Default with
+            Timeout = TimeSpan.FromMinutes 5.0
+        }
+
+    let runTask =
+        TurnLoop.runAsync
+            (client :> IChatClient)
+            history
+            (makeTools [])
+            options
+            delay
+            CancellationToken.None
+            alwaysLeased
+
+    // The deadline arms on the seam clock before the provider call blocks:
+    // poll for the recorded request, never sleep past it.
+    let armed = waitForSeam (TimeSpan.FromSeconds 5.0) (fun () -> requested.Count = 1)
+
+    armed |> should equal true
+    requested |> List.ofSeq |> should equal [ TimeSpan.FromMinutes 5.0 ]
+
+    // Still pending before the budget elapses: advancing short of it fires
+    // nothing.
+    clock.Advance(TimeSpan.FromMinutes 4.0)
+    runTask.IsCompleted |> should equal false
+
+    clock.Advance(TimeSpan.FromMinutes 1.0 + TimeSpan.FromSeconds 1.0)
+
+    let finished = runTask.Wait(TimeSpan.FromSeconds 10.0)
+    finished |> should equal true
+
+    let result = runTask.GetAwaiter().GetResult()
+    result.Status |> should equal TurnStatus.Failed
+    result.AssistantText |> should equal ""
+    client.Calls |> should equal 1
+
+    match result.Outcome with
+    | :? TurnFailed as failed -> failed.Reason |> should equal TurnLoop.TimeoutExceededMessage
+    | _ -> failwith "Expected a TurnFailed outcome."
+
+[<Fact>]
+let ``External cancellation wins over a pending seam deadline`` () =
+    use cts = new CancellationTokenSource()
+    let clock = FakeTimeProvider()
+    let delay = SystemLlmDelay(clock) :> ILlmDelay
+    let client = new DeadlineObservingClient()
+    let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+
+    let options: TurnLoop.TurnLoopOptions =
+        { TurnLoop.TurnLoopOptions.Default with
+            Timeout = TimeSpan.FromMinutes 5.0
+        }
+
+    // The caller aborts before the seam clock ever advances: the
+    // cancellation propagates instead of settling, so isTimeout never
+    // conflates the abort with the deadline.
+    cts.Cancel()
+
+    (fun () ->
+        TurnLoop.runAsync (client :> IChatClient) history (makeTools []) options delay cts.Token alwaysLeased
+        |> fun task -> task.GetAwaiter().GetResult() |> ignore)
+    |> should throw typeof<OperationCanceledException>
+
+    client.Calls |> should equal 0
+
+[<Fact>]
+let ``A null delay seam is rejected`` () =
+    let client = new ScriptedChatClient([ textResponse "never" ])
+    let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+    let nullDelay = Unchecked.defaultof<ILlmDelay>
+
+    (fun () ->
+        TurnLoop.runAsync
+            (client :> IChatClient)
+            history
+            (makeTools [])
+            TurnLoop.TurnLoopOptions.Default
+            nullDelay
+            CancellationToken.None
+            alwaysLeased
+        |> fun task -> task.GetAwaiter().GetResult() |> ignore)
+    |> should throw typeof<ArgumentNullException>
 
 [<Fact>]
 let ``External cancellation still propagates when a short deadline is configured`` () =
@@ -927,6 +1102,7 @@ let private runLoopWithInjects
         history
         tools
         options
+        (NeverDelay() :> ILlmDelay)
         token
         isLeased
         drain

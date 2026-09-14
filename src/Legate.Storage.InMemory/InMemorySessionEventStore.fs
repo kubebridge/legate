@@ -266,8 +266,16 @@ type InMemorySessionEventStore(database: InMemoryDatabase) =
                                     :> SessionEvent
                                 | :? TurnCompletedEvent ->
                                     TurnCompletedEvent(sessionId, turnId, sequence, timestamp) :> SessionEvent
-                                | :? TurnAbortedEvent ->
-                                    TurnAbortedEvent(sessionId, turnId, sequence, timestamp) :> SessionEvent
+                                | :? TurnAbortedEvent as source ->
+                                    TurnAbortedEvent(
+                                        sessionId,
+                                        turnId,
+                                        sequence,
+                                        timestamp,
+                                        source.Cause,
+                                        source.Reason
+                                    )
+                                    :> SessionEvent
                                 | :? TurnFailedEvent as source ->
                                     TurnFailedEvent(sessionId, turnId, sequence, timestamp, source.Reason)
                                     :> SessionEvent

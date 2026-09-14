@@ -19,7 +19,10 @@ open Microsoft.Extensions.AI
 // and lease loss propagate. Tool results over the configured char limit are
 // truncated with a single marker. Per-turn budgets (MaxIterations,
 // Timeout) are enforced here; metadata wrap belongs to a follow-up issue.
-// The provider path streams via LlmStreaming (one TextDelta per non-empty
+// The wall-clock budget is a hard deadline fired off the injected ILlmDelay
+// seam (issue 35), never the real clock: under a virtual clock the deadline
+// fires when the test advances past it, and a delay that is already complete
+// settles the turn as Failed immediately. The provider path streams via LlmStreaming (one TextDelta per non-empty
 // text chunk, one ReasoningDelta per non-empty reasoning chunk, full
 // messages accumulated with raw blocks intact, single-delta fallback for
 // non-streaming providers).
@@ -360,16 +363,20 @@ module internal TurnLoop =
     /// HasPendingInjects for the session actor's new turn.
     /// The iteration budget is a pre-call check that settles the turn as
     /// Failed with a TurnFailed reason instead of calling the model again.
-    /// The timeout is a linked-CTS hard deadline covering provider and tool
-    /// execution: pre-call checks settle as Failed without further effects,
-    /// and in-flight cancellation caused only by the deadline maps to the
-    /// timeout reason while external cancellation still propagates. The
+    /// The timeout is a seam-fired hard deadline covering provider and tool
+    /// execution: the injected <c>ILlmDelay</c> wait for the Timeout budget
+    /// cancels the deadline scope when it elapses (virtual time under a
+    /// virtual clock), and the terminal-write boundary settles as Failed
+    /// without further effects, while in-flight cancellation caused only by
+    /// the deadline maps to the timeout reason and external cancellation
+    /// still propagates. The
     /// lease hook stays first so a fenced loser still produces zero effects.
     let runAsyncWithDeltasAndInjects
         (client: IChatClient)
         (history: IList<ChatMessage>)
         (tools: IReadOnlyDictionary<string, AITool>)
         (options: TurnLoopOptions)
+        (delay: ILlmDelay)
         (cancellationToken: CancellationToken)
         (isLeaseValid: unit -> bool)
         (onTextDelta: string -> unit)
@@ -381,6 +388,7 @@ module internal TurnLoop =
         ArgumentNullException.ThrowIfNull(client)
         ArgumentNullException.ThrowIfNull(history)
         ArgumentNullException.ThrowIfNull(tools)
+        ArgumentNullException.ThrowIfNull(delay)
         ArgumentNullException.ThrowIfNull(isLeaseValid)
         ArgumentNullException.ThrowIfNull(onTextDelta)
         ArgumentNullException.ThrowIfNull(onReasoningDelta)
@@ -397,7 +405,30 @@ module internal TurnLoop =
         if options.Timeout <= TimeSpan.Zero then
             raise (ArgumentOutOfRangeException(nameof options, "Timeout must be positive."))
 
-        let timeoutCts = new CancellationTokenSource(options.Timeout)
+        let timeoutCts = new CancellationTokenSource()
+
+        // Seam-fired hard deadline: the budget elapses on the injected
+        // delay seam, never on the real clock. Under a virtual clock the
+        // wait completes when the test advances past the Timeout; under the
+        // system clock it completes after the Timeout elapses for real. Only
+        // a completed wait cancels the scope: external cancellation faults
+        // the wait instead, so the isTimeout check below never conflates an
+        // abort with a timeout. A faulted wait is out of contract and fires
+        // nothing; the loop keeps its external-cancellation behaviour.
+        delay
+            .Delay(options.Timeout, cancellationToken)
+            .ContinueWith(
+                Action<Task>(fun elapsed ->
+                    if elapsed.Status = TaskStatus.RanToCompletion then
+                        try
+                            timeoutCts.Cancel()
+                        with :? ObjectDisposedException ->
+                            ()),
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default
+            )
+        |> ignore
 
         let linkedCts =
             CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token)
@@ -576,6 +607,7 @@ module internal TurnLoop =
         (history: IList<ChatMessage>)
         (tools: IReadOnlyDictionary<string, AITool>)
         (options: TurnLoopOptions)
+        (delay: ILlmDelay)
         (cancellationToken: CancellationToken)
         (isLeaseValid: unit -> bool)
         (drainInjected: DrainInjected)
@@ -587,6 +619,7 @@ module internal TurnLoop =
             history
             tools
             options
+            delay
             cancellationToken
             isLeaseValid
             ignore
@@ -604,6 +637,7 @@ module internal TurnLoop =
         (history: IList<ChatMessage>)
         (tools: IReadOnlyDictionary<string, AITool>)
         (options: TurnLoopOptions)
+        (delay: ILlmDelay)
         (cancellationToken: CancellationToken)
         (isLeaseValid: unit -> bool)
         (onTextDelta: string -> unit)
@@ -614,6 +648,7 @@ module internal TurnLoop =
             history
             tools
             options
+            delay
             cancellationToken
             isLeaseValid
             onTextDelta
@@ -636,7 +671,8 @@ module internal TurnLoop =
         (history: IList<ChatMessage>)
         (tools: IReadOnlyDictionary<string, AITool>)
         (options: TurnLoopOptions)
+        (delay: ILlmDelay)
         (cancellationToken: CancellationToken)
         (isLeaseValid: unit -> bool)
         : Task<TurnResult> =
-        runAsyncWithDeltas client history tools options cancellationToken isLeaseValid ignore ignore
+        runAsyncWithDeltas client history tools options delay cancellationToken isLeaseValid ignore ignore

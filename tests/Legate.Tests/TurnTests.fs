@@ -20,6 +20,10 @@ let nullString = Unchecked.defaultof<string>
 // Empty Nullable<'T> spellings; Nullable() inline reads ambiguously.
 let noStamp = Unchecked.defaultof<Nullable<DateTimeOffset>>
 
+// Empty stop cause: a turn that completed normally or is still in flight
+// carries no cause.
+let noStopCause = Unchecked.defaultof<Nullable<StopCause>>
+
 // The null TurnOutcome value; Unchecked.defaultof<string> only spells the
 // null string, so an object-typed null needs its own spelling.
 let noOutcome = Unchecked.defaultof<TurnOutcome>
@@ -43,6 +47,7 @@ let sampleTurn () =
                 OutputTokens = 340L
             }
         Error = nullString
+        StopCause = noStopCause
     }
 
 /// Builds a turn still in flight: no completion stamp, no error.
@@ -154,6 +159,7 @@ let ``Turn CLIMutable record holds the sample values F# construction set`` () =
     turn.Iterations |> should equal 7
     turn.Usage.OutputTokens |> should equal 340L
     turn.Error |> should equal null
+    turn.StopCause.HasValue |> should equal false
 
 [<Fact>]
 let ``Turn JSON round-trip preserves every field with default options`` () =
@@ -172,6 +178,23 @@ let ``Turn JSON round-trip preserves every field with default options`` () =
     restored.Usage.InputTokens |> should equal 1200L
     restored.Usage.OutputTokens |> should equal 340L
     restored.Error |> should equal null
+    restored.StopCause.HasValue |> should equal false
+
+[<Fact>]
+let ``Turn JSON round-trips a stopped turn with its cause`` () =
+    let stopped =
+        { sampleTurn () with
+            Status = TurnStatus.Aborted
+            CompletedAt = Nullable(DateTimeOffset(2024, 1, 2, 3, 5, 6, TimeSpan.Zero))
+            StopCause = Nullable StopCause.ExplicitAbort
+        }
+
+    let json = JsonSerializer.Serialize stopped
+    let restored = deserialize<Turn> json
+
+    restored.Status |> should equal TurnStatus.Aborted
+    restored.StopCause.HasValue |> should equal true
+    restored.StopCause.Value |> should equal StopCause.ExplicitAbort
 
 [<Fact>]
 let ``Turn JSON round-trips an in-flight turn with every null in place`` () =
@@ -264,6 +287,47 @@ let ``TurnFailed round-trips to the correct subtype via $type`` () =
     | restored ->
         (restored :? TurnFailed) |> should equal true
         (restored :?> TurnFailed).Reason |> should equal "tool call timed out"
+
+// ───────────────────────────────────────────────────────────────────────────
+// StopCause
+
+[<Fact>]
+let ``StopCause has exactly the four documented members`` () =
+    Enum.GetNames<StopCause>()
+    |> should
+        equal
+        [|
+            "ExplicitAbort"
+            "Deadline"
+            "LeaseLoss"
+            "HostShutdown"
+        |]
+
+    int StopCause.ExplicitAbort |> should equal 0
+    int StopCause.Deadline |> should equal 1
+    int StopCause.LeaseLoss |> should equal 2
+    int StopCause.HostShutdown |> should equal 3
+
+[<Fact>]
+let ``TurnAborted round-trips to the correct subtype via $type with who and why`` () =
+    let outcome = TurnAborted(StopCause.ExplicitAbort, "host stop") :> TurnOutcome
+
+    let json = JsonSerializer.Serialize(outcome, jsonOptions)
+    json.Contains("\"$type\":\"turnAborted\"") |> should equal true
+
+    match JsonSerializer.Deserialize<TurnOutcome>(json, jsonOptions) with
+    | null -> failwith "deserialised to null"
+    | restored ->
+        (restored :? TurnAborted) |> should equal true
+
+        let aborted = restored :?> TurnAborted
+        aborted.Cause |> should equal StopCause.ExplicitAbort
+        aborted.Reason |> should equal "host stop"
+
+[<Fact>]
+let ``TurnAborted is sealed`` () =
+    typeof<TurnAborted>.IsSealed |> should equal true
+    typeof<TurnAborted>.BaseType |> should equal typeof<TurnOutcome>
 
 // ───────────────────────────────────────────────────────────────────────────
 // TurnResult

@@ -51,6 +51,38 @@ type TurnStatus =
     /// No transitions leave Failed.
     | Failed = 5
 
+/// Why a turn stopped instead of completing: the exactly-one-winner of the
+/// stop-cause arbitration (issue 35). Settlement and stop are mutually
+/// exclusive: at most one of the turn's completion and these causes lands
+/// on the turn, and the winner is recorded on
+/// <see cref="T:Legate.Turn" />.StopCause plus
+/// <see cref="T:Legate.TurnAborted" /> or
+/// <see cref="T:Legate.TurnFailed" />. A flat enum, never a stringly reason,
+/// so hosts branch on it without parsing messages.
+type StopCause =
+
+    /// The host aborted the turn through <c>Abort</c> while it was running.
+    /// Settles the turn as <see cref="F:Legate.TurnStatus.Aborted" /> with a
+    /// <see cref="T:Legate.TurnAborted" /> outcome.
+    | ExplicitAbort = 0
+
+    /// The turn spent its wall-clock budget: the hard deadline enforced
+    /// through the injected <see cref="T:Legate.ILlmDelay" /> seam fired.
+    /// Settles the turn as <see cref="F:Legate.TurnStatus.Failed" /> with a
+    /// <see cref="T:Legate.TurnFailed" /> outcome carrying the timeout
+    /// reason.
+    | Deadline = 1
+
+    /// The turn lost its lease (expiry or takeover): the loser stops with
+    /// zero further effects and never settles, so this cause propagates
+    /// instead of landing on the turn.
+    | LeaseLoss = 2
+
+    /// The host shut down while the turn was running. Settles the turn as
+    /// <see cref="F:Legate.TurnStatus.Aborted" /> with a
+    /// <see cref="T:Legate.TurnAborted" /> outcome, like an explicit abort.
+    | HostShutdown = 3
+
 /// Token usage for one turn: input and output token counts, aligned with
 /// the long counters Microsoft.Extensions.AI reports. Usage never carries
 /// cost: pricing is a host concern, computed from these counts outside the
@@ -96,6 +128,12 @@ type Turn =
         /// Why the turn failed, populated when Status is Failed and null
         /// otherwise. Never contains secrets or tool arguments.
         Error: string | null
+        /// Which stop cause settled the turn, or empty (HasValue is false)
+        /// when the turn completed normally or is still in flight. One of
+        /// <see cref="T:Legate.StopCause" />: abort and host-shutdown causes
+        /// land with Status Aborted, the deadline cause with Status Failed,
+        /// and lease loss never lands (the loser stops with zero effects).
+        StopCause: Nullable<StopCause>
     }
 
 /// The structured completion of a settled turn, delivered only when the
@@ -106,6 +144,7 @@ type Turn =
 [<JsonPolymorphic(TypeDiscriminatorPropertyName = "$type")>]
 [<JsonDerivedType(typeof<TurnFinished>, "turnFinished")>]
 [<JsonDerivedType(typeof<TurnPartiallyFinished>, "turnPartiallyFinished")>]
+[<JsonDerivedType(typeof<TurnAborted>, "turnAborted")>]
 [<JsonDerivedType(typeof<TurnFailed>, "turnFailed")>]
 type TurnOutcome() = class end
 
@@ -125,6 +164,21 @@ and [<Sealed>] TurnPartiallyFinished(summary: string) =
 
     /// A host-readable summary of the progress the turn made.
     member _.Summary = summary
+
+/// The turn stopped before completing: the host aborted it or shut down
+/// while it ran. Carries the typed stop cause (who stopped the turn) and
+/// the reason (why), never a stringly reason alone: the cause is the
+/// exactly-one-winner of the stop-cause arbitration.
+/// <param name="cause">Which abort-family stop cause won: ExplicitAbort or HostShutdown.</param>
+/// <param name="reason">Why the turn stopped. Never contains secrets or tool arguments.</param>
+and [<Sealed>] TurnAborted(cause: StopCause, reason: string) =
+    inherit TurnOutcome()
+
+    /// Which abort-family stop cause won the arbitration for the turn.
+    member _.Cause = cause
+
+    /// Why the turn stopped. Never contains secrets or tool arguments.
+    member _.Reason = reason
 
 /// The turn failed inside the loop (a tool or provider error).
 /// <param name="reason">Why the turn failed. Never contains secrets or tool arguments.</param>

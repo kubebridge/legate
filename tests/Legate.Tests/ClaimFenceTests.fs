@@ -117,6 +117,7 @@ let private sampleTurn (sessionId: SessionId) (turnId: TurnId) : Turn =
         Iterations = 0
         Usage = sampleUsage ()
         Error = null
+        StopCause = Unchecked.defaultof<Nullable<StopCause>>
     }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -560,7 +561,14 @@ let private runFenced
             VerifyClaim = verifyClaim
         }
 
-    TurnLoop.runAsync client history tools options CancellationToken.None TurnLoopTests.alwaysLeased
+    TurnLoop.runAsync
+        client
+        history
+        tools
+        options
+        (TurnLoopTests.NeverDelay() :> ILlmDelay)
+        CancellationToken.None
+        TurnLoopTests.alwaysLeased
     |> fun task -> task.GetAwaiter().GetResult()
 
 /// One assistant turn calling the named tools in order.
@@ -622,6 +630,7 @@ let ``Actor runner with a dead lease faults without calling the provider`` () =
             (client :> IChatClient)
             tools
             TurnLoop.TurnLoopOptions.Default
+            (TurnLoopTests.NeverDelay() :> ILlmDelay)
             (fun () -> false)
             None
 
@@ -660,7 +669,11 @@ let ``Actor runner keeps its always-live default`` () =
     let tools = TurnLoopTests.makeTools []
 
     let runner =
-        SessionActor.createTurnRunner (client :> IChatClient) tools TurnLoop.TurnLoopOptions.Default
+        SessionActor.createTurnRunner
+            (client :> IChatClient)
+            tools
+            TurnLoop.TurnLoopOptions.Default
+            (TurnLoopTests.NeverDelay() :> ILlmDelay)
 
     let payload = UserMessagePayload(UserMessage.Text("hi")) :> InboxPayload
 
