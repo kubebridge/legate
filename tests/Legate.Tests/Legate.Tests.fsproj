@@ -23,6 +23,8 @@
     <Compile Include="InMemoryAgentStoreTests.fs" />
     <Compile Include="InMemoryBlobStoreTests.fs" />
     <Compile Include="InMemoryAgentPackageTests.fs" />
+    <Compile Include="ProcessWorkspaceTests.fs" />
+    <Compile Include="ProcessWorkspaceRuntimeTests.fs" />
     <Compile Include="SessionTests.fs" />
     <Compile Include="WorkspaceRuntimeTests.fs" />
     <Compile Include="LlmTests.fs" />
@@ -44,6 +46,7 @@
     <ProjectReference Include="../../src/Legate/Legate.fsproj" />
     <ProjectReference Include="../../src/Legate.Storage.InMemory/Legate.Storage.InMemory.fsproj" />
     <ProjectReference Include="../../src/Legate.Testing/Legate.Testing.fsproj" />
+    <ProjectReference Include="../../src/Legate.Workspace.Process/Legate.Workspace.Process.fsproj" />
   </ItemGroup>
 
   <ItemGroup>
