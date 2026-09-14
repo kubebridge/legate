@@ -494,20 +494,27 @@ type InMemorySessionStore(database: InMemoryDatabase) =
             if isNull (box claim) then
                 raise (ArgumentNullException(nameof claim))
 
-            if
-                status <> TurnStatus.Completed
-                && status <> TurnStatus.Aborted
-                && status <> TurnStatus.Failed
-            then
-                raise (
-                    InvalidSessionStateException(
-                        SessionId.New(),
-                        "nonTerminal",
-                        "Only terminal statuses (Completed, Aborted, Failed) settle a turn."
-                    )
-                )
-
             lock database.Gate (fun () ->
+                // The guard runs inside the gate, so the typed exception
+                // carries the session the settle targeted; a claim that
+                // resolves nowhere falls through to the stale-claim
+                // rejection below.
+                let sessionOfClaim =
+                    database.OpenTurns
+                    |> Seq.tryFind (fun pair -> (pair.Key |> fst).Equals tenant && pair.Value.TurnId = claim.TurnId)
+                    |> Option.map (fun pair -> pair.Key |> snd)
+
+                match sessionOfClaim, status with
+                | Some sessionId, (TurnStatus.Pending | TurnStatus.Running | TurnStatus.Suspended) ->
+                    raise (
+                        InvalidSessionStateException(
+                            sessionId,
+                            "nonTerminal",
+                            "Only terminal statuses (Completed, Aborted, Failed) settle a turn."
+                        )
+                    )
+                | _ -> ()
+
                 match resolve tenant claim with
                 | Choice1Of3(sessionId, _: TurnClaim) ->
                     // The token still fences: the first settle wins, and a

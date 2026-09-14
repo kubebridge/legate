@@ -83,6 +83,24 @@ type BlobStoreConformance(store: IBlobStore) =
 
             Assert.NotNull(box metadata)
 
+            // Round-trip: the committed bytes read back identically,
+            // which catches a store that commits the wrong buffer
+            // (empty or partial content) while metadata still lands.
+            let! read = store.Get("conformance/commit", CancellationToken.None)
+
+            Assert.Equal<byte>(bytes, read)
+
+            // A second committed write replaces the first content.
+            let! rewrite = store.OpenWrite("conformance/commit", "text/plain", CancellationToken.None)
+
+            let replacement = System.Text.Encoding.UTF8.GetBytes "replaced"
+            let! _ = rewrite.WriteAsync(replacement, 0, replacement.Length, CancellationToken.None)
+            rewrite.Dispose()
+
+            let! replaced = store.Get("conformance/commit", CancellationToken.None)
+
+            Assert.Equal<byte>(replacement, replaced)
+
             // An abandoned stream never commits: no key, no metadata.
             let! abandoned = store.OpenWrite("conformance/abandoned", "text/plain", CancellationToken.None)
 
