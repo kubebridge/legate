@@ -40,13 +40,12 @@ module internal SyncAsync =
 /// database when disposed: an abandoned stream that is never disposed
 /// commits nothing, and a disposed stream lands atomically under the
 /// database's gate lock.
-type internal CommitOnDisposeStream(database: InMemoryDatabase, key: string, contentType: string, buffer: MemoryStream)
-    =
+type internal CommitOnDisposeStream(database: InMemoryDatabase, key: string, contentType: string) =
     inherit MemoryStream()
 
     override this.Dispose(disposing: bool) =
         if disposing then
-            let bytes = buffer.ToArray()
+            let bytes = this.ToArray()
 
             lock database.Gate (fun () ->
                 let etag = Ulid.NewUlid().ToString()
@@ -113,6 +112,9 @@ type InMemoryBlobStore(database: InMemoryDatabase) =
             if isNull (box content.Bytes) then
                 raise (ArgumentNullException(nameof content))
 
+            if isNull (box content.ContentType) then
+                raise (ArgumentNullException(nameof content))
+
             BlobKeys.Validate key |> ignore
 
             lock database.Gate (fun () -> write key (bytesOf content) (contentTypeOf content))
@@ -120,6 +122,9 @@ type InMemoryBlobStore(database: InMemoryDatabase) =
 
         member _.CompareExchange(key, content, expectedEtag, _) =
             if isNull (box content.Bytes) then
+                raise (ArgumentNullException(nameof content))
+
+            if isNull (box content.ContentType) then
                 raise (ArgumentNullException(nameof content))
 
             BlobKeys.Validate key |> ignore
@@ -154,8 +159,7 @@ type InMemoryBlobStore(database: InMemoryDatabase) =
 
             BlobKeys.Validate key |> ignore
 
-            new CommitOnDisposeStream(database, key, contentType, new MemoryStream()) :> Stream
-            |> ok
+            new CommitOnDisposeStream(database, key, contentType) :> Stream |> ok
 
         member _.List(prefix, _) =
             BlobKeys.ValidatePrefix prefix |> ignore

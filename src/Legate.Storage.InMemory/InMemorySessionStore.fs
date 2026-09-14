@@ -11,13 +11,16 @@ open Legate
 /// inbox, turn claims under a lease with the fencing semantics the contract
 /// pins, dispatch candidates, and the capacity counts. One live claim per
 /// session and one open turn per session:
-/// <see cref="M:Legate.ISessionStore.ClaimNextTurn*" /> consumes the head
+/// <see cref="M:Legate.ISessionStore.ClaimNextTurn" /> consumes the head
 /// pending user message into a new turn, or the head pending reply into a
 /// resume of the open turn with the attempt incremented; a live unexpired
 /// claim makes every further claim the missing branch. Lease expiry reads
 /// the database's clock, and every transition runs under the database's
 /// gate lock, so claims and settlements are atomic under concurrent
-/// callers and a takeover race leaves the loser with zero effects.
+/// callers and a takeover race leaves the loser with zero effects. The
+/// stored row's <see cref="P:Legate.Session.CurrentTurnId" /> is stamped on
+/// claim and cleared on settlement, the basis of the CurrentTurnId-based
+/// state rules.
 type InMemorySessionStore(database: InMemoryDatabase) =
 
     do
@@ -76,11 +79,38 @@ type InMemorySessionStore(database: InMemoryDatabase) =
                 Choice1Of3(sessionId, live)
             | _ -> Choice2Of3()
 
-    let applySettlement (tenant: TenantId) (sessionId: SessionId) (claim: TurnClaim) (status: TurnStatus) =
+    /// Stamps the stored session row's CurrentTurnId, the field the
+    /// CurrentTurnId-based state rules read.
+    let stampCurrentTurn (tenant: TenantId) (sessionId: SessionId) (turnId: TurnId option) =
+        match sessionRow tenant sessionId with
+        | None -> ()
+        | Some session ->
+            let stamped =
+                match turnId with
+                | None -> Nullable()
+                | Some id -> Nullable id
+
+            let updated =
+                { session with
+                    CurrentTurnId = stamped
+                    UpdatedAt = database.UtcNow
+                }
+
+            database.Sessions[(tenant, sessionId)] <- updated
+
+    let applySettlement
+        (tenant: TenantId)
+        (sessionId: SessionId)
+        (claim: TurnClaim)
+        (status: TurnStatus)
+        (outcome: TurnOutcome | null)
+        =
         database.Settlements[(tenant, sessionId, claim.TurnId)] <- status
+        database.Outcomes[(tenant, sessionId, claim.TurnId)] <- outcome
         database.LiveClaims.Remove((tenant, sessionId)) |> ignore
         database.OpenTurns.Remove((tenant, sessionId)) |> ignore
         database.CurrentTurnIds.Remove((tenant, sessionId)) |> ignore
+        stampCurrentTurn tenant sessionId None
 
     interface ISessionStore with
 
@@ -123,27 +153,32 @@ type InMemorySessionStore(database: InMemoryDatabase) =
                 raise (ArgumentOutOfRangeException(nameof pageSize, "The page size must be positive."))
 
             lock database.Gate (fun () ->
+                // The stable ordering key is the (updatedAt, id) pair; both
+                // are rendered as fixed-width ordinal strings so the
+                // comparison is total and independent of clock offsets.
+                let tokenOf (session: Session) =
+                    sprintf "%s|%O" (session.UpdatedAt.ToString "O") session.Id
+
                 let query =
                     database.Sessions.Values
                     |> Seq.filter (fun session -> session.Tenant.Equals tenant)
                     |> Seq.filter (fun session -> state.HasValue |> not || session.State = state.Value)
-                    |> Seq.sortByDescending (fun session -> session.UpdatedAt.ToString("O"))
+                    |> Seq.sortByDescending tokenOf
                     |> Seq.toList
-
-                let tokenOf (session: Session) =
-                    sprintf "%s|%O" (session.UpdatedAt.ToString "O") session.Id
 
                 let remaining =
                     match continuation with
                     | null -> query
-                    | token -> query |> List.skipWhile (fun session -> tokenOf session <> token) |> List.skip 1
+                    | token ->
+                        match query |> List.tryFindIndex (fun session -> tokenOf session = token) with
+                        | Some index -> query |> List.skip (index + 1)
+                        | None -> []
 
                 let page = remaining |> List.truncate pageSize
 
-                let hasMore =
-                    match List.tryLast page with
-                    | None -> false
-                    | Some last -> query |> List.exists (fun session -> tokenOf session <> tokenOf last)
+                // The final page's continuation is null: hasMore means
+                // something sorts after the last item on the page.
+                let hasMore = remaining.Length > page.Length
 
                 {
                     Items = page :> IReadOnlyList<Session>
@@ -201,10 +236,10 @@ type InMemorySessionStore(database: InMemoryDatabase) =
             lock database.Gate (fun () ->
                 let session = requireSession tenant sessionId
 
-                if
-                    session.State = SessionState.Running
-                    || session.State = SessionState.WaitingForInput
-                then
+                // The rule is CurrentTurnId-based: the store's claim
+                // tracking decides, not the lifecycle state the host
+                // maintains.
+                if database.CurrentTurnIds.ContainsKey(tenant, sessionId) then
                     raise (
                         InvalidSessionStateException(
                             sessionId,
@@ -334,10 +369,10 @@ type InMemorySessionStore(database: InMemoryDatabase) =
                         | false, _ -> None
 
                     match pending, openTurn with
-                    | Some({
+                    | Some {
                                Payload = :? ReplyPayload
                                Position = position
-                           }),
+                           },
                       Some openRow ->
                         // Resume: consume the reply and re-claim the same
                         // open turn under a fresh token, attempt + 1.
@@ -357,12 +392,13 @@ type InMemorySessionStore(database: InMemoryDatabase) =
                         database.OpenTurns[(tenant, sessionId)] <- OpenTurnRow(openRow.TurnId, attempt)
                         database.LiveClaims[(tenant, sessionId)] <- claim
                         database.CurrentTurnIds[(tenant, sessionId)] <- claim.TurnId
+                        stampCurrentTurn tenant sessionId (Some claim.TurnId)
 
                         TurnLeaseRenewed claim :> TurnLeaseState
-                    | Some({
+                    | Some {
                                Payload = :? UserMessagePayload
                                Position = position
-                           }),
+                           },
                       _ ->
                         // New turn: consume the message and mint a fresh
                         // turn; a stale open turn from a lapsed claim is
@@ -383,6 +419,7 @@ type InMemorySessionStore(database: InMemoryDatabase) =
                         database.OpenTurns[(tenant, sessionId)] <- OpenTurnRow(turnId, 1)
                         database.LiveClaims[(tenant, sessionId)] <- claim
                         database.CurrentTurnIds[(tenant, sessionId)] <- turnId
+                        stampCurrentTurn tenant sessionId (Some turnId)
 
                         TurnLeaseRenewed claim :> TurnLeaseState
                     | _ ->
@@ -453,22 +490,37 @@ type InMemorySessionStore(database: InMemoryDatabase) =
                 | Choice3Of3() -> TurnLeaseMissing claim.TurnId :> TurnLeaseState)
             |> ok
 
-        member _.SettleTurn(tenant, claim, status, _: TurnOutcome | null, _) =
+        member _.SettleTurn(tenant, claim, status, outcome, _) =
             if isNull (box claim) then
                 raise (ArgumentNullException(nameof claim))
+
+            if
+                status <> TurnStatus.Completed
+                && status <> TurnStatus.Aborted
+                && status <> TurnStatus.Failed
+            then
+                raise (
+                    InvalidSessionStateException(
+                        SessionId.New(),
+                        "nonTerminal",
+                        "Only terminal statuses (Completed, Aborted, Failed) settle a turn."
+                    )
+                )
 
             lock database.Gate (fun () ->
                 match resolve tenant claim with
                 | Choice1Of3(sessionId, _: TurnClaim) ->
                     // The token still fences: the first settle wins, and a
-                    // lapsed-but-uncontested lease does not unseat it.
+                    // lapsed-but-uncontested lease does not unseat it (a
+                    // settle is terminal; nothing can take over a turn the
+                    // owner is settling).
                     let settlementKey = (tenant, sessionId, claim.TurnId)
 
                     match database.Settlements.TryGetValue settlementKey with
                     | true, applied when applied = status -> TurnAlreadySettled claim.TurnId :> TurnSettlement
                     | true, _ -> TurnSettleRejected(claim.TurnId, "alreadySettledByOther") :> TurnSettlement
                     | false, _ ->
-                        applySettlement tenant sessionId claim status
+                        applySettlement tenant sessionId claim status outcome
                         TurnSettled(claim.TurnId, status) :> TurnSettlement
                 | Choice2Of3() -> TurnSettleRejected(claim.TurnId, "staleClaim") :> TurnSettlement
                 | Choice3Of3() ->
@@ -497,7 +549,7 @@ type InMemorySessionStore(database: InMemoryDatabase) =
                 | Choice1Of3(sessionId, live) ->
                     // Abort settles Aborted and releases the lease; a
                     // later settle observes the applied settlement.
-                    applySettlement tenant sessionId claim TurnStatus.Aborted
+                    applySettlement tenant sessionId claim TurnStatus.Aborted null
                     TurnLeaseHeld live :> TurnLeaseState
                 | Choice2Of3() -> TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState
                 | Choice3Of3() -> TurnLeaseMissing claim.TurnId :> TurnLeaseState)

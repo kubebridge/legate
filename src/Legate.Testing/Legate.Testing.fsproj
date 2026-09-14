@@ -1,6 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
+    <IsPackable>false</IsPackable>
     <RootNamespace>Legate.Testing</RootNamespace>
     <Description>Test support for Legate: the shared store conformance suite, a manual-advance clock, and the scripted chat client and session harness. Referenced by test projects; not for host use.</Description>
   </PropertyGroup>

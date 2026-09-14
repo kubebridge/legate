@@ -29,7 +29,7 @@ type InMemorySessionEventStore(database: InMemoryDatabase) =
     // serialised JSON form, the only fair cross-implementation estimate
     // available inside the store.
     let eventBytes (event: SessionEvent) =
-        float (JsonSerializer.Serialize(event, jsonOptions).Length)
+        float (System.Text.Encoding.UTF8.GetByteCount(JsonSerializer.Serialize(event, jsonOptions)))
 
     let journalRow (tenant: TenantId) (sessionId: SessionId) =
         match database.Journals.TryGetValue((tenant, sessionId)) with
@@ -46,7 +46,9 @@ type InMemorySessionEventStore(database: InMemoryDatabase) =
 
     let claimFences (tenant: TenantId) (sessionId: SessionId) (claimToken: string) =
         match database.LiveClaims.TryGetValue((tenant, sessionId)) with
-        | true, live -> String.Equals(live.Token, claimToken, StringComparison.Ordinal)
+        | true, live ->
+            String.Equals(live.Token, claimToken, StringComparison.Ordinal)
+            && live.ExpiresAt > database.UtcNow
         | false, _ -> false
 
     interface ISessionEventStore with
@@ -358,6 +360,8 @@ type InMemorySessionEventStore(database: InMemoryDatabase) =
 
             lock database.Gate (fun () ->
                 match database.CleanupLeases.TryGetValue((tenant, sessionId)) with
+                | true, held when held.ExpiresAt <= database.UtcNow ->
+                    EventCleanupRejected(sessionId, "leaseExpired") :> EventCleanupSettlement
                 | true, held when String.Equals(held.Token, claimToken, StringComparison.Ordinal) ->
                     database.CleanupLeases.Remove((tenant, sessionId)) |> ignore
 
@@ -369,8 +373,6 @@ type InMemorySessionEventStore(database: InMemoryDatabase) =
                     | false, _ -> ()
 
                     EventCleanupApplied(sessionId, true) :> EventCleanupSettlement
-                | true, held when held.ExpiresAt <= database.UtcNow ->
-                    EventCleanupRejected(sessionId, "leaseExpired") :> EventCleanupSettlement
                 | _ -> EventCleanupRejected(sessionId, "staleClaim") :> EventCleanupSettlement)
             |> ok
 
@@ -380,10 +382,10 @@ type InMemorySessionEventStore(database: InMemoryDatabase) =
 
             lock database.Gate (fun () ->
                 match database.CleanupLeases.TryGetValue((tenant, sessionId)) with
+                | true, held when held.ExpiresAt <= database.UtcNow ->
+                    EventCleanupRejected(sessionId, "leaseExpired") :> EventCleanupSettlement
                 | true, held when String.Equals(held.Token, claimToken, StringComparison.Ordinal) ->
                     database.CleanupLeases.Remove((tenant, sessionId)) |> ignore
                     EventCleanupApplied(sessionId, false) :> EventCleanupSettlement
-                | true, held when held.ExpiresAt <= database.UtcNow ->
-                    EventCleanupRejected(sessionId, "leaseExpired") :> EventCleanupSettlement
                 | _ -> EventCleanupRejected(sessionId, "staleClaim") :> EventCleanupSettlement)
             |> ok

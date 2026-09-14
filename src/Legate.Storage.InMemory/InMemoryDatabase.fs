@@ -36,10 +36,8 @@ type InMemoryStoreOptions() =
 /// appends on the session store's claim tokens and the custom-tool store
 /// resolves agents through the agent rows, so one database instance backs
 /// every store the runtime registers; constructing separate databases
-/// splits that shared state. The six interface-typed store properties
-/// (<see cref="P:Legate.Storage.InMemory.InMemoryDatabase.SessionStore" />,
-/// and its siblings, defined as extensions beside the store classes) hand
-/// out stores over this one instance.
+/// splits that shared state. The <see cref="T:Legate.Storage.InMemory.InMemoryStoreFactory" />
+/// module hands out every store over this one instance.
 ///
 /// <para>Threading: all mutations run under one lock, so every store call is
 /// atomic against every other call on the same database instance. This
@@ -87,6 +85,9 @@ type InMemoryDatabase(timeProvider: TimeProvider, options: InMemoryStoreOptions)
     // on settle/abort, the input of CurrentTurnId-based state rules.
     let currentTurnIds = Dictionary<(TenantId * SessionId), TurnId>()
 
+    // The structured outcome recorded at settlement, per settled turn.
+    let outcomes = Dictionary<(TenantId * SessionId * TurnId), TurnOutcome | null>()
+
     // Journals per (tenant, session id): the ordered events and the flag
     // telling replay the journal was archived away.
     let journals = Dictionary<(TenantId * SessionId), JournalRow>()
@@ -118,44 +119,47 @@ type InMemoryDatabase(timeProvider: TimeProvider, options: InMemoryStoreOptions)
     /// The one gate every store locks. Stores take it for multi-table
     /// transitions; single-table calls may rely on the stores' own locking
     /// discipline that funnels through this same gate.
-    member _.Gate = gate
+    member internal _.Gate = gate
 
     /// The session rows, keyed by (tenant, session id). Internal: stores
     /// mutate through the gate only.
-    member _.Sessions = sessions
+    member internal _.Sessions = sessions
 
     /// The inbox rows per (tenant, session id), in append order.
-    member _.Inboxes = inboxes
+    member internal _.Inboxes = inboxes
 
     /// The next inbox position per (tenant, session id).
-    member _.InboxPositions = inboxPositions
+    member internal _.InboxPositions = inboxPositions
 
     /// The open turns per (tenant, session id).
     member internal _.OpenTurns = openTurns
 
     /// The live claim per (tenant, session id).
-    member _.LiveClaims = liveClaims
+    member internal _.LiveClaims = liveClaims
 
     /// The terminal settlement per (tenant, session id, turn id).
-    member _.Settlements = settlements
+    member internal _.Settlements = settlements
 
     /// The last usage checkpoint per (tenant, session id, turn id).
-    member _.UsageCheckpoints = usageCheckpoints
+    member internal _.UsageCheckpoints = usageCheckpoints
 
     /// The current turn id per (tenant, session id).
-    member _.CurrentTurnIds = currentTurnIds
+    member internal _.CurrentTurnIds = currentTurnIds
+
+    /// The structured outcome recorded at settlement, per settled turn.
+    member internal _.Outcomes = outcomes
 
     /// The journals per (tenant, session id).
     member internal _.Journals = journals
 
     /// The cleanup leases per (tenant, session id).
-    member _.CleanupLeases = cleanupLeases
+    member internal _.CleanupLeases = cleanupLeases
 
     /// The agent rows keyed by (tenant, agent id).
-    member _.Agents = agents
+    member internal _.Agents = agents
 
     /// The custom tools per (tenant, agent id), name-keyed.
-    member _.CustomTools = customTools
+    member internal _.CustomTools = customTools
 
     /// The blob rows keyed by validated key.
     member internal _.Blobs = blobs
@@ -201,10 +205,10 @@ and internal JournalRow(events: List<SessionEvent>, archived: bool, totalBytes: 
 and internal BlobRow(content: BlobContent, metadata: BlobMetadata) =
 
     /// The blob's content.
-    member _.Content = content
+    member internal _.Content = content
 
     /// The blob's metadata.
-    member _.Metadata = metadata
+    member internal _.Metadata = metadata
 
 /// One agent package row: the stored versions, the active pointer, and the
 /// host-supplied source label of the last write.

@@ -202,6 +202,80 @@ type SessionStoreConformance(store: ISessionStore, clock: TestClock, tenant: Ten
             Assert.True(settleLost :? TurnSettleRejected)
         }
 
+    // ── Settlement preconditions ──
+
+    [<Fact>]
+    member this.``SettleTurn rejects non-terminal statuses``() =
+        task {
+            let! created = store.CreateSession(tenant, this.SampleSession(), CancellationToken.None)
+
+            let message = UserMessagePayload(UserMessage.Text("terminal guard")) :> InboxPayload
+
+            let! _ = store.AppendInboxMessage(tenant, created.Id, message, DeliveryMode.Queue, CancellationToken.None)
+
+            let! claimed =
+                store.ClaimNextTurn(tenant, created.Id, "settler", TimeSpan.FromMinutes 5., CancellationToken.None)
+
+            let claim = (claimed :?> TurnLeaseRenewed).Claim
+
+            Assert.Throws<InvalidSessionStateException>(fun () ->
+                store
+                    .SettleTurn(tenant, claim, TurnStatus.Running, null, CancellationToken.None)
+                    .GetAwaiter()
+                    .GetResult()
+                |> ignore)
+            |> ignore
+
+            // The bogus settle had no effect: the correct settle still wins.
+            let! settled = store.SettleTurn(tenant, claim, TurnStatus.Completed, null, CancellationToken.None)
+
+            Assert.True(settled :? TurnSettled)
+        }
+
+    // ── CurrentTurnId surfacing ──
+
+    [<Fact>]
+    member this.``Claim stamps and settlement clears the row's CurrentTurnId``() =
+        task {
+            let! created = store.CreateSession(tenant, this.SampleSession(), CancellationToken.None)
+
+            let message =
+                UserMessagePayload(UserMessage.Text("current turn stamp")) :> InboxPayload
+
+            let! _ = store.AppendInboxMessage(tenant, created.Id, message, DeliveryMode.Queue, CancellationToken.None)
+
+            let! claimed =
+                store.ClaimNextTurn(tenant, created.Id, "stamper", TimeSpan.FromMinutes 5., CancellationToken.None)
+
+            let claim = (claimed :?> TurnLeaseRenewed).Claim
+
+            let! during = store.GetSession(tenant, created.Id, CancellationToken.None)
+
+            match during with
+            | null -> failwith "expected the session"
+            | session ->
+                Assert.True(session.CurrentTurnId.HasValue)
+                Assert.Equal(claim.TurnId, session.CurrentTurnId.Value)
+
+            // Rebinding is blocked while the turn is in flight.
+            Assert.Throws<InvalidSessionStateException>(fun () ->
+                store
+                    .SetSessionAgent(tenant, created.Id, AgentId.New(), CancellationToken.None)
+                    .GetAwaiter()
+                    .GetResult()
+                |> ignore)
+            |> ignore
+
+            let! settled = store.SettleTurn(tenant, claim, TurnStatus.Completed, null, CancellationToken.None)
+
+            Assert.True(settled :? TurnSettled)
+
+            let! after = store.GetSession(tenant, created.Id, CancellationToken.None)
+
+            match after with
+            | null -> failwith "expected the session"
+            | session -> Assert.False(session.CurrentTurnId.HasValue)
+        }
     // ── Settlement idempotency ──
 
     [<Fact>]
