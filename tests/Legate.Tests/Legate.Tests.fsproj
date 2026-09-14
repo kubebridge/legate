@@ -12,6 +12,7 @@
     <Compile Include="IdentifiersTests.fs" />
     <Compile Include="ExceptionsTests.fs" />
     <Compile Include="SeamsTests.fs" />
+    <Compile Include="FakeClockTests.fs" />
     <Compile Include="BlobsTests.fs" />
     <Compile Include="MessagesTests.fs" />
     <Compile Include="PermissionTests.fs" />

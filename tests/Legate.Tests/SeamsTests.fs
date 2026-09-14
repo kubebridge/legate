@@ -7,24 +7,10 @@ open System.Threading
 open System.Threading.Tasks
 open FsUnit.Xunit
 open Legate
+open Legate.Testing
 open Microsoft.Extensions.DependencyInjection
 open Microsoft.Extensions.Time.Testing
 open Xunit
-
-/// Test double that records every requested delay instead of waiting.
-type RecordingDelay() =
-    let lockObject = obj ()
-    let mutable recorded: TimeSpan list = []
-
-    interface ILlmDelay with
-        member _.Delay(delay, _cancellationToken) =
-            lock lockObject (fun () -> recorded <- delay :: recorded)
-            Task.CompletedTask
-
-    member _.Recorded = lock lockObject (fun () -> List.rev recorded)
-
-    member _.Clear() =
-        lock lockObject (fun () -> recorded <- [])
 
 // ───────────────────────────────────────────────────────────────────────────
 // SystemLlmDelay
@@ -207,6 +193,7 @@ let ``RecordingDelay records every requested delay`` () =
     delay.Delay(TimeSpan.FromSeconds 2., CancellationToken.None).GetAwaiter().GetResult()
 
     recording.Recorded
+    |> Seq.toList
     |> should
         equal
         [
