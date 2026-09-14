@@ -15,6 +15,7 @@
     <Compile Include="FakeClockTests.fs" />
     <Compile Include="BlobsTests.fs" />
     <Compile Include="MessagesTests.fs" />
+    <Compile Include="UntrustedContextTests.fs" />
     <Compile Include="PermissionTests.fs" />
     <Compile Include="TurnTests.fs" />
     <Compile Include="LlmStreamingTests.fs" />

@@ -13,6 +13,7 @@
     <Compile Include="Seams.fs" />
     <Compile Include="Blobs.fs" />
     <Compile Include="Messages.fs" />
+    <Compile Include="UntrustedContext.fs" />
     <Compile Include="Permissions.fs" />
     <Compile Include="Turns.fs" />
     <Compile Include="Llm.fs" />
