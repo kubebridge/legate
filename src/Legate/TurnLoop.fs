@@ -9,18 +9,20 @@ open System.Threading
 open System.Threading.Tasks
 open Microsoft.Extensions.AI
 
-// Internal Akka-free ReAct loop core. Per iteration the loop streams the
-// provider via LlmStreaming (one TextDelta per non-empty text chunk, one
-// ReasoningDelta per non-empty reasoning chunk, full messages accumulated
-// with raw blocks intact, single-delta fallback for non-streaming
-// providers), appends the response messages, executes the response's
-// function calls sequentially in order, appends the function results, and
-// repeats until a response carries no function calls. Unknown tool names
-// and tool exceptions map to Error: texts and continue; cancellation and
-// lease loss propagate. Tool results over the configured char limit are
+// Internal Akka-free ReAct loop core. Per iteration the loop drains pending
+// Inject inbox entries at the iteration boundary (after the prior tool
+// results are appended, before the next provider call), folds each
+// UserMessagePayload into a ChatRole.User message in position order, and
+// repeats until a response carries no function calls. Folding never spends
+// the MaxIterations budget; the timeout still bounds the turn. Unknown tool
+// names and tool exceptions map to Error: texts and continue; cancellation
+// and lease loss propagate. Tool results over the configured char limit are
 // truncated with a single marker. Per-turn budgets (MaxIterations,
-// Timeout) are enforced here; no inject fold, no metadata wrap: those
-// belong to follow-up issues.
+// Timeout) are enforced here; metadata wrap belongs to a follow-up issue.
+// The provider path streams via LlmStreaming (one TextDelta per non-empty
+// text chunk, one ReasoningDelta per non-empty reasoning chunk, full
+// messages accumulated with raw blocks intact, single-delta fallback for
+// non-streaming providers).
 //
 // Nullness warning 3261 is suppressed in this file: MEAI interop surfaces
 // nulls (null responses, messages, contents, usage, result objects) that the
@@ -132,6 +134,87 @@ module internal TurnLoop =
         /// Creates the exception with the default lease-lost message.
         new() = TurnLeaseLostException("The turn lease was lost.")
 
+    /// Pull-model drain hook for pending Inject inbox entries: returns the
+    /// session's currently pending entries in position order. The loop owns
+    /// the fold plus the pending signal; the session actor (#34) owns store
+    /// routing, journal writes, and the new-turn start and provides the
+    /// store-backed implementation. Must be non-destructive: entries leave
+    /// the pending set only through the consume hook. A null return is
+    /// treated as empty.
+    type DrainInjected = unit -> IReadOnlyList<InboxEntry>
+
+    /// Journal hook for one folded Inject entry: records the entry's user
+    /// message once under the running turn. Owned by the session actor
+    /// (#34); the loop calls it exactly once per folded entry, after the
+    /// message is appended to history and before the consume hook.
+    type JournalInjected = InboxEntry -> unit
+
+    /// Consume hook for one folded Inject entry: marks it consumed so a
+    /// later drain never returns it again. Owned by the session actor
+    /// (#34); the loop calls it exactly once per folded entry, after the
+    /// journal hook.
+    type ConsumeInjected = InboxEntry -> unit
+
+    /// Completion of a loop run with the inject fold applied: the settled
+    /// turn result plus the new-turn signal for the session actor (#34).
+    /// HasPendingInjects is true only when a would-complete turn peeked
+    /// pending Inject user messages, left them pending, and folded nothing
+    /// on that path; the actor starts the new turn.
+    type TurnLoopCompletion =
+        {
+            /// The settled turn result.
+            Result: TurnResult
+            /// True when Inject entries stayed pending past a would-complete
+            /// turn and the actor must start a new turn to act on them.
+            HasPendingInjects: bool
+        }
+
+    /// No-op drain: no pending Inject entries.
+    let private noInjects () : IReadOnlyList<InboxEntry> =
+        ResizeArray<InboxEntry>() :> IReadOnlyList<InboxEntry>
+
+    /// No-op journal/consume hook: records and marks nothing.
+    let private ignoreInject (_: InboxEntry) : unit = ()
+
+    /// Selects the foldable entries from a drain result in position order:
+    /// Delivery Inject carrying a UserMessagePayload. Queue, Interrupt, and
+    /// Reply payloads are ignored and stay pending for the session actor.
+    /// Null entries and a null drain result are treated as empty.
+    let private selectInjects (entries: IReadOnlyList<InboxEntry>) : InboxEntry list =
+        if isNull (box entries) then
+            []
+        else
+            entries
+            |> Seq.filter (fun entry ->
+                not (isNull (box entry))
+                && entry.Delivery = DeliveryMode.Inject
+                && (entry.Payload :? UserMessagePayload))
+            |> Seq.sortBy (fun entry -> entry.Position)
+            |> List.ofSeq
+
+    /// Converts one Inject user message to a ChatRole.User history message,
+    /// appending the raw parts verbatim in order. Metadata is ignored here:
+    /// the metadata wrap owns it. Null messages, parts, and part entries
+    /// are treated as empty rather than failing.
+    let private injectToMessage (entry: InboxEntry) : ChatMessage =
+        let payload = entry.Payload :?> UserMessagePayload
+
+        let parts =
+            if
+                isNull (box payload)
+                || isNull (box payload.Message)
+                || isNull (box payload.Message.Parts)
+            then
+                ResizeArray<AIContent>() :> IList<AIContent>
+            else
+                payload.Message.Parts
+                |> Seq.filter (fun part -> not (isNull (box part)))
+                |> List.ofSeq
+                |> ResizeArray<AIContent>
+                :> IList<AIContent>
+
+        ChatMessage(ChatRole.User, parts)
+
     /// Truncates a tool result to the configured limit, appending
     /// TruncationMarker when cut. Exactly-at-limit passes through.
     let truncateToolResult (options: TurnLoopOptions) (text: string) : string =
@@ -240,17 +323,28 @@ module internal TurnLoop =
             Outcome = TurnFailed(reason) :> TurnOutcome
         }
 
-    /// Runs the ReAct loop to completion with delta callbacks. Each
-    /// provider call streams through LlmStreaming: one text delta per
-    /// non-empty text chunk and one reasoning delta per non-empty reasoning
-    /// chunk fan out to <c>onTextDelta</c> and <c>onReasoningDelta</c> as
-    /// they arrive, the accumulated messages carry raw blocks verbatim, and
-    /// non-streaming providers fall back to a single delta per kind.
-    /// Reasoning never reaches AssistantText: it concatenates TextContent
-    /// only. Appends response and tool-result messages to history in order
-    /// and returns the final assistant text as a Completed TurnResult.
+    /// Runs the ReAct loop to completion with delta callbacks and the
+    /// Inject fold. Each provider call streams through LlmStreaming: one
+    /// text delta per non-empty text chunk and one reasoning delta per
+    /// non-empty reasoning chunk fan out to <c>onTextDelta</c> and
+    /// <c>onReasoningDelta</c> as they arrive, the accumulated messages
+    /// carry raw blocks verbatim, and non-streaming providers fall back to
+    /// a single delta per kind. Reasoning never reaches AssistantText: it
+    /// concatenates TextContent only. Appends response and tool-result
+    /// messages to history in order and returns the final assistant text
+    /// as a Completed TurnResult.
     /// Checks the lease hook before every provider call and every tool
     /// invocation; cancellation and lease loss propagate.
+    /// At each iteration boundary, after the lease and budget checks and
+    /// before the provider call, drains <c>drainInjected</c> and folds each
+    /// Inject UserMessagePayload into a ChatRole.User message in position
+    /// order: the message is appended to history, journaled once through
+    /// <c>onInjectJournaled</c>, and marked consumed once through
+    /// <c>onInjectConsumed</c>. Queue, Interrupt, and Reply entries are
+    /// ignored and stay pending. Folding never spends the iteration
+    /// budget. A would-complete turn peeks the drain instead of folding:
+    /// pending Inject user messages stay pending and surface as
+    /// HasPendingInjects for the session actor's new turn.
     /// The iteration budget is a pre-call check that settles the turn as
     /// Failed with a TurnFailed reason instead of calling the model again.
     /// The timeout is a linked-CTS hard deadline covering provider and tool
@@ -258,7 +352,7 @@ module internal TurnLoop =
     /// and in-flight cancellation caused only by the deadline maps to the
     /// timeout reason while external cancellation still propagates. The
     /// lease hook stays first so a fenced loser still produces zero effects.
-    let runAsyncWithDeltas
+    let runAsyncWithDeltasAndInjects
         (client: IChatClient)
         (history: IList<ChatMessage>)
         (tools: IReadOnlyDictionary<string, AITool>)
@@ -267,13 +361,19 @@ module internal TurnLoop =
         (isLeaseValid: unit -> bool)
         (onTextDelta: string -> unit)
         (onReasoningDelta: string -> unit)
-        : Task<TurnResult> =
+        (drainInjected: DrainInjected)
+        (onInjectJournaled: JournalInjected)
+        (onInjectConsumed: ConsumeInjected)
+        : Task<TurnLoopCompletion> =
         ArgumentNullException.ThrowIfNull(client)
         ArgumentNullException.ThrowIfNull(history)
         ArgumentNullException.ThrowIfNull(tools)
         ArgumentNullException.ThrowIfNull(isLeaseValid)
         ArgumentNullException.ThrowIfNull(onTextDelta)
         ArgumentNullException.ThrowIfNull(onReasoningDelta)
+        ArgumentNullException.ThrowIfNull(drainInjected)
+        ArgumentNullException.ThrowIfNull(onInjectJournaled)
+        ArgumentNullException.ThrowIfNull(onInjectConsumed)
 
         if options.MaxToolResultChars <= 0 then
             raise (ArgumentOutOfRangeException(nameof options, "MaxToolResultChars must be positive."))
@@ -301,10 +401,49 @@ module internal TurnLoop =
         let chatOptions = ChatOptions()
         chatOptions.Tools <- ResizeArray<AITool>(tools.Values) :> IList<AITool>
 
+        // Folds the pending Inject user messages at the iteration
+        // boundary in position order: append, journal once, consume once.
+        let foldInjects () =
+            let pending = selectInjects (drainInjected ())
+
+            for entry in pending do
+                history.Add(injectToMessage entry)
+                onInjectJournaled entry
+                onInjectConsumed entry
+
+        // Peeks the drain for the would-complete path: true when Inject
+        // user messages arrived during the final iteration and stay
+        // pending for the session actor's new turn.
+        let hasPendingInjects () =
+            selectInjects (drainInjected ()) |> List.isEmpty |> not
+
+        let completedCompletion iterations inputTokens outputTokens assistantText : TurnLoopCompletion =
+            {
+                Result =
+                    {
+                        AssistantText = assistantText
+                        Status = TurnStatus.Completed
+                        Iterations = iterations
+                        Usage =
+                            {
+                                InputTokens = inputTokens
+                                OutputTokens = outputTokens
+                            }
+                        Outcome = null
+                    }
+                HasPendingInjects = hasPendingInjects ()
+            }
+
+        let failedCompletion iterations inputTokens outputTokens reason : TurnLoopCompletion =
+            {
+                Result = failedResult iterations inputTokens outputTokens reason
+                HasPendingInjects = false
+            }
+
         // Runs one round of tool calls in order. Returns None when every
         // call ran, or the timeout settlement when the deadline fired
         // mid-round so no further tool runs.
-        let rec runTools roundIterations roundInput roundOutput pending : Task<TurnResult option> =
+        let rec runTools roundIterations roundInput roundOutput pending : Task<TurnLoopCompletion option> =
             task {
                 match pending with
                 | [] -> return None
@@ -315,7 +454,7 @@ module internal TurnLoop =
                         raise (TurnLeaseLostException())
 
                     if timeoutCts.IsCancellationRequested then
-                        return Some(failedResult roundIterations roundInput roundOutput TimeoutExceededMessage)
+                        return Some(failedCompletion roundIterations roundInput roundOutput TimeoutExceededMessage)
                     else
                         let! rawText = invokeOneAsync tools call linkedToken
                         let text = truncateToolResult options rawText
@@ -331,20 +470,22 @@ module internal TurnLoop =
                         return! runTools roundIterations roundInput roundOutput rest
             }
 
-        let rec loop iterations inputTokens outputTokens : Task<TurnResult> =
+        let rec loop iterations inputTokens outputTokens : Task<TurnLoopCompletion> =
             task {
                 cancellationToken.ThrowIfCancellationRequested()
 
                 if not (isLeaseValid ()) then
-                    return! Task.FromException<TurnResult>(TurnLeaseLostException())
+                    return! Task.FromException<TurnLoopCompletion>(TurnLeaseLostException())
                 elif iterations >= options.MaxIterations then
-                    return failedResult iterations inputTokens outputTokens MaxIterationsExceededMessage
+                    return failedCompletion iterations inputTokens outputTokens MaxIterationsExceededMessage
                 elif timeoutCts.IsCancellationRequested then
                     // The deadline fired before the next provider call:
                     // external cancellation already propagated above, so
                     // this is ours. Settle without calling the model again.
-                    return failedResult iterations inputTokens outputTokens TimeoutExceededMessage
+                    return failedCompletion iterations inputTokens outputTokens TimeoutExceededMessage
                 else
+                    foldInjects ()
+
                     try
                         let! response =
                             LlmStreaming.streamResponseAsync
@@ -360,18 +501,7 @@ module internal TurnLoop =
                         let mutable nextOutput = outputTokens
 
                         if isNull response then
-                            return
-                                {
-                                    AssistantText = ""
-                                    Status = TurnStatus.Completed
-                                    Iterations = nextIterations
-                                    Usage =
-                                        {
-                                            InputTokens = nextInput
-                                            OutputTokens = nextOutput
-                                        }
-                                    Outcome = null
-                                }
+                            return completedCompletion nextIterations nextInput nextOutput ""
                         else
                             addUsage &nextInput &nextOutput response.Usage
 
@@ -389,18 +519,7 @@ module internal TurnLoop =
                             if calls.IsEmpty then
                                 let assistantText = if isNull response.Text then "" else response.Text
 
-                                return
-                                    {
-                                        AssistantText = assistantText
-                                        Status = TurnStatus.Completed
-                                        Iterations = nextIterations
-                                        Usage =
-                                            {
-                                                InputTokens = nextInput
-                                                OutputTokens = nextOutput
-                                            }
-                                        Outcome = null
-                                    }
+                                return completedCompletion nextIterations nextInput nextOutput assistantText
                             else
                                 let! toolOutcome = runTools nextIterations nextInput nextOutput calls
 
@@ -410,7 +529,7 @@ module internal TurnLoop =
                     with :? OperationCanceledException when isTimeout () ->
                         // In-flight provider or tool work died to the
                         // deadline alone: the hard-deadline stop cause.
-                        return failedResult iterations inputTokens outputTokens TimeoutExceededMessage
+                        return failedCompletion iterations inputTokens outputTokens TimeoutExceededMessage
             }
 
         task {
@@ -420,6 +539,67 @@ module internal TurnLoop =
                 timeoutCts.Dispose()
                 linkedCts.Dispose()
         }
+
+    /// Runs the ReAct loop to completion with the Inject fold and delta
+    /// callbacks dropped: provider calls still stream (or fall back for
+    /// non-streaming providers) with no deltas emitted, and pending Inject
+    /// entries still fold at each iteration boundary. Returns the settled
+    /// result plus the new-turn pending signal.
+    let runAsyncWithInjects
+        (client: IChatClient)
+        (history: IList<ChatMessage>)
+        (tools: IReadOnlyDictionary<string, AITool>)
+        (options: TurnLoopOptions)
+        (cancellationToken: CancellationToken)
+        (isLeaseValid: unit -> bool)
+        (drainInjected: DrainInjected)
+        (onInjectJournaled: JournalInjected)
+        (onInjectConsumed: ConsumeInjected)
+        : Task<TurnLoopCompletion> =
+        runAsyncWithDeltasAndInjects
+            client
+            history
+            tools
+            options
+            cancellationToken
+            isLeaseValid
+            ignore
+            ignore
+            drainInjected
+            onInjectJournaled
+            onInjectConsumed
+
+    /// Runs the ReAct loop to completion with delta callbacks. Same as
+    /// <c>runAsyncWithDeltasAndInjects</c> with a no-op Inject fold:
+    /// the drain stays empty and the journal/consume hooks record nothing,
+    /// so the pending signal is always false.
+    let runAsyncWithDeltas
+        (client: IChatClient)
+        (history: IList<ChatMessage>)
+        (tools: IReadOnlyDictionary<string, AITool>)
+        (options: TurnLoopOptions)
+        (cancellationToken: CancellationToken)
+        (isLeaseValid: unit -> bool)
+        (onTextDelta: string -> unit)
+        (onReasoningDelta: string -> unit)
+        : Task<TurnResult> =
+        runAsyncWithDeltasAndInjects
+            client
+            history
+            tools
+            options
+            cancellationToken
+            isLeaseValid
+            onTextDelta
+            onReasoningDelta
+            noInjects
+            ignoreInject
+            ignoreInject
+        |> fun inner ->
+            task {
+                let! completion = inner
+                return completion.Result
+            }
 
     /// Runs the ReAct loop to completion. Same as
     /// <c>runAsyncWithDeltas</c> with the delta callbacks dropped: provider
