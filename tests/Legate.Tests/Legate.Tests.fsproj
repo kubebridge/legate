@@ -42,6 +42,7 @@
     <Compile Include="AgentPackagesTests.fs" />
     <Compile Include="LegateOptionsTests.fs" />
     <Compile Include="LegateOptionsBindingTests.fs" />
+    <Compile Include="BuilderTests.fs" />
   </ItemGroup>
 
   <ItemGroup>
