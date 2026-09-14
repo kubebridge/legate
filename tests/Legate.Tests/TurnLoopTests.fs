@@ -81,6 +81,31 @@ let toolMessages (history: IList<ChatMessage>) : ChatMessage list =
 
 let alwaysLeased () = true
 
+/// IChatClient double that treats the passed token as the work: it waits for
+/// the token to fire (event-driven on the wait handle, no sleeps) and then
+/// observes it, so a linked deadline surfaces as
+/// OperationCanceledException from in-flight provider work.
+type DeadlineObservingClient() =
+    let mutable calls = 0
+
+    interface IChatClient with
+        member _.GetResponseAsync(_, _, ct) =
+            calls <- calls + 1
+
+            task {
+                use handle = ct.WaitHandle
+                handle.WaitOne(TimeSpan.FromSeconds 30.0) |> ignore
+                ct.ThrowIfCancellationRequested()
+                return textResponse "never"
+            }
+
+        member _.GetStreamingResponseAsync(_, _, _) = raise (NotImplementedException())
+
+        member _.GetService(_, _) = null
+        member _.Dispose() = ()
+
+    member _.Calls = calls
+
 let makeTools (pairs: (string * AIFunction) list) : IReadOnlyDictionary<string, AITool> =
     let table = Dictionary<string, AITool>()
 
@@ -248,7 +273,11 @@ let ``Tool exception continues with Error message only`` () =
 
 [<Fact>]
 let ``Overlong tool result is truncated with the marker`` () =
-    let options: TurnLoop.TurnLoopOptions = { MaxToolResultChars = 4 }
+    let options: TurnLoop.TurnLoopOptions =
+        { TurnLoop.TurnLoopOptions.Default with
+            MaxToolResultChars = 4
+        }
+
     let invocations = ref []
     let fn = stubTool "big" "abcdef" invocations
 
@@ -268,7 +297,11 @@ let ``Overlong tool result is truncated with the marker`` () =
 
 [<Fact>]
 let ``Result exactly at the limit passes through without the marker`` () =
-    let options: TurnLoop.TurnLoopOptions = { MaxToolResultChars = 4 }
+    let options: TurnLoop.TurnLoopOptions =
+        { TurnLoop.TurnLoopOptions.Default with
+            MaxToolResultChars = 4
+        }
+
     let invocations = ref []
     let fn = stubTool "exact" "abcd" invocations
 
@@ -335,3 +368,227 @@ let ``Lease loss stops the loop with zero further effects`` () =
 
     client.Calls |> should equal 1
     invocations.Value |> should equal [ "lookup" ]
+
+// ───────────────────────────────────────────────────────────────────────────
+// Issue 39 Task 1: effective budget resolution
+
+[<Fact>]
+let ``Unset session knobs resolve to the Turns defaults`` () =
+    let resolved = TurnLoop.resolveBudget (SessionOptions()) (TurnsOptions())
+
+    resolved.MaxIterations |> should equal 50
+    resolved.Timeout |> should equal (TimeSpan.FromMinutes 30.0)
+    resolved.MaxToolResultChars |> should equal TurnLoop.DefaultMaxToolResultChars
+
+[<Fact>]
+let ``Per-session overrides win over the Turns defaults`` () =
+    let session = SessionOptions()
+    session.MaxIterations <- 7
+    session.Timeout <- Nullable(TimeSpan.FromMinutes 5.0)
+
+    let turns = TurnsOptions()
+    turns.DefaultMaxIterations <- 10
+    turns.DefaultTimeout <- TimeSpan.FromHours 1.0
+
+    let resolved = TurnLoop.resolveBudget session turns
+
+    resolved.MaxIterations |> should equal 7
+    resolved.Timeout |> should equal (TimeSpan.FromMinutes 5.0)
+
+[<Fact>]
+let ``Negative session MaxIterations is rejected`` () =
+    let session = SessionOptions()
+    session.MaxIterations <- -1
+
+    (fun () -> TurnLoop.resolveBudget session (TurnsOptions()) |> ignore)
+    |> should throw typeof<ArgumentOutOfRangeException>
+
+[<Fact>]
+let ``Non-positive session Timeout is rejected`` () =
+    let session = SessionOptions()
+    session.Timeout <- Nullable(TimeSpan.Zero)
+
+    (fun () -> TurnLoop.resolveBudget session (TurnsOptions()) |> ignore)
+    |> should throw typeof<ArgumentOutOfRangeException>
+
+[<Fact>]
+let ``Non-positive Turns default iterations are rejected`` () =
+    let turns = TurnsOptions(DefaultMaxIterations = 0)
+
+    (fun () -> TurnLoop.resolveBudget (SessionOptions()) turns |> ignore)
+    |> should throw typeof<ArgumentOutOfRangeException>
+
+[<Fact>]
+let ``Non-positive Turns default timeout is rejected`` () =
+    let turns = TurnsOptions(DefaultTimeout = TimeSpan.Zero)
+
+    (fun () -> TurnLoop.resolveBudget (SessionOptions()) turns |> ignore)
+    |> should throw typeof<ArgumentOutOfRangeException>
+
+// ───────────────────────────────────────────────────────────────────────────
+// Issue 39 Task 2: iteration budget
+
+[<Fact>]
+let ``Iteration cap settles Failed with TurnFailed and makes no further provider call`` () =
+    let invocations = ref []
+    let fn = stubTool "lookup" "row-1" invocations
+
+    let first =
+        new ChatResponse(ResizeArray<ChatMessage>([| callMessage [ "c1", "lookup" ] |]))
+
+    let second =
+        new ChatResponse(ResizeArray<ChatMessage>([| callMessage [ "c2", "lookup" ] |]))
+
+    let client = new ScriptedChatClient([ first; second; textResponse "never" ])
+    let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+
+    let options: TurnLoop.TurnLoopOptions =
+        { TurnLoop.TurnLoopOptions.Default with
+            MaxIterations = 1
+        }
+
+    let result =
+        runLoop client history (makeTools [ "lookup", fn ]) options CancellationToken.None alwaysLeased
+
+    result.Status |> should equal TurnStatus.Failed
+    result.Iterations |> should equal 1
+    result.AssistantText |> should equal ""
+    client.Calls |> should equal 1
+    invocations.Value |> should equal [ "lookup" ]
+
+    match result.Outcome with
+    | :? TurnFailed as failed -> failed.Reason |> should equal TurnLoop.MaxIterationsExceededMessage
+    | _ -> failwith "Expected a TurnFailed outcome."
+
+[<Fact>]
+let ``Zero MaxIterations on the loop options is rejected`` () =
+    let client = new ScriptedChatClient([ textResponse "never" ])
+    let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+
+    let options: TurnLoop.TurnLoopOptions =
+        { TurnLoop.TurnLoopOptions.Default with
+            MaxIterations = 0
+        }
+
+    (fun () ->
+        runLoop client history (makeTools []) options CancellationToken.None alwaysLeased
+        |> ignore)
+    |> should throw typeof<ArgumentOutOfRangeException>
+
+[<Fact>]
+let ``Lease loss wins over an exhausted iteration budget`` () =
+    let invocations = ref []
+    let fn = stubTool "lookup" "row-1" invocations
+
+    let first =
+        new ChatResponse(ResizeArray<ChatMessage>([| callMessage [ "c1", "lookup" ] |]))
+
+    let client = new ScriptedChatClient([ first; textResponse "never" ])
+    let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+    let mutable checks = 0
+
+    // Leased for the first provider call and its tool; the second loop
+    // top finds both a dead lease and a spent budget, and the lease hook
+    // stays first so the loser throws with zero further effects.
+    let isLeased () =
+        checks <- checks + 1
+        checks <= 2
+
+    let options: TurnLoop.TurnLoopOptions =
+        { TurnLoop.TurnLoopOptions.Default with
+            MaxIterations = 1
+        }
+
+    (fun () ->
+        runLoop client history (makeTools [ "lookup", fn ]) options CancellationToken.None isLeased
+        |> ignore)
+    |> should throw typeof<TurnLoop.TurnLeaseLostException>
+
+    client.Calls |> should equal 1
+    invocations.Value |> should equal [ "lookup" ]
+
+// ───────────────────────────────────────────────────────────────────────────
+// Issue 39 Task 3: timeout budget
+
+[<Fact>]
+let ``Deadline expiry settles Failed as the hard-deadline stop and cancels in-flight work`` () =
+    let client = new DeadlineObservingClient()
+    let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+
+    let options: TurnLoop.TurnLoopOptions =
+        { TurnLoop.TurnLoopOptions.Default with
+            Timeout = TimeSpan.FromMilliseconds 100.0
+        }
+
+    let result =
+        TurnLoop.runAsync (client :> IChatClient) history (makeTools []) options CancellationToken.None alwaysLeased
+        |> fun task -> task.GetAwaiter().GetResult()
+
+    result.Status |> should equal TurnStatus.Failed
+    result.AssistantText |> should equal ""
+    client.Calls |> should equal 1
+
+    match result.Outcome with
+    | :? TurnFailed as failed -> failed.Reason |> should equal TurnLoop.TimeoutExceededMessage
+    | _ -> failwith "Expected a TurnFailed outcome."
+
+[<Fact>]
+let ``External cancellation still propagates when a short deadline is configured`` () =
+    use cts = new CancellationTokenSource()
+    cts.Cancel()
+    let client = new ScriptedChatClient([ textResponse "never" ])
+    let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+
+    let options: TurnLoop.TurnLoopOptions =
+        { TurnLoop.TurnLoopOptions.Default with
+            Timeout = TimeSpan.FromMilliseconds 100.0
+        }
+
+    (fun () -> runLoop client history (makeTools []) options cts.Token alwaysLeased |> ignore)
+    |> should throw typeof<OperationCanceledException>
+
+    client.Calls |> should equal 0
+
+[<Fact>]
+let ``Zero Timeout on the loop options is rejected`` () =
+    let client = new ScriptedChatClient([ textResponse "never" ])
+    let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+
+    let options: TurnLoop.TurnLoopOptions =
+        { TurnLoop.TurnLoopOptions.Default with
+            Timeout = TimeSpan.Zero
+        }
+
+    (fun () ->
+        runLoop client history (makeTools []) options CancellationToken.None alwaysLeased
+        |> ignore)
+    |> should throw typeof<ArgumentOutOfRangeException>
+
+// ───────────────────────────────────────────────────────────────────────────
+// Issue 39 Task 5: resolved session budget flows into the loop
+
+[<Fact>]
+let ``Resolved session budget flows into the loop`` () =
+    let session = SessionOptions()
+    session.MaxIterations <- 1
+    let resolved = TurnLoop.resolveBudget session (TurnsOptions())
+
+    let invocations = ref []
+    let fn = stubTool "lookup" "row-1" invocations
+
+    let first =
+        new ChatResponse(ResizeArray<ChatMessage>([| callMessage [ "c1", "lookup" ] |]))
+
+    let client = new ScriptedChatClient([ first; textResponse "never" ])
+    let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+
+    let result =
+        runLoop client history (makeTools [ "lookup", fn ]) resolved CancellationToken.None alwaysLeased
+
+    result.Status |> should equal TurnStatus.Failed
+    result.Iterations |> should equal 1
+    client.Calls |> should equal 1
+
+    match result.Outcome with
+    | :? TurnFailed as failed -> failed.Reason |> should equal TurnLoop.MaxIterationsExceededMessage
+    | _ -> failwith "Expected a TurnFailed outcome."

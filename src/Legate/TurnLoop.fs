@@ -15,8 +15,9 @@ open Microsoft.Extensions.AI
 // results, and repeats until a response carries no function calls. Unknown
 // tool names and tool exceptions map to Error: texts and continue;
 // cancellation and lease loss propagate. Tool results over the configured
-// char limit are truncated with a single marker. No budgets, no streaming,
-// no inject fold, no metadata wrap: those belong to follow-up issues.
+// char limit are truncated with a single marker. Per-turn budgets
+// (MaxIterations, Timeout) are enforced here; no streaming, no inject fold,
+// no metadata wrap: those belong to follow-up issues.
 //
 // Nullness warning 3261 is suppressed in this file: MEAI interop surfaces
 // nulls (null responses, messages, contents, usage, result objects) that the
@@ -36,19 +37,88 @@ module internal TurnLoop =
     [<Literal>]
     let DefaultMaxToolResultChars = 4000
 
-    /// Internal loop tuning. Only the tool-result char limit lives here;
-    /// budgets, streaming, inject, and metadata belong to follow-up issues.
+    /// Reason carried by <see cref="T:Legate.TurnFailed" /> when the turn
+    /// spends its model-iteration budget. Never contains secrets or tool
+    /// arguments.
+    [<Literal>]
+    let MaxIterationsExceededMessage = "The turn reached its maximum iterations."
+
+    /// Reason carried by <see cref="T:Legate.TurnFailed" /> when the turn
+    /// spends its wall-clock budget. Never contains secrets or tool
+    /// arguments.
+    [<Literal>]
+    let TimeoutExceededMessage = "The turn exceeded its timeout."
+
+    /// Internal loop tuning: the tool-result char limit plus the effective
+    /// per-turn budget. The budget fields always carry resolved values (see
+    /// <c>resolveBudget</c>); streaming, inject, and metadata belong to
+    /// follow-up issues.
     type TurnLoopOptions =
         {
             /// Maximum tool-result chars before truncation with <see cref="TruncationMarker" />.
             MaxToolResultChars: int
+            /// Maximum model iterations the turn may spend. At least 1.
+            MaxIterations: int
+            /// Maximum wall-clock time the turn may spend. Positive.
+            Timeout: TimeSpan
         }
 
-        /// Default tuning: 4000 chars before truncation.
+        /// Default tuning: 4000 chars before truncation with the iteration
+        /// and wall-clock budgets mirroring the <c>Turns</c> configuration
+        /// defaults. The session path resolves through
+        /// <c>resolveBudget</c> instead.
         static member Default =
             {
                 MaxToolResultChars = DefaultMaxToolResultChars
+                MaxIterations = TurnsOptions().DefaultMaxIterations
+                Timeout = TurnsOptions().DefaultTimeout
             }
+
+    /// Resolves the effective per-turn budget: the session's explicit knobs
+    /// win, unset knobs (0 iterations, empty timeout) fall back to the
+    /// configured <c>Turns</c> defaults. Raises
+    /// <see cref="T:System.ArgumentOutOfRangeException" /> on any explicit
+    /// or resolved non-positive value.
+    let resolveBudget (sessionOptions: SessionOptions) (turns: TurnsOptions) : TurnLoopOptions =
+        ArgumentNullException.ThrowIfNull(sessionOptions)
+        ArgumentNullException.ThrowIfNull(turns)
+
+        let maxIterations =
+            if sessionOptions.MaxIterations = 0 then
+                turns.DefaultMaxIterations
+            elif sessionOptions.MaxIterations < 0 then
+                raise (
+                    ArgumentOutOfRangeException(
+                        nameof sessionOptions,
+                        "SessionOptions.MaxIterations must be 0 (the configured default) or positive."
+                    )
+                )
+            else
+                sessionOptions.MaxIterations
+
+        if maxIterations < 1 then
+            raise (ArgumentOutOfRangeException(nameof turns, "The resolved MaxIterations must be at least 1."))
+
+        let timeout =
+            if not sessionOptions.Timeout.HasValue then
+                turns.DefaultTimeout
+            elif sessionOptions.Timeout.Value <= TimeSpan.Zero then
+                raise (
+                    ArgumentOutOfRangeException(
+                        nameof sessionOptions,
+                        "SessionOptions.Timeout must be empty (the configured default) or positive."
+                    )
+                )
+            else
+                sessionOptions.Timeout.Value
+
+        if timeout <= TimeSpan.Zero then
+            raise (ArgumentOutOfRangeException(nameof turns, "The resolved Timeout must be positive."))
+
+        { TurnLoopOptions.Default with
+            MaxIterations = maxIterations
+            Timeout = timeout
+        }
 
     /// Raised when the lease-check hook reports the turn lease is lost.
     /// Propagates instead of completing so the actor can fence the loser
@@ -145,10 +215,39 @@ module internal TurnLoop =
                 | _ -> return UnknownToolMessage
         }
 
+    /// Builds the Failed TurnResult for an exhausted budget: the spent
+    /// iteration count and accumulated usage with a TurnFailed outcome
+    /// carrying the typed reason. AssistantText is empty: the turn produced
+    /// no final text.
+    let private failedResult
+        (iterations: int)
+        (inputTokens: int64)
+        (outputTokens: int64)
+        (reason: string)
+        : TurnResult =
+        {
+            AssistantText = ""
+            Status = TurnStatus.Failed
+            Iterations = iterations
+            Usage =
+                {
+                    InputTokens = inputTokens
+                    OutputTokens = outputTokens
+                }
+            Outcome = TurnFailed(reason) :> TurnOutcome
+        }
+
     /// Runs the ReAct loop to completion. Appends response and tool-result
     /// messages to history in order and returns the final assistant text as
     /// a Completed TurnResult. Checks the lease hook before every provider
     /// call and every tool invocation; cancellation and lease loss propagate.
+    /// The iteration budget is a pre-call check that settles the turn as
+    /// Failed with a TurnFailed reason instead of calling the model again.
+    /// The timeout is a linked-CTS hard deadline covering provider and tool
+    /// execution: pre-call checks settle as Failed without further effects,
+    /// and in-flight cancellation caused only by the deadline maps to the
+    /// timeout reason while external cancellation still propagates. The
+    /// lease hook stays first so a fenced loser still produces zero effects.
     let runAsync
         (client: IChatClient)
         (history: IList<ChatMessage>)
@@ -165,54 +264,83 @@ module internal TurnLoop =
         if options.MaxToolResultChars <= 0 then
             raise (ArgumentOutOfRangeException(nameof options, "MaxToolResultChars must be positive."))
 
+        if options.MaxIterations < 1 then
+            raise (ArgumentOutOfRangeException(nameof options, "MaxIterations must be at least 1."))
+
+        if options.Timeout <= TimeSpan.Zero then
+            raise (ArgumentOutOfRangeException(nameof options, "Timeout must be positive."))
+
+        let timeoutCts = new CancellationTokenSource(options.Timeout)
+
+        let linkedCts =
+            CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token)
+
+        let linkedToken = linkedCts.Token
+
+        // True only when the linked token died to our own deadline: the
+        // caller's token is untouched, so this never conflates an
+        // external abort with a timeout.
+        let isTimeout () =
+            timeoutCts.IsCancellationRequested
+            && not cancellationToken.IsCancellationRequested
+
         let chatOptions = ChatOptions()
         chatOptions.Tools <- ResizeArray<AITool>(tools.Values) :> IList<AITool>
 
-        let rec loop (iterations: int) (inputTokens: int64) (outputTokens: int64) : Task<TurnResult> =
+        // Runs one round of tool calls in order. Returns None when every
+        // call ran, or the timeout settlement when the deadline fired
+        // mid-round so no further tool runs.
+        let rec runTools roundIterations roundInput roundOutput pending : Task<TurnResult option> =
+            task {
+                match pending with
+                | [] -> return None
+                | call :: rest ->
+                    cancellationToken.ThrowIfCancellationRequested()
+
+                    if not (isLeaseValid ()) then
+                        raise (TurnLeaseLostException())
+
+                    if timeoutCts.IsCancellationRequested then
+                        return Some(failedResult roundIterations roundInput roundOutput TimeoutExceededMessage)
+                    else
+                        let! rawText = invokeOneAsync tools call linkedToken
+                        let text = truncateToolResult options rawText
+                        let resultContent = FunctionResultContent(call.CallId, text)
+
+                        let toolMessage =
+                            ChatMessage(
+                                ChatRole.Tool,
+                                ResizeArray<AIContent>([| resultContent :> AIContent |]) :> IList<AIContent>
+                            )
+
+                        history.Add(toolMessage)
+                        return! runTools roundIterations roundInput roundOutput rest
+            }
+
+        let rec loop iterations inputTokens outputTokens : Task<TurnResult> =
             task {
                 cancellationToken.ThrowIfCancellationRequested()
 
                 if not (isLeaseValid ()) then
                     return! Task.FromException<TurnResult>(TurnLeaseLostException())
+                elif iterations >= options.MaxIterations then
+                    return failedResult iterations inputTokens outputTokens MaxIterationsExceededMessage
+                elif timeoutCts.IsCancellationRequested then
+                    // The deadline fired before the next provider call:
+                    // external cancellation already propagated above, so
+                    // this is ours. Settle without calling the model again.
+                    return failedResult iterations inputTokens outputTokens TimeoutExceededMessage
                 else
-                    let! response = client.GetResponseAsync(history, chatOptions, cancellationToken)
-                    let nextIterations = iterations + 1
-                    let mutable nextInput = inputTokens
-                    let mutable nextOutput = outputTokens
+                    try
+                        let! response = client.GetResponseAsync(history, chatOptions, linkedToken)
+                        let nextIterations = iterations + 1
+                        let mutable nextInput = inputTokens
+                        let mutable nextOutput = outputTokens
 
-                    if isNull response then
-                        return
-                            {
-                                AssistantText = ""
-                                Status = TurnStatus.Completed
-                                Iterations = nextIterations
-                                Usage =
-                                    {
-                                        InputTokens = nextInput
-                                        OutputTokens = nextOutput
-                                    }
-                                Outcome = null
-                            }
-                    else
-                        addUsage &nextInput &nextOutput response.Usage
-
-                        if not (isNull response.Messages) then
-                            for message in response.Messages do
-                                if not (isNull message) then
-                                    history.Add(message)
-
-                        let calls =
-                            if isNull response.Messages then
-                                []
-                            else
-                                collectCalls response.Messages
-
-                        if calls.IsEmpty then
-                            let assistantText = if isNull response.Text then "" else response.Text
-
+                        if isNull response then
                             return
                                 {
-                                    AssistantText = assistantText
+                                    AssistantText = ""
                                     Status = TurnStatus.Completed
                                     Iterations = nextIterations
                                     Usage =
@@ -223,25 +351,50 @@ module internal TurnLoop =
                                     Outcome = null
                                 }
                         else
-                            for call in calls do
-                                cancellationToken.ThrowIfCancellationRequested()
+                            addUsage &nextInput &nextOutput response.Usage
 
-                                if not (isLeaseValid ()) then
-                                    raise (TurnLeaseLostException())
+                            if not (isNull response.Messages) then
+                                for message in response.Messages do
+                                    if not (isNull message) then
+                                        history.Add(message)
 
-                                let! rawText = invokeOneAsync tools call cancellationToken
-                                let text = truncateToolResult options rawText
-                                let resultContent = FunctionResultContent(call.CallId, text)
+                            let calls =
+                                if isNull response.Messages then
+                                    []
+                                else
+                                    collectCalls response.Messages
 
-                                let toolMessage =
-                                    ChatMessage(
-                                        ChatRole.Tool,
-                                        ResizeArray<AIContent>([| resultContent :> AIContent |]) :> IList<AIContent>
-                                    )
+                            if calls.IsEmpty then
+                                let assistantText = if isNull response.Text then "" else response.Text
 
-                                history.Add(toolMessage)
+                                return
+                                    {
+                                        AssistantText = assistantText
+                                        Status = TurnStatus.Completed
+                                        Iterations = nextIterations
+                                        Usage =
+                                            {
+                                                InputTokens = nextInput
+                                                OutputTokens = nextOutput
+                                            }
+                                        Outcome = null
+                                    }
+                            else
+                                let! toolOutcome = runTools nextIterations nextInput nextOutput calls
 
-                            return! loop nextIterations nextInput nextOutput
+                                match toolOutcome with
+                                | Some timedOut -> return timedOut
+                                | None -> return! loop nextIterations nextInput nextOutput
+                    with :? OperationCanceledException when isTimeout () ->
+                        // In-flight provider or tool work died to the
+                        // deadline alone: the hard-deadline stop cause.
+                        return failedResult iterations inputTokens outputTokens TimeoutExceededMessage
             }
 
-        loop 0 0L 0L
+        task {
+            try
+                return! loop 0 0L 0L
+            finally
+                timeoutCts.Dispose()
+                linkedCts.Dispose()
+        }
