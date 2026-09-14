@@ -40,6 +40,8 @@
     <Compile Include="SessionEventStoreTests.fs" />
     <Compile Include="AgentStoreTests.fs" />
     <Compile Include="AgentPackagesTests.fs" />
+    <Compile Include="LegateOptionsTests.fs" />
+    <Compile Include="LegateOptionsBindingTests.fs" />
   </ItemGroup>
 
   <ItemGroup>
@@ -53,6 +55,8 @@
   <ItemGroup>
     <PackageReference Include="FSharp.Core" />
     <PackageReference Include="FsUnit.xUnit" />
+    <PackageReference Include="Microsoft.Extensions.Configuration" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.EnvironmentVariables" />
     <PackageReference Include="Microsoft.Extensions.DependencyInjection" />
     <PackageReference Include="Microsoft.Extensions.TimeProvider.Testing" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" />
