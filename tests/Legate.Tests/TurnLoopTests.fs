@@ -8,6 +8,7 @@ open System.Threading
 open System.Threading.Tasks
 open FsUnit.Xunit
 open Legate
+open Legate.Tests.LlmStreamingTests
 open Microsoft.Extensions.AI
 open Xunit
 
@@ -368,6 +369,284 @@ let ``Lease loss stops the loop with zero further effects`` () =
 
     client.Calls |> should equal 1
     invocations.Value |> should equal [ "lookup" ]
+
+// ───────────────────────────────────────────────────────────────────────────
+// Issue 40: delta streaming at the iteration call site
+
+/// Streaming IChatClient that treats the passed token as the work: its
+/// enumeration waits for the token to fire (no sleeps) and then observes
+/// it, so a linked deadline surfaces as OperationCanceledException from
+/// in-flight streaming work.
+type DeadlineUpdates(cancellationToken: CancellationToken) =
+    interface IAsyncEnumerable<ChatResponseUpdate> with
+        member _.GetAsyncEnumerator(_) =
+            { new IAsyncEnumerator<ChatResponseUpdate> with
+                member _.Current = Unchecked.defaultof<ChatResponseUpdate>
+
+                member _.MoveNextAsync() =
+                    ValueTask<bool>(
+                        task {
+                            do! Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken)
+                            return false
+                        }
+                    )
+
+                member _.DisposeAsync() = ValueTask()
+            }
+
+/// Scripted streaming IChatClient: yields the queued updates for each call
+/// in order. The streaming entry point works here; the non-streaming one
+/// raises, mirroring a streaming-only provider.
+type ScriptedStreamingLoopClient(updatesPerCall: ChatResponseUpdate list list) =
+    let mutable calls = 0
+
+    interface IChatClient with
+        member _.GetResponseAsync(_, _, _) =
+            raise (NotImplementedException("streaming only"))
+
+        member _.GetStreamingResponseAsync(_, _, _) =
+            calls <- calls + 1
+            let index = min (calls - 1) (updatesPerCall.Length - 1)
+            EnumerableUpdates(updatesPerCall[index]) :> IAsyncEnumerable<ChatResponseUpdate>
+
+        member _.GetService(_, _) = null
+        member _.Dispose() = ()
+
+    member _.Calls = calls
+
+/// Streaming IChatClient that treats the passed token as the work: it waits
+/// for the token to fire (no sleeps) and then observes it, so a linked
+/// deadline surfaces as OperationCanceledException from in-flight streaming
+/// work.
+type StreamingDeadlineClient() =
+    let mutable calls = 0
+
+    interface IChatClient with
+        member _.GetResponseAsync(_, _, _) =
+            raise (NotImplementedException("streaming only"))
+
+        member _.GetStreamingResponseAsync(_, _, ct) =
+            calls <- calls + 1
+            DeadlineUpdates(ct) :> IAsyncEnumerable<ChatResponseUpdate>
+
+        member _.GetService(_, _) = null
+        member _.Dispose() = ()
+
+    member _.Calls = calls
+
+let streamUpdate (text: string) : ChatResponseUpdate =
+    ChatResponseUpdate(Nullable ChatRole.Assistant, text)
+
+let reasoningStreamUpdate (text: string) : ChatResponseUpdate =
+    ChatResponseUpdate(
+        Nullable ChatRole.Assistant,
+        ResizeArray<AIContent>(
+            [|
+                TextReasoningContent(text) :> AIContent
+            |]
+        )
+        :> IList<AIContent>
+    )
+
+let private runLoopWithDeltas
+    (client: IChatClient)
+    (history: IList<ChatMessage>)
+    (tools: IReadOnlyDictionary<string, AITool>)
+    (options: TurnLoop.TurnLoopOptions)
+    (token: CancellationToken)
+    (isLeased: unit -> bool)
+    : TurnResult * string list * string list =
+    let texts = ResizeArray<string>()
+    let reasonings = ResizeArray<string>()
+
+    let result =
+        TurnLoop.runAsyncWithDeltas
+            client
+            history
+            tools
+            options
+            token
+            isLeased
+            (fun text -> texts.Add(text))
+            (fun text -> reasonings.Add(text))
+        |> fun task -> task.GetAwaiter().GetResult()
+
+    result, List.ofSeq texts, List.ofSeq reasonings
+
+let assistantTextOf (history: IList<ChatMessage>) : string =
+    history
+    |> Seq.collect (fun message ->
+        if isNull (box message) || message.Role <> ChatRole.Assistant then
+            Seq.empty
+        else
+            message.Contents
+            |> Seq.choose (fun content ->
+                match content with
+                | :? TextContent as text when not (isNull (box text)) ->
+                    Some(if isNull (box text.Text) then "" else text.Text)
+                | _ -> None))
+    |> String.concat ""
+
+[<Fact>]
+let ``Streaming chunks emit ordered deltas and coalesce into one history message`` () =
+    let client =
+        new ScriptedStreamingLoopClient(
+            [
+                [
+                    streamUpdate "Hel"
+                    streamUpdate "lo"
+                    streamUpdate " world"
+                ]
+            ]
+        )
+
+    let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+
+    let result, texts, reasonings =
+        runLoopWithDeltas
+            (client :> IChatClient)
+            history
+            (makeTools [])
+            TurnLoop.TurnLoopOptions.Default
+            CancellationToken.None
+            alwaysLeased
+
+    result.AssistantText |> should equal "Hello world"
+    result.Status |> should equal TurnStatus.Completed
+    result.Iterations |> should equal 1
+    texts |> should equal [ "Hel"; "lo"; " world" ]
+    // Counts rather than `should equal []`: the matcher boxes a generic
+    // empty list, which does not compare equal to a typed empty list.
+    reasonings.Length |> should equal 0
+    client.Calls |> should equal 1
+    assistantTextOf history |> should equal "Hello world"
+
+[<Fact>]
+let ``Streaming deltas fold into a single Assistant cell with reasoning excluded`` () =
+    let client =
+        new ScriptedStreamingLoopClient(
+            [
+                [
+                    reasoningStreamUpdate "hmm"
+                    streamUpdate "done"
+                    reasoningStreamUpdate " more"
+                ]
+            ]
+        )
+
+    let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+
+    let result, texts, reasonings =
+        runLoopWithDeltas
+            (client :> IChatClient)
+            history
+            (makeTools [])
+            TurnLoop.TurnLoopOptions.Default
+            CancellationToken.None
+            alwaysLeased
+
+    result.AssistantText |> should equal "done"
+    texts |> should equal [ "done" ]
+    reasonings |> should equal [ "hmm"; " more" ]
+
+    let sessionId = SessionId.Parse "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+    let turnId = TurnId.Parse "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+    let stamp = DateTimeOffset(2024, 1, 2, 3, 4, 5, TimeSpan.Zero)
+    let noSequence = Unchecked.defaultof<Nullable<int64>>
+
+    let events =
+        ResizeArray<SessionEvent>(
+            texts
+            |> List.map (fun text -> TextDeltaEvent(sessionId, turnId, noSequence, stamp, text) :> SessionEvent)
+        )
+        :> IReadOnlyList<SessionEvent>
+
+    let cells = SessionCellDeriver.Fold(sessionId, turnId, null, stamp, events)
+    cells.Count |> should equal 1
+    cells[0].Kind |> should equal SessionCellKind.Assistant
+    cells[0].Content |> should equal "done"
+
+[<Fact>]
+let ``Streaming preserves raw thought signatures into the history`` () =
+    let signature = obj ()
+    let reasoning = TextReasoningContent("thinking")
+    reasoning.RawRepresentation <- signature
+
+    let update =
+        ChatResponseUpdate(
+            Nullable ChatRole.Assistant,
+            ResizeArray<AIContent>([| reasoning :> AIContent |]) :> IList<AIContent>
+        )
+
+    let client = new ScriptedStreamingLoopClient([ [ update; streamUpdate "done" ] ])
+    let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+
+    let result, _, reasonings =
+        runLoopWithDeltas
+            (client :> IChatClient)
+            history
+            (makeTools [])
+            TurnLoop.TurnLoopOptions.Default
+            CancellationToken.None
+            alwaysLeased
+
+    result.AssistantText |> should equal "done"
+    reasonings |> should equal [ "thinking" ]
+
+    let stored =
+        history
+        |> Seq.collect (fun message -> message.Contents)
+        |> Seq.choose (fun content ->
+            match content with
+            | :? TextReasoningContent as stored when not (isNull (box stored)) -> Some stored
+            | _ -> None)
+        |> List.ofSeq
+
+    stored.Length |> should equal 1
+
+    Object.ReferenceEquals(stored[0].RawRepresentation, signature)
+    |> should equal true
+
+[<Fact>]
+let ``Non-streaming clients fall back to a single delta`` () =
+    let client = new ScriptedChatClient([ textResponse "done" ])
+    let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+
+    let result, texts, reasonings =
+        runLoopWithDeltas
+            (client :> IChatClient)
+            history
+            (makeTools [])
+            TurnLoop.TurnLoopOptions.Default
+            CancellationToken.None
+            alwaysLeased
+
+    result.AssistantText |> should equal "done"
+    texts |> should equal [ "done" ]
+    reasonings.Length |> should equal 0
+    client.Calls |> should equal 1
+
+[<Fact>]
+let ``Streaming respects the iteration deadline`` () =
+    let client = new StreamingDeadlineClient()
+    let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+
+    let options: TurnLoop.TurnLoopOptions =
+        { TurnLoop.TurnLoopOptions.Default with
+            Timeout = TimeSpan.FromMilliseconds 100.0
+        }
+
+    let result, texts, _ =
+        runLoopWithDeltas (client :> IChatClient) history (makeTools []) options CancellationToken.None alwaysLeased
+
+    result.Status |> should equal TurnStatus.Failed
+    result.AssistantText |> should equal ""
+    texts.Length |> should equal 0
+    client.Calls |> should equal 1
+
+    match result.Outcome with
+    | :? TurnFailed as failed -> failed.Reason |> should equal TurnLoop.TimeoutExceededMessage
+    | _ -> failwith "Expected a TurnFailed outcome."
 
 // ───────────────────────────────────────────────────────────────────────────
 // Issue 39 Task 1: effective budget resolution

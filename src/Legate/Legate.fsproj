@@ -9,6 +9,7 @@
   <ItemGroup>
     <Compile Include="AssemblyInfo.fs" />
     <Compile Include="Seams.fs" />
+    <Compile Include="LlmStreaming.fs" />
     <Compile Include="TurnLoop.fs" />
     <Compile Include="LegateOptionsBinding.fs" />
     <Compile Include="LegateDefaults.fs" />

@@ -9,15 +9,18 @@ open System.Threading
 open System.Threading.Tasks
 open Microsoft.Extensions.AI
 
-// Internal Akka-free ReAct loop core. Per iteration the loop calls
-// non-streaming GetResponseAsync, appends the response messages, executes the
-// response's function calls sequentially in order, appends the function
-// results, and repeats until a response carries no function calls. Unknown
-// tool names and tool exceptions map to Error: texts and continue;
-// cancellation and lease loss propagate. Tool results over the configured
-// char limit are truncated with a single marker. Per-turn budgets
-// (MaxIterations, Timeout) are enforced here; no streaming, no inject fold,
-// no metadata wrap: those belong to follow-up issues.
+// Internal Akka-free ReAct loop core. Per iteration the loop streams the
+// provider via LlmStreaming (one TextDelta per non-empty text chunk, one
+// ReasoningDelta per non-empty reasoning chunk, full messages accumulated
+// with raw blocks intact, single-delta fallback for non-streaming
+// providers), appends the response messages, executes the response's
+// function calls sequentially in order, appends the function results, and
+// repeats until a response carries no function calls. Unknown tool names
+// and tool exceptions map to Error: texts and continue; cancellation and
+// lease loss propagate. Tool results over the configured char limit are
+// truncated with a single marker. Per-turn budgets (MaxIterations,
+// Timeout) are enforced here; no inject fold, no metadata wrap: those
+// belong to follow-up issues.
 //
 // Nullness warning 3261 is suppressed in this file: MEAI interop surfaces
 // nulls (null responses, messages, contents, usage, result objects) that the
@@ -51,8 +54,8 @@ module internal TurnLoop =
 
     /// Internal loop tuning: the tool-result char limit plus the effective
     /// per-turn budget. The budget fields always carry resolved values (see
-    /// <c>resolveBudget</c>); streaming, inject, and metadata belong to
-    /// follow-up issues.
+    /// <c>resolveBudget</c>); inject and metadata belong to follow-up
+    /// issues.
     type TurnLoopOptions =
         {
             /// Maximum tool-result chars before truncation with <see cref="TruncationMarker" />.
@@ -237,10 +240,17 @@ module internal TurnLoop =
             Outcome = TurnFailed(reason) :> TurnOutcome
         }
 
-    /// Runs the ReAct loop to completion. Appends response and tool-result
-    /// messages to history in order and returns the final assistant text as
-    /// a Completed TurnResult. Checks the lease hook before every provider
-    /// call and every tool invocation; cancellation and lease loss propagate.
+    /// Runs the ReAct loop to completion with delta callbacks. Each
+    /// provider call streams through LlmStreaming: one text delta per
+    /// non-empty text chunk and one reasoning delta per non-empty reasoning
+    /// chunk fan out to <c>onTextDelta</c> and <c>onReasoningDelta</c> as
+    /// they arrive, the accumulated messages carry raw blocks verbatim, and
+    /// non-streaming providers fall back to a single delta per kind.
+    /// Reasoning never reaches AssistantText: it concatenates TextContent
+    /// only. Appends response and tool-result messages to history in order
+    /// and returns the final assistant text as a Completed TurnResult.
+    /// Checks the lease hook before every provider call and every tool
+    /// invocation; cancellation and lease loss propagate.
     /// The iteration budget is a pre-call check that settles the turn as
     /// Failed with a TurnFailed reason instead of calling the model again.
     /// The timeout is a linked-CTS hard deadline covering provider and tool
@@ -248,18 +258,22 @@ module internal TurnLoop =
     /// and in-flight cancellation caused only by the deadline maps to the
     /// timeout reason while external cancellation still propagates. The
     /// lease hook stays first so a fenced loser still produces zero effects.
-    let runAsync
+    let runAsyncWithDeltas
         (client: IChatClient)
         (history: IList<ChatMessage>)
         (tools: IReadOnlyDictionary<string, AITool>)
         (options: TurnLoopOptions)
         (cancellationToken: CancellationToken)
         (isLeaseValid: unit -> bool)
+        (onTextDelta: string -> unit)
+        (onReasoningDelta: string -> unit)
         : Task<TurnResult> =
         ArgumentNullException.ThrowIfNull(client)
         ArgumentNullException.ThrowIfNull(history)
         ArgumentNullException.ThrowIfNull(tools)
         ArgumentNullException.ThrowIfNull(isLeaseValid)
+        ArgumentNullException.ThrowIfNull(onTextDelta)
+        ArgumentNullException.ThrowIfNull(onReasoningDelta)
 
         if options.MaxToolResultChars <= 0 then
             raise (ArgumentOutOfRangeException(nameof options, "MaxToolResultChars must be positive."))
@@ -332,7 +346,15 @@ module internal TurnLoop =
                     return failedResult iterations inputTokens outputTokens TimeoutExceededMessage
                 else
                     try
-                        let! response = client.GetResponseAsync(history, chatOptions, linkedToken)
+                        let! response =
+                            LlmStreaming.streamResponseAsync
+                                client
+                                history
+                                chatOptions
+                                linkedToken
+                                onTextDelta
+                                onReasoningDelta
+
                         let nextIterations = iterations + 1
                         let mutable nextInput = inputTokens
                         let mutable nextOutput = outputTokens
@@ -398,3 +420,17 @@ module internal TurnLoop =
                 timeoutCts.Dispose()
                 linkedCts.Dispose()
         }
+
+    /// Runs the ReAct loop to completion. Same as
+    /// <c>runAsyncWithDeltas</c> with the delta callbacks dropped: provider
+    /// calls still stream (or fall back for non-streaming providers), but no
+    /// deltas are emitted.
+    let runAsync
+        (client: IChatClient)
+        (history: IList<ChatMessage>)
+        (tools: IReadOnlyDictionary<string, AITool>)
+        (options: TurnLoopOptions)
+        (cancellationToken: CancellationToken)
+        (isLeaseValid: unit -> bool)
+        : Task<TurnResult> =
+        runAsyncWithDeltas client history tools options cancellationToken isLeaseValid ignore ignore
