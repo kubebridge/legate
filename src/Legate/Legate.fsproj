@@ -10,6 +10,9 @@
     <Compile Include="AssemblyInfo.fs" />
     <Compile Include="Seams.fs" />
     <Compile Include="LegateOptionsBinding.fs" />
+    <Compile Include="LegateDefaults.fs" />
+    <Compile Include="LegateStartupValidation.fs" />
+    <Compile Include="LegateBuilder.fs" />
     <Compile Include="AddLegate.fs" />
   </ItemGroup>
 
