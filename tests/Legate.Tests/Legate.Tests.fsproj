@@ -47,6 +47,7 @@
     <Compile Include="LegateOptionsBindingTests.fs" />
     <Compile Include="BuilderTests.fs" />
     <Compile Include="ActorSystemColdStartTests.fs" />
+    <Compile Include="SessionActorTests.fs" />
   </ItemGroup>
 
   <ItemGroup>

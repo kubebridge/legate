@@ -15,17 +15,20 @@ open Microsoft.Extensions.Options
 // Local-only actor system for single-node hosts. A singleton hosted service
 // creates one Akka.NET ActorSystem with minimal inline HOCON (no remoting,
 // cluster, or sharding) when Cluster:Mode is Local, fronts it with a session
-// router that spawns one identity-only child per session id, and stops
-// through coordinated shutdown bounded by Cluster:ShutdownGraceSeconds.
-// Clustered mode is untouched: this service starts nothing and stops nothing
-// there. The children carry identity only (no inbox, turn, or lease logic):
-// the session state machine belongs to later issues.
+// router that spawns one child per session id, and stops through coordinated
+// shutdown bounded by Cluster:ShutdownGraceSeconds. Clustered mode is
+// untouched: this service starts nothing and stops nothing there. Each child
+// is the SessionActor state machine when a child factory is configured, or
+// the legacy identity-only child otherwise (no store or turn runner is
+// available until the session client facade configures one): resolving an
+// id stays observable either way.
 
 // ──────────────────────────────────────────────────────────────────────────
 // Router protocol
 
-/// The session router protocol. Identity only: resolving a session id
-/// returns the same child for the same id and a distinct child per id.
+/// The session router protocol. Resolving a session id returns the same
+/// child for the same id and a distinct child per id, whether the child is
+/// a session actor or the legacy identity-only placeholder.
 type internal SessionRouterMessage = ResolveSession of sessionId: string
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -71,14 +74,30 @@ module internal LocalActorSystem =
         let config = ConfigurationFactory.ParseString(localHocon)
         Akka.FSharp.System.create systemName config
 
-    /// A session child carries identity only: it accepts any message and
-    /// does nothing, so resolving an id is observable without running turn
-    /// logic. Inlined at the spawn site: a shared actorOf value would hit
-    /// the value restriction on its generic continuation.
+    /// The legacy identity-only child spawn: accepts any message and does
+    /// nothing, so resolving an id is observable without running session
+    /// logic. Used when no child factory is configured, and for router ids
+    /// that do not parse as session ids. Inlined callers would hit the value
+    /// restriction on the generic continuation, so this stays a function.
+    /// <param name="sessionId">The session id being resolved (unused).</param>
+    /// <param name="context">The parent context spawning the child.</param>
+    /// <param name="name">The child actor name.</param>
+    /// <returns>The identity-only child actor.</returns>
+    let identitySpawn (_sessionId: string) (context: IActorContext) (name: string) : IActorRef =
+        spawn context name (actorOf (fun (_: obj) -> ()))
+
     /// The router loop: a Map from session id to child plus a counter for
     /// child actor names (names stay valid because they never embed the
-    /// session id; identity lives in the Map).
-    let private sessionRouter (mailbox: Actor<SessionRouterMessage>) =
+    /// session id; identity lives in the Map). The child factory maps each
+    /// new session id to its spawn: the session actor factory once the
+    /// session client facade configures one, the identity spawn otherwise.
+    /// <param name="spawnSession">Spawns the child for a new session id.</param>
+    /// <param name="mailbox">The router mailbox.</param>
+    /// <returns>The router actor computation.</returns>
+    let private sessionRouter
+        (spawnSession: string -> IActorContext -> string -> IActorRef)
+        (mailbox: Actor<SessionRouterMessage>)
+        =
         let rec loop (children: Map<string, IActorRef>) (nextId: int) =
             actor {
                 let! message = mailbox.Receive()
@@ -90,7 +109,7 @@ module internal LocalActorSystem =
                         mailbox.Sender() <! child
                         return! loop children nextId
                     | None ->
-                        let child = spawn mailbox.Context $"session-{nextId}" (actorOf (fun (_: obj) -> ()))
+                        let child = spawnSession sessionId mailbox.Context $"session-{nextId}"
 
                         mailbox.Sender() <! child
                         return! loop (Map.add sessionId child children) (nextId + 1)
@@ -98,12 +117,30 @@ module internal LocalActorSystem =
 
         loop Map.empty 0
 
-    /// Spawns the single session router under the system guardian.
+    /// Spawns the single session router under the system guardian with the
+    /// legacy identity-only children.
     /// <param name="system">The local actor system hosting the router.</param>
     /// <returns>The session router actor.</returns>
     let spawnRouter (system: Akka.Actor.ActorSystem) : IActorRef =
         ArgumentNullException.ThrowIfNull(system)
-        spawn system routerName sessionRouter
+        spawn system routerName (sessionRouter identitySpawn)
+
+    /// Spawns the single session router under the system guardian with
+    /// session actor children spawned through the factory (see
+    /// <see cref="M:Legate.SessionActor.spawnFactory" />).
+    /// <param name="system">The local actor system hosting the router.</param>
+    /// <param name="spawnSession">Spawns the session actor for a new session id.</param>
+    /// <returns>The session router actor.</returns>
+    let spawnRouterWith
+        (system: Akka.Actor.ActorSystem)
+        (spawnSession: string -> IActorContext -> string -> IActorRef)
+        : IActorRef =
+        ArgumentNullException.ThrowIfNull(system)
+
+        if isNull (box spawnSession) then
+            raise (ArgumentNullException(nameof spawnSession))
+
+        spawn system routerName (sessionRouter spawnSession)
 
 // ──────────────────────────────────────────────────────────────────────────
 // Hosted service
@@ -112,7 +149,7 @@ module internal LocalActorSystem =
 /// Local cluster mode; Clustered mode resolves no system and no router.
 /// Stop bounds coordinated shutdown by
 /// <c>Cluster:ShutdownGraceSeconds</c>.
-type internal LocalActorSystemService(options: IOptions<LegateOptions>, timeProvider: TimeProvider) =
+type internal LocalActorSystemService(options: IOptions<LegateOptions>, timeProvider: TimeProvider) as this =
 
     do ArgumentNullException.ThrowIfNull(options)
     do ArgumentNullException.ThrowIfNull(timeProvider)
@@ -134,8 +171,17 @@ type internal LocalActorSystemService(options: IOptions<LegateOptions>, timeProv
     /// This is the cold-start hook the timing test reads.
     member _.LastColdStart: TimeSpan = lastColdStart
 
-    /// Resolves the identity-only session child for a session id: the same
-    /// id returns the same actor, distinct ids return distinct actors.
+    /// Spawns the session actor child for a newly resolved session id.
+    /// None keeps the legacy identity-only children; Some wires the
+    /// SessionActor state machine (see
+    /// <see cref="M:Legate.SessionActor.spawnFactory" />). The session
+    /// client facade owns setting this once it can supply the store and
+    /// turn runner; until then resolving an id stays observable either
+    /// way. Set before StartAsync.
+    member val SessionChildFactory: (string -> IActorContext -> string -> IActorRef) option = None with get, set
+
+    /// Resolves the session child for a session id: the same id returns
+    /// the same actor, distinct ids return distinct actors.
     /// <param name="sessionId">The session whose child to resolve.</param>
     /// <param name="cancellationToken">Cancels the resolve.</param>
     /// <returns>The session child actor.</returns>
@@ -169,7 +215,12 @@ type internal LocalActorSystemService(options: IOptions<LegateOptions>, timeProv
                 if options.Value.Cluster.Mode = ClusterMode.Local then
                     let startTimestamp = timeProvider.GetTimestamp()
                     let created = LocalActorSystem.createSystem ()
-                    let routerRef = LocalActorSystem.spawnRouter created
+
+                    let routerRef =
+                        match this.SessionChildFactory with
+                        | Some spawnSession -> LocalActorSystem.spawnRouterWith created spawnSession
+                        | None -> LocalActorSystem.spawnRouter created
+
                     system <- created
                     router <- routerRef
                     lastColdStart <- timeProvider.GetElapsedTime startTimestamp
