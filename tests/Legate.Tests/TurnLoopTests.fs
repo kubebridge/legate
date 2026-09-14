@@ -871,3 +871,305 @@ let ``Resolved session budget flows into the loop`` () =
     match result.Outcome with
     | :? TurnFailed as failed -> failed.Reason |> should equal TurnLoop.MaxIterationsExceededMessage
     | _ -> failwith "Expected a TurnFailed outcome."
+
+// ───────────────────────────────────────────────────────────────────────────
+// Issue 41: Inject fold at iteration boundaries
+
+let sampleInjectSessionId () =
+    SessionId.Parse "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+
+let injectStamp () =
+    DateTimeOffset(2024, 1, 2, 3, 4, 5, TimeSpan.Zero)
+
+let injectEntry (position: int64) (payload: InboxPayload) (delivery: DeliveryMode) : InboxEntry =
+    {
+        SessionId = sampleInjectSessionId ()
+        Position = position
+        Payload = payload
+        Delivery = delivery
+        Consumed = false
+        AppendedAt = injectStamp ()
+    }
+
+let textInject (position: int64) (text: string) : InboxEntry =
+    injectEntry position (UserMessagePayload(UserMessage.Text text) :> InboxPayload) DeliveryMode.Inject
+
+let userMessagesOf (history: IList<ChatMessage>) : ChatMessage list =
+    [
+        for message in history do
+            if not (isNull (box message)) && message.Role = ChatRole.User then
+                yield message
+    ]
+
+let userTextsOf (history: IList<ChatMessage>) : string list =
+    [
+        for message in userMessagesOf history do
+            for content in message.Contents do
+                match content with
+                | :? TextContent as text when not (isNull (box text)) ->
+                    yield (if isNull (box text.Text) then "" else text.Text)
+                | _ -> ()
+    ]
+
+let private runLoopWithInjects
+    (client: ScriptedChatClient)
+    (history: IList<ChatMessage>)
+    (tools: IReadOnlyDictionary<string, AITool>)
+    (options: TurnLoop.TurnLoopOptions)
+    (token: CancellationToken)
+    (isLeased: unit -> bool)
+    (drain: TurnLoop.DrainInjected)
+    (onJournaled: TurnLoop.JournalInjected)
+    (onConsumed: TurnLoop.ConsumeInjected)
+    : TurnLoop.TurnLoopCompletion =
+    TurnLoop.runAsyncWithInjects
+        (client :> IChatClient)
+        history
+        tools
+        options
+        token
+        isLeased
+        drain
+        onJournaled
+        onConsumed
+    |> fun task -> task.GetAwaiter().GetResult()
+
+[<Fact>]
+let ``Injects fold after tool results before the next provider call in arrival order`` () =
+    let invocations = ref []
+    let fn = stubTool "lookup" "row-1" invocations
+
+    let first =
+        new ChatResponse(ResizeArray<ChatMessage>([| callMessage [ "c1", "lookup" ] |]))
+
+    let client = new ScriptedChatClient([ first; textResponse "finished" ])
+    let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+
+    let firstInject = textInject 2L "steer-one"
+    let secondInject = textInject 1L "steer-two"
+    let journaled = ResizeArray<InboxEntry>()
+    let consumed = ResizeArray<InboxEntry>()
+    let mutable drains = 0
+
+    // Empty before the first provider call; the two injects arrive while
+    // the tool runs and fold at the next boundary. Positions arrive
+    // out of order so the fold must sort them.
+    let drain () : IReadOnlyList<InboxEntry> =
+        drains <- drains + 1
+
+        if drains = 2 then
+            ResizeArray<InboxEntry>([| firstInject; secondInject |]) :> IReadOnlyList<InboxEntry>
+        else
+            ResizeArray<InboxEntry>() :> IReadOnlyList<InboxEntry>
+
+    let completion =
+        runLoopWithInjects
+            client
+            history
+            (makeTools [ "lookup", fn ])
+            TurnLoop.TurnLoopOptions.Default
+            CancellationToken.None
+            alwaysLeased
+            drain
+            journaled.Add
+            consumed.Add
+
+    completion.Result.AssistantText |> should equal "finished"
+    completion.Result.Status |> should equal TurnStatus.Completed
+    // Injects never spend the iteration budget: two provider calls only.
+    completion.Result.Iterations |> should equal 2
+    completion.HasPendingInjects |> should equal false
+    client.Calls |> should equal 2
+
+    // Placement: tool result, then the injects in position order, then
+    // the final assistant message.
+    let roles = history |> Seq.map (fun message -> message.Role) |> List.ofSeq
+
+    roles
+    |> should
+        equal
+        [
+            ChatRole.Assistant
+            ChatRole.Tool
+            ChatRole.User
+            ChatRole.User
+            ChatRole.Assistant
+        ]
+
+    userTextsOf history |> should equal [ "steer-two"; "steer-one" ]
+    journaled |> List.ofSeq |> should equal [ secondInject; firstInject ]
+    consumed |> List.ofSeq |> should equal [ secondInject; firstInject ]
+
+[<Fact>]
+let ``Empty drain is a no-op`` () =
+    let client = new ScriptedChatClient([ textResponse "done" ])
+    let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+    let journaled = ResizeArray<InboxEntry>()
+    let consumed = ResizeArray<InboxEntry>()
+
+    let drain () : IReadOnlyList<InboxEntry> =
+        ResizeArray<InboxEntry>() :> IReadOnlyList<InboxEntry>
+
+    let completion =
+        runLoopWithInjects
+            client
+            history
+            (makeTools [])
+            TurnLoop.TurnLoopOptions.Default
+            CancellationToken.None
+            alwaysLeased
+            drain
+            journaled.Add
+            consumed.Add
+
+    completion.Result.AssistantText |> should equal "done"
+    completion.Result.Iterations |> should equal 1
+    completion.HasPendingInjects |> should equal false
+    journaled.Count |> should equal 0
+    consumed.Count |> should equal 0
+    userMessagesOf history |> List.length |> should equal 0
+
+[<Fact>]
+let ``Queue Interrupt and Reply entries are ignored and stay pending`` () =
+    let client = new ScriptedChatClient([ textResponse "done" ])
+    let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+
+    let queued =
+        injectEntry 1L (UserMessagePayload(UserMessage.Text "queued") :> InboxPayload) DeliveryMode.Queue
+
+    let interrupted =
+        injectEntry 2L (UserMessagePayload(UserMessage.Text "interrupted") :> InboxPayload) DeliveryMode.Interrupt
+
+    let replyInject =
+        injectEntry
+            3L
+            (ReplyPayload(PermissionDecision("req-1", PermissionDecisionKind.AllowOnce) :> Reply) :> InboxPayload)
+            DeliveryMode.Inject
+
+    let valid = textInject 4L "steer"
+    let journaled = ResizeArray<InboxEntry>()
+    let consumed = ResizeArray<InboxEntry>()
+
+    let store =
+        ResizeArray<InboxEntry>(
+            [|
+                queued
+                interrupted
+                replyInject
+                valid
+            |]
+        )
+
+    let drain () : IReadOnlyList<InboxEntry> =
+        let pending =
+            store
+            |> Seq.filter (fun entry -> consumed |> Seq.exists (fun c -> c.Position = entry.Position) |> not)
+            |> List.ofSeq
+
+        ResizeArray<InboxEntry>(pending) :> IReadOnlyList<InboxEntry>
+
+    let completion =
+        runLoopWithInjects
+            client
+            history
+            (makeTools [])
+            TurnLoop.TurnLoopOptions.Default
+            CancellationToken.None
+            alwaysLeased
+            drain
+            journaled.Add
+            consumed.Add
+
+    completion.Result.AssistantText |> should equal "done"
+    completion.HasPendingInjects |> should equal false
+    // Only the Inject user message folds; the rest stay pending.
+    userTextsOf history |> should equal [ "steer" ]
+    journaled |> List.ofSeq |> should equal [ valid ]
+    consumed |> List.ofSeq |> should equal [ valid ]
+
+[<Fact>]
+let ``Inject arriving during the final iteration stays pending with the new-turn signal`` () =
+    let client = new ScriptedChatClient([ textResponse "done" ])
+    let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+    let late = textInject 7L "late-steer"
+    let journaled = ResizeArray<InboxEntry>()
+    let consumed = ResizeArray<InboxEntry>()
+    let mutable drains = 0
+
+    // Empty at the iteration boundary, then the inject arrives while the
+    // final provider call is in flight and is peeked on the
+    // would-complete path.
+    let drain () : IReadOnlyList<InboxEntry> =
+        drains <- drains + 1
+
+        if drains = 1 then
+            ResizeArray<InboxEntry>() :> IReadOnlyList<InboxEntry>
+        else
+            ResizeArray<InboxEntry>([| late |]) :> IReadOnlyList<InboxEntry>
+
+    let completion =
+        runLoopWithInjects
+            client
+            history
+            (makeTools [])
+            TurnLoop.TurnLoopOptions.Default
+            CancellationToken.None
+            alwaysLeased
+            drain
+            journaled.Add
+            consumed.Add
+
+    completion.Result.AssistantText |> should equal "done"
+    completion.Result.Status |> should equal TurnStatus.Completed
+    completion.HasPendingInjects |> should equal true
+    // Nothing folded: the message stays pending for the session actor.
+    userMessagesOf history |> List.length |> should equal 0
+    journaled.Count |> should equal 0
+    consumed.Count |> should equal 0
+
+[<Fact>]
+let ``Inject appends raw parts verbatim and ignores metadata`` () =
+    let client = new ScriptedChatClient([ textResponse "done" ])
+    let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+
+    let parts =
+        ResizeArray<AIContent>(
+            [|
+                TextContent("first") :> AIContent
+                TextContent("second") :> AIContent
+            |]
+        )
+        :> IReadOnlyList<AIContent>
+
+    let metadata = Dictionary<string, string>()
+    metadata["source"] <- "host"
+    let message = UserMessage(parts, metadata)
+
+    let entry =
+        injectEntry 1L (UserMessagePayload(message) :> InboxPayload) DeliveryMode.Inject
+
+    let journaled = ResizeArray<InboxEntry>()
+    let consumed = ResizeArray<InboxEntry>()
+
+    let drain () : IReadOnlyList<InboxEntry> =
+        if consumed.Count = 0 then
+            ResizeArray<InboxEntry>([| entry |]) :> IReadOnlyList<InboxEntry>
+        else
+            ResizeArray<InboxEntry>() :> IReadOnlyList<InboxEntry>
+
+    let completion =
+        runLoopWithInjects
+            client
+            history
+            (makeTools [])
+            TurnLoop.TurnLoopOptions.Default
+            CancellationToken.None
+            alwaysLeased
+            drain
+            journaled.Add
+            consumed.Add
+
+    completion.HasPendingInjects |> should equal false
+    userTextsOf history |> should equal [ "first"; "second" ]
+    journaled |> List.ofSeq |> should equal [ entry ]
+    consumed |> List.ofSeq |> should equal [ entry ]
