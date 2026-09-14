@@ -180,9 +180,11 @@ type ProcessWorkspace internal (runtimeId: string, rootDirectory: string, defaul
     /// Starts the shell with the workspace as its working directory and both
     /// streams redirected. The shell inherits the process's environment; the
     /// caller's injected variables are added on top, overriding on name
-    /// collisions. Values may carry secrets and are never logged. The POSIX
-    /// payload is single-quoted so the whole command line reaches
-    /// <c>/bin/sh -c</c> as one argument.
+    /// collisions. Values may carry secrets and are never logged. The
+    /// command line is passed argument-by-argument, so the POSIX shell
+    /// receives the payload as one verbatim <c>-c</c> argument with no
+    /// quoting, and cmd.exe re-parses after <c>/c</c> exactly as a user
+    /// shell would.
     let startShell (command: string) (env: IReadOnlyDictionary<string, string> | null) : Process =
         let startInfo = ProcessStartInfo()
 
@@ -194,10 +196,14 @@ type ProcessWorkspace internal (runtimeId: string, rootDirectory: string, defaul
                  | null -> "cmd.exe"
                  | value -> value)
 
-            startInfo.Arguments <- sprintf "/d /s /c %s" command
+            startInfo.ArgumentList.Add "/d"
+            startInfo.ArgumentList.Add "/s"
+            startInfo.ArgumentList.Add "/c"
+            startInfo.ArgumentList.Add command
         else
             startInfo.FileName <- "/bin/sh"
-            startInfo.Arguments <- sprintf "-c '%s'" (command.Replace("'", "'\\''"))
+            startInfo.ArgumentList.Add "-c"
+            startInfo.ArgumentList.Add command
 
         startInfo.WorkingDirectory <- root
         startInfo.UseShellExecute <- false
