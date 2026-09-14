@@ -26,8 +26,9 @@ open Microsoft.Extensions.DependencyInjection.Extensions
 /// apply with <c>TryAdd</c> after the host configuration runs, so host
 /// registrations always win. Missing required registrations (no provider, no
 /// session store, no workspace runtime) fail at host start with one message
-/// listing everything missing. Never creates the actor system (issue 30 owns
-/// it) or a session client facade (later cycles own it).
+/// listing everything missing. Registers the local actor system hosted
+/// service (Local cluster mode only; Clustered mode is untouched) and
+/// never a session client facade (later cycles own it).
 [<Sealed; AbstractClass; Extension>]
 type LegateServiceCollectionExtensions =
 
@@ -80,6 +81,7 @@ type LegateServiceCollectionExtensions =
 
         LegateDefaultRegistration.register services
         LegateStartupChecks.register services
+        LocalActorSystemRegistration.register services
         services
 
 // ──────────────────────────────────────────────────────────────────────────

@@ -124,6 +124,36 @@ let ``Binds duration forms to TimeSpans`` () =
     options.Workspace.IdleTeardownAfter |> should equal (TimeSpan.FromSeconds 30.0)
 
 [<Fact>]
+let ``Binds the cluster shutdown grace duration`` () =
+    let section =
+        buildSection
+            [
+                "Legate:Cluster:ShutdownGraceSeconds", "45s"
+            ]
+
+    let options = LegateOptionsBinding.bind section
+
+    options.Cluster.ShutdownGraceSeconds |> should equal (TimeSpan.FromSeconds 45.0)
+
+    options.Validate() |> should equal null
+
+[<Fact>]
+let ``Non-positive shutdown grace fails validation with the section path`` () =
+    let section =
+        buildSection
+            [
+                "Legate:Cluster:ShutdownGraceSeconds", "0s"
+            ]
+
+    let ex =
+        Assert.Throws<InvalidOperationException>(fun () -> LegateOptionsBinding.bind section |> ignore)
+
+    ex.Message.Contains("Cluster") |> should equal true
+
+    ex.Message.Contains("ShutdownGraceSeconds must be positive.")
+    |> should equal true
+
+[<Fact>]
 let ``Invalid duration fails with the section path`` () =
     let section =
         buildSection

@@ -231,12 +231,19 @@ let ``Cluster defaults run local with no seeds`` () =
     let options = ClusterOptions()
     options.Mode |> should equal ClusterMode.Local
     options.SeedNodes.Count |> should equal 0
+    options.ShutdownGraceSeconds |> should equal (TimeSpan.FromSeconds 30.0)
     options.Validate() |> should equal null
 
 [<Fact>]
 let ``Cluster Validate flags unknown mode and bad seeds`` () =
     ClusterOptions(Mode = enum<ClusterMode> 99).Validate()
     |> should equal "Mode has an unknown cluster mode."
+
+    ClusterOptions(ShutdownGraceSeconds = TimeSpan.Zero).Validate()
+    |> should equal "ShutdownGraceSeconds must be positive."
+
+    ClusterOptions(ShutdownGraceSeconds = TimeSpan.FromSeconds(-1.0)).Validate()
+    |> should equal "ShutdownGraceSeconds must be positive."
 
     let nullSeeds = ClusterOptions()
     nullSeeds.SeedNodes <- nullRef<List<string>>

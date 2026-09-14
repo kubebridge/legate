@@ -43,8 +43,8 @@ type internal LegateOptionsValidation() =
 /// Fails host startup with one message listing every missing required
 /// registration: no <see cref="T:Legate.ILlmProvider" />, no
 /// <see cref="T:Legate.ISessionStore" />, or no
-/// <see cref="T:Legate.IWorkspaceRuntime" />. Issue 30 owns the local actor
-/// system hosted service; this service only validates.
+/// <see cref="T:Legate.IWorkspaceRuntime" />. The local actor system hosted
+/// service registers separately; this service only validates.
 type internal LegateStartupValidation(serviceProvider: IServiceProvider) =
 
     do ArgumentNullException.ThrowIfNull(serviceProvider)
