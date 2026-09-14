@@ -43,7 +43,7 @@ open System.Text.Json.Serialization
 /// <item><term>usage</term><description>token usage was checkpointed.</description></item>
 /// <item><term>compacted</term><description>the conversation was summarised.</description></item>
 /// <item><term>turnCompleted</term><description>the turn settled normally.</description></item>
-/// <item><term>turnAborted</term><description>the host aborted the turn.</description></item>
+/// <item><term>turnAborted</term><description>the turn stopped with its stop cause (abort or host shutdown).</description></item>
 /// <item><term>turnFailed</term><description>the turn failed inside the loop.</description></item>
 /// <item><term>sessionClosed</term><description>the session closed.</description></item>
 /// </list>
@@ -368,14 +368,31 @@ and [<Sealed>] TurnCompletedEvent
     (sessionId: SessionId, turnId: TurnId, sequence: Nullable<int64>, timestamp: DateTimeOffset) =
     inherit SessionEvent(sessionId, turnId, sequence, timestamp)
 
-/// The host aborted the turn.
+/// The turn stopped before completing: the host aborted it or shut down
+/// while it ran. Carries the typed stop cause that won the arbitration,
+/// mirroring <see cref="T:Legate.TurnAborted" />.
 /// <param name="sessionId">The session the event belongs to.</param>
-/// <param name="turnId">The turn that was aborted.</param>
+/// <param name="turnId">The turn that was stopped.</param>
 /// <param name="sequence">The event's per-session sequence number, or empty while in flight.</param>
 /// <param name="timestamp">When the event was raised.</param>
+/// <param name="cause">Which abort-family stop cause won: ExplicitAbort or HostShutdown.</param>
+/// <param name="reason">Why the turn stopped. Never contains secrets or tool arguments.</param>
 and [<Sealed>] TurnAbortedEvent
-    (sessionId: SessionId, turnId: TurnId, sequence: Nullable<int64>, timestamp: DateTimeOffset) =
+    (
+        sessionId: SessionId,
+        turnId: TurnId,
+        sequence: Nullable<int64>,
+        timestamp: DateTimeOffset,
+        cause: StopCause,
+        reason: string
+    ) =
     inherit SessionEvent(sessionId, turnId, sequence, timestamp)
+
+    /// Which abort-family stop cause won the arbitration for the turn.
+    member _.Cause = cause
+
+    /// Why the turn stopped. Never contains secrets or tool arguments.
+    member _.Reason = reason
 
 /// The turn failed inside the loop (a tool or provider error) or its budget
 /// ran out. Carries the same never-secrets reason

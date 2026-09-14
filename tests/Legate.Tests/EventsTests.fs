@@ -59,7 +59,9 @@ let sampleEvents: (string * (unit -> SessionEvent)) list =
         "usage", fun () -> UsageEvent(sessionId, turnId, noSequence, stamp, 1200L, 340L) :> SessionEvent
         "compacted", fun () -> CompactedEvent(sessionId, turnId, noSequence, stamp, 9000L, 1200L) :> SessionEvent
         "turnCompleted", fun () -> TurnCompletedEvent(sessionId, turnId, noSequence, stamp) :> SessionEvent
-        "turnAborted", fun () -> TurnAbortedEvent(sessionId, turnId, noSequence, stamp) :> SessionEvent
+        "turnAborted",
+        fun () ->
+            TurnAbortedEvent(sessionId, turnId, noSequence, stamp, StopCause.ExplicitAbort, "host stop") :> SessionEvent
         "turnFailed",
         fun () -> TurnFailedEvent(sessionId, turnId, noSequence, stamp, "provider returned 500") :> SessionEvent
         "sessionClosed", fun () -> SessionClosedEvent(sessionId, turnId, noSequence, stamp) :> SessionEvent
@@ -275,6 +277,17 @@ let ``Compacted round-trips both estimates`` () =
     let compacted = restored :?> CompactedEvent
     compacted.BeforeEstimate |> should equal 9000L
     compacted.AfterEstimate |> should equal 1200L
+
+[<Fact>]
+let ``TurnAborted round-trips its cause and reason`` () =
+    let restored =
+        roundTrip "turnAborted" (fun () ->
+            TurnAbortedEvent(sessionId, turnId, noSequence, stamp, StopCause.HostShutdown, "host draining")
+            :> SessionEvent)
+
+    let aborted = restored :?> TurnAbortedEvent
+    aborted.Cause |> should equal StopCause.HostShutdown
+    aborted.Reason |> should equal "host draining"
 
 [<Fact>]
 let ``TurnFailed round-trips its failure reason`` () =

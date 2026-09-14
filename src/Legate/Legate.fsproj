@@ -12,6 +12,7 @@
     <Compile Include="ClaimHeartbeat.fs" />
     <Compile Include="ClaimFence.fs" />
     <Compile Include="LlmStreaming.fs" />
+    <Compile Include="StopArbitration.fs" />
     <Compile Include="TurnLoop.fs" />
     <Compile Include="LegateOptionsBinding.fs" />
     <Compile Include="LegateDefaults.fs" />

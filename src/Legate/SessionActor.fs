@@ -33,9 +33,12 @@ open Microsoft.Extensions.AI
 // metadata ops to stashed follow-ups with epoch fencing.
 //
 // Out of scope here, owned elsewhere: claim tokens and fencing (#33),
-// Inject/Interrupt delivery (#34), abort stop-cause arbitration (#35: Close
-// wires turn cancellation only), and suspend triggers with reply matching
-// (#36: WaitingForInput is modelled and preserved, never entered).
+// Inject/Interrupt delivery (#34), and suspend triggers with reply matching
+// (#36: WaitingForInput is modelled and preserved, never entered). Abort is
+// a first-class turn-level verb here (#35): AbortSession carries a typed
+// stop cause, exactly one of settlement and stop wins per turn, and Close
+// stays lifecycle-only (it wires turn cancellation without recording a
+// stop cause).
 
 // ──────────────────────────────────────────────────────────────────────────
 // Protocol
@@ -69,6 +72,18 @@ type internal SessionActorMessage =
     /// cancellation only, then closes idempotently in the store. Valid in
     /// every state. Answered with the stored session.
     | CloseSession of cancellationToken: CancellationToken
+
+    /// Abort the running turn under a typed stop cause: records the pending
+    /// stop, cancels the turn, and settles Aborted under the winning cause
+    /// when the turn reports back. Exactly one of settlement and stop wins:
+    /// a completion that landed first stands and the abort is a no-op, a
+    /// stop that landed first maps even a successful completion to Aborted,
+    /// and a second abort keeps the first cause. Idle is a no-op returning
+    /// the current state, as is WaitingForInput (suspended turns belong to
+    /// issue 36: nothing runs to abort). Only abort-family causes
+    /// (ExplicitAbort, HostShutdown) act; anything else is a no-op. Answered
+    /// with <see cref="T:Legate.SessionSnapshot" />.
+    | AbortSession of cause: StopCause * reason: string * cancellationToken: CancellationToken
 
     /// Reads the actor's current state plus the store's pending inbox count.
     /// Answered with <see cref="T:Legate.SessionSnapshot" />.
@@ -127,6 +142,11 @@ type internal SessionActorProps =
         SessionId: SessionId
         /// Runs one turn for an inbox entry. Never null.
         RunTurn: InboxEntry -> CancellationToken -> Task<TurnResult>
+        /// Observes each settled turn result (the carried result, or the
+        /// abort-mapped Aborted result when a stop won) on the actor thread,
+        /// or None for no observation. Guarded: a throwing observer never
+        /// kills the actor.
+        OnTurnSettled: (TurnResult -> unit) option
     }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -221,20 +241,23 @@ module internal SessionActor =
 
     /// Builds a Queue turn runner over TurnLoop.runAsync: one ChatRole.User
     /// history message from the entry's parts and no Inject fold, running
-    /// under the given lease hook.
+    /// under the given lease hook and the given deadline seam.
     /// <param name="client">The chat client the turn runs against.</param>
     /// <param name="tools">The tools the turn may call.</param>
     /// <param name="options">The turn loop tuning and per-turn budget.</param>
+    /// <param name="delay">The delay seam the hard deadline fires off. Must not be null.</param>
     /// <param name="isLeaseValid">The lease hook the loop checks. Must not be null.</param>
     /// <returns>A runner executing one Queue inbox entry per turn.</returns>
     let private runnerFor
         (client: IChatClient)
         (tools: IReadOnlyDictionary<string, AITool>)
         (options: TurnLoop.TurnLoopOptions)
+        (delay: ILlmDelay)
         (isLeaseValid: unit -> bool)
         : (InboxEntry -> CancellationToken -> Task<TurnResult>) =
         ArgumentNullException.ThrowIfNull(client)
         ArgumentNullException.ThrowIfNull(tools)
+        ArgumentNullException.ThrowIfNull(delay)
         ArgumentNullException.ThrowIfNull(isLeaseValid)
 
         fun entry cancellationToken ->
@@ -256,7 +279,7 @@ module internal SessionActor =
                     history.Add(ChatMessage(ChatRole.User, parts :> IList<AIContent>))
                 | _ -> history.Add(ChatMessage(ChatRole.User, ""))
 
-                return! TurnLoop.runAsync client history tools options cancellationToken isLeaseValid
+                return! TurnLoop.runAsync client history tools options delay cancellationToken isLeaseValid
             }
 
     /// Builds the default turn runner over TurnLoop.runAsync for Queue
@@ -265,13 +288,15 @@ module internal SessionActor =
     /// <param name="client">The chat client the turn runs against.</param>
     /// <param name="tools">The tools the turn may call.</param>
     /// <param name="options">The turn loop tuning and per-turn budget.</param>
+    /// <param name="delay">The delay seam the hard deadline fires off. Must not be null.</param>
     /// <returns>A runner executing one Queue inbox entry per turn.</returns>
     let createTurnRunner
         (client: IChatClient)
         (tools: IReadOnlyDictionary<string, AITool>)
         (options: TurnLoop.TurnLoopOptions)
+        (delay: ILlmDelay)
         : (InboxEntry -> CancellationToken -> Task<TurnResult>) =
-        runnerFor client tools options (fun () -> true)
+        runnerFor client tools options delay (fun () -> true)
 
     /// Builds the claimed turn runner over TurnLoop.runAsync for Queue
     /// delivery (issue 33): the same history shape as
@@ -282,6 +307,7 @@ module internal SessionActor =
     /// <param name="client">The chat client the turn runs against.</param>
     /// <param name="tools">The tools the turn may call.</param>
     /// <param name="options">The turn loop tuning and per-turn budget.</param>
+    /// <param name="delay">The delay seam the hard deadline fires off. Must not be null.</param>
     /// <param name="isLeaseValid">The heartbeat-backed lease hook (ClaimHeartbeat.ClaimLeaseView.IsValid). Must not be null.</param>
     /// <param name="verifyClaim">The last-moment per-tool fence (ClaimFence.checkBeforeCallAsync), or None for no fence.</param>
     /// <returns>A runner executing one Queue inbox entry per turn under the claim.</returns>
@@ -289,6 +315,7 @@ module internal SessionActor =
         (client: IChatClient)
         (tools: IReadOnlyDictionary<string, AITool>)
         (options: TurnLoop.TurnLoopOptions)
+        (delay: ILlmDelay)
         (isLeaseValid: unit -> bool)
         (verifyClaim: (unit -> Task<bool>) option)
         : (InboxEntry -> CancellationToken -> Task<TurnResult>) =
@@ -298,6 +325,7 @@ module internal SessionActor =
             { options with
                 VerifyClaim = verifyClaim
             }
+            delay
             isLeaseValid
 
     /// The session actor: recovers from the store, then owns the state
@@ -383,7 +411,83 @@ module internal SessionActor =
 
                 (SessionState.Idle, None)
 
-        let rec loop (state: SessionState) (running: RunningTurn option) =
+        /// Builds the observable snapshot for a state: the lifecycle state,
+        /// the store's pending inbox count, and the running entry position.
+        /// <param name="state">The actor's current lifecycle state.</param>
+        /// <param name="running">The turn in flight, or None.</param>
+        /// <returns>The actor's current snapshot.</returns>
+        let takeSnapshot (state: SessionState) (running: RunningTurn option) : SessionSnapshot =
+            {
+                SessionId = props.SessionId
+                State = state
+                PendingCount = pendingCount props
+                RunningPosition = running |> Option.map (fun inFlight -> inFlight.Entry.Position)
+            }
+
+        /// Observes a settled turn result through the props hook. Guarded: a
+        /// throwing observer never kills the actor.
+        /// <param name="result">The settled (or abort-mapped) turn result.</param>
+        let notifySettled (result: TurnResult) : unit =
+            match props.OnTurnSettled with
+            | Some observe ->
+                try
+                    observe result
+                with _ ->
+                    ()
+            | None -> ()
+
+        /// Maps a reported result to the Aborted result a won stop settles:
+        /// the stop cause wins over whatever the turn reported, even a
+        /// success, so settlement and stop stay mutually exclusive. Falls
+        /// back to the carried result when the cause maps to no settlement
+        /// (only abort-family causes reach the pending stop, so this never
+        /// fires).
+        /// <param name="cause">The stop cause that won.</param>
+        /// <param name="reason">Why the turn stopped.</param>
+        /// <param name="result">The result the turn reported.</param>
+        /// <returns>The result the actor settles.</returns>
+        let mapAborted (cause: StopCause) (reason: string) (result: TurnResult) : TurnResult =
+            match StopArbitration.settlementFor cause reason with
+            | Some(status, outcome) ->
+                { result with
+                    Status = status
+                    Outcome = outcome
+                }
+            | None -> result
+
+        /// Builds the Aborted result a won stop settles when the turn left
+        /// no result behind (a faulted attempt): zero iterations and usage,
+        /// the abort-family outcome carrying who and why. Falls back to a
+        /// Failed result when the cause maps to no settlement (only
+        /// abort-family causes reach the pending stop, so this never fires).
+        /// <param name="cause">The stop cause that won.</param>
+        /// <param name="reason">Why the turn stopped.</param>
+        /// <returns>The result the actor settles.</returns>
+        let abortedResult (cause: StopCause) (reason: string) : TurnResult =
+            match StopArbitration.settlementFor cause reason with
+            | Some(status, outcome) ->
+                {
+                    AssistantText = ""
+                    Status = status
+                    Iterations = 0
+                    Usage = { InputTokens = 0L; OutputTokens = 0L }
+                    Outcome = outcome
+                }
+            | None ->
+                {
+                    AssistantText = ""
+                    Status = TurnStatus.Failed
+                    Iterations = 0
+                    Usage = { InputTokens = 0L; OutputTokens = 0L }
+                    Outcome = TurnFailed(reason) :> TurnOutcome
+                }
+
+        let rec loop
+            (state: SessionState)
+            (running: RunningTurn option)
+            (arbitration: StopArbitration.ArbitrationState)
+            (pendingStop: (StopCause * string) option)
+            =
             actor {
                 let! message = mailbox.Receive()
 
@@ -392,7 +496,7 @@ module internal SessionActor =
                     match state with
                     | SessionState.Closed ->
                         mailbox.Sender() <! PromptRejected SessionState.Closed
-                        return! loop state running
+                        return! loop state running arbitration pendingStop
                     | SessionState.Idle ->
                         let appended =
                             awaitTask (
@@ -427,7 +531,7 @@ module internal SessionActor =
 
                         let next = startTurn first
                         mailbox.Sender() <! PromptAccepted appended
-                        return! loop SessionState.Running (Some next)
+                        return! loop SessionState.Running (Some next) StopArbitration.Undecided None
                     | SessionState.Running
                     | SessionState.WaitingForInput ->
                         let appended =
@@ -442,7 +546,7 @@ module internal SessionActor =
                             )
 
                         mailbox.Sender() <! PromptAccepted appended
-                        return! loop state running
+                        return! loop state running arbitration pendingStop
                     | _ ->
                         // Out-of-range stored state: stay durable but start
                         // nothing new.
@@ -458,7 +562,7 @@ module internal SessionActor =
                             )
 
                         mailbox.Sender() <! PromptAccepted appended
-                        return! loop state running
+                        return! loop state running arbitration pendingStop
                 | CloseSession cancellationToken ->
                     match running with
                     | Some inFlight -> inFlight.Cts.Cancel()
@@ -468,35 +572,83 @@ module internal SessionActor =
                         awaitTask (props.Store.CloseSession(props.Tenant, props.SessionId, cancellationToken))
 
                     mailbox.Sender() <! closed
-                    return! loop SessionState.Closed None
-                | GetSnapshot ->
-                    let snapshot =
-                        {
-                            SessionId = props.SessionId
-                            State = state
-                            PendingCount = pendingCount props
-                            RunningPosition = running |> Option.map (fun inFlight -> inFlight.Entry.Position)
-                        }
+                    return! loop SessionState.Closed None StopArbitration.Undecided None
+                | AbortSession(cause, reason, _) ->
+                    match state, running with
+                    | SessionState.Running, Some inFlight when
+                        cause = StopCause.ExplicitAbort || cause = StopCause.HostShutdown
+                        ->
+                        let nextArbitration, won = StopArbitration.applyStop arbitration cause
 
-                    mailbox.Sender() <! snapshot
-                    return! loop state running
-                | SessionTurnSettled(entry, _) ->
+                        let nextStop = if won then Some(cause, reason) else pendingStop
+
+                        if won then
+                            inFlight.Cts.Cancel()
+
+                        mailbox.Sender() <! takeSnapshot state running
+                        return! loop state running nextArbitration nextStop
+                    | _ ->
+                        // Idle, WaitingForInput (suspended turns belong to
+                        // issue 36: nothing runs to abort), Closed, unknown
+                        // states, and non-abort-family causes: a no-op
+                        // returning the current state.
+                        mailbox.Sender() <! takeSnapshot state running
+                        return! loop state running arbitration pendingStop
+                | GetSnapshot ->
+                    mailbox.Sender() <! takeSnapshot state running
+                    return! loop state running arbitration pendingStop
+                | SessionTurnSettled(entry, result) ->
                     match state, running with
                     | SessionState.Running, Some inFlight when inFlight.Entry.Position = entry.Position ->
-                        inFlight.Cts.Dispose()
-                        let nextState, nextRunning = settle entry CancellationToken.None
-                        return! loop nextState nextRunning
-                    | _ -> return! loop state running
+                        match arbitration with
+                        | StopArbitration.Undecided ->
+                            // Settlement wins: the carried result stands.
+                            inFlight.Cts.Dispose()
+                            notifySettled result
+                            let nextState, nextRunning = settle entry CancellationToken.None
+                            return! loop nextState nextRunning StopArbitration.Undecided None
+                        | StopArbitration.Decided(StopArbitration.StopWins cause) ->
+                            // The stop landed first, so it wins even over a
+                            // success: map to Aborted under the winning
+                            // cause, then run the settle bookkeeping once.
+                            inFlight.Cts.Dispose()
+
+                            let reason = pendingStop |> Option.map snd |> Option.defaultValue ""
+
+                            notifySettled (mapAborted cause reason result)
+                            let nextState, nextRunning = settle entry CancellationToken.None
+                            return! loop nextState nextRunning StopArbitration.Undecided None
+                        | StopArbitration.Decided StopArbitration.SettlementWins ->
+                            // Stale: the turn already settled, so this
+                            // completion produces zero effects.
+                            return! loop state running arbitration pendingStop
+                    | _ -> return! loop state running arbitration pendingStop
                 | SessionTurnFaulted(entry, _) ->
                     match state, running with
                     | SessionState.Running, Some inFlight when inFlight.Entry.Position = entry.Position ->
-                        inFlight.Cts.Dispose()
-                        let nextState, nextRunning = settle entry CancellationToken.None
-                        return! loop nextState nextRunning
-                    | _ -> return! loop state running
+                        match arbitration with
+                        | StopArbitration.Undecided ->
+                            inFlight.Cts.Dispose()
+                            let nextState, nextRunning = settle entry CancellationToken.None
+                            return! loop nextState nextRunning StopArbitration.Undecided None
+                        | StopArbitration.Decided(StopArbitration.StopWins cause) ->
+                            // The stop arrived first, so it wins even over
+                            // a real fault: settle Aborted under the cause.
+                            inFlight.Cts.Dispose()
+
+                            let reason = pendingStop |> Option.map snd |> Option.defaultValue ""
+
+                            notifySettled (abortedResult cause reason)
+                            let nextState, nextRunning = settle entry CancellationToken.None
+                            return! loop nextState nextRunning StopArbitration.Undecided None
+                        | StopArbitration.Decided StopArbitration.SettlementWins ->
+                            // Stale: the turn already settled, so this fault
+                            // produces zero effects.
+                            return! loop state running arbitration pendingStop
+                    | _ -> return! loop state running arbitration pendingStop
             }
 
-        loop initialState None
+        loop initialState None StopArbitration.Undecided None
 
     /// Builds the child-spawn factory the session router uses: parses the
     /// router's string id into a SessionId and spawns the session actor,
@@ -526,6 +678,7 @@ module internal SessionActor =
                         Tenant = tenant
                         SessionId = parsed
                         RunTurn = runTurn
+                        OnTurnSettled = None
                     }
 
                 spawn context name (behavior props)
@@ -663,3 +816,73 @@ module internal SessionActor =
     let getSnapshotAsync (session: IActorRef) (cancellationToken: CancellationToken) : Task<SessionSnapshot> =
         ArgumentNullException.ThrowIfNull(session)
         askAsync<SessionSnapshot> session GetSnapshot cancellationToken
+
+    /// Aborts the turn running in a session: the client boundary turn-level
+    /// verb. Idle is a no-op returning the current snapshot, as is
+    /// WaitingForInput (suspended turns belong to issue 36: nothing runs to
+    /// abort). Running records the pending stop under the typed cause,
+    /// cancels the turn, and settles Aborted under the winning cause when
+    /// the turn reports back; settlement and stop stay mutually exclusive
+    /// and a second abort keeps the first cause. Close stays lifecycle-only
+    /// and never records a stop cause. Unknown sessions throw
+    /// SessionNotFoundException and Closed sessions throw
+    /// InvalidSessionStateException before touching the actor; a Close
+    /// racing the abort maps to the same exception.
+    /// <param name="store">The durable store.</param>
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="sessionId">The session to abort the turn in.</param>
+    /// <param name="session">The session actor.</param>
+    /// <param name="cause">Which abort-family stop cause wins: ExplicitAbort or HostShutdown.</param>
+    /// <param name="reason">Why the turn stops. Must not be null. Never contains secrets or tool arguments.</param>
+    /// <param name="cancellationToken">Cancels the abort.</param>
+    /// <returns>The actor's snapshot after the abort was accepted.</returns>
+    let abortAsync
+        (store: ISessionStore)
+        (tenant: TenantId)
+        (sessionId: SessionId)
+        (session: IActorRef)
+        (cause: StopCause)
+        (reason: string)
+        (cancellationToken: CancellationToken)
+        : Task<SessionSnapshot> =
+        ArgumentNullException.ThrowIfNull(store)
+        ArgumentNullException.ThrowIfNull(session)
+
+        if isNull (box reason) then
+            raise (ArgumentNullException(nameof reason))
+
+        if cause <> StopCause.ExplicitAbort && cause <> StopCause.HostShutdown then
+            raise (
+                ArgumentOutOfRangeException(
+                    nameof cause,
+                    "Only ExplicitAbort and HostShutdown abort a turn: the deadline arrives through the turn loop and lease loss through the claim fence."
+                )
+            )
+
+        task {
+            let! current = requireSessionAsync store tenant sessionId cancellationToken
+
+            if current.State = SessionState.Closed then
+                raise (
+                    InvalidSessionStateException(
+                        sessionId,
+                        current.State.ToString(),
+                        "The session is closed and accepts no abort."
+                    )
+                )
+
+            let! snapshot =
+                askAsync<SessionSnapshot> session (AbortSession(cause, reason, cancellationToken)) cancellationToken
+
+            if snapshot.State = SessionState.Closed then
+                return
+                    raise (
+                        InvalidSessionStateException(
+                            sessionId,
+                            snapshot.State.ToString(),
+                            "The session closed before the abort was accepted."
+                        )
+                    )
+            else
+                return snapshot
+        }

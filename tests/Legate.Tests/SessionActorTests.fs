@@ -81,6 +81,27 @@ let private spawnSession
             Tenant = tenant
             SessionId = sessionId
             RunTurn = runTurn
+            OnTurnSettled = None
+        }
+
+    spawn system $"test-{Guid.NewGuid():N}" (SessionActor.behavior props)
+
+/// Spawns a session actor observing each settled result into the probe: the
+/// carried result, or the abort-mapped Aborted result when a stop won.
+let private spawnSessionWithProbe
+    (system: ActorSystem)
+    (store: ISessionStore)
+    (sessionId: SessionId)
+    (runTurn: InboxEntry -> CancellationToken -> Task<TurnResult>)
+    (probe: TurnResult -> unit)
+    : IActorRef =
+    let props: SessionActorProps =
+        {
+            Store = store
+            Tenant = tenant
+            SessionId = sessionId
+            RunTurn = runTurn
+            OnTurnSettled = Some probe
         }
 
     spawn system $"test-{Guid.NewGuid():N}" (SessionActor.behavior props)
@@ -96,6 +117,19 @@ let private prompt (store: ISessionStore) (sessionId: SessionId) (session: IActo
 let private close (store: ISessionStore) (sessionId: SessionId) (session: IActorRef) : Session =
     let call =
         SessionActor.closeAsync store tenant sessionId session CancellationToken.None
+
+    call.GetAwaiter().GetResult()
+
+/// Aborts through the client boundary and blocks for the snapshot.
+let private abort
+    (store: ISessionStore)
+    (sessionId: SessionId)
+    (session: IActorRef)
+    (cause: StopCause)
+    (reason: string)
+    : SessionSnapshot =
+    let call =
+        SessionActor.abortAsync store tenant sessionId session cause reason CancellationToken.None
 
     call.GetAwaiter().GetResult()
 
@@ -321,7 +355,11 @@ let ``Close on Running aborts the turn first through cancellation`` () =
     let client = new BlockingChatClient(ended) :> IChatClient
 
     let inner =
-        SessionActor.createTurnRunner client (noTools ()) TurnLoop.TurnLoopOptions.Default
+        SessionActor.createTurnRunner
+            client
+            (noTools ())
+            TurnLoop.TurnLoopOptions.Default
+            (TurnLoopTests.NeverDelay() :> ILlmDelay)
 
     let mutable observed = 0
 
@@ -597,3 +635,310 @@ let ``Router spawns session actors with same-id stability`` () =
         snapshot.State |> should equal SessionState.Idle
     finally
         (service :> IHostedService).StopAsync(CancellationToken.None).GetAwaiter().GetResult()
+
+// ──────────────────────────────────────────────────────────────────────────
+// Abort with typed stop causes (issue 35)
+
+[<Fact>]
+let ``Abort on Idle is a no-op returning the current state`` () =
+    use system = createSystem ()
+    let store = createStore ()
+    let created = createSession store
+    let settled = ResizeArray<TurnResult>()
+    let runner = ScriptedRunner([ "never" ])
+    let session = spawnSessionWithProbe system store created.Id runner.Func settled.Add
+
+    try
+        let snapshot = abort store created.Id session StopCause.ExplicitAbort "host stop"
+
+        snapshot.State |> should equal SessionState.Idle
+        snapshot.PendingCount |> should equal 0
+        snapshot.RunningPosition |> should equal None
+        runner.Calls |> should equal 0
+        settled.Count |> should equal 0
+        (storedOf store created.Id).State |> should equal SessionState.Idle
+    finally
+        stopSystem system
+
+[<Fact>]
+let ``Abort on Running settles Aborted with the winning cause`` () =
+    use system = createSystem ()
+    let store = createStore ()
+    let created = createSession store
+    let settled = ResizeArray<TurnResult>()
+    let runner = GatedRunner([ "doomed" ])
+    let session = spawnSessionWithProbe system store created.Id runner.Func settled.Add
+
+    try
+        prompt store created.Id session "doomed" |> ignore
+
+        let running =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () -> (snapshotOf session).State = SessionState.Running)
+
+        running |> should equal true
+
+        let snapshot = abort store created.Id session StopCause.ExplicitAbort "host stop"
+        snapshot.State |> should equal SessionState.Running
+
+        // The stop arrived first, so it wins even though the turn then
+        // reports a success: the settlement maps to Aborted under the cause.
+        runner.Release()
+
+        let drained =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () ->
+                settled.Count = 1 && (snapshotOf session).State = SessionState.Idle)
+
+        drained |> should equal true
+        settled[0].Status |> should equal TurnStatus.Aborted
+
+        match settled[0].Outcome with
+        | :? TurnAborted as aborted ->
+            aborted.Cause |> should equal StopCause.ExplicitAbort
+            aborted.Reason |> should equal "host stop"
+        | _ -> failwith "Expected a TurnAborted outcome."
+
+        (pendingOf store created.Id).Count |> should equal 0
+    finally
+        stopSystem system
+
+[<Fact>]
+let ``Settlement racing an abort wins: exactly one winner`` () =
+    use system = createSystem ()
+    let store = createStore ()
+    let created = createSession store
+    let settled = ResizeArray<TurnResult>()
+    let runner = ScriptedRunner([ "done" ])
+    let session = spawnSessionWithProbe system store created.Id runner.Func settled.Add
+
+    try
+        prompt store created.Id session "quick" |> ignore
+
+        let drained =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () ->
+                settled.Count = 1 && (snapshotOf session).State = SessionState.Idle)
+
+        drained |> should equal true
+        settled[0].Status |> should equal TurnStatus.Completed
+
+        // The turn already settled, so the abort is a no-op: still Idle,
+        // still settled exactly once.
+        let snapshot = abort store created.Id session StopCause.ExplicitAbort "too late"
+        snapshot.State |> should equal SessionState.Idle
+        settled.Count |> should equal 1
+        runner.Calls |> should equal 1
+        (pendingOf store created.Id).Count |> should equal 0
+    finally
+        stopSystem system
+
+[<Fact>]
+let ``A second abort keeps the first cause`` () =
+    use system = createSystem ()
+    let store = createStore ()
+    let created = createSession store
+    let settled = ResizeArray<TurnResult>()
+    let runner = GatedRunner([ "doomed" ])
+    let session = spawnSessionWithProbe system store created.Id runner.Func settled.Add
+
+    try
+        prompt store created.Id session "doomed" |> ignore
+
+        let running =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () -> (snapshotOf session).State = SessionState.Running)
+
+        running |> should equal true
+
+        let first = abort store created.Id session StopCause.ExplicitAbort "first"
+        first.State |> should equal SessionState.Running
+
+        let second = abort store created.Id session StopCause.HostShutdown "second"
+        second.State |> should equal SessionState.Running
+
+        runner.Release()
+
+        let drained =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () ->
+                settled.Count = 1 && (snapshotOf session).State = SessionState.Idle)
+
+        drained |> should equal true
+        settled[0].Status |> should equal TurnStatus.Aborted
+
+        match settled[0].Outcome with
+        | :? TurnAborted as aborted ->
+            aborted.Cause |> should equal StopCause.ExplicitAbort
+            aborted.Reason |> should equal "first"
+        | _ -> failwith "Expected a TurnAborted outcome."
+    finally
+        stopSystem system
+
+[<Fact>]
+let ``Queue drain continues after an abort settle`` () =
+    use system = createSystem ()
+    let store = createStore ()
+    let created = createSession store
+    let settled = ResizeArray<TurnResult>()
+    let runner = GatedRunner([ "first"; "second" ])
+    let session = spawnSessionWithProbe system store created.Id runner.Func settled.Add
+
+    try
+        prompt store created.Id session "first" |> ignore
+
+        let running =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () -> (snapshotOf session).State = SessionState.Running)
+
+        running |> should equal true
+
+        prompt store created.Id session "second" |> ignore
+
+        abort store created.Id session StopCause.ExplicitAbort "host stop" |> ignore
+        runner.Release()
+
+        let drained =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () ->
+                runner.Calls = 2 && (snapshotOf session).State = SessionState.Idle)
+
+        drained |> should equal true
+
+        // The aborted first turn settles once under its cause, then the
+        // queued second entry drains and settles normally.
+        settled.Count |> should equal 2
+        settled[0].Status |> should equal TurnStatus.Aborted
+
+        match settled[0].Outcome with
+        | :? TurnAborted as aborted ->
+            aborted.Cause |> should equal StopCause.ExplicitAbort
+            aborted.Reason |> should equal "host stop"
+        | _ -> failwith "Expected a TurnAborted outcome."
+
+        settled[1].Status |> should equal TurnStatus.Completed
+
+        runner.Entries
+        |> Seq.map entryText
+        |> List.ofSeq
+        |> should equal [ "first"; "second" ]
+
+        (pendingOf store created.Id).Count |> should equal 0
+    finally
+        stopSystem system
+
+[<Fact>]
+let ``Abort on Idle leaves non-Queue entries pending`` () =
+    use system = createSystem ()
+    let store = createStore ()
+    let created = createSession store
+    let runner = ScriptedRunner([ "never" ])
+    let session = spawnSession system store created.Id runner.Func
+
+    try
+        let payload = UserMessagePayload(UserMessage.Text("steer")) :> InboxPayload
+
+        store
+            .AppendInboxMessage(tenant, created.Id, payload, DeliveryMode.Inject, CancellationToken.None)
+            .GetAwaiter()
+            .GetResult()
+        |> ignore
+
+        let snapshot = abort store created.Id session StopCause.ExplicitAbort "host stop"
+
+        snapshot.State |> should equal SessionState.Idle
+        runner.Calls |> should equal 0
+        (pendingOf store created.Id).Count |> should equal 1
+    finally
+        stopSystem system
+
+[<Fact>]
+let ``Abort while WaitingForInput is a no-op`` () =
+    use system = createSystem ()
+    let store = createStore ()
+    let created = createSession store
+
+    store
+        .UpdateSessionState(tenant, created.Id, SessionState.WaitingForInput, CancellationToken.None)
+        .GetAwaiter()
+        .GetResult()
+    |> ignore
+
+    let settled = ResizeArray<TurnResult>()
+    let runner = ScriptedRunner([ "waiting" ])
+    let session = spawnSessionWithProbe system store created.Id runner.Func settled.Add
+
+    try
+        let snapshot = abort store created.Id session StopCause.ExplicitAbort "host stop"
+
+        // Suspended turns belong to issue 36: nothing runs to abort.
+        snapshot.State |> should equal SessionState.WaitingForInput
+        runner.Calls |> should equal 0
+        settled.Count |> should equal 0
+    finally
+        stopSystem system
+
+[<Fact>]
+let ``Abort on Closed throws InvalidSessionStateException at the boundary`` () =
+    use system = createSystem ()
+    let store = createStore ()
+    let created = createSession store
+    let runner = ScriptedRunner([ "done" ])
+    let session = spawnSession system store created.Id runner.Func
+
+    try
+        close store created.Id session |> ignore
+
+        let ex =
+            Assert.Throws<InvalidSessionStateException>(fun () ->
+                abort store created.Id session StopCause.ExplicitAbort "late" |> ignore)
+
+        ex.SessionId |> should equal created.Id
+        ex.CurrentState |> should equal (SessionState.Closed.ToString())
+        runner.Calls |> should equal 0
+    finally
+        stopSystem system
+
+[<Fact>]
+let ``Abort on an unknown session throws SessionNotFoundException`` () =
+    use system = createSystem ()
+    let store = createStore ()
+    let created = createSession store
+    let runner = ScriptedRunner([ "done" ])
+    let session = spawnSession system store created.Id runner.Func
+    let missing = SessionId.New()
+
+    try
+        Assert.Throws<SessionNotFoundException>(fun () ->
+            abort store missing session StopCause.ExplicitAbort "ghost" |> ignore)
+        |> ignore
+    finally
+        stopSystem system
+
+[<Fact>]
+let ``Abort rejects a non-abort-family cause`` () =
+    use system = createSystem ()
+    let store = createStore ()
+    let created = createSession store
+    let runner = ScriptedRunner([ "done" ])
+    let session = spawnSession system store created.Id runner.Func
+
+    try
+        Assert.Throws<ArgumentOutOfRangeException>(fun () ->
+            abort store created.Id session StopCause.Deadline "deadline" |> ignore)
+        |> ignore
+
+        Assert.Throws<ArgumentOutOfRangeException>(fun () ->
+            abort store created.Id session StopCause.LeaseLoss "lease" |> ignore)
+        |> ignore
+    finally
+        stopSystem system
+
+[<Fact>]
+let ``Abort rejects a null reason`` () =
+    use system = createSystem ()
+    let store = createStore ()
+    let created = createSession store
+    let runner = ScriptedRunner([ "done" ])
+    let session = spawnSession system store created.Id runner.Func
+    let nullReason = Unchecked.defaultof<string>
+
+    try
+        Assert.Throws<ArgumentNullException>(fun () ->
+            abort store created.Id session StopCause.ExplicitAbort nullReason |> ignore)
+        |> ignore
+    finally
+        stopSystem system

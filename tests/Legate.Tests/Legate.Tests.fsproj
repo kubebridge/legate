@@ -48,6 +48,7 @@
     <Compile Include="BuilderTests.fs" />
     <Compile Include="ActorSystemColdStartTests.fs" />
     <Compile Include="SessionActorTests.fs" />
+    <Compile Include="StopArbitrationTests.fs" />
     <Compile Include="ClaimHeartbeatTests.fs" />
     <Compile Include="ClaimFenceTests.fs" />
   </ItemGroup>
