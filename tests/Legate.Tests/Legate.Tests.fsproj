@@ -16,6 +16,13 @@
     <Compile Include="MessagesTests.fs" />
     <Compile Include="PermissionTests.fs" />
     <Compile Include="TurnTests.fs" />
+    <Compile Include="TestClockTests.fs" />
+    <Compile Include="InMemoryDatabaseTests.fs" />
+    <Compile Include="InMemorySessionStoreTests.fs" />
+    <Compile Include="InMemorySessionEventStoreTests.fs" />
+    <Compile Include="InMemoryAgentStoreTests.fs" />
+    <Compile Include="InMemoryBlobStoreTests.fs" />
+    <Compile Include="InMemoryAgentPackageTests.fs" />
     <Compile Include="SessionTests.fs" />
     <Compile Include="WorkspaceRuntimeTests.fs" />
     <Compile Include="LlmTests.fs" />
@@ -35,6 +42,8 @@
   <ItemGroup>
     <ProjectReference Include="../../src/Legate.Abstractions/Legate.Abstractions.fsproj" />
     <ProjectReference Include="../../src/Legate/Legate.fsproj" />
+    <ProjectReference Include="../../src/Legate.Storage.InMemory/Legate.Storage.InMemory.fsproj" />
+    <ProjectReference Include="../../src/Legate.Testing/Legate.Testing.fsproj" />
   </ItemGroup>
 
   <ItemGroup>

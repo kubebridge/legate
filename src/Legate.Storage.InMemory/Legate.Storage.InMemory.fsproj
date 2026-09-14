@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>Legate.Storage.InMemory</RootNamespace>
+    <Description>In-memory implementations of the Legate store contracts: sessions, events, agents, custom tools, blobs, and agent packages, with correct atomicity and fencing semantics. For tests and samples; not durable.</Description>
+  </PropertyGroup>
+
+  <!-- Compile order is explicit: register every new file here, in dependency order. -->
+  <ItemGroup>
+    <Compile Include="InMemoryDatabase.fs" />
+    <Compile Include="InMemorySessionStore.fs" />
+    <Compile Include="InMemorySessionEventStore.fs" />
+    <Compile Include="InMemoryAgentStore.fs" />
+    <Compile Include="InMemoryBlobStore.fs" />
+    <Compile Include="InMemoryAgentPackageStore.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../Legate.Abstractions/Legate.Abstractions.fsproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="FSharp.Core" />
+    <PackageReference Include="Ulid" />
+  </ItemGroup>
+
+</Project>
