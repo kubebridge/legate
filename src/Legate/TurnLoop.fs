@@ -55,9 +55,14 @@ module internal TurnLoop =
     let TimeoutExceededMessage = "The turn exceeded its timeout."
 
     /// Internal loop tuning: the tool-result char limit plus the effective
-    /// per-turn budget. The budget fields always carry resolved values (see
+    /// per-turn budget, with the optional last-moment claim fence. The
+    /// budget fields always carry resolved values (see
     /// <c>resolveBudget</c>); inject and metadata belong to follow-up
-    /// issues.
+    /// issues. VerifyClaim carries issue 33's per-tool fence
+    /// (ClaimFence.checkBeforeCallAsync): each tool invocation verifies the
+    /// claim at the last moment and loses the lease on a fenced-out claim.
+    /// None means no fence; the session path resolves through
+    /// <c>resolveBudget</c> instead, which leaves the fence unset.
     type TurnLoopOptions =
         {
             /// Maximum tool-result chars before truncation with <see cref="TruncationMarker" />.
@@ -66,17 +71,20 @@ module internal TurnLoop =
             MaxIterations: int
             /// Maximum wall-clock time the turn may spend. Positive.
             Timeout: TimeSpan
+            /// The last-moment per-tool claim fence, or None for no fence.
+            VerifyClaim: (unit -> Task<bool>) option
         }
 
         /// Default tuning: 4000 chars before truncation with the iteration
         /// and wall-clock budgets mirroring the <c>Turns</c> configuration
-        /// defaults. The session path resolves through
+        /// defaults and no claim fence. The session path resolves through
         /// <c>resolveBudget</c> instead.
         static member Default =
             {
                 MaxToolResultChars = DefaultMaxToolResultChars
                 MaxIterations = TurnsOptions().DefaultMaxIterations
                 Timeout = TurnsOptions().DefaultTimeout
+                VerifyClaim = None
             }
 
     /// Resolves the effective per-turn budget: the session's explicit knobs
@@ -334,7 +342,12 @@ module internal TurnLoop =
     /// messages to history in order and returns the final assistant text
     /// as a Completed TurnResult.
     /// Checks the lease hook before every provider call and every tool
-    /// invocation; cancellation and lease loss propagate.
+    /// invocation; cancellation and lease loss propagate. When
+    /// TurnLoopOptions carries the verifyClaim hook (issue 33's
+    /// ClaimFence.checkBeforeCallAsync), each tool invocation additionally
+    /// verifies the claim at the last moment and raises
+    /// TurnLeaseLostException on a fenced-out claim, so the loser of a
+    /// takeover never invokes the tool.
     /// At each iteration boundary, after the lease and budget checks and
     /// before the provider call, drains <c>drainInjected</c> and folds each
     /// Inject UserMessagePayload into a ChatRole.User message in position
@@ -456,6 +469,19 @@ module internal TurnLoop =
                     if timeoutCts.IsCancellationRequested then
                         return Some(failedCompletion roundIterations roundInput roundOutput TimeoutExceededMessage)
                     else
+                        // Last-moment fence (issue 33): the sync hook above
+                        // is the heartbeat's cached view; the options hook
+                        // verifies the claim token immediately before the
+                        // tool runs, so a takeover between the check and
+                        // the call still fences the loser out.
+                        match options.VerifyClaim with
+                        | Some verify ->
+                            let! live = verify ()
+
+                            if not live then
+                                raise (TurnLeaseLostException())
+                        | None -> ()
+
                         let! rawText = invokeOneAsync tools call linkedToken
                         let text = truncateToolResult options rawText
                         let resultContent = FunctionResultContent(call.CallId, text)

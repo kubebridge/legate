@@ -219,21 +219,23 @@ module internal SessionActor =
         with :? SessionNotFoundException ->
             0
 
-    /// Builds the default turn runner over TurnLoop.runAsync for Queue
-    /// delivery: one ChatRole.User history message from the entry's parts,
-    /// no Inject fold, and an always-live lease hook (claim tokens and
-    /// fencing belong to #33).
+    /// Builds a Queue turn runner over TurnLoop.runAsync: one ChatRole.User
+    /// history message from the entry's parts and no Inject fold, running
+    /// under the given lease hook.
     /// <param name="client">The chat client the turn runs against.</param>
     /// <param name="tools">The tools the turn may call.</param>
     /// <param name="options">The turn loop tuning and per-turn budget.</param>
+    /// <param name="isLeaseValid">The lease hook the loop checks. Must not be null.</param>
     /// <returns>A runner executing one Queue inbox entry per turn.</returns>
-    let createTurnRunner
+    let private runnerFor
         (client: IChatClient)
         (tools: IReadOnlyDictionary<string, AITool>)
         (options: TurnLoop.TurnLoopOptions)
+        (isLeaseValid: unit -> bool)
         : (InboxEntry -> CancellationToken -> Task<TurnResult>) =
         ArgumentNullException.ThrowIfNull(client)
         ArgumentNullException.ThrowIfNull(tools)
+        ArgumentNullException.ThrowIfNull(isLeaseValid)
 
         fun entry cancellationToken ->
             task {
@@ -254,8 +256,49 @@ module internal SessionActor =
                     history.Add(ChatMessage(ChatRole.User, parts :> IList<AIContent>))
                 | _ -> history.Add(ChatMessage(ChatRole.User, ""))
 
-                return! TurnLoop.runAsync client history tools options cancellationToken (fun () -> true)
+                return! TurnLoop.runAsync client history tools options cancellationToken isLeaseValid
             }
+
+    /// Builds the default turn runner over TurnLoop.runAsync for Queue
+    /// delivery: one ChatRole.User history message from the entry's parts,
+    /// no Inject fold, and an always-live lease hook with no claim fence.
+    /// <param name="client">The chat client the turn runs against.</param>
+    /// <param name="tools">The tools the turn may call.</param>
+    /// <param name="options">The turn loop tuning and per-turn budget.</param>
+    /// <returns>A runner executing one Queue inbox entry per turn.</returns>
+    let createTurnRunner
+        (client: IChatClient)
+        (tools: IReadOnlyDictionary<string, AITool>)
+        (options: TurnLoop.TurnLoopOptions)
+        : (InboxEntry -> CancellationToken -> Task<TurnResult>) =
+        runnerFor client tools options (fun () -> true)
+
+    /// Builds the claimed turn runner over TurnLoop.runAsync for Queue
+    /// delivery (issue 33): the same history shape as
+    /// <see cref="M:Legate.SessionActor.createTurnRunner" />, running under
+    /// the claim's heartbeat-backed lease hook with the options-carried
+    /// per-tool fence, so a fenced loser stops before its next provider
+    /// call and never invokes a tool.
+    /// <param name="client">The chat client the turn runs against.</param>
+    /// <param name="tools">The tools the turn may call.</param>
+    /// <param name="options">The turn loop tuning and per-turn budget.</param>
+    /// <param name="isLeaseValid">The heartbeat-backed lease hook (ClaimHeartbeat.ClaimLeaseView.IsValid). Must not be null.</param>
+    /// <param name="verifyClaim">The last-moment per-tool fence (ClaimFence.checkBeforeCallAsync), or None for no fence.</param>
+    /// <returns>A runner executing one Queue inbox entry per turn under the claim.</returns>
+    let createClaimedTurnRunner
+        (client: IChatClient)
+        (tools: IReadOnlyDictionary<string, AITool>)
+        (options: TurnLoop.TurnLoopOptions)
+        (isLeaseValid: unit -> bool)
+        (verifyClaim: (unit -> Task<bool>) option)
+        : (InboxEntry -> CancellationToken -> Task<TurnResult>) =
+        runnerFor
+            client
+            tools
+            { options with
+                VerifyClaim = verifyClaim
+            }
+            isLeaseValid
 
     /// The session actor: recovers from the store, then owns the state
     /// machine. The mailbox parameter is injected by the spawn functions;
