@@ -9,6 +9,8 @@
   <!-- Compile order is explicit: register every new file here, in dependency order. -->
   <ItemGroup>
     <Compile Include="TestClock.fs" />
+    <Compile Include="FakeClock.fs" />
+    <Compile Include="SeamFakes.fs" />
     <Compile Include="SessionStoreConformance.fs" />
     <Compile Include="SessionEventStoreConformance.fs" />
     <Compile Include="AgentStoreConformance.fs" />
