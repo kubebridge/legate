@@ -40,6 +40,18 @@ dotnet fsi build.fsx -- -t CheckFormat  # non-mutating format gate (CI)
 dotnet fsi build.fsx -- -t Pack         # Release NuGet packages into ./artifacts
 ```
 
+## Local actor system
+
+`Cluster:Mode = Local` (the default) starts an in-process Akka.NET actor
+system with no remoting or clustering, fronted by a session router that
+spawns one identity-only child per session id. Graceful shutdown drains
+within `Cluster:ShutdownGraceSeconds` (default `30s`).
+
+Cold start is measured by `ActorSystemColdStartTests` (look for
+`legate-local-cold-start-ms` in the test output): ~15 ms on a Windows dev
+machine, against a target of well under the few-hundred-milliseconds
+start-to-first-token budget. Akka stays for single-node on these numbers.
+
 ## Contributing
 
 See `CONTRIBUTING.md`. Contributions are accepted under the DCO; sign your

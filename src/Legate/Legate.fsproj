@@ -12,6 +12,7 @@
     <Compile Include="LegateOptionsBinding.fs" />
     <Compile Include="LegateDefaults.fs" />
     <Compile Include="LegateStartupValidation.fs" />
+    <Compile Include="LocalActorSystem.fs" />
     <Compile Include="LegateBuilder.fs" />
     <Compile Include="AddLegate.fs" />
   </ItemGroup>
@@ -21,6 +22,8 @@
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="Akka" />
+    <PackageReference Include="Akka.FSharp" />
     <PackageReference Include="FSharp.Core" />
     <PackageReference Include="Microsoft.Extensions.Configuration" />
     <PackageReference Include="Microsoft.Extensions.Configuration.Abstractions" />

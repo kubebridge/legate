@@ -296,9 +296,9 @@ type PermissionsBuilder internal (services: IServiceCollection) as this =
 /// The Microsoft-style builder hosts configure inside
 /// <c>services.AddLegate(configure)</c>: seven sub-builders plus
 /// <see cref="M:Legate.LegateBuilder.UseConfiguration(Microsoft.Extensions.Configuration.IConfigurationSection)" />.
-/// Never creates the actor system (issue 30 owns it) or a session client
-/// facade (later cycles own it): registration, options, and startup
-/// validation only.
+/// The local actor system registers through AddLegate (Local mode only);
+/// no session client facade yet (later cycles own it): registration,
+/// options, and startup validation only.
 [<Sealed>]
 type LegateBuilder internal (services: IServiceCollection) as this =
     do ArgumentNullException.ThrowIfNull(services)

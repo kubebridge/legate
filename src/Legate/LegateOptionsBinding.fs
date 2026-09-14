@@ -28,6 +28,7 @@ module internal LegateOptionsBinding =
             "Llm:Coordination:RateLimitCooldown"
             "Workspace:IdleTeardownAfter"
             "Completion:RetryDelay"
+            "Cluster:ShutdownGraceSeconds"
         ]
 
     // Relative paths of every flat-choice enum with its type and the phrase

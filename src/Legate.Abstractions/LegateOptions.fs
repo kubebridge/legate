@@ -359,10 +359,11 @@ type CompletionOptions() =
         else
             Array.head violations
 
-/// Cluster settings: the deployment mode and the seed nodes clustered mode
-/// discovers through. Bound from the <c>Legate</c> configuration section;
-/// mutable so hosts can set properties before registering. Defaults run a
-/// single node with no seed nodes.
+/// Cluster settings: the deployment mode, the seed nodes clustered mode
+/// discovers through, and how long the local actor system waits for graceful
+/// shutdown. Bound from the <c>Legate</c> configuration section; mutable so
+/// hosts can set properties before registering. Defaults run a single node
+/// with no seed nodes and a 30 s shutdown grace.
 type ClusterOptions() =
 
     /// How the runtime is deployed. Default
@@ -373,12 +374,19 @@ type ClusterOptions() =
     /// Empty means no seed nodes.
     member val SeedNodes: List<string> = List<string>() with get, set
 
+    /// How long the local actor system waits for graceful shutdown
+    /// (coordinated shutdown on host stop) before the host continues
+    /// stopping. Default 30 s; must stay positive.
+    member val ShutdownGraceSeconds: TimeSpan = TimeSpan.FromSeconds 30.0 with get, set
+
     /// Returns null when every knob is in range, otherwise a message for the
     /// first violation.
     /// <returns>The first violation's message, or null when the settings are valid.</returns>
     member this.Validate() : string | null =
         if not (Enum.IsDefined(typeof<ClusterMode>, this.Mode)) then
             "Mode has an unknown cluster mode."
+        elif this.ShutdownGraceSeconds <= TimeSpan.Zero then
+            "ShutdownGraceSeconds must be positive."
         elif isNull (box this.SeedNodes) then
             "SeedNodes must not be null."
         else

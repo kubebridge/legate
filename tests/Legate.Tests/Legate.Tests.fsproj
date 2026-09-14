@@ -43,6 +43,7 @@
     <Compile Include="LegateOptionsTests.fs" />
     <Compile Include="LegateOptionsBindingTests.fs" />
     <Compile Include="BuilderTests.fs" />
+    <Compile Include="ActorSystemColdStartTests.fs" />
   </ItemGroup>
 
   <ItemGroup>
@@ -54,6 +55,8 @@
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="Akka" />
+    <PackageReference Include="Akka.FSharp" />
     <PackageReference Include="FSharp.Core" />
     <PackageReference Include="FsUnit.xUnit" />
     <PackageReference Include="Microsoft.Extensions.Configuration" />

@@ -3,7 +3,9 @@
   <!-- Central package versions. Projects reference packages without a Version
        attribute; bump versions here only. -->
   <ItemGroup>
-    <PackageVersion Include="FSharp.Core" Version="10.0.101" />
+    <PackageVersion Include="Akka" Version="1.5.71" />
+    <PackageVersion Include="Akka.FSharp" Version="1.5.71" />
+    <PackageVersion Include="FSharp.Core" Version="10.0.111" />
     <PackageVersion Include="Microsoft.Extensions.AI.Abstractions" Version="10.6.0" />
     <PackageVersion Include="Microsoft.Extensions.Configuration" Version="10.0.3" />
     <PackageVersion Include="Microsoft.Extensions.Configuration.Abstractions" Version="10.0.3" />
