@@ -104,6 +104,8 @@ type ProcessWorkspaceRuntime
                 || binding.Contains("..")
                 || binding.Contains('\\')
                 || binding.Contains('\u0000')
+                || binding = "."
+                || binding.EndsWith('/')
             then
                 raise (
                     WorkspaceException(
@@ -130,7 +132,7 @@ type ProcessWorkspaceRuntime
             Directory.CreateDirectory(Path.Combine(directory, "output")) |> ignore
             Directory.CreateDirectory(Path.Combine(directory, "scratch")) |> ignore
 
-            new ProcessWorkspace(runtimeId, directory) :> IWorkspace
+            new ProcessWorkspace(runtimeId, directory, options.DefaultExecTimeout) :> IWorkspace
         with
         | :? WorkspaceException -> reraise ()
         | error ->

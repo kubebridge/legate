@@ -72,6 +72,62 @@ module internal ProcessWorkspacePaths =
     let resolve (root: string) (path: string) : string =
         Path.GetFullPath(Path.Combine(root, path.Replace('/', Path.DirectorySeparatorChar)))
 
+module internal ProcessWorkspaceWrite =
+
+    /// The host IO failure translated into
+    /// <see cref="T:Legate.WorkspaceException" /> for the write path.
+    let writeFailed (path: string) (error: exn) : exn =
+        WorkspaceException(path, sprintf "The workspace could not write the file; the host reported: %s." error.Message)
+
+    /// Writes content to the destination through a sibling temp file with
+    /// an atomic replace, translating host IO failures into
+    /// <see cref="T:Legate.WorkspaceException" />. Cancellation propagates
+    /// as-is, the temp file is cleaned up on every failure path.
+    let atomically (path: string) (fullPath: string) (content: byte[]) (cancellationToken: CancellationToken) : Task =
+        task {
+            // Directories first so the atomic replace below never races a
+            // missing parent.
+            match Path.GetDirectoryName fullPath with
+            | null -> ()
+            | directory when not (Directory.Exists directory) -> Directory.CreateDirectory directory |> ignore
+            | _ -> ()
+
+            // Atomic replace: write to a sibling temp file, close it, then
+            // swap over the destination, so readers never see a partial
+            // file and an existing file is always overwritten.
+            let tempPath = sprintf "%s.legate-tmp-%s" fullPath (Ulid.NewUlid().ToString())
+
+            let mutable failure: exn | null = null
+
+            try
+                use stream =
+                    new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None)
+
+                do! stream.WriteAsync(content, 0, content.Length, cancellationToken)
+                do! stream.FlushAsync(cancellationToken)
+            with
+            | :? OperationCanceledException as cancelled -> failure <- cancelled
+            | error -> failure <- writeFailed path error
+
+            if isNull (box failure) then
+                try
+                    File.Move(tempPath, fullPath, overwrite = true)
+                with error ->
+                    failure <- writeFailed path error
+
+            // Clean the temp file on every failure path so a failed write
+            // leaves no litter in the workspace.
+            if not (isNull (box failure)) then
+                try
+                    File.Delete tempPath
+                with _ ->
+                    ()
+
+            match failure with
+            | null -> ()
+            | error -> return raise error
+        }
+
 /// The workspace bound by <see cref="T:Legate.Workspace.Process.ProcessWorkspaceRuntime" />:
 /// confined file operations over the session's scratch directory and
 /// <see cref="M:Legate.IWorkspace.Exec" /> through the platform shell
@@ -88,7 +144,7 @@ module internal ProcessWorkspacePaths =
 /// command that prints without bound can balloon memory; the runtime never
 /// logs captured output, command lines, or environment values.</para>
 [<Sealed>]
-type ProcessWorkspace internal (runtimeId: string, rootDirectory: string) =
+type ProcessWorkspace internal (runtimeId: string, rootDirectory: string, defaultExecTimeout: Nullable<TimeSpan>) =
 
     do
         if String.IsNullOrWhiteSpace runtimeId then
@@ -101,6 +157,8 @@ type ProcessWorkspace internal (runtimeId: string, rootDirectory: string) =
             raise (ArgumentException("A workspace root directory must be an absolute path.", nameof rootDirectory))
 
     let root = Path.GetFullPath rootDirectory
+    // The effective default exec timeout, empty when exec may run unbounded.
+    let defaultExecTimeout = defaultExecTimeout
 
     let mutable disposed = 0
 
@@ -122,7 +180,9 @@ type ProcessWorkspace internal (runtimeId: string, rootDirectory: string) =
     /// Starts the shell with the workspace as its working directory and both
     /// streams redirected. The shell inherits the process's environment; the
     /// caller's injected variables are added on top, overriding on name
-    /// collisions. Values may carry secrets and are never logged.
+    /// collisions. Values may carry secrets and are never logged. The POSIX
+    /// payload is single-quoted so the whole command line reaches
+    /// <c>/bin/sh -c</c> as one argument.
     let startShell (command: string) (env: IReadOnlyDictionary<string, string> | null) : Process =
         let startInfo = ProcessStartInfo()
 
@@ -137,7 +197,7 @@ type ProcessWorkspace internal (runtimeId: string, rootDirectory: string) =
             startInfo.Arguments <- sprintf "/d /s /c %s" command
         else
             startInfo.FileName <- "/bin/sh"
-            startInfo.Arguments <- sprintf "-c %s" (command.Replace("'", "'\\''"))
+            startInfo.Arguments <- sprintf "-c '%s'" (command.Replace("'", "'\\''"))
 
         startInfo.WorkingDirectory <- root
         startInfo.UseShellExecute <- false
@@ -208,19 +268,27 @@ type ProcessWorkspace internal (runtimeId: string, rootDirectory: string) =
 
             let mutable timedOut = false
 
-            use linked =
-                let source = CancellationTokenSource.CreateLinkedTokenSource cancellationToken
+            // One CTS carries both arms: CancelAfter arms the effective
+            // timeout (the caller's span, or the runtime's configured
+            // default, or unbounded), and the caller's cancellation flows
+            // through the linked token.
+            use linked = CancellationTokenSource.CreateLinkedTokenSource cancellationToken
 
+            let effectiveTimeout =
                 if timeout.HasValue then
-                    let delay = Task.Delay(timeout.Value, CancellationToken.None)
+                    Nullable timeout.Value
+                else
+                    defaultExecTimeout
 
-                    delay.ContinueWith(fun (_: Task) ->
-                        if delay.Status = TaskStatus.RanToCompletion then
-                            timedOut <- true
-                            source.Cancel())
-                    |> ignore
+            if effectiveTimeout.HasValue then
+                linked.CancelAfter effectiveTimeout.Value
 
-                source
+            // The timeout arm marks the result when the effective timeout
+            // fires; with no effective timeout the callback is a no-op.
+            use _timeoutMark =
+                linked.Token.Register(fun () ->
+                    if effectiveTimeout.HasValue then
+                        timedOut <- true)
 
             use _killRegistration = linked.Token.Register(fun () -> killTree shell)
 
@@ -257,7 +325,17 @@ type ProcessWorkspace internal (runtimeId: string, rootDirectory: string) =
 
             task {
                 cancellationToken.ThrowIfCancellationRequested()
-                return File.Exists(ProcessWorkspacePaths.resolve root path)
+
+                try
+                    return File.Exists(ProcessWorkspacePaths.resolve root path)
+                with error ->
+                    return
+                        raise (
+                            WorkspaceException(
+                                root,
+                                sprintf "The workspace could not probe the path; the host reported: %s." error.Message
+                            )
+                        )
             }
 
         member workspace.ReadFile(path, cancellationToken) =
@@ -273,7 +351,16 @@ type ProcessWorkspace internal (runtimeId: string, rootDirectory: string) =
                 if not (File.Exists fullPath) then
                     raise (FileNotFoundException("No file exists at this workspace path.", path))
 
-                return new FileStream(fullPath, FileMode.Open, FileAccess.Read, FileShare.Read) :> Stream
+                try
+                    return new FileStream(fullPath, FileMode.Open, FileAccess.Read, FileShare.Read) :> Stream
+                with error ->
+                    return
+                        raise (
+                            WorkspaceException(
+                                root,
+                                sprintf "The workspace could not open the file; the host reported: %s." error.Message
+                            )
+                        )
             }
 
         member workspace.WriteFile(path, content, cancellationToken) =
@@ -323,11 +410,20 @@ type ProcessWorkspace internal (runtimeId: string, rootDirectory: string) =
 
                 let fullPath = ProcessWorkspacePaths.resolve root path
 
-                if File.Exists fullPath then
-                    File.Delete fullPath
-                    return true
-                else
-                    return false
+                try
+                    if File.Exists fullPath then
+                        File.Delete fullPath
+                        return true
+                    else
+                        return false
+                with error ->
+                    return
+                        raise (
+                            WorkspaceException(
+                                root,
+                                sprintf "The workspace could not delete the file; the host reported: %s." error.Message
+                            )
+                        )
             }
 
         member workspace.DisposeAsync() =
