@@ -50,7 +50,7 @@ type SessionCellKind =
 /// <item><term>System</term><description>one cell per PermissionRequestedEvent, PermissionResolvedEvent, QuestionAskedEvent, or QuestionAnsweredEvent, one per TurnFailedEvent, one per ContextPrunedEvent, one per CompactionFailedEvent, and one per SkillInvalidEvent; content is the tool name, decision, question, answer, failure reason, prune summary, or skip reason; metadata carries the request or question id (or the pruned count plus the before/after estimates, or the skill name) plus the event discriminator.</description></item>
 /// </list>
 /// Progress markers (turnStarted, usage, compacted, turnCompleted,
-/// turnAborted, sessionClosed) produce no cells; hosts read them from the
+/// turnAborted, sessionClosed, skillLoaded) produce no cells; hosts read them from the
 /// event stream. Non-tool kinds carry null ToolName and ToolCallId; the
 /// fold never sets Artifacts.
 /// <param name="id">The cell's id, stamped by the store on persist; the default id while unstamped.</param>
@@ -650,7 +650,8 @@ type SessionCellDeriver() =
 
                 | _ ->
                     // Progress markers (turnStarted, usage, compacted,
-                    // turnCompleted, turnAborted, sessionClosed) produce
+                    // turnCompleted, turnAborted, sessionClosed,
+                    // skillLoaded) produce
                     // no cells; hosts read them from the event stream.
                     // They do not break an open text run: a usage
                     // checkpoint mid-run is not model output, so the run

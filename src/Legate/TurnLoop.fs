@@ -777,6 +777,16 @@ module internal TurnLoop =
     [<Literal>]
     let AskUserToolName = "ask_user"
 
+    /// The built-in tool name that loads a packaged skill's content: a call
+    /// to this tool reads the skill's SKILL.md from the active package
+    /// version and journals a SkillLoadedEvent. The loader bypasses the
+    /// permission gate like ask_user: package metadata is already authorized
+    /// by the session bind, so there is nothing for a policy to decide;
+    /// companion files the skill names are read afterward through the normal
+    /// file tools with the policy applied.
+    [<Literal>]
+    let SkillToolName = "skill"
+
     /// Reason carried by <see cref="T:Legate.TurnFailed" /> when the turn
     /// calls ask_user under a Fail headless policy: the question has no
     /// host to answer it. Never contains the question or the options hint.
@@ -933,7 +943,9 @@ module internal TurnLoop =
     /// ask_user tool bypasses the policy and suspends as a question with
     /// the same carrier, unless TurnLoopOptions carries the headless
     /// policy: Fail fails the turn fast and AnswerWith continues with the
-    /// canned answer, neither suspending. The caller (SessionActor) journals the matching
+    /// canned answer, neither suspending. The skill tool bypasses the policy
+    /// too and executes directly: it reads package metadata only, already
+    /// authorized by the session bind. The caller (SessionActor) journals the matching
     /// PermissionRequestedEvent or QuestionAskedEvent and owns the
     /// store-first WaitingForInput transition; the loop only parks the
     /// cursor. Reply-never-starts-a-turn: a suspension never starts work.
@@ -1168,6 +1180,17 @@ module internal TurnLoop =
                                             roundOutput
                                             AskUserHeadlessFailMessage
                                     )
+                        elif String.Equals(toolName, SkillToolName, StringComparison.Ordinal) then
+                            // Skill loader bypass (issue 68): the loader reads
+                            // package metadata only, already authorized by the
+                            // session bind, so it never consults the policy.
+                            // The last-moment VerifyClaim fence above still
+                            // applies, so a takeover loser never reaches the
+                            // invocation.
+                            let! rawText = invokeOneAsync tools call linkedToken
+                            let text = truncateToolResult options rawText
+                            appendToolResult history call.CallId text
+                            return! runTools roundIterations roundInput roundOutput rest
                         else
                             let remembered = allowed.Contains(toolName)
 

@@ -308,6 +308,16 @@ type InMemorySessionEventStore(database: InMemoryDatabase) =
                                         source.Reason
                                     )
                                     :> SessionEvent
+                                | :? SkillLoadedEvent as source ->
+                                    SkillLoadedEvent(
+                                        sessionId,
+                                        turnId,
+                                        sequence,
+                                        timestamp,
+                                        source.SkillName,
+                                        source.Companions
+                                    )
+                                    :> SessionEvent
                                 | _ ->
                                     raise (
                                         ArgumentException(

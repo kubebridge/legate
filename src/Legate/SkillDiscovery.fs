@@ -265,22 +265,26 @@ module internal SkillDiscovery =
         lines.Add "</available_skills>"
         String.Join("\n", lines)
 
-    /// The SKILL.md path of one listed skill name.
+    /// The SKILL.md path of one listed skill name. Internal so the skill
+    /// loader (issue 68) resolves the same path discovery reads.
     /// <param name="skillName">The skill name package info listed.</param>
     /// <returns>The package-relative SKILL.md path.</returns>
-    let private skillFilePath (skillName: string) : string =
+    let skillFilePath (skillName: string) : string =
         ".agent/skills/" + skillName + "/SKILL.md"
 
     /// The companion prefix of one listed skill name: everything staged
-    /// lives under it.
+    /// lives under it. Internal so the skill loader (issue 68) lists the
+    /// same companions discovery stages.
     /// <param name="skillName">The skill name package info listed.</param>
     /// <returns>The package-relative skill directory prefix.</returns>
-    let private skillPrefix (skillName: string) : string = ".agent/skills/" + skillName + "/"
+    let skillPrefix (skillName: string) : string = ".agent/skills/" + skillName + "/"
 
     /// Reads one store stream up to the discovery bound and disposes it.
+    /// Internal so the skill loader (issue 68) reuses the same bound;
+    /// the loader truncates with the marker where discovery reports invalid.
     /// <param name="source">The stream to drain; always disposed.</param>
     /// <returns>The bytes, or the reason the file cannot be discovered.</returns>
-    let private readBounded (source: Stream) : Result<byte[], string> =
+    let readBounded (source: Stream) : Result<byte[], string> =
         try
             use _source = source
             use memory = new MemoryStream()
