@@ -2,6 +2,7 @@
   <Folder Name="/src/">
     <Project Path="src/Legate.Abstractions/Legate.Abstractions.fsproj" />
     <Project Path="src/Legate/Legate.fsproj" />
+    <Project Path="src/Legate.Llm.Google/Legate.Llm.Google.fsproj" />
     <Project Path="src/Legate.Storage.InMemory/Legate.Storage.InMemory.fsproj" />
     <Project Path="src/Legate.Testing/Legate.Testing.fsproj" />
     <Project Path="src/Legate.Workspace.Process/Legate.Workspace.Process.fsproj" />
