@@ -3,11 +3,15 @@ module Legate.Tests.McpInvocationTests
 
 open System
 open System.Collections.Generic
+open System.IO
 open System.Threading
 open System.Threading.Tasks
 open FsUnit.Xunit
+open Legate
 open Legate.Mcp
+open Legate.Mcp.McpArtifacts
 open ModelContextProtocol
+open ModelContextProtocol.Protocol
 open Xunit
 
 // Scripted sessions only: no subprocess, no socket. The scripted session
@@ -17,6 +21,10 @@ open Xunit
 
 // ──────────────────────────
 // Scripted session
+
+/// Empty binary list for results carrying no binary blocks.
+let private noBinaries () : IReadOnlyList<McpBinaryPart> =
+    ResizeArray<McpBinaryPart>() :> IReadOnlyList<McpBinaryPart>
 
 /// One scripted session: answers every call with the scripted result,
 /// records the token it received, and raises the scripted failure instead
@@ -121,7 +129,16 @@ let private single (observations: ResizeArray<McpInvocation.McpCallObservation>)
 [<Fact>]
 let ``Success returns the text and stamps a clean observation`` () =
     let observations = ResizeArray<McpInvocation.McpCallObservation>()
-    let session = ImmediateSession({ Text = "ok"; IsError = false }, null)
+
+    let session =
+        ImmediateSession(
+            {
+                Text = "ok"
+                IsError = false
+                Binaries = noBinaries ()
+            },
+            null
+        )
 
     invoke (session :> IMcpServerSession) observations CancellationToken.None
     |> should equal "ok"
@@ -141,6 +158,7 @@ let ``IsError maps to Error from carrying the tool name`` () =
             {
                 Text = "denied by policy"
                 IsError = true
+                Binaries = noBinaries ()
             },
             null
         )
@@ -159,7 +177,14 @@ let ``Transport failure maps to Error calling with the exception shape`` () =
     let observations = ResizeArray<McpInvocation.McpCallObservation>()
 
     let session =
-        ImmediateSession({ Text = ""; IsError = false }, InvalidOperationException("connection reset"))
+        ImmediateSession(
+            {
+                Text = ""
+                IsError = false
+                Binaries = noBinaries ()
+            },
+            InvalidOperationException("connection reset")
+        )
 
     invoke (session :> IMcpServerSession) observations CancellationToken.None
     |> should equal "Error calling alpha_read: InvalidOperationException: connection reset"
@@ -180,7 +205,14 @@ let ``Elicitation decline maps to Error calling text and the turn continues`` ()
     // raises the SDK exception type with the decline message, and invoke
     // returns the mapped text instead of throwing, so the turn continues.
     let session =
-        ImmediateSession({ Text = ""; IsError = false }, McpException("The elicitation request was declined."))
+        ImmediateSession(
+            {
+                Text = ""
+                IsError = false
+                Binaries = noBinaries ()
+            },
+            McpException("The elicitation request was declined.")
+        )
 
     let text = invoke (session :> IMcpServerSession) observations CancellationToken.None
 
@@ -195,7 +227,15 @@ let ``Elicitation decline maps to Error calling text and the turn continues`` ()
 
 [<Fact>]
 let ``Null sink observes nothing`` () =
-    let session = ImmediateSession({ Text = "ok"; IsError = false }, null)
+    let session =
+        ImmediateSession(
+            {
+                Text = "ok"
+                IsError = false
+                Binaries = noBinaries ()
+            },
+            null
+        )
 
     let pending =
         McpInvocation.invokeAsync
@@ -214,7 +254,16 @@ let ``Null sink observes nothing`` () =
 [<Fact>]
 let ``Cancel aborts the call and stamps nothing`` () =
     let observations = ResizeArray<McpInvocation.McpCallObservation>()
-    let session = ScriptedInvokeSession({ Text = "ok"; IsError = false }, null)
+
+    let session =
+        ScriptedInvokeSession(
+            {
+                Text = "ok"
+                IsError = false
+                Binaries = noBinaries ()
+            },
+            null
+        )
 
     use cts = new CancellationTokenSource()
 
@@ -236,7 +285,16 @@ let ``Cancel aborts the call and stamps nothing`` () =
 
 [<Fact>]
 let ``Turn token reaches CallToolAsync`` () =
-    let session = ImmediateSession({ Text = "ok"; IsError = false }, null)
+    let session =
+        ImmediateSession(
+            {
+                Text = "ok"
+                IsError = false
+                Binaries = noBinaries ()
+            },
+            null
+        )
+
     use cts = new CancellationTokenSource()
 
     let pending =
@@ -247,3 +305,348 @@ let ``Turn token reaches CallToolAsync`` () =
     match session.Seen with
     | Some seen -> seen |> should equal cts.Token
     | None -> Assert.Fail("The session never received the call.") |> ignore
+
+// ──────────────────────────
+// Artifact handling: scripted sessions and scoped in-memory sinks only.
+
+// A minimal 1x1 PNG payload.
+let private png1x1 () : byte[] =
+    [|
+        0x89uy
+        0x50uy
+        0x4Euy
+        0x47uy
+        0x0Duy
+        0x0Auy
+        0x1Auy
+        0x0Auy
+        0x00uy
+        0x00uy
+        0x00uy
+        0x0Duy
+        0x49uy
+        0x48uy
+        0x44uy
+        0x52uy
+        0x00uy
+        0x00uy
+        0x00uy
+        0x01uy
+        0x00uy
+        0x00uy
+        0x00uy
+        0x01uy
+        0x08uy
+        0x02uy
+        0x00uy
+        0x00uy
+        0x00uy
+        0x90uy
+        0x77uy
+        0x53uy
+        0xDEuy
+    |]
+
+/// A scoped in-memory artifact sink: names land under the fixed prefix,
+/// every Put name is recorded, Put honors cancellation first, and Put
+/// optionally fails.
+type internal ScopedArtifactStore(prefix: string, failPut: bool) =
+    let backing = Dictionary<string, byte[] * string>(StringComparer.Ordinal)
+    let names = ResizeArray<string>()
+    let missing: byte[] | null = null
+
+    interface IArtifactBlobStore with
+        member _.Get(name, _) =
+            match backing.TryGetValue(prefix + name) with
+            | true, (bytes, _) -> Task.FromResult(bytes)
+            | false, _ -> Task.FromResult(missing)
+
+        member _.Put(name, content, cancellationToken) =
+            cancellationToken.ThrowIfCancellationRequested()
+            names.Add(name)
+
+            if failPut then
+                raise (InvalidOperationException("store unavailable"))
+
+            backing[prefix + name] <- content.Bytes, content.ContentType
+
+            Task.FromResult(BlobMetadata(content.ContentType, int64 content.Bytes.Length, Guid.NewGuid().ToString("N")))
+
+        member _.CompareExchange(_, _, _, _) : Task<BlobMetadata | null> =
+            raise (NotSupportedException("test sink only stores"))
+
+        member _.OpenRead(_, _) : Task<Stream> =
+            raise (NotSupportedException("test sink only stores"))
+
+        member _.OpenWrite(_, _, _) : Task<Stream> =
+            raise (NotSupportedException("test sink only stores"))
+
+        member _.List(_, _) : IAsyncEnumerable<string> =
+            raise (NotSupportedException("test sink only stores"))
+
+        member _.DeletePrefix(_, _) : Task<int> =
+            raise (NotSupportedException("test sink only stores"))
+
+        member _.GetMetadata(_, _) : Task<BlobMetadata | null> =
+            raise (NotSupportedException("test sink only stores"))
+
+        member _.TryGetPresignedUrl(_, _, _) : Task<Uri | null> =
+            raise (NotSupportedException("test sink only stores"))
+
+    /// The full keys stored so far.
+    member _.StoredKeys: string list = backing.Keys |> Seq.toList
+
+    /// The relative names handed to Put, in order.
+    member _.PutNames: string list = names |> Seq.toList
+
+/// One SDK image answer: text plus a 1x1 PNG, split exactly as the
+/// connector splits them so placeholders match.
+let private imageAnswer (bytes: byte[]) (mime: string) (text: string) : McpCallResult =
+    let blocks = ResizeArray<ContentBlock>()
+    blocks.Add(TextContentBlock(Text = text) :> ContentBlock)
+    blocks.Add(ImageContentBlock.FromBytes(ReadOnlyMemory bytes, mime) :> ContentBlock)
+
+    let result = CallToolResult(Content = blocks)
+
+    let rendered, binaries = McpProtocolMapping.splitCallResult result
+
+    {
+        Text = rendered
+        IsError = false
+        Binaries = binaries
+    }
+
+/// One SDK blob-resource answer over an embedded PDF.
+let private blobAnswer () : McpCallResult =
+    let pdf = [| 0x25uy; 0x50uy; 0x44uy; 0x46uy |]
+
+    let contents =
+        BlobResourceContents.FromBytes(ReadOnlyMemory pdf, "files/report.pdf", "application/pdf")
+
+    let blocks = ResizeArray<ContentBlock>()
+    blocks.Add(EmbeddedResourceBlock(Resource = contents) :> ContentBlock)
+
+    let result = CallToolResult(Content = blocks)
+
+    let rendered, binaries = McpProtocolMapping.splitCallResult result
+
+    {
+        Text = rendered
+        IsError = false
+        Binaries = binaries
+    }
+
+/// Invokes through the artifact-aware path with the given sink and caps.
+let private invokeArtifacts
+    (session: IMcpServerSession)
+    (store: IArtifactBlobStore | null)
+    (caps: McpArtifacts.McpArtifactCaps)
+    (observations: ResizeArray<McpInvocation.McpCallObservation>)
+    (cancellationToken: CancellationToken)
+    : string =
+    let sink =
+        Action<McpInvocation.McpCallObservation>(fun observation -> observations.Add(observation))
+
+    McpInvocation.invokeWithArtifactsAsync
+        session
+        "alpha_read"
+        "read"
+        (noArguments ())
+        cancellationToken
+        sink
+        store
+        caps
+    |> fun pending -> pending.GetAwaiter().GetResult()
+
+[<Fact>]
+let ``Image block is stored and substituted with a text reference`` () =
+    let observations = ResizeArray<McpInvocation.McpCallObservation>()
+    let store = ScopedArtifactStore("artifacts/tenant-a/session-1/", false)
+    let answer = imageAnswer (png1x1 ()) "image/png" "snapshot"
+    let session = ImmediateSession(answer, null)
+
+    let result =
+        invokeArtifacts
+            (session :> IMcpServerSession)
+            (store :> IArtifactBlobStore)
+            McpArtifacts.McpArtifactCaps.Default
+            observations
+            CancellationToken.None
+
+    result.Contains("[artifact:") |> should equal true
+    result.Contains("mime=\"image/png\"") |> should equal true
+    result.Contains("dimensions=\"1x1\"") |> should equal true
+    result.Contains($"{(png1x1 ()).Length} bytes") |> should equal true
+    result.Contains("[non-text content:") |> should equal false
+    store.StoredKeys.Length |> should equal 1
+
+    let stamped = single observations
+    stamped.Text |> should equal result
+    stamped.IsError |> should equal false
+
+[<Fact>]
+let ``Binary resource is stored with its URI name and no dimensions`` () =
+    let observations = ResizeArray<McpInvocation.McpCallObservation>()
+    let store = ScopedArtifactStore("artifacts/tenant-a/session-1/", false)
+    let session = ImmediateSession(blobAnswer (), null)
+
+    let result =
+        invokeArtifacts
+            (session :> IMcpServerSession)
+            (store :> IArtifactBlobStore)
+            McpArtifacts.McpArtifactCaps.Default
+            observations
+            CancellationToken.None
+
+    result.Contains("[artifact:") |> should equal true
+    result.Contains("mime=\"application/pdf\"") |> should equal true
+    result.Contains("report-pdf") |> should equal true
+    result.Contains("dimensions=") |> should equal false
+    store.StoredKeys.Length |> should equal 1
+
+    let stamped = single observations
+    stamped.Text |> should equal result
+    stamped.IsError |> should equal false
+
+[<Fact>]
+let ``Oversized image yields a bounded rejection and the turn continues`` () =
+    let observations = ResizeArray<McpInvocation.McpCallObservation>()
+    let store = ScopedArtifactStore("artifacts/tenant-a/session-1/", false)
+    let answer = imageAnswer (png1x1 ()) "image/png" "snapshot"
+    let session = ImmediateSession(answer, null)
+
+    let caps =
+        {
+            MaxBytes = 10
+            MaxDimension = 4096
+            MaxPixels = 16777216L
+        }
+
+    let result =
+        invokeArtifacts
+            (session :> IMcpServerSession)
+            (store :> IArtifactBlobStore)
+            caps
+            observations
+            CancellationToken.None
+
+    result.Contains("[artifact rejected:") |> should equal true
+    result.Contains("exceeds 10-byte cap") |> should equal true
+    store.StoredKeys.Length |> should equal 0
+
+    let stamped = single observations
+    stamped.Text |> should equal result
+    stamped.IsError |> should equal false
+
+[<Fact>]
+let ``Storage failure returns the original text and the turn continues`` () =
+    let observations = ResizeArray<McpInvocation.McpCallObservation>()
+    let store = ScopedArtifactStore("artifacts/tenant-a/session-1/", true)
+    let answer = imageAnswer (png1x1 ()) "image/png" "snapshot"
+    let session = ImmediateSession(answer, null)
+
+    let result =
+        invokeArtifacts
+            (session :> IMcpServerSession)
+            (store :> IArtifactBlobStore)
+            McpArtifacts.McpArtifactCaps.Default
+            observations
+            CancellationToken.None
+
+    result |> should equal answer.Text
+
+    let stamped = single observations
+    stamped.Text |> should equal answer.Text
+    stamped.IsError |> should equal false
+
+[<Fact>]
+let ``Null sink keeps placeholder output`` () =
+    let observations = ResizeArray<McpInvocation.McpCallObservation>()
+    let answer = imageAnswer (png1x1 ()) "image/png" "snapshot"
+    let session = ImmediateSession(answer, null)
+
+    let result =
+        invokeArtifacts
+            (session :> IMcpServerSession)
+            null
+            McpArtifacts.McpArtifactCaps.Default
+            observations
+            CancellationToken.None
+
+    result |> should equal answer.Text
+
+    let stamped = single observations
+    stamped.Text |> should equal answer.Text
+    stamped.IsError |> should equal false
+
+[<Fact>]
+let ``Tenancy: sinks receive only pre-scoped names and never leak across tenants`` () =
+    let observations = ResizeArray<McpInvocation.McpCallObservation>()
+    let storeA = ScopedArtifactStore("artifacts/tenant-a/session-1/", false)
+    let storeB = ScopedArtifactStore("artifacts/tenant-b/session-2/", false)
+    let answer = imageAnswer (png1x1 ()) "image/png" "snapshot"
+    let session = ImmediateSession(answer, null)
+
+    invokeArtifacts
+        (session :> IMcpServerSession)
+        (storeA :> IArtifactBlobStore)
+        McpArtifacts.McpArtifactCaps.Default
+        observations
+        CancellationToken.None
+    |> ignore
+
+    storeA.StoredKeys.Length |> should equal 1
+    storeB.StoredKeys.Length |> should equal 0
+
+    for name in storeA.PutNames do
+        name.Contains("tenant") |> should equal false
+        BlobKeys.Validate name |> ignore
+
+    for key in storeA.StoredKeys do
+        key.StartsWith("artifacts/tenant-a/session-1/", StringComparison.Ordinal)
+        |> should equal true
+
+    invokeArtifacts
+        (session :> IMcpServerSession)
+        (storeB :> IArtifactBlobStore)
+        McpArtifacts.McpArtifactCaps.Default
+        observations
+        CancellationToken.None
+    |> ignore
+
+    storeB.StoredKeys.Length |> should equal 1
+    storeA.StoredKeys.Length |> should equal 1
+
+    for key in storeB.StoredKeys do
+        key.StartsWith("artifacts/tenant-b/session-2/", StringComparison.Ordinal)
+        |> should equal true
+
+[<Fact>]
+let ``Cancelled store propagates with nothing stamped`` () =
+    let observations = ResizeArray<McpInvocation.McpCallObservation>()
+    let store = ScopedArtifactStore("artifacts/tenant-a/session-1/", false)
+    let answer = imageAnswer (png1x1 ()) "image/png" "snapshot"
+    let session = ImmediateSession(answer, null)
+
+    use cts = new CancellationTokenSource()
+    cts.Cancel()
+
+    let sink =
+        Action<McpInvocation.McpCallObservation>(fun observation -> observations.Add(observation))
+
+    let pending =
+        McpInvocation.invokeWithArtifactsAsync
+            (session :> IMcpServerSession)
+            "alpha_read"
+            "read"
+            (noArguments ())
+            cts.Token
+            sink
+            (store :> IArtifactBlobStore)
+            McpArtifacts.McpArtifactCaps.Default
+
+    (fun () -> pending.GetAwaiter().GetResult() |> ignore)
+    |> should throw typeof<OperationCanceledException>
+
+    observations.Count |> should equal 0
+    store.StoredKeys.Length |> should equal 0

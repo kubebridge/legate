@@ -31,15 +31,41 @@ open ModelContextProtocol.Protocol
 // ──────────────────────────
 // Session and connector contracts
 
-/// One SDK-free call result: the rendered text plus whether the server
-/// flagged it as an error. Internal: the per-call invocation maps these
-/// onto model-facing error texts.
+/// One binary payload extracted beside the rendered text: the mime type
+/// plus the decoded bytes. Internal: the per-call invocation validates
+/// these against the caps and stores them through the caller-supplied
+/// artifact sink, substituting a text reference.
+type internal McpBinaryPart =
+    {
+        /// The payload mime type, never null: empty server values read as
+        /// <c>application/octet-stream</c>.
+        MimeType: string
+        /// The decoded payload bytes, or null when the base64 was blank
+        /// or malformed: null fails validation downstream with a bounded
+        /// rejection, never an exception.
+        Bytes: byte[] | null
+        /// The display name from the resource URI tail, or null for bare
+        /// content blocks without a URI.
+        Name: string | null
+        /// The exact placeholder the text rendering emitted for this
+        /// block, used for ordered substitution.
+        Placeholder: string
+    }
+
+/// One SDK-free call result: the rendered text, whether the server
+/// flagged it as an error, and the binary payloads extracted beside the
+/// text. Internal: the per-call invocation maps the text onto
+/// model-facing error texts and, when a sink is present, stores the
+/// binaries as artifacts.
 type internal McpCallResult =
     {
         /// The rendered text result, never null.
         Text: string
         /// Whether the server flagged the result as an error.
         IsError: bool
+        /// The binary payloads extracted beside the text, in block order;
+        /// empty when the result carried no binary blocks, never null.
+        Binaries: IReadOnlyList<McpBinaryPart>
     }
 
 /// One connected MCP server: lists its tools and forwards calls for the
@@ -215,25 +241,118 @@ module internal McpProtocolMapping =
             AnnotationTitle = if isNull (box annotations) then null else annotations.Title
         }
 
-    /// Renders one call result as text: the text blocks joined by
-    /// newlines. Non-text blocks (binary payloads belong to their
-    /// follow-up) contribute a short placeholder naming the block type,
-    /// never the bytes.
+    /// The placeholder one non-text block contributes to the rendered
+    /// text: the block type named, never the bytes. Kept in one helper
+    /// so the text rendering and the binary extraction emit byte-identical
+    /// placeholders for ordered substitution.
+    /// <param name="blockType">The block type, as carried on the block.</param>
+    /// <returns>The placeholder text.</returns>
+    let private placeholderFor (blockType: string) : string = $"[non-text content: {blockType}]"
+
+    /// Reads the mime type, defaulting empty server values to
+    /// <c>application/octet-stream</c>.
+    /// <param name="mimeType">The server mime type, or null.</param>
+    /// <returns>The mime type, never null.</returns>
+    let private mimeOrDefault (mimeType: string | null) : string =
+        if String.IsNullOrWhiteSpace mimeType then
+            "application/octet-stream"
+        else
+            mimeType
+
+    /// Copies one SDK decoded payload into an array. The SDK carries the
+    /// raw bytes on <c>DecodedData</c> (the <c>Data</c>/<c>Blob</c>
+    /// properties hold base64 text); an empty payload reads as an empty
+    /// array, which fails validation downstream with a bounded rejection.
+    /// <param name="data">The decoded SDK payload.</param>
+    /// <returns>The payload bytes, never null.</returns>
+    let private copyOf (data: ReadOnlyMemory<byte>) : byte[] = data.ToArray()
+
+    /// Reads the display name from a resource URI tail: the text after
+    /// the final slash, cut at any query, fragment, or parameter mark.
+    /// Blank URIs read as null.
+    /// <param name="uri">The resource URI, or null.</param>
+    /// <returns>The URI tail, or null.</returns>
+    let private resourceName (uri: string | null) : string | null =
+        if String.IsNullOrWhiteSpace uri then
+            null
+        else
+            let trimmed = uri.Trim()
+            let slash = trimmed.LastIndexOf('/')
+            let tail = if slash < 0 then trimmed else trimmed.Substring(slash + 1)
+            let cut = tail.IndexOfAny([| '?'; '#'; ';' |])
+            let name = if cut < 0 then tail else tail.Substring(0, cut)
+
+            if String.IsNullOrWhiteSpace name then null else name
+
+    /// Splits one call result into its rendered text plus the binary
+    /// payloads extracted beside it: image and audio blocks plus embedded
+    /// blob resources yield mime plus bytes; text blocks, text resources,
+    /// resource links, and unknown blocks contribute only their
+    /// placeholder. The text is byte-identical to
+    /// <c>renderCallResult</c>.
     /// <param name="result">The call result, or null.</param>
-    /// <returns>The text result, never null.</returns>
-    let renderCallResult (result: CallToolResult | null) : string =
+    /// <returns>The rendered text with the binaries in block order.</returns>
+    let splitCallResult (result: CallToolResult | null) : string * IReadOnlyList<McpBinaryPart> =
         if isNull (box result) || isNull (box result.Content) then
-            ""
+            "", ResizeArray<McpBinaryPart>() :> IReadOnlyList<McpBinaryPart>
         else
             let parts = ResizeArray<string>()
+            let binaries = ResizeArray<McpBinaryPart>()
 
             for block in result.Content do
                 if not (isNull (box block)) then
                     match block with
                     | :? TextContentBlock as text -> parts.Add(if isNull (box text.Text) then "" else text.Text)
-                    | _ -> parts.Add($"[non-text content: {block.Type}]")
+                    | :? ImageContentBlock as image ->
+                        let placeholder = placeholderFor image.Type
+                        parts.Add(placeholder)
 
-            String.Join("\n", parts)
+                        binaries.Add(
+                            {
+                                MimeType = mimeOrDefault image.MimeType
+                                Bytes = copyOf image.DecodedData
+                                Name = null
+                                Placeholder = placeholder
+                            }
+                        )
+                    | :? AudioContentBlock as audio ->
+                        let placeholder = placeholderFor audio.Type
+                        parts.Add(placeholder)
+
+                        binaries.Add(
+                            {
+                                MimeType = mimeOrDefault audio.MimeType
+                                Bytes = copyOf audio.DecodedData
+                                Name = null
+                                Placeholder = placeholder
+                            }
+                        )
+                    | :? EmbeddedResourceBlock as embedded ->
+                        let placeholder = placeholderFor embedded.Type
+                        parts.Add(placeholder)
+
+                        match box embedded.Resource with
+                        | :? BlobResourceContents as blob ->
+                            binaries.Add(
+                                {
+                                    MimeType = mimeOrDefault blob.MimeType
+                                    Bytes = copyOf blob.DecodedData
+                                    Name = resourceName blob.Uri
+                                    Placeholder = placeholder
+                                }
+                            )
+                        | _ -> ()
+                    | _ -> parts.Add(placeholderFor block.Type)
+
+            String.Join("\n", parts), binaries :> IReadOnlyList<McpBinaryPart>
+
+    /// Renders one call result as text: the text blocks joined by
+    /// newlines. Non-text blocks contribute a short placeholder naming
+    /// the block type, never the bytes; binary payloads are extracted
+    /// beside the text by <c>splitCallResult</c>.
+    /// <param name="result">The call result, or null.</param>
+    /// <returns>The text result, never null.</returns>
+    let renderCallResult (result: CallToolResult | null) : string = splitCallResult result |> fst
 
 // ──────────────────────────
 // Elicitation
@@ -310,10 +429,13 @@ type internal SdkMcpServerSession(serverName: string, client: McpClient) =
                         cancellationToken
                     )
 
+                let text, binaries = McpProtocolMapping.splitCallResult result
+
                 return
                     {
-                        Text = McpProtocolMapping.renderCallResult result
+                        Text = text
                         IsError = not (isNull (box result)) && result.IsError.HasValue && result.IsError.Value
+                        Binaries = binaries
                     }
             }
 
