@@ -6,6 +6,7 @@ open System.Text.Json
 open System.Text.Json.Serialization
 open FsUnit.Xunit
 open Legate
+open Microsoft.Extensions.AI
 open Xunit
 
 // The generic Deserialize<'T> overload is annotated to return 'T | null,
@@ -65,9 +66,11 @@ let sampleEvents: (string * (unit -> SessionEvent)) list =
         "turnFailed",
         fun () -> TurnFailedEvent(sessionId, turnId, noSequence, stamp, "provider returned 500") :> SessionEvent
         "sessionClosed", fun () -> SessionClosedEvent(sessionId, turnId, noSequence, stamp) :> SessionEvent
+        "userMessage",
+        fun () -> UserMessageEvent(sessionId, turnId, noSequence, stamp, UserMessage.Text "steer") :> SessionEvent
     ]
 
-// The 16 discriminator strings the base type's XML doc documents as the
+// The 17 discriminator strings the base type's XML doc documents as the
 // wire contract, in the same order as the JsonDerivedType attributes.
 let discriminatorContract =
     [|
@@ -87,6 +90,7 @@ let discriminatorContract =
         "turnAborted"
         "turnFailed"
         "sessionClosed"
+        "userMessage"
     |]
 
 /// Reads the TypeDiscriminator values from the JsonDerivedType attributes
@@ -298,6 +302,27 @@ let ``TurnFailed round-trips its failure reason`` () =
     let failed = restored :?> TurnFailedEvent
     failed.Reason |> should equal "budget exhausted"
 
+[<Fact>]
+let ``UserMessage round-trips its message verbatim`` () =
+    let restored =
+        roundTrip "userMessage" (fun () ->
+            UserMessageEvent(sessionId, turnId, noSequence, stamp, UserMessage.Text "steer") :> SessionEvent)
+
+    let injected = restored :?> UserMessageEvent
+    injected.SessionId |> should equal sessionId
+    injected.TurnId |> should equal turnId
+    injected.Sequence.HasValue |> should equal false
+
+    let texts =
+        [
+            for part in injected.Message.Parts do
+                match part with
+                | :? TextContent as text when not (isNull (box text)) -> yield text.Text
+                | _ -> ()
+        ]
+
+    texts |> should equal [ "steer" ]
+
 // ───────────────────────────────────────────────────────────────────────────
 // Sequence and base-field nullability
 
@@ -344,7 +369,7 @@ let ``Base fields carry the constructor values the constructor set`` () =
 
 [<Fact>]
 let ``An undocumented $type value is rejected instead of guessed`` () =
-    // The 16 documented discriminators are the wire contract: anything
+    // The 17 documented discriminators are the wire contract: anything
     // outside the set must fail the read rather than deserialise to a base
     // instance. The BCL raises NotSupportedException for a discriminator
     // with no registered derived type (surfaced possibly wrapped in a

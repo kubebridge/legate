@@ -743,6 +743,7 @@ let expectedRules: (string * int * SessionCellKind) list =
         "turnAborted", 0, SessionCellKind.User // progress marker: no cells
         "turnFailed", 1, SessionCellKind.System
         "sessionClosed", 0, SessionCellKind.User // progress marker: no cells
+        "userMessage", 1, SessionCellKind.User // one User cell per folded Inject message
     ]
 
 [<Fact>]
@@ -806,6 +807,8 @@ let ``The fold classifies a bare event of every kind per the mapped rule`` () =
                     :> SessionEvent
             | "turnFailed" -> fun () -> TurnFailedEvent(sessionId, turnId, noSequence, stamp, "reason") :> SessionEvent
             | "sessionClosed" -> fun () -> SessionClosedEvent(sessionId, turnId, noSequence, stamp) :> SessionEvent
+            | "userMessage" ->
+                fun () -> UserMessageEvent(sessionId, turnId, noSequence, stamp, userMessage "steer") :> SessionEvent
             | _ -> failwith (sprintf "unmapped discriminator '%s' in the pin table" discriminator)
 
         let cells = foldEvents [ buildEvent () ]
