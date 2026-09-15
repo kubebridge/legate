@@ -81,6 +81,13 @@
     <Compile Include="SubAgentsTests.fs" />
     <Compile Include="TaskToolTests.fs" />
     <Compile Include="SsrfGuardTests.fs" />
+    <Compile Include="McpOptionsTests.fs" />
+    <Compile Include="McpNamingTests.fs" />
+    <Compile Include="McpDiscoveryTests.fs" />
+    <Compile Include="McpProjectionTests.fs" />
+    <Compile Include="McpConnectorTests.fs" />
+    <Compile Include="McpToolSourceTests.fs" />
+    <Compile Include="McpServiceExtensionsTests.fs" />
   </ItemGroup>
 
   <ItemGroup>
@@ -91,6 +98,7 @@
     <ProjectReference Include="../../src/Legate.Storage.InMemory/Legate.Storage.InMemory.fsproj" />
     <ProjectReference Include="../../src/Legate.Testing/Legate.Testing.fsproj" />
     <ProjectReference Include="../../src/Legate.Workspace.Process/Legate.Workspace.Process.fsproj" />
+    <ProjectReference Include="../../src/Legate.Mcp/Legate.Mcp.fsproj" />
   </ItemGroup>
 
   <ItemGroup>
@@ -103,6 +111,7 @@
     <PackageReference Include="Microsoft.Extensions.Configuration" />
     <PackageReference Include="Microsoft.Extensions.Configuration.EnvironmentVariables" />
     <PackageReference Include="Microsoft.Extensions.DependencyInjection" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
     <PackageReference Include="Microsoft.Extensions.TimeProvider.Testing" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" />
     <PackageReference Include="xunit" />
