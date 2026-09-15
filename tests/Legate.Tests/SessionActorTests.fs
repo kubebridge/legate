@@ -2824,3 +2824,178 @@ let ``Compact on Closed throws InvalidSessionStateException at the boundary`` ()
         ex.CurrentState |> should equal (SessionState.Closed.ToString())
     finally
         stopSystem system
+
+// ───────────────────────────────────────────────────────────────────────────
+// AutoClose (issue 82)
+
+/// Creates a session row with AutoClose set, mirroring createSession.
+let private createAutoCloseSession (store: ISessionStore) : Session =
+    let options = SessionOptions()
+    options.AutoClose <- true
+
+    let template = sampleSession ()
+    let session = { template with Options = options }
+
+    store.CreateSession(tenant, session, CancellationToken.None).GetAwaiter().GetResult()
+
+/// An Aborted TurnResult as a settled report: the carried result stands.
+let private abortedResult (text: string) =
+    { completed text with
+        Status = TurnStatus.Aborted
+        Outcome = TurnAborted(StopCause.ExplicitAbort, "host stop") :> TurnOutcome
+    }
+
+/// A Failed TurnResult as a settled report.
+let private failedTurnResult (text: string) (reason: string) =
+    { completed text with
+        Status = TurnStatus.Failed
+        Outcome = TurnFailed(reason) :> TurnOutcome
+    }
+
+/// Turn runner answering every turn with one fixed result.
+type FixedRunner(result: TurnResult) =
+    let mutable calls = 0
+
+    /// How many turns ran.
+    member _.Calls = calls
+
+    /// Runs one turn for an entry.
+    member _.Run(_entry: InboxEntry, _cancellationToken: CancellationToken) : Task<TurnResult> =
+        calls <- calls + 1
+        Task.FromResult(result)
+
+    /// The runner as the actor's delegate.
+    member this.Func: (InboxEntry -> CancellationToken -> Task<TurnResult>) =
+        fun entry cancellationToken -> this.Run(entry, cancellationToken)
+
+[<Fact>]
+let ``AutoClose closes the session after the first Completed turn`` () =
+    use system = createSystem ()
+    let store = createStore ()
+    let created = createAutoCloseSession store
+    let runner = ScriptedRunner([ "hello" ])
+    let session = spawnSession system store created.Id runner.Func
+
+    try
+        prompt store created.Id session "hello" |> ignore
+
+        let closed =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () -> (snapshotOf session).State = SessionState.Closed)
+
+        closed |> should equal true
+        (storedOf store created.Id).State |> should equal SessionState.Closed
+        (pendingOf store created.Id).Count |> should equal 0
+
+        // A prompt racing the close rejects at the boundary.
+        let ex =
+            Assert.Throws<InvalidSessionStateException>(fun () -> prompt store created.Id session "late" |> ignore)
+
+        ex.SessionId |> should equal created.Id
+    finally
+        stopSystem system
+
+[<Fact>]
+let ``AutoClose leaves an Aborted turn open`` () =
+    use system = createSystem ()
+    let store = createStore ()
+    let created = createAutoCloseSession store
+    let runner = FixedRunner(abortedResult "stopped")
+    let session = spawnSession system store created.Id runner.Func
+
+    try
+        prompt store created.Id session "stop me" |> ignore
+
+        let settled =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () -> (snapshotOf session).State = SessionState.Idle)
+
+        settled |> should equal true
+        (storedOf store created.Id).State |> should equal SessionState.Idle
+        (pendingOf store created.Id).Count |> should equal 0
+    finally
+        stopSystem system
+
+[<Fact>]
+let ``AutoClose leaves a Failed turn open`` () =
+    use system = createSystem ()
+    let store = createStore ()
+    let created = createAutoCloseSession store
+    let runner = FixedRunner(failedTurnResult "" "the tool exploded")
+    let session = spawnSession system store created.Id runner.Func
+
+    try
+        prompt store created.Id session "break me" |> ignore
+
+        let settled =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () -> (snapshotOf session).State = SessionState.Idle)
+
+        settled |> should equal true
+        (storedOf store created.Id).State |> should equal SessionState.Idle
+        (pendingOf store created.Id).Count |> should equal 0
+    finally
+        stopSystem system
+
+[<Fact>]
+let ``AutoClose wins over a queued second prompt`` () =
+    use system = createSystem ()
+    let store = createStore ()
+    let created = createAutoCloseSession store
+    let runner = GatedRunner([ "first"; "second" ])
+    let session = spawnSession system store created.Id runner.Func
+
+    try
+        prompt store created.Id session "first" |> ignore
+
+        let running =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () -> (snapshotOf session).State = SessionState.Running)
+
+        running |> should equal true
+
+        prompt store created.Id session "second" |> ignore
+        runner.Release()
+
+        let closed =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () -> (snapshotOf session).State = SessionState.Closed)
+
+        closed |> should equal true
+        // The settle-then-close sequencing never started the second turn.
+        runner.Calls |> should equal 1
+        (storedOf store created.Id).State |> should equal SessionState.Closed
+        (pendingOf store created.Id).Count |> should equal 1
+    finally
+        stopSystem system
+
+[<Fact>]
+let ``AutoClose closes a suspendable session after its first Completed turn`` () =
+    use system = createSystem ()
+    let store = createStore ()
+    let created = createAutoCloseSession store
+    let journal = RecordingEventStore()
+
+    let runner =
+        ScriptSuspendRunner(settledCompletion "done", settledCompletion "never")
+
+    let settled = ResizeArray<TurnResult>()
+
+    let session =
+        spawnSuspendable
+            system
+            store
+            journal
+            (TurnLoopTests.NeverDelay() :> ILlmDelay)
+            (TimeSpan.FromMinutes 5.0)
+            created.Id
+            runner
+            settled
+
+    try
+        promptSuspendable store created.Id session "run" |> ignore
+
+        let closed =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () -> (storedOf store created.Id).State = SessionState.Closed)
+
+        closed |> should equal true
+        settled.Count |> should equal 1
+        settled[0].AssistantText |> should equal "done"
+        (pendingOf store created.Id).Count |> should equal 0
+    finally
+        stopSystem system

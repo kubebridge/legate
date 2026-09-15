@@ -156,6 +156,13 @@ and [<Sealed>] TurnFinished(summary: string) =
     /// A host-readable summary of what the turn accomplished.
     member _.Summary = summary
 
+    /// True when the runtime synthesized this outcome because a structured
+    /// turn stopped without calling finish or fail: the summary carries the
+    /// final assistant text. False when the model called finish explicitly.
+    /// Defaults to false, so payloads written before the flag existed read
+    /// as explicit and the $type discriminator is unchanged.
+    member val IsImplicit = false with get, set
+
 /// The turn made progress but ended early: its budget (model iterations or
 /// wall-clock time) ran out before the model stopped calling tools.
 /// <param name="summary">A host-readable summary of the progress the turn made.</param>
