@@ -64,6 +64,8 @@
     <Compile Include="ProviderErrorsTests.fs" />
     <Compile Include="OpenAICompatibleProviderTests.fs" />
     <Compile Include="OpenAIRegistrationTests.fs" />
+    <Compile Include="WorkspaceLayoutTests.fs" />
+    <Compile Include="DownloadUrlToolTests.fs" />
   </ItemGroup>
 
   <ItemGroup>
