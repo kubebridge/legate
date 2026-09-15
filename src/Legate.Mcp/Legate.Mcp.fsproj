@@ -15,6 +15,7 @@
     <Compile Include="McpConnector.fs" />
     <Compile Include="McpInvocation.fs" />
     <Compile Include="McpToolSource.fs" />
+    <Compile Include="McpConfigFile.fs" />
     <Compile Include="McpServiceExtensions.fs" />
   </ItemGroup>
 

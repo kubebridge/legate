@@ -89,6 +89,7 @@
     <Compile Include="McpInvocationTests.fs" />
     <Compile Include="McpToolSourceTests.fs" />
     <Compile Include="McpServiceExtensionsTests.fs" />
+    <Compile Include="McpConfigFileTests.fs" />
     <Compile Include="CustomToolNamesTests.fs" />
     <Compile Include="CustomToolSchemaTests.fs" />
     <Compile Include="CustomToolFunctionTests.fs" />
