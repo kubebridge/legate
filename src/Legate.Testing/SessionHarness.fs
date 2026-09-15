@@ -23,9 +23,9 @@ open Microsoft.Extensions.AI
 
 /// How a session harness opens its session: the tenant and agent ids, the
 /// session title, the turn budget, the suspension wait, the permission
-/// policy, and the two delay seams. Construct and set properties; every
-/// knob carries a default, so `SessionHarnessOptions()` alone opens a
-/// plain prompted session.
+/// policy, the ask-user headless policy, and the two delay seams.
+/// Construct and set properties; every knob carries a default, so
+/// `SessionHarnessOptions()` alone opens a plain prompted session.
 type SessionHarnessOptions() =
 
     /// The tenant the session belongs to. Defaults to "harness".
@@ -52,6 +52,10 @@ type SessionHarnessOptions() =
     /// The permission policy the turn evaluates per tool call, or null for
     /// no gate (every call executes). Defaults to null.
     member val Policy: IPermissionPolicy | null = null with get, set
+
+    /// The ask_user headless policy the turn answers questions with, or
+    /// null to suspend for a host answer (interactive). Defaults to null.
+    member val AskUser: AskUserOptions | null = null with get, set
 
     /// The delay seam the turn's hard deadline fires off, or null for the
     /// harness default: a recording wait on the harness clock that fires
@@ -272,6 +276,14 @@ type SessionHarness
         if options.AskTimeout <= TimeSpan.Zero then
             raise (ArgumentOutOfRangeException(nameof options, "AskTimeout must be positive."))
 
+        match Option.ofObj (options.AskUser) with
+        | None -> ()
+        | Some ask ->
+            match Option.ofObj (ask.Validate()) with
+            | None -> ()
+            | Some violation ->
+                raise (ArgumentException($"The harness ask-user policy is invalid: {violation}", nameof options))
+
     /// Extracts the journal claim token from a granted claim.
     static let claimTokenOf (claim: TurnLeaseState) : string =
         match claim with
@@ -327,6 +339,7 @@ type SessionHarness
                 { TurnLoop.TurnLoopOptions.Default with
                     MaxIterations = resolved.MaxIterations
                     Timeout = resolved.TurnTimeout
+                    AskUser = Option.ofObj resolved.AskUser
                 }
 
             // The loop reads a null policy as no gate; defaultof carries

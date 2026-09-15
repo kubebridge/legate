@@ -23,6 +23,7 @@
     <Compile Include="WorkspaceLayout.fs" />
     <Compile Include="DownloadUrlTool.fs" />
     <Compile Include="TurnLoop.fs" />
+    <Compile Include="AskUserTool.fs" />
     <Compile Include="ExecTool.fs" />
     <Compile Include="Compaction.fs" />
     <Compile Include="LegateOptionsBinding.fs" />

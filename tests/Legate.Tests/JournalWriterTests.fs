@@ -870,6 +870,7 @@ let private testCursor (requestId: string) (question: string) : TurnLoop.TurnLoo
         ToolCallId = "c1"
         Kind = TurnLoop.QuestionSuspension
         QuestionText = question
+        QuestionOptions = []
         HistorySnapshot = ResizeArray<ChatMessage>() :> IList<ChatMessage>
         InputTokens = 3L
         OutputTokens = 5L

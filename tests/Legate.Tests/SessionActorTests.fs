@@ -1025,6 +1025,7 @@ let private suspendCursor
                 "Which region?"
             else
                 ""
+        QuestionOptions = []
         HistorySnapshot = ResizeArray<ChatMessage>() :> IList<ChatMessage>
         InputTokens = 3L
         OutputTokens = 5L

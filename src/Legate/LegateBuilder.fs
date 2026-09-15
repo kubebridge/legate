@@ -353,6 +353,7 @@ type LegateBuilder internal (services: IServiceCollection) as this =
                 target.Llm <- bound.Llm
                 target.Workspace <- bound.Workspace
                 target.Completion <- bound.Completion
+                target.AskUser <- bound.AskUser
                 target.Cluster <- bound.Cluster)
         )
         |> ignore

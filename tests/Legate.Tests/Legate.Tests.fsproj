@@ -68,6 +68,7 @@
     <Compile Include="FileToolsTests.fs" />
     <Compile Include="WorkspaceLayoutTests.fs" />
     <Compile Include="DownloadUrlToolTests.fs" />
+    <Compile Include="AskUserToolTests.fs" />
     <Compile Include="EditToolsTests.fs" />
     <Compile Include="SearchToolsTests.fs" />
   </ItemGroup>

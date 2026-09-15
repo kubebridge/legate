@@ -41,6 +41,16 @@ module SessionHarnessTests =
         options.Policy <- policy
         options
 
+    let private questionArgs (question: string) : IDictionary<string, obj> =
+        let args = Dictionary<string, obj>()
+        args["question"] <- question :> obj
+        args :> IDictionary<string, obj>
+
+    let private optionsWithAskUser (askUser: AskUserOptions) : SessionHarnessOptions =
+        let options = SessionHarnessOptions()
+        options.AskUser <- askUser
+        options
+
     let private sequencesOf (events: IReadOnlyList<SessionEvent>) : int64 list =
         [
             for event in events do
@@ -202,3 +212,121 @@ module SessionHarnessTests =
         Assert.Throws<ArgumentOutOfRangeException>(fun () ->
             SessionHarness.CreateAsync(client, sourced [], badBudget) |> ignore)
         |> ignore
+
+        let badAskUser = SessionHarnessOptions()
+        badAskUser.AskUser <- AskUserOptions(Mode = AskUserMode.AnswerWith)
+
+        Assert.Throws<ArgumentException>(fun () -> SessionHarness.CreateAsync(client, sourced [], badAskUser) |> ignore)
+        |> ignore
+
+    [<Fact>]
+    let ``Question suspends and the matching answer resumes`` () : Task =
+        task {
+            let client =
+                scripted
+                    [
+                        ScriptStep.ToolCall("q1", "ask_user", questionArgs "Which region?")
+                        ScriptStep.Text "done"
+                    ]
+
+            use! harness = SessionHarness.CreateAsync(client, sourced [ AskUserTool.Create() ])
+
+            // Prompt without waiting: the turn suspends on the question.
+            // Every wait below is event-driven; nothing sleeps.
+            let! _ = harness.PromptAsync("run", CancellationToken.None)
+
+            let! requestId = harness.WaitForSuspensionAsync(CancellationToken.None)
+            Assert.False(String.IsNullOrEmpty requestId)
+
+            let! suspended = harness.CollectEventsAsync(CancellationToken.None)
+
+            let asked =
+                suspended
+                |> Seq.choose (fun event ->
+                    match event with
+                    | :? QuestionAskedEvent as asked when not (isNull (box asked)) -> Some asked
+                    | _ -> None)
+                |> List.ofSeq
+
+            Assert.Equal(1, asked.Length)
+            Assert.Equal(requestId, asked[0].QuestionId)
+            Assert.Equal("Which region?", asked[0].Question)
+
+            // The matching answer resumes from the cursor and settles.
+            let! result = harness.ReplyAndSettleAsync(QuestionAnswer(requestId, "east"), CancellationToken.None)
+
+            Assert.Equal(TurnStatus.Completed, result.Status)
+            Assert.Equal("done", result.AssistantText)
+
+            let! events = harness.CollectEventsAsync(CancellationToken.None)
+
+            let answered =
+                events
+                |> Seq.choose (fun event ->
+                    match event with
+                    | :? QuestionAnsweredEvent as answered when not (isNull (box answered)) -> Some answered
+                    | _ -> None)
+                |> List.ofSeq
+
+            Assert.Equal(1, answered.Length)
+            Assert.Equal(requestId, answered[0].QuestionId)
+            Assert.Equal("east", answered[0].Answer)
+
+            let! session = harness.GetSessionAsync(CancellationToken.None)
+            Assert.Equal(SessionState.Idle, session.State)
+        }
+
+    [<Fact>]
+    let ``Fail ask-user policy fails the turn without suspending`` () : Task =
+        task {
+            let client =
+                scripted
+                    [
+                        ScriptStep.ToolCall("q1", "ask_user", questionArgs "Which region?")
+                        ScriptStep.Text "never"
+                    ]
+
+            let options = optionsWithAskUser (AskUserOptions())
+            use! harness = SessionHarness.CreateAsync(client, sourced [ AskUserTool.Create() ], options)
+
+            let! result = harness.PromptAndSettleAsync("run", CancellationToken.None)
+
+            Assert.Equal(TurnStatus.Failed, result.Status)
+
+            match result.Outcome with
+            | :? TurnFailed as failed -> Assert.Equal(TurnLoop.AskUserHeadlessFailMessage, failed.Reason)
+            | _ -> Assert.Fail("The failed turn carries no TurnFailed outcome.")
+
+            // Nothing suspended, so the journal holds no question events.
+            let! events = harness.CollectEventsAsync(CancellationToken.None)
+            Assert.Empty(events)
+
+            Assert.Equal(1, harness.SettledResults.Count)
+        }
+
+    [<Fact>]
+    let ``AnswerWith ask-user policy continues with the canned answer`` () : Task =
+        task {
+            let client =
+                scripted
+                    [
+                        ScriptStep.ToolCall("q1", "ask_user", questionArgs "Which region?")
+                        ScriptStep.Text "done"
+                    ]
+
+            let options =
+                optionsWithAskUser (AskUserOptions(Mode = AskUserMode.AnswerWith, CannedAnswer = "canned-42"))
+
+            use! harness = SessionHarness.CreateAsync(client, sourced [ AskUserTool.Create() ], options)
+
+            // The canned answer resumes the turn without any host reply.
+            let! result = harness.PromptAndSettleAsync("run", CancellationToken.None)
+
+            Assert.Equal(TurnStatus.Completed, result.Status)
+            Assert.Equal("done", result.AssistantText)
+
+            let! events = harness.CollectEventsAsync(CancellationToken.None)
+            Assert.Empty(events)
+
+            Assert.Equal(1, harness.SettledResults.Count)
+        }

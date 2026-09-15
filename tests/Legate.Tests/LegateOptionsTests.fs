@@ -42,6 +42,9 @@ let ``Defaults validate to null and describe a single node`` () =
     options.Pruning.PrunedMarker
     |> should equal ContextPruningOptions.DefaultPrunedMarker
 
+    options.AskUser.Mode |> should equal AskUserMode.Fail
+    options.AskUser.CannedAnswer |> should equal null
+
     options.Sessions.Validate() |> should equal null
     options.Turns.Validate() |> should equal null
     options.Permissions.Validate() |> should equal null
@@ -50,6 +53,7 @@ let ``Defaults validate to null and describe a single node`` () =
     options.Completion.Validate() |> should equal null
     options.Cluster.Validate() |> should equal null
     options.Pruning.Validate() |> should equal null
+    options.AskUser.Validate() |> should equal null
 
 [<Fact>]
 let ``Options are mutable`` () =
@@ -348,3 +352,40 @@ let ``Root Validate prefixes pruning violations`` () =
 
     options.Validate()
     |> should equal "Pruning: ReservedBufferTokens must be at least 0."
+
+// ──────────────────────────────────────────────────────────────────────────
+// AskUser
+
+[<Fact>]
+let ``AskUser defaults fail the turn and validate`` () =
+    let options = AskUserOptions()
+    options.Mode |> should equal AskUserMode.Fail
+    options.CannedAnswer |> should equal null
+    options.Validate() |> should equal null
+
+[<Fact>]
+let ``AskUser Validate flags unknown mode and missing canned answer`` () =
+    AskUserOptions(Mode = enum<AskUserMode> 99).Validate()
+    |> should equal "Mode has an unknown ask-user mode."
+
+    AskUserOptions(Mode = AskUserMode.AnswerWith).Validate()
+    |> should equal "CannedAnswer must be a non-empty string when Mode is AnswerWith."
+
+    let blank = AskUserOptions(Mode = AskUserMode.AnswerWith, CannedAnswer = "  ")
+
+    blank.Validate()
+    |> should equal "CannedAnswer must be a non-empty string when Mode is AnswerWith."
+
+    AskUserOptions(Mode = AskUserMode.AnswerWith, CannedAnswer = "canned").Validate()
+    |> should equal null
+
+[<Fact>]
+let ``Root Validate prefixes ask-user violations`` () =
+    let options = LegateOptions()
+    options.AskUser.Mode <- enum<AskUserMode> 99
+
+    options.Validate() |> should equal "AskUser: Mode has an unknown ask-user mode."
+
+    let nullSection = LegateOptions()
+    nullSection.AskUser <- nullRef<AskUserOptions>
+    nullSection.Validate() |> should equal "AskUser must not be null."
