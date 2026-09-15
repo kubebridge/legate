@@ -31,6 +31,17 @@ open ModelContextProtocol.Protocol
 // ──────────────────────────
 // Session and connector contracts
 
+/// One SDK-free call result: the rendered text plus whether the server
+/// flagged it as an error. Internal: the per-call invocation maps these
+/// onto model-facing error texts.
+type internal McpCallResult =
+    {
+        /// The rendered text result, never null.
+        Text: string
+        /// Whether the server flagged the result as an error.
+        IsError: bool
+    }
+
 /// One connected MCP server: lists its tools and forwards calls for the
 /// process lifetime. Internal: scripted by tests, SDK-backed in
 /// production.
@@ -45,15 +56,16 @@ type internal IMcpServerSession =
     /// <returns>The server's tools.</returns>
     abstract ListToolsAsync: cancellationToken: CancellationToken -> Task<IReadOnlyList<McpDiscovery.McpDiscoveredTool>>
 
-    /// Forwards one call to the named server tool. Minimal passthrough:
-    /// full per-call semantics belong to the per-call follow-up.
+    /// Forwards one call to the named server tool, returning the rendered
+    /// text with the server's error flag. Transport failures raise; the
+    /// per-call invocation maps both onto model-facing error texts.
     /// <param name="toolName">The server's tool name.</param>
     /// <param name="arguments">The call arguments.</param>
     /// <param name="cancellationToken">Token that abandons the call.</param>
-    /// <returns>The text result.</returns>
+    /// <returns>The text result with the error flag.</returns>
     abstract CallToolAsync:
         toolName: string * arguments: IReadOnlyDictionary<string, obj> * cancellationToken: CancellationToken ->
-            Task<string>
+            Task<McpCallResult>
 
 /// Connects one configured server. Internal: scripted by tests,
 /// SDK-backed in production.
@@ -224,6 +236,36 @@ module internal McpProtocolMapping =
             String.Join("\n", parts)
 
 // ──────────────────────────
+// Elicitation
+
+/// The elicitation rejector: headless sessions never prompt a user, so
+/// every server elicitation request is declined and the declined call
+/// fails into the per-call error mapping as an <c>Error calling</c> text
+/// with the turn continuing. Internal: unit-tested by invoking the
+/// delegate directly, so no test needs a live server.
+module internal McpElicitation =
+
+    /// The elicitation action declining every request.
+    [<Literal>]
+    let DeclineAction = "decline"
+
+    /// Builds client options declining every elicitation request: the
+    /// delegate ignores the request and returns the decline, so the
+    /// server fails the eliciting call into the error mapping.
+    /// <returns>Client options carrying the rejector.</returns>
+    let buildClientOptions () : McpClientOptions =
+        let reject =
+            Func<ElicitRequestParams, CancellationToken, ValueTask<ElicitResult>>(fun _ _ ->
+                ValueTask<ElicitResult>(ElicitResult(Action = DeclineAction)))
+
+        let handlers = McpClientHandlers()
+        handlers.ElicitationHandler <- reject
+
+        let options = McpClientOptions()
+        options.Handlers <- handlers
+        options
+
+// ──────────────────────────
 // SDK session and connector
 
 /// One connected SDK server: the client lives until disposed.
@@ -255,7 +297,7 @@ type internal SdkMcpServerSession(serverName: string, client: McpClient) =
 
         member _.CallToolAsync
             (toolName: string, arguments: IReadOnlyDictionary<string, obj>, cancellationToken: CancellationToken)
-            : Task<string> =
+            : Task<McpCallResult> =
             task {
                 ArgumentNullException.ThrowIfNull(toolName)
 
@@ -268,7 +310,11 @@ type internal SdkMcpServerSession(serverName: string, client: McpClient) =
                         cancellationToken
                     )
 
-                return McpProtocolMapping.renderCallResult result
+                return
+                    {
+                        Text = McpProtocolMapping.renderCallResult result
+                        IsError = not (isNull (box result)) && result.IsError.HasValue && result.IsError.Value
+                    }
             }
 
     interface IAsyncDisposable with
@@ -327,7 +373,7 @@ type internal SdkMcpServerConnector(logger: ILogger | null, httpClient: HttpClie
                 let! client =
                     McpClient.CreateAsync(
                         transport,
-                        Unchecked.defaultof<McpClientOptions>,
+                        McpElicitation.buildClientOptions (),
                         Unchecked.defaultof<ILoggerFactory>,
                         cancellationToken
                     )

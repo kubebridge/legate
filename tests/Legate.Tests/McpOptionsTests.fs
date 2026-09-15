@@ -108,3 +108,54 @@ let ``Binds servers and the suffix policy from configuration`` () =
         options.Servers[1].Url |> should equal "http://127.0.0.1:8080/mcp"
         options.Servers[1].Headers["Authorization"] |> should equal "Bearer test"
         options.Validate() |> should equal null
+
+[<Fact>]
+let ``Overrides default to empty collections`` () =
+    let overrides = McpServerOverrides()
+    overrides.DisabledTools.Count |> should equal 0
+    overrides.DescriptionOverrides.Count |> should equal 0
+
+[<Fact>]
+let ``Servers default to no overrides and still validate`` () =
+    let options = McpOptions()
+    options.Servers.Add(stdioServer "alpha")
+    options.Servers[0].Overrides |> should equal null
+    options.Validate() |> should equal null
+
+[<Fact>]
+let ``Binds overrides from the server section`` () =
+    let section =
+        buildSection
+            [
+                "Legate:Tools:Mcp:Servers:0:Name", "alpha"
+                "Legate:Tools:Mcp:Servers:0:Command", "npx"
+                "Legate:Tools:Mcp:Servers:0:Overrides:DisabledTools:0", "secret"
+                "Legate:Tools:Mcp:Servers:0:Overrides:DescriptionOverrides:read", "Rewritten."
+            ]
+
+    let bound: McpOptions | null = section.Get<McpOptions>()
+
+    match bound with
+    | null -> Assert.Fail("Configuration binding returned null.") |> ignore
+    | options ->
+        options.Servers.Count |> should equal 1
+        options.Servers[0].Overrides |> should not' (equal null)
+
+        match box options.Servers[0].Overrides with
+        | :? McpServerOverrides as overrides ->
+            overrides.DisabledTools |> Seq.toList |> should equal [ "secret" ]
+            overrides.DescriptionOverrides["read"] |> should equal "Rewritten."
+        | _ -> Assert.Fail("Overrides must bind.") |> ignore
+
+        options.Validate() |> should equal null
+
+[<Fact>]
+let ``Overrides never invalidate a server`` () =
+    let options = McpOptions()
+    let server = stdioServer "alpha"
+    let overrides = McpServerOverrides()
+    overrides.DisabledTools.Add("unknown-tool")
+    overrides.DescriptionOverrides["unknown-tool"] <- "Rewritten."
+    server.Overrides <- overrides
+    options.Servers.Add(server)
+    options.Validate() |> should equal null
