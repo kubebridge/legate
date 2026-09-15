@@ -43,7 +43,7 @@ open Microsoft.Extensions.AI
 // ──────────────────────────────────────────────────────────────────────────
 // Protocol
 
-/// How the session actor answers a Queue prompt. The actor never throws
+/// How the session actor answers a prompt. The actor never throws
 /// InvalidSessionStateException: a Closed-state prompt is rejected with the
 /// current state and the client boundary maps it to the exception.
 type internal SessionPromptReply =
@@ -56,17 +56,34 @@ type internal SessionPromptReply =
     /// appended. Carries the state the session was in.
     | PromptRejected of state: SessionState
 
-/// The session actor protocol. QueuePrompt, CloseSession, and GetSnapshot
+/// The session actor protocol. QueuePrompt, InjectPrompt,
+/// InterruptPrompt, CloseSession, and GetSnapshot
 /// are answered to the sender; the SessionTurnSettled and SessionTurnFaulted completions
 /// are one-way (Tell) from the turn task back to the actor.
 type internal SessionActorMessage =
 
     /// Queue a user message: appends to the durable inbox, starts a turn
     /// when Idle, waits when Running or WaitingForInput, rejects when
-    /// Closed. Only Queue delivery reaches the actor; the client boundary
-    /// enforces that. Answered with
+    /// Closed. Carries Queue delivery only; Inject and Interrupt delivery
+    /// arrive through InjectPrompt and InterruptPrompt. Answered with
     /// <see cref="T:Legate.SessionPromptReply" />.
     | QueuePrompt of payload: InboxPayload * cancellationToken: CancellationToken
+
+    /// Inject a user message into the running turn: appends to the durable
+    /// inbox with Inject delivery, starts a turn when Idle, folds at the
+    /// next iteration boundary when Running through the runner's drain
+    /// hooks, waits when WaitingForInput, rejects when Closed. Never
+    /// aborts the running turn. Answered with
+    /// <see cref="T:Legate.SessionPromptReply" />.
+    | InjectPrompt of payload: InboxPayload * cancellationToken: CancellationToken
+
+    /// Interrupt the running turn with a user message: appends to the
+    /// durable inbox with Interrupt delivery, starts a turn when Idle,
+    /// aborts the running turn under ExplicitAbort and drains the
+    /// Interrupt entry first when Running, waits when WaitingForInput,
+    /// rejects when Closed. Answered with
+    /// <see cref="T:Legate.SessionPromptReply" />.
+    | InterruptPrompt of payload: InboxPayload * cancellationToken: CancellationToken
 
     /// Close the session: aborts the running turn first through
     /// cancellation only, then closes idempotently in the store. Valid in
@@ -151,6 +168,12 @@ type internal SessionActorProps =
         /// or None for no observation. Guarded: a throwing observer never
         /// kills the actor.
         OnTurnSettled: (TurnResult -> unit) option
+        /// Observes each Inject user message the running turn folds, as a
+        /// UserMessageEvent carrying the running (injecting) turn's id, or
+        /// None for no observation. The runner calls it once per folded
+        /// entry, after the message is appended to history and before the
+        /// consume hook. Guarded: a throwing observer never kills the turn.
+        OnInjectJournaled: (UserMessageEvent -> unit) option
     }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -165,6 +188,11 @@ module internal SessionActor =
     /// so this only fires when the system is wedged.
     let askTimeout = TimeSpan.FromSeconds 10.0
 
+    /// Reason carried by TurnAborted when an Interrupt prompt pre-empts the
+    /// running turn. Never contains secrets or tool arguments.
+    [<Literal>]
+    let InterruptReason = "The turn was interrupted by a new message."
+
     /// Awaits a fast store metadata task synchronously on the actor thread.
     /// The actor computation cannot bind tasks (only mailbox receives), and
     /// blocking here preserves the single-threaded sequencing the
@@ -174,23 +202,35 @@ module internal SessionActor =
     /// <returns>The task's result.</returns>
     let private awaitTask<'T> (task: Task<'T>) : 'T = task.GetAwaiter().GetResult()
 
-    /// Selects the drainable entries from a pending read in position order:
-    /// Queue delivery carrying a user message. Anything else (Inject,
-    /// Interrupt, Reply payloads) stays pending for its owning issue. Null
-    /// entries and a null read result are treated as empty.
+    /// Selects the drainable entries from a pending read in position order,
+    /// in two tiers: Interrupt user messages first in position order, then
+    /// Queue-plus-Inject user messages in position order. Reply payloads
+    /// never drain to a new turn: they resume a suspended turn instead, so
+    /// they stay pending for their owning issue, as does anything that is
+    /// not a user message. Null entries and a null read result are treated
+    /// as empty.
     /// <param name="entries">The pending read result.</param>
-    /// <returns>The drainable entries in position order.</returns>
-    let private selectQueueUserMessages (entries: IReadOnlyList<InboxEntry>) : InboxEntry list =
+    /// <returns>The drainable entries, Interrupt tier first.</returns>
+    let private selectDrainableEntries (entries: IReadOnlyList<InboxEntry>) : InboxEntry list =
         if isNull (box entries) then
             []
         else
-            entries
-            |> Seq.filter (fun entry ->
-                not (isNull (box entry))
-                && entry.Delivery = DeliveryMode.Queue
-                && (entry.Payload :? UserMessagePayload))
-            |> Seq.sortBy (fun entry -> entry.Position)
-            |> List.ofSeq
+            let userMessages =
+                entries
+                |> Seq.filter (fun entry -> not (isNull (box entry)) && (entry.Payload :? UserMessagePayload))
+                |> Seq.sortBy (fun entry -> entry.Position)
+                |> List.ofSeq
+
+            let interrupts =
+                userMessages
+                |> List.filter (fun entry -> entry.Delivery = DeliveryMode.Interrupt)
+
+            let queued =
+                userMessages
+                |> List.filter (fun entry ->
+                    entry.Delivery = DeliveryMode.Queue || entry.Delivery = DeliveryMode.Inject)
+
+            interrupts @ queued
 
     /// Rebuilds the actor's starting state from the store: the stored
     /// lifecycle state. A stored Running state means the previous owner
@@ -243,21 +283,55 @@ module internal SessionActor =
         with :? SessionNotFoundException ->
             0
 
+    /// Store-backed Inject fold wiring for one session: what the
+    /// Inject-aware turn runner closes over to fold Inject entries at
+    /// iteration boundaries (issue 34 over issue 41's drain hooks). The
+    /// drain reads the session's pending inbox, the journal sink observes
+    /// one UserMessageEvent per folded entry under the running turn's id,
+    /// and the consume marks each folded entry so it never refolds.
+    type internal InjectFoldWiring =
+        {
+            /// The durable store the inbox persists through.
+            Store: ISessionStore
+            /// The tenant the session belongs to.
+            Tenant: TenantId
+            /// The session the wiring drains and consumes for.
+            SessionId: SessionId
+            /// Observes each folded Inject entry as a UserMessageEvent, or
+            /// None for no observation. Guarded by the runner: a throwing
+            /// observer never kills the turn.
+            JournalEvent: (UserMessageEvent -> unit) option
+        }
+
     /// Builds a Queue turn runner over TurnLoop.runAsync: one ChatRole.User
     /// history message from the entry's parts and no Inject fold, running
-    /// under the given lease hook and the given deadline seam.
+    /// under the given lease hook and the given deadline seam. With an
+    /// Inject wiring the runner instead calls
+    /// TurnLoop.runAsyncWithInjects: the turn mints one TurnId at
+    /// invocation (the invocation runs synchronously inside the actor's
+    /// startTurn, so the id is the running turn's), folds pending Inject
+    /// entries at each iteration boundary, journals each folded entry once
+    /// as a UserMessageEvent under that id, and marks it consumed before
+    /// the next provider call. The drain and consume block the turn thread
+    /// on the store (the hooks are synchronous): the consume must land
+    /// before the turn reports back, or the settle drain would redeliver
+    /// the folded entry as a new turn and journal it twice. The
+    /// would-complete pending signal is discarded: the settle drain
+    /// re-reads the store and starts the Inject new turn implicitly.
     /// <param name="client">The chat client the turn runs against.</param>
     /// <param name="tools">The tools the turn may call.</param>
     /// <param name="options">The turn loop tuning and per-turn budget.</param>
     /// <param name="delay">The delay seam the hard deadline fires off. Must not be null.</param>
     /// <param name="isLeaseValid">The lease hook the loop checks. Must not be null.</param>
-    /// <returns>A runner executing one Queue inbox entry per turn.</returns>
+    /// <param name="inject">The store-backed Inject fold wiring, or None for a Queue-only turn with no fold.</param>
+    /// <returns>A runner executing one inbox entry per turn.</returns>
     let private runnerFor
         (client: IChatClient)
         (tools: IReadOnlyDictionary<string, AITool>)
         (options: TurnLoop.TurnLoopOptions)
         (delay: ILlmDelay)
         (isLeaseValid: unit -> bool)
+        (inject: InjectFoldWiring option)
         : (InboxEntry -> CancellationToken -> Task<TurnResult>) =
         ArgumentNullException.ThrowIfNull(client)
         ArgumentNullException.ThrowIfNull(tools)
@@ -283,7 +357,68 @@ module internal SessionActor =
                     history.Add(ChatMessage(ChatRole.User, parts :> IList<AIContent>))
                 | _ -> history.Add(ChatMessage(ChatRole.User, ""))
 
-                return! TurnLoop.runAsync client history tools options delay cancellationToken isLeaseValid
+                match inject with
+                | None -> return! TurnLoop.runAsync client history tools options delay cancellationToken isLeaseValid
+                | Some wiring ->
+                    // Per-turn mint: this closure runs synchronously inside
+                    // the actor's startTurn, once per turn, so the id is
+                    // the running (injecting) turn's for every entry this
+                    // turn folds.
+                    let turnId = TurnId.New()
+
+                    let drainInjected () : IReadOnlyList<InboxEntry> =
+                        wiring.Store
+                            .ReadPendingInbox(wiring.Tenant, wiring.SessionId, CancellationToken.None)
+                            .GetAwaiter()
+                            .GetResult()
+
+                    let journalInjected (injected: InboxEntry) : unit =
+                        if not (isNull (box injected)) then
+                            match injected.Payload with
+                            | :? UserMessagePayload as payload when
+                                not (isNull (box payload)) && not (isNull (box payload.Message))
+                                ->
+                                let event =
+                                    UserMessageEvent(
+                                        injected.SessionId,
+                                        turnId,
+                                        Nullable<int64>(),
+                                        DateTimeOffset.UtcNow,
+                                        payload.Message
+                                    )
+
+                                match wiring.JournalEvent with
+                                | Some observe ->
+                                    try
+                                        observe event
+                                    with _ ->
+                                        ()
+                                | None -> ()
+                            | _ -> ()
+
+                    let consumeInjected (injected: InboxEntry) : unit =
+                        let positions = [| injected.Position |] :> IReadOnlyList<int64>
+
+                        wiring.Store
+                            .MarkInboxConsumed(wiring.Tenant, wiring.SessionId, positions, CancellationToken.None)
+                            .GetAwaiter()
+                            .GetResult()
+                        |> ignore
+
+                    let! completion =
+                        TurnLoop.runAsyncWithInjects
+                            client
+                            history
+                            tools
+                            options
+                            delay
+                            cancellationToken
+                            isLeaseValid
+                            drainInjected
+                            journalInjected
+                            consumeInjected
+
+                    return completion.Result
             }
 
     /// Builds the default turn runner over TurnLoop.runAsync for Queue
@@ -300,7 +435,33 @@ module internal SessionActor =
         (options: TurnLoop.TurnLoopOptions)
         (delay: ILlmDelay)
         : (InboxEntry -> CancellationToken -> Task<TurnResult>) =
-        runnerFor client tools options delay (fun () -> true)
+        runnerFor client tools options delay (fun () -> true) None
+
+    /// Builds the Inject-aware turn runner over
+    /// TurnLoop.runAsyncWithInjects (issue 34): the same history shape as
+    /// <see cref="M:Legate.SessionActor.createTurnRunner" />, folding
+    /// pending Inject entries at each iteration boundary through the
+    /// store-backed wiring and journaling each folded entry once as a
+    /// UserMessageEvent under the running turn's id. The would-complete
+    /// pending signal is discarded: the settle drain re-reads the store
+    /// and starts the Inject new turn implicitly.
+    /// <param name="client">The chat client the turn runs against.</param>
+    /// <param name="tools">The tools the turn may call.</param>
+    /// <param name="options">The turn loop tuning and per-turn budget.</param>
+    /// <param name="delay">The delay seam the hard deadline fires off. Must not be null.</param>
+    /// <param name="wiring">The store-backed Inject fold wiring for the session.</param>
+    /// <returns>A runner executing one inbox entry per turn with the Inject fold.</returns>
+    let createInjectFoldRunner
+        (client: IChatClient)
+        (tools: IReadOnlyDictionary<string, AITool>)
+        (options: TurnLoop.TurnLoopOptions)
+        (delay: ILlmDelay)
+        (wiring: InjectFoldWiring)
+        : (InboxEntry -> CancellationToken -> Task<TurnResult>) =
+        if isNull (box wiring) then
+            raise (ArgumentNullException(nameof wiring))
+
+        runnerFor client tools options delay (fun () -> true) (Some wiring)
 
     /// Builds the claimed turn runner over TurnLoop.runAsync for Queue
     /// delivery (issue 33): the same history shape as
@@ -331,6 +492,7 @@ module internal SessionActor =
             }
             delay
             isLeaseValid
+            None
 
     /// The session actor: recovers from the store, then owns the state
     /// machine. The mailbox parameter is injected by the spawn functions;
@@ -389,8 +551,13 @@ module internal SessionActor =
             { Entry = entry; Cts = cts }
 
         /// Settles a finished turn attempt: consumes the attempt's entry
-        /// store-first, then drains the next pending Queue entry into a
-        /// new turn or returns the session to Idle.
+        /// store-first, then drains the next pending entry into a new turn
+        /// or returns the session to Idle. The drain tiers Interrupt user
+        /// messages first in position order, then Queue-plus-Inject user
+        /// messages in position order; Reply payloads never start a turn.
+        /// A final-iteration Inject the loop left pending (its
+        /// would-complete signal is discarded across the runner boundary)
+        /// starts its new turn here, implicitly.
         /// <param name="entry">The entry the finished attempt executed.</param>
         /// <param name="cancellationToken">Abandons the settle reads.</param>
         /// <returns>The next loop state and in-flight turn.</returns>
@@ -403,7 +570,7 @@ module internal SessionActor =
             let pending =
                 awaitTask (props.Store.ReadPendingInbox(props.Tenant, props.SessionId, cancellationToken))
 
-            match selectQueueUserMessages pending with
+            match selectDrainableEntries pending with
             | next :: _ ->
                 let running = startTurn next
                 (SessionState.Running, Some running)
@@ -487,6 +654,53 @@ module internal SessionActor =
                     Outcome = TurnFailed(reason) :> TurnOutcome
                 }
 
+        /// Appends a prompt entry without starting a turn: the entry waits
+        /// for the settle drain (Running), for the Reply resume
+        /// (WaitingForInput), or stays durable with nothing new starting
+        /// (an out-of-range stored state).
+        /// <param name="payload">What the entry carries: a user message.</param>
+        /// <param name="delivery">How the message was delivered.</param>
+        /// <param name="cancellationToken">Abandons the append.</param>
+        /// <returns>The appended inbox entry.</returns>
+        let appendWaiting
+            (payload: InboxPayload)
+            (delivery: DeliveryMode)
+            (cancellationToken: CancellationToken)
+            : InboxEntry =
+            awaitTask (
+                props.Store.AppendInboxMessage(props.Tenant, props.SessionId, payload, delivery, cancellationToken)
+            )
+
+        /// Appends a prompt entry while Idle and starts its turn: persists
+        /// Running store-first, then drains tier-first (Interrupt first,
+        /// then Queue-plus-Inject in position order), so an older entry
+        /// orphaned by a restart wins over the just-appended one. The
+        /// appended entry is the fallback when nothing else is drainable.
+        /// <param name="payload">What the entry carries: a user message.</param>
+        /// <param name="delivery">How the message was delivered.</param>
+        /// <param name="cancellationToken">Abandons the append.</param>
+        /// <returns>The appended entry and the in-flight turn.</returns>
+        let startIdleTurn
+            (payload: InboxPayload)
+            (delivery: DeliveryMode)
+            (cancellationToken: CancellationToken)
+            : InboxEntry * RunningTurn =
+            let appended = appendWaiting payload delivery cancellationToken
+
+            awaitTask (
+                props.Store.UpdateSessionState(props.Tenant, props.SessionId, SessionState.Running, cancellationToken)
+            )
+            |> ignore
+
+            let pending =
+                awaitTask (props.Store.ReadPendingInbox(props.Tenant, props.SessionId, cancellationToken))
+
+            let first =
+                selectDrainableEntries pending |> List.tryHead |> Option.defaultValue appended
+
+            let next = startTurn first
+            (appended, next)
+
         let rec loop
             (state: SessionState)
             (running: RunningTurn option)
@@ -503,69 +717,90 @@ module internal SessionActor =
                         mailbox.Sender() <! PromptRejected SessionState.Closed
                         return! loop state running arbitration pendingStop
                     | SessionState.Idle ->
-                        let appended =
-                            awaitTask (
-                                props.Store.AppendInboxMessage(
-                                    props.Tenant,
-                                    props.SessionId,
-                                    payload,
-                                    DeliveryMode.Queue,
-                                    cancellationToken
-                                )
-                            )
-
-                        awaitTask (
-                            props.Store.UpdateSessionState(
-                                props.Tenant,
-                                props.SessionId,
-                                SessionState.Running,
-                                cancellationToken
-                            )
-                        )
-                        |> ignore
-
-                        // Drain oldest-first: the just-appended entry joins
-                        // whatever the inbox already held (for example work
-                        // that survived a restart), and the earliest entry
-                        // starts the turn.
-                        let pending =
-                            awaitTask (props.Store.ReadPendingInbox(props.Tenant, props.SessionId, cancellationToken))
-
-                        let first =
-                            selectQueueUserMessages pending |> List.tryHead |> Option.defaultValue appended
-
-                        let next = startTurn first
+                        let appended, next = startIdleTurn payload DeliveryMode.Queue cancellationToken
                         mailbox.Sender() <! PromptAccepted appended
                         return! loop SessionState.Running (Some next) StopArbitration.Undecided None
                     | SessionState.Running
                     | SessionState.WaitingForInput ->
-                        let appended =
-                            awaitTask (
-                                props.Store.AppendInboxMessage(
-                                    props.Tenant,
-                                    props.SessionId,
-                                    payload,
-                                    DeliveryMode.Queue,
-                                    cancellationToken
-                                )
-                            )
-
+                        let appended = appendWaiting payload DeliveryMode.Queue cancellationToken
                         mailbox.Sender() <! PromptAccepted appended
                         return! loop state running arbitration pendingStop
                     | _ ->
                         // Out-of-range stored state: stay durable but start
                         // nothing new.
-                        let appended =
-                            awaitTask (
-                                props.Store.AppendInboxMessage(
-                                    props.Tenant,
-                                    props.SessionId,
-                                    payload,
-                                    DeliveryMode.Queue,
-                                    cancellationToken
-                                )
-                            )
+                        let appended = appendWaiting payload DeliveryMode.Queue cancellationToken
+                        mailbox.Sender() <! PromptAccepted appended
+                        return! loop state running arbitration pendingStop
+                | InjectPrompt(payload, cancellationToken) ->
+                    match state with
+                    | SessionState.Closed ->
+                        mailbox.Sender() <! PromptRejected SessionState.Closed
+                        return! loop state running arbitration pendingStop
+                    | SessionState.Idle ->
+                        let appended, next = startIdleTurn payload DeliveryMode.Inject cancellationToken
+                        mailbox.Sender() <! PromptAccepted appended
+                        return! loop SessionState.Running (Some next) StopArbitration.Undecided None
+                    | SessionState.Running
+                    | SessionState.WaitingForInput ->
+                        // Append-and-wait: the running turn folds the entry
+                        // at its next iteration boundary, and a suspended
+                        // turn leaves it for the settle drain. Never aborts.
+                        let appended = appendWaiting payload DeliveryMode.Inject cancellationToken
+                        mailbox.Sender() <! PromptAccepted appended
+                        return! loop state running arbitration pendingStop
+                    | _ ->
+                        let appended = appendWaiting payload DeliveryMode.Inject cancellationToken
+                        mailbox.Sender() <! PromptAccepted appended
+                        return! loop state running arbitration pendingStop
+                | InterruptPrompt(payload, cancellationToken) ->
+                    match state with
+                    | SessionState.Closed ->
+                        mailbox.Sender() <! PromptRejected SessionState.Closed
+                        return! loop state running arbitration pendingStop
+                    | SessionState.Idle ->
+                        let appended, next = startIdleTurn payload DeliveryMode.Interrupt cancellationToken
+                        mailbox.Sender() <! PromptAccepted appended
+                        return! loop SessionState.Running (Some next) StopArbitration.Undecided None
+                    | SessionState.Running ->
+                        // Pre-empt through the abort verb: the entry joins
+                        // the inbox first so the settle drain finds it, then
+                        // the running turn aborts under ExplicitAbort through
+                        // the same arbitration cell AbortSession uses. The
+                        // settle consumes the aborted entry and drains the
+                        // Interrupt entry first with the rest of the inbox
+                        // intact. A stop that already won keeps the first
+                        // cause; the new entry still drains after the
+                        // settle.
+                        let appended = appendWaiting payload DeliveryMode.Interrupt cancellationToken
 
+                        match running with
+                        | Some inFlight ->
+                            let nextArbitration, won =
+                                StopArbitration.applyStop arbitration StopCause.ExplicitAbort
+
+                            let nextStop =
+                                if won then
+                                    Some(StopCause.ExplicitAbort, InterruptReason)
+                                else
+                                    pendingStop
+
+                            if won then
+                                inFlight.Cts.Cancel()
+
+                            mailbox.Sender() <! PromptAccepted appended
+                            return! loop state running nextArbitration nextStop
+                        | None ->
+                            mailbox.Sender() <! PromptAccepted appended
+                            return! loop state running arbitration pendingStop
+                    | SessionState.WaitingForInput ->
+                        // Append-and-wait: suspended turns belong to issue
+                        // 36, so nothing runs to abort and Reply still
+                        // resumes the suspended turn.
+                        let appended = appendWaiting payload DeliveryMode.Interrupt cancellationToken
+                        mailbox.Sender() <! PromptAccepted appended
+                        return! loop state running arbitration pendingStop
+                    | _ ->
+                        let appended = appendWaiting payload DeliveryMode.Interrupt cancellationToken
                         mailbox.Sender() <! PromptAccepted appended
                         return! loop state running arbitration pendingStop
                 | CloseSession cancellationToken ->
@@ -684,6 +919,7 @@ module internal SessionActor =
                         SessionId = parsed
                         RunTurn = runTurn
                         OnTurnSettled = None
+                        OnInjectJournaled = None
                     }
 
                 spawn context name (behavior props)
@@ -732,24 +968,33 @@ module internal SessionActor =
             | session -> return session
         }
 
-    /// Queues a user message on a session: the client boundary. Validates
+    /// Prompts a session with a delivery mode: the client boundary. Validates
     /// the session is present and not Closed before touching the actor, so
     /// invalid transitions throw here, never inside the actor. A rejection
     /// that still races through (Closed between the check and the actor)
-    /// maps to the same exception.
+    /// maps to the same exception. Queue appends and acts on the message
+    /// once the running turn (if any) finishes; Inject appends and folds
+    /// into the running turn at its next iteration boundary without
+    /// interrupting it; Interrupt appends and pre-empts the running turn,
+    /// settling it as Aborted under ExplicitAbort before starting the new
+    /// turn. While WaitingForInput every mode appends and waits (Reply
+    /// still resumes the suspended turn), and while Idle every mode starts
+    /// a turn normally through the tiered drain.
     /// <param name="store">The durable store.</param>
     /// <param name="tenant">The tenant the session belongs to.</param>
     /// <param name="sessionId">The session to prompt.</param>
     /// <param name="session">The session actor.</param>
     /// <param name="message">The user message. Must not be null.</param>
+    /// <param name="delivery">How the message is delivered to a running turn.</param>
     /// <param name="cancellationToken">Cancels the prompt.</param>
     /// <returns>The appended inbox entry.</returns>
-    let promptQueueAsync
+    let promptAsync
         (store: ISessionStore)
         (tenant: TenantId)
         (sessionId: SessionId)
         (session: IActorRef)
         (message: UserMessage)
+        (delivery: DeliveryMode)
         (cancellationToken: CancellationToken)
         : Task<InboxEntry> =
         ArgumentNullException.ThrowIfNull(store)
@@ -772,8 +1017,20 @@ module internal SessionActor =
 
             let payload = UserMessagePayload(message) :> InboxPayload
 
-            let! reply =
-                askAsync<SessionPromptReply> session (QueuePrompt(payload, cancellationToken)) cancellationToken
+            let prompt =
+                match delivery with
+                | DeliveryMode.Queue -> QueuePrompt(payload, cancellationToken)
+                | DeliveryMode.Inject -> InjectPrompt(payload, cancellationToken)
+                | DeliveryMode.Interrupt -> InterruptPrompt(payload, cancellationToken)
+                | unknown ->
+                    raise (
+                        ArgumentOutOfRangeException(
+                            nameof delivery,
+                            sprintf "Unknown delivery mode: %O. Expected Queue, Inject, or Interrupt." unknown
+                        )
+                    )
+
+            let! reply = askAsync<SessionPromptReply> session prompt cancellationToken
 
             match reply with
             | PromptAccepted entry -> return entry
@@ -787,6 +1044,28 @@ module internal SessionActor =
                         )
                     )
         }
+
+    /// Queues a user message on a session: the client boundary. Validates
+    /// the session is present and not Closed before touching the actor, so
+    /// invalid transitions throw here, never inside the actor. A rejection
+    /// that still races through (Closed between the check and the actor)
+    /// maps to the same exception.
+    /// <param name="store">The durable store.</param>
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="sessionId">The session to prompt.</param>
+    /// <param name="session">The session actor.</param>
+    /// <param name="message">The user message. Must not be null.</param>
+    /// <param name="cancellationToken">Cancels the prompt.</param>
+    /// <returns>The appended inbox entry.</returns>
+    let promptQueueAsync
+        (store: ISessionStore)
+        (tenant: TenantId)
+        (sessionId: SessionId)
+        (session: IActorRef)
+        (message: UserMessage)
+        (cancellationToken: CancellationToken)
+        : Task<InboxEntry> =
+        promptAsync store tenant sessionId session message DeliveryMode.Queue cancellationToken
 
     /// Closes a session: the client boundary. Valid in every state and
     /// idempotent; on a Running session the actor aborts the turn first

@@ -3,6 +3,7 @@ module Legate.Tests.SessionActorTests
 
 open System
 open System.Collections.Generic
+open System.Text.Json
 open System.Threading
 open System.Threading.Tasks
 open Akka.Actor
@@ -82,6 +83,7 @@ let private spawnSession
             SessionId = sessionId
             RunTurn = runTurn
             OnTurnSettled = None
+            OnInjectJournaled = None
         }
 
     spawn system $"test-{Guid.NewGuid():N}" (SessionActor.behavior props)
@@ -102,6 +104,7 @@ let private spawnSessionWithProbe
             SessionId = sessionId
             RunTurn = runTurn
             OnTurnSettled = Some probe
+            OnInjectJournaled = None
         }
 
     spawn system $"test-{Guid.NewGuid():N}" (SessionActor.behavior props)
@@ -1106,6 +1109,7 @@ let private spawnSuspendable
             SessionId = sessionId
             RunTurn = (fun _ _ -> Task.FromResult(completed "unused"))
             OnTurnSettled = Some(fun result -> lock settled (fun () -> settled.Add(result)))
+            OnInjectJournaled = None
         }
 
     let deps: SessionActor.SuspendDeps =
@@ -1627,3 +1631,611 @@ let ``Takeover while suspended leaves the loser with zero journal effects`` () =
         | _ -> failwith "Expected the winner's single write to replay."
     finally
         stopSystem system
+
+// ──────────────────────────────────────────────────────────────────────────
+// Inject and Interrupt delivery modes (issue 34)
+
+/// Prompts through the delivery-mode boundary and blocks for the ack.
+let private promptWithDelivery
+    (store: ISessionStore)
+    (sessionId: SessionId)
+    (session: IActorRef)
+    (text: string)
+    (delivery: DeliveryMode)
+    : InboxEntry =
+    SessionActor.promptAsync store tenant sessionId session (UserMessage.Text text) delivery CancellationToken.None
+    |> fun task -> task.GetAwaiter().GetResult()
+
+/// Appends one user message straight to the store with the given delivery
+/// (pre-existing inbox, or crash-orphaned work).
+let private appendStoredWith
+    (store: ISessionStore)
+    (sessionId: SessionId)
+    (text: string)
+    (delivery: DeliveryMode)
+    : InboxEntry =
+    let payload = UserMessagePayload(UserMessage.Text(text)) :> InboxPayload
+
+    store.AppendInboxMessage(tenant, sessionId, payload, delivery, CancellationToken.None).GetAwaiter().GetResult()
+
+/// Spawns a session actor observing settled results and folded Inject
+/// journal events into the probes. Settled observations arrive on the
+/// actor thread (serialised like the existing probe); journal
+/// observations arrive on the turn thread and are locked.
+let private spawnSessionFull
+    (system: ActorSystem)
+    (store: ISessionStore)
+    (sessionId: SessionId)
+    (runTurn: InboxEntry -> CancellationToken -> Task<TurnResult>)
+    (settled: ResizeArray<TurnResult>)
+    (journaled: ResizeArray<UserMessageEvent>)
+    : IActorRef =
+    let props: SessionActorProps =
+        {
+            Store = store
+            Tenant = tenant
+            SessionId = sessionId
+            RunTurn = runTurn
+            OnTurnSettled = Some settled.Add
+            OnInjectJournaled = Some(fun event -> lock journaled (fun () -> journaled.Add(event)))
+        }
+
+    spawn system $"test-{Guid.NewGuid():N}" (SessionActor.behavior props)
+
+/// Builds the Inject-aware production runner over the given client for one
+/// session, journaling folded Inject entries into the probe.
+let private injectRunner
+    (store: ISessionStore)
+    (sessionId: SessionId)
+    (client: IChatClient)
+    (tools: IReadOnlyDictionary<string, AITool>)
+    (journaled: ResizeArray<UserMessageEvent>)
+    : (InboxEntry -> CancellationToken -> Task<TurnResult>) =
+    let wiring: SessionActor.InjectFoldWiring =
+        {
+            Store = store
+            Tenant = tenant
+            SessionId = sessionId
+            JournalEvent = Some(fun event -> lock journaled (fun () -> journaled.Add(event)))
+        }
+
+    SessionActor.createInjectFoldRunner
+        client
+        tools
+        TurnLoop.TurnLoopOptions.Default
+        (TurnLoopTests.NeverDelay() :> ILlmDelay)
+        wiring
+
+/// The user texts carried by one provider call, in order.
+let private callUserTexts (messages: IEnumerable<ChatMessage>) : string list =
+    if isNull (box messages) then
+        []
+    else
+        [
+            for message in messages do
+                if not (isNull (box message)) && message.Role = ChatRole.User then
+                    if not (isNull (box message.Contents)) then
+                        for content in message.Contents do
+                            match content with
+                            | :? TextContent as text when not (isNull (box text)) ->
+                                yield (if isNull (box text.Text) then "" else text.Text)
+                            | _ -> ()
+        ]
+
+/// Scripted IChatClient that returns queued responses in order and records
+/// the user texts of every provider call, so Inject tests prove the folded
+/// message reached the model context. Streaming is unimplemented like
+/// TurnLoopTests.ScriptedChatClient: the loop falls back to a single delta.
+type RecordingChatClient(responses: ChatResponse list) =
+    let gate = obj ()
+    let mutable calls = 0
+    let seen = ResizeArray<string list>()
+
+    interface IChatClient with
+        member _.GetResponseAsync(messages, _, _) =
+            let index =
+                lock gate (fun () ->
+                    calls <- calls + 1
+                    seen.Add(callUserTexts messages)
+                    min (calls - 1) (responses.Length - 1))
+
+            Task.FromResult(responses[index])
+
+        member _.GetStreamingResponseAsync(_, _, _) = raise (NotImplementedException())
+
+        member _.GetService(_, _) = null
+        member _.Dispose() = ()
+
+    /// How many provider calls ran.
+    member _.Calls = lock gate (fun () -> calls)
+
+    /// The user texts of every provider call, in call order.
+    member _.Seen = lock gate (fun () -> seen |> List.ofSeq)
+
+/// An AIFunction that signals Started and then waits for its gate before
+/// answering, so the test can Inject while the tool runs. The gate always
+/// releases on the test thread: the waiting turn never needs cancellation.
+let private gatedTool
+    (name: string)
+    (result: string)
+    (started: TaskCompletionSource<unit>)
+    (gate: TaskCompletionSource<unit>)
+    (invocations: string list ref)
+    : AIFunction =
+    let method =
+        System.Func<Task<string>>(fun () ->
+            task {
+                started.TrySetResult() |> ignore
+                do! gate.Task
+                invocations.Value <- invocations.Value @ [ name ]
+                return result
+            })
+
+    AIFunctionFactory.Create(method, name, Unchecked.defaultof<string>, Unchecked.defaultof<JsonSerializerOptions>)
+
+/// An IChatClient whose first provider call blocks until its token fires
+/// (the pre-empted turn) and whose later calls answer with the given text.
+/// Streaming is unimplemented: the loop falls back to a single delta.
+type BlockingFirstClient(secondText: string) =
+    let gate = obj ()
+    let mutable calls = 0
+
+    interface IChatClient with
+        member _.GetResponseAsync(_, _, cancellationToken) =
+            task {
+                let call =
+                    lock gate (fun () ->
+                        calls <- calls + 1
+                        calls)
+
+                if call = 1 then
+                    do! Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken)
+                    return TurnLoopTests.textResponse "never"
+                else
+                    return TurnLoopTests.textResponse secondText
+            }
+
+        member _.GetStreamingResponseAsync(_, _, _) = raise (NotImplementedException())
+
+        member _.GetService(_, _) = null
+        member _.Dispose() = ()
+
+    /// How many provider calls ran.
+    member _.Calls = lock gate (fun () -> calls)
+
+/// The text carried by a journaled Inject event, joining its text parts.
+let private journaledText (event: UserMessageEvent) : string =
+    if
+        isNull (box event)
+        || isNull (box event.Message)
+        || isNull (box event.Message.Parts)
+    then
+        ""
+    else
+        event.Message.Parts
+        |> Seq.choose (fun part ->
+            match part with
+            | :? TextContent as text when not (isNull (box text)) ->
+                Some(if isNull (box text.Text) then "" else text.Text)
+            | _ -> None)
+        |> String.concat "\n"
+
+[<Fact>]
+let ``Inject while Running folds into history before the next provider call`` () =
+    use system = createSystem ()
+    let store = createStore ()
+    let created = createSession store
+    let started = new TaskCompletionSource<unit>()
+    let gate = new TaskCompletionSource<unit>()
+    let invocations = ref []
+
+    let first =
+        new ChatResponse(
+            ResizeArray<ChatMessage>(
+                [|
+                    TurnLoopTests.callMessage [ "c1", "lookup" ]
+                |]
+            )
+        )
+
+    let client =
+        new RecordingChatClient(
+            [
+                first
+                TurnLoopTests.textResponse "finished"
+            ]
+        )
+
+    let tools =
+        TurnLoopTests.makeTools
+            [
+                "lookup", gatedTool "lookup" "row-1" started gate invocations
+            ]
+
+    let settled = ResizeArray<TurnResult>()
+    let journaled = ResizeArray<UserMessageEvent>()
+    let entries = ResizeArray<InboxEntry>()
+    let inner = injectRunner store created.Id (client :> IChatClient) tools journaled
+
+    let runner entry cancellationToken =
+        task {
+            lock entries (fun () -> entries.Add(entry))
+            return! inner entry cancellationToken
+        }
+
+    let session = spawnSessionFull system store created.Id runner settled journaled
+
+    try
+        prompt store created.Id session "first" |> ignore
+
+        // The turn reaches the slow tool before anything is injected.
+        let atTool =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () -> started.Task.IsCompleted)
+
+        atTool |> should equal true
+
+        promptWithDelivery store created.Id session "steer-one" DeliveryMode.Inject
+        |> ignore
+
+        promptWithDelivery store created.Id session "steer-two" DeliveryMode.Inject
+        |> ignore
+
+        let queued =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () -> (pendingOf store created.Id).Count = 3)
+
+        queued |> should equal true
+
+        let beforeFold = DateTimeOffset.UtcNow
+        gate.TrySetResult() |> ignore
+
+        let drained =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () ->
+                settled.Count = 1 && (snapshotOf session).State = SessionState.Idle)
+
+        drained |> should equal true
+        let afterFold = DateTimeOffset.UtcNow
+
+        settled[0].Status |> should equal TurnStatus.Completed
+        settled[0].AssistantText |> should equal "finished"
+
+        // Two provider calls only: the fold never spends the iteration
+        // budget, and the second call sees both steers in position order
+        // after the tool result.
+        client.Calls |> should equal 2
+        client.Seen.Length |> should equal 2
+        client.Seen[0] |> should equal [ "first" ]
+        client.Seen[1] |> should equal [ "first"; "steer-one"; "steer-two" ]
+        invocations.Value |> should equal [ "lookup" ]
+
+        // Each folded entry journaled exactly once, under the running
+        // turn's id, with an empty sequence, a fold-time stamp, and the
+        // verbatim message.
+        let events = lock journaled (fun () -> journaled |> List.ofSeq)
+        events.Length |> should equal 2
+        events[0].SessionId |> should equal created.Id
+        events[1].SessionId |> should equal created.Id
+        events[0].TurnId.Value |> should equal events[1].TurnId.Value
+        String.IsNullOrEmpty(events[0].TurnId.Value) |> should equal false
+        events[0].Sequence.HasValue |> should equal false
+        events[1].Sequence.HasValue |> should equal false
+        events |> List.map journaledText |> should equal [ "steer-one"; "steer-two" ]
+
+        for event in events do
+            (event.Timestamp >= beforeFold && event.Timestamp <= afterFold)
+            |> should equal true
+
+        // One turn ran; the folded entries were consumed by the fold, so
+        // the settle starts no new turn.
+        entries.Count |> should equal 1
+        (pendingOf store created.Id).Count |> should equal 0
+    finally
+        stopSystem system
+
+[<Fact>]
+let ``Inject left pending past a would-complete turn starts a new turn at settle`` () =
+    use system = createSystem ()
+    let store = createStore ()
+    let created = createSession store
+    let runner = GatedRunner([ "first"; "late" ])
+    let session = spawnSession system store created.Id runner.Func
+
+    try
+        prompt store created.Id session "first" |> ignore
+
+        let running =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () -> (snapshotOf session).State = SessionState.Running)
+
+        running |> should equal true
+
+        // A scripted runner has no iteration boundary to fold at: the
+        // Inject waits, and the settle drain starts its new turn. The
+        // TurnLoop pending signal never crosses the runner boundary.
+        let injected =
+            promptWithDelivery store created.Id session "late-steer" DeliveryMode.Inject
+
+        injected.Delivery |> should equal DeliveryMode.Inject
+
+        runner.Release()
+
+        let drained =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () ->
+                runner.Calls = 2 && (snapshotOf session).State = SessionState.Idle)
+
+        drained |> should equal true
+
+        runner.Entries
+        |> Seq.map entryText
+        |> List.ofSeq
+        |> should equal [ "first"; "late-steer" ]
+
+        runner.Entries[1].Delivery |> should equal DeliveryMode.Inject
+        (pendingOf store created.Id).Count |> should equal 0
+    finally
+        stopSystem system
+
+[<Fact>]
+let ``Interrupt aborts the slow turn as Aborted and drains Interrupt-first with the inbox intact`` () =
+    use system = createSystem ()
+    let store = createStore ()
+    let created = createSession store
+    let client = new BlockingFirstClient("after interrupt")
+    let settled = ResizeArray<TurnResult>()
+    let journaled = ResizeArray<UserMessageEvent>()
+    let entries = ResizeArray<InboxEntry>()
+
+    let inner =
+        injectRunner store created.Id (client :> IChatClient) (TurnLoopTests.makeTools []) journaled
+
+    let runner entry cancellationToken =
+        task {
+            lock entries (fun () -> entries.Add(entry))
+            return! inner entry cancellationToken
+        }
+
+    let session = spawnSessionFull system store created.Id runner settled journaled
+
+    try
+        prompt store created.Id session "first" |> ignore
+
+        let running =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () ->
+                client.Calls = 1 && (snapshotOf session).State = SessionState.Running)
+
+        running |> should equal true
+
+        // Queued before the interrupt: survives the abort and drains after it.
+        prompt store created.Id session "second" |> ignore
+
+        promptWithDelivery store created.Id session "stop that" DeliveryMode.Interrupt
+        |> ignore
+
+        let drained =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () ->
+                settled.Count = 3 && (snapshotOf session).State = SessionState.Idle)
+
+        drained |> should equal true
+
+        // The pre-empted turn settles once under the winning cause, then
+        // the Interrupt entry drains first with the queued entry intact
+        // behind it.
+        settled[0].Status |> should equal TurnStatus.Aborted
+
+        match settled[0].Outcome with
+        | :? TurnAborted as aborted ->
+            aborted.Cause |> should equal StopCause.ExplicitAbort
+            aborted.Reason |> should equal SessionActor.InterruptReason
+        | _ -> failwith "Expected a TurnAborted outcome."
+
+        settled[1].Status |> should equal TurnStatus.Completed
+        settled[1].AssistantText |> should equal "after interrupt"
+        settled[2].Status |> should equal TurnStatus.Completed
+        settled[2].AssistantText |> should equal "after interrupt"
+
+        lock entries (fun () -> entries |> Seq.map entryText |> List.ofSeq)
+        |> should equal [ "first"; "stop that"; "second" ]
+
+        client.Calls |> should equal 3
+        (pendingOf store created.Id).Count |> should equal 0
+    finally
+        stopSystem system
+
+[<Fact>]
+let ``Interrupt while Idle starts a turn normally`` () =
+    use system = createSystem ()
+    let store = createStore ()
+    let created = createSession store
+    let runner = ScriptedRunner([ "stopped" ])
+    let session = spawnSession system store created.Id runner.Func
+
+    try
+        let entry =
+            promptWithDelivery store created.Id session "stop" DeliveryMode.Interrupt
+
+        entry.Delivery |> should equal DeliveryMode.Interrupt
+
+        let drained =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () ->
+                runner.Calls = 1 && (snapshotOf session).State = SessionState.Idle)
+
+        drained |> should equal true
+        runner.Entries[0].Position |> should equal entry.Position
+        entryText runner.Entries[0] |> should equal "stop"
+        (pendingOf store created.Id).Count |> should equal 0
+    finally
+        stopSystem system
+
+[<Fact>]
+let ``Inject and Interrupt while WaitingForInput append and wait`` () =
+    use system = createSystem ()
+    let store = createStore ()
+    let created = createSession store
+
+    store
+        .UpdateSessionState(tenant, created.Id, SessionState.WaitingForInput, CancellationToken.None)
+        .GetAwaiter()
+        .GetResult()
+    |> ignore
+
+    let runner = ScriptedRunner([ "waiting" ])
+    let session = spawnSession system store created.Id runner.Func
+
+    try
+        (snapshotOf session).State |> should equal SessionState.WaitingForInput
+
+        promptWithDelivery store created.Id session "steer" DeliveryMode.Inject
+        |> ignore
+
+        promptWithDelivery store created.Id session "stop" DeliveryMode.Interrupt
+        |> ignore
+
+        (snapshotOf session).State |> should equal SessionState.WaitingForInput
+        (pendingOf store created.Id).Count |> should equal 2
+
+        let quiet =
+            Task.WhenAny(Task.Delay(TimeSpan.FromMilliseconds 500.0))
+            |> fun delay -> delay.GetAwaiter().GetResult()
+
+        quiet |> ignore
+        runner.Calls |> should equal 0
+    finally
+        stopSystem system
+
+[<Fact>]
+let ``Settle drains Interrupt first then Queue-plus-Inject in position order, Reply never`` () =
+    use system = createSystem ()
+    let store = createStore ()
+    let created = createSession store
+
+    // Orphaned inbox in tier-shuffling position order: the Queue entry is
+    // oldest, the Interrupt newest, and a Reply entry must never drain.
+    ignore (appendStoredWith store created.Id "queued" DeliveryMode.Queue)
+    ignore (appendStoredWith store created.Id "steered" DeliveryMode.Inject)
+    let interrupt = appendStoredWith store created.Id "stopped" DeliveryMode.Interrupt
+
+    let replyPayload =
+        ReplyPayload(PermissionDecision("req-1", PermissionDecisionKind.AllowOnce)) :> InboxPayload
+
+    let replyEntry =
+        store
+            .AppendInboxMessage(tenant, created.Id, replyPayload, DeliveryMode.Queue, CancellationToken.None)
+            .GetAwaiter()
+            .GetResult()
+
+    let runner = ScriptedRunner([ "one"; "two"; "three"; "four" ])
+    let session = spawnSession system store created.Id runner.Func
+
+    try
+        (snapshotOf session).State |> should equal SessionState.Idle
+        (snapshotOf session).PendingCount |> should equal 4
+
+        prompt store created.Id session "trigger" |> ignore
+
+        let drained =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () ->
+                runner.Calls = 4 && (snapshotOf session).State = SessionState.Idle)
+
+        drained |> should equal true
+
+        // Interrupt tier first in position order, then Queue-plus-Inject
+        // in position order; the Reply entry never starts a turn.
+        runner.Entries
+        |> Seq.map entryText
+        |> List.ofSeq
+        |> should
+            equal
+            [
+                "stopped"
+                "queued"
+                "steered"
+                "trigger"
+            ]
+
+        runner.Entries[0].Position |> should equal interrupt.Position
+
+        let pending = pendingOf store created.Id
+        pending.Count |> should equal 1
+        pending[0].Position |> should equal replyEntry.Position
+
+        match pending[0].Payload with
+        | :? ReplyPayload -> ()
+        | _ -> failwith "Expected the remaining pending entry to be the Reply."
+    finally
+        stopSystem system
+
+// ──────────────────────────────────────────────────────────────────────────
+// Fold projection for folded Inject messages (issue 34)
+
+[<Fact>]
+let ``Fold derives one User cell per matching-turn UserMessageEvent`` () =
+    let sessionId = SessionId.New()
+    let turnId = TurnId.New()
+    let eventStamp = DateTimeOffset(2024, 5, 6, 7, 8, 9, TimeSpan.Zero)
+    let noSequence = Unchecked.defaultof<Nullable<int64>>
+
+    let metadata = Dictionary<string, string>()
+    metadata["source"] <- "inject"
+
+    let parts =
+        ResizeArray<AIContent>(
+            [|
+                TextContent("first") :> AIContent
+                TextContent("second") :> AIContent
+            |]
+        )
+        :> IReadOnlyList<AIContent>
+
+    let injected =
+        UserMessageEvent(sessionId, turnId, noSequence, eventStamp, UserMessage(parts, metadata))
+
+    let cells =
+        SessionCellDeriver.Fold(sessionId, turnId, null, eventStamp, [ injected :> SessionEvent ])
+
+    cells.Count |> should equal 1
+    cells[0].Kind |> should equal SessionCellKind.User
+    cells[0].Content |> should equal "first\nsecond"
+    cells[0].Iteration |> should equal 0
+    cells[0].Timestamp |> should equal eventStamp
+    cells[0].IsError |> should equal false
+    cells[0].SessionId |> should equal sessionId
+    cells[0].TurnId |> should equal turnId
+    cells[0].ToolName |> should equal null
+    cells[0].ToolCallId |> should equal null
+    cells[0].Artifacts |> should equal null
+
+    match cells[0].Metadata with
+    | null -> failwith "injected message metadata was lost"
+    | meta -> meta["source"] |> should equal "inject"
+
+[<Fact>]
+let ``Fold ignores UserMessageEvents from other turns`` () =
+    let sessionId = SessionId.New()
+    let turnId = TurnId.New()
+    let eventStamp = DateTimeOffset(2024, 5, 6, 7, 8, 9, TimeSpan.Zero)
+    let noSequence = Unchecked.defaultof<Nullable<int64>>
+
+    let foreign =
+        UserMessageEvent(sessionId, TurnId.New(), noSequence, eventStamp, UserMessage.Text "other")
+
+    let cells =
+        SessionCellDeriver.Fold(sessionId, turnId, null, eventStamp, [ foreign :> SessionEvent ])
+
+    cells.Count |> should equal 0
+
+[<Fact>]
+let ``Fold orders the initial user cell before the injected one`` () =
+    let sessionId = SessionId.New()
+    let turnId = TurnId.New()
+    let eventStamp = DateTimeOffset(2024, 5, 6, 7, 8, 9, TimeSpan.Zero)
+    let noSequence = Unchecked.defaultof<Nullable<int64>>
+
+    let injected =
+        UserMessageEvent(sessionId, turnId, noSequence, eventStamp, UserMessage.Text "steer")
+
+    let cells =
+        SessionCellDeriver.Fold(sessionId, turnId, UserMessage.Text "hello", eventStamp, [ injected :> SessionEvent ])
+
+    cells.Count |> should equal 2
+    cells[0].Content |> should equal "hello"
+    cells[1].Content |> should equal "steer"
+    cells[1].Kind |> should equal SessionCellKind.User
+    cells[1].Iteration |> should equal 0

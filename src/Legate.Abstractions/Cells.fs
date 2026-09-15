@@ -43,7 +43,7 @@ type SessionCellKind =
 /// user message and ordered events by <see cref="T:Legate.SessionCellDeriver" />,
 /// which documents and pins the rules this section states:
 /// <list type="table">
-/// <item><term>User</term><description>one cell per journaled user message; content joins its TextContent parts with newlines, metadata carries the message's host metadata, iteration 0, timestamp the message's journaled timestamp.</description></item>
+/// <item><term>User</term><description>one cell per journaled user message: the turn's initial message, plus one per matching-turn UserMessageEvent (a folded Inject message); content joins its TextContent parts with newlines, metadata carries the message's host metadata, iteration 0, timestamp the message's journaled timestamp.</description></item>
 /// <item><term>Assistant</term><description>one cell per contiguous run of TextDeltaEvents; content concatenates the deltas; timestamp is the first delta's. Reasoning deltas are transient and produce no cell.</description></item>
 /// <item><term>ToolCall</term><description>one cell per ToolCallStartedEvent, emitted immediately so hosts render the call while it runs; toolName and toolCallId set; content is empty because arguments are journaled, never streamed.</description></item>
 /// <item><term>ToolResult</term><description>one cell per ToolCallCompletedEvent: content is the call's accumulated ToolCallOutputEvent fragments, or the error reason when the call failed with no output; isError mirrors the completion event's error. A call started but never completed yields no result cell (abort case).</description></item>
@@ -354,6 +354,50 @@ type SessionCellDeriver() =
         for event in events do
             if event.TurnId = turnId then
                 match event with
+                | :? UserMessageEvent as injected when not (isNull (box injected)) ->
+                    // Rule 1b: each injected user message folded into this
+                    // turn derives one User cell, iteration 0 with the
+                    // message's host metadata and the event's timestamp,
+                    // exactly like the initial user cell. Text parts join
+                    // with newlines; a message with no text parts derives
+                    // empty content. Flushes any open assistant run first so
+                    // the cell lands in journaled order.
+                    flushRun ()
+
+                    let builder = Text.StringBuilder()
+                    let mutable parts = 0
+
+                    let injectedMessage = injected.Message
+
+                    if not (isNull (box injectedMessage)) && not (isNull (box injectedMessage.Parts)) then
+                        for part in injectedMessage.Parts do
+                            match part with
+                            | :? TextContent as text when not (isNull (box text)) ->
+                                if parts > 0 then
+                                    builder.Append '\n' |> ignore
+
+                                builder.Append(text.Text) |> ignore
+                                parts <- parts + 1
+                            | _ -> ()
+
+                    let injectedMetadata =
+                        if isNull (box injectedMessage) then
+                            None
+                        else
+                            match injectedMessage.Metadata with
+                            | null -> None
+                            | value -> Some value
+
+                    addCell
+                        SessionCellKind.User
+                        (builder.ToString())
+                        null
+                        null
+                        false
+                        0
+                        injectedMetadata
+                        injected.Timestamp
+
                 | :? TextDeltaEvent as delta ->
                     // Rule 2: a contiguous text-delta run folds into one
                     // assistant cell, stamped with the first delta's

@@ -46,6 +46,7 @@ open System.Text.Json.Serialization
 /// <item><term>turnAborted</term><description>the turn stopped with its stop cause (abort or host shutdown).</description></item>
 /// <item><term>turnFailed</term><description>the turn failed inside the loop.</description></item>
 /// <item><term>sessionClosed</term><description>the session closed.</description></item>
+/// <item><term>userMessage</term><description>an injected user message was folded into the running turn.</description></item>
 /// </list>
 /// Every subtype is named <c>&lt;Kind&gt;Event</c> so no kind name collides
 /// with an existing Legate type (for example <see cref="T:Legate.TurnFailed" />
@@ -68,6 +69,7 @@ open System.Text.Json.Serialization
 [<JsonDerivedType(typeof<TurnAbortedEvent>, "turnAborted")>]
 [<JsonDerivedType(typeof<TurnFailedEvent>, "turnFailed")>]
 [<JsonDerivedType(typeof<SessionClosedEvent>, "sessionClosed")>]
+[<JsonDerivedType(typeof<UserMessageEvent>, "userMessage")>]
 type SessionEvent(sessionId: SessionId, turnId: TurnId, sequence: Nullable<int64>, timestamp: DateTimeOffset) =
 
     /// The session the event belongs to. Sequence numbers are per-session,
@@ -418,3 +420,24 @@ and [<Sealed>] TurnFailedEvent
 and [<Sealed>] SessionClosedEvent
     (sessionId: SessionId, turnId: TurnId, sequence: Nullable<int64>, timestamp: DateTimeOffset) =
     inherit SessionEvent(sessionId, turnId, sequence, timestamp)
+
+/// An injected user message was folded into the running turn at an
+/// iteration boundary (issue 34): the session actor journals one of these
+/// per folded Inject entry through its journal callback, carrying the
+/// running (injecting) turn's id. The transcript fold derives one User
+/// cell per matching-turn event.
+/// <param name="sessionId">The session the event belongs to.</param>
+/// <param name="turnId">The running turn the message was folded into.</param>
+/// <param name="sequence">The event's per-session sequence number, or empty while in flight.</param>
+/// <param name="timestamp">When the message was folded.</param>
+/// <param name="message">The injected user message, verbatim. Must not be null.</param>
+and [<Sealed>] UserMessageEvent
+    (sessionId: SessionId, turnId: TurnId, sequence: Nullable<int64>, timestamp: DateTimeOffset, message: UserMessage) =
+    inherit SessionEvent(sessionId, turnId, sequence, timestamp)
+
+    do
+        if box message |> isNull then
+            raise (ArgumentNullException(nameof message))
+
+    /// The injected user message, verbatim.
+    member _.Message = message
