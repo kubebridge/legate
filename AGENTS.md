@@ -43,7 +43,8 @@ published to NuGet yet. `Docs/ARCHITECTURE.md` is the normative target.
   `Microsoft.Extensions.AI.Abstractions`, and `Ulid`; never on Akka.
 - **`src/Legate/`**: the runtime (actors, dispatcher, ReAct loop, built-in
   tools, LLM coordinator, hosted services, `AddLegate`). References
-  `Legate.Abstractions`. Grants `InternalsVisibleTo` to `Legate.Tests` only.
+  `Legate.Abstractions`. Grants `InternalsVisibleTo` to `Legate.Tests` and
+  `Legate.Testing`.
 - **`tests/Legate.Tests/`**: xUnit + FsUnit.xUnit suite covering both
   projects. One `<Name>Tests.fs` module per source module.
 - **Future packages** (`Legate.Llm.*`, `Legate.Storage.*`,

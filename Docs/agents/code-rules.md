@@ -37,7 +37,7 @@ so the public boundary follows these rules; internal code stays idiomatic F#.
   properties and defaults.
 - Interfaces meant for hosts to implement stay small and use only BCL types.
 - Everything outside the contract is `internal`; `InternalsVisibleTo` is
-  granted to `Legate.Tests` only.
+  granted to `Legate.Tests` and `Legate.Testing` only.
 - Every public type and member has an XML doc comment (the build emits
   documentation files and warnings are errors).
 - Do not expose `FSharp.Core` types from `Legate.Abstractions`.
