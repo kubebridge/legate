@@ -86,6 +86,11 @@ type SessionOptions() =
     /// <see cref="T:Legate.IPermissionPolicy" />.
     member val Permissions: IPermissionPolicy | null = null with get, set
 
+    /// The ask_user headless policy the session's questions are answered
+    /// against, or null to use the runtime default from configuration.
+    /// The policy contract is <see cref="T:Legate.AskUserOptions" />.
+    member val AskUser: AskUserOptions | null = null with get, set
+
     /// The sink notified when a headless session completes, or null when
     /// the host observes completion another way. The sink contract is
     /// <see cref="T:Legate.ISessionCompletionSink" />.

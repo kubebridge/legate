@@ -259,18 +259,41 @@ let ``Unknown permission decision fails with the section path`` () =
     ex.Message.Contains("unknown permission decision") |> should equal true
 
 [<Fact>]
-let ``Unknown crash resume fails with the section path`` () =
-    let section =
-        buildSection
-            [
-                "Legate:Turns:CrashResume", "Someday"
-            ]
+let ``Unknown ask-user mode fails with the section path`` () =
+    let section = buildSection [ "Legate:AskUser:Mode", "Sometimes" ]
 
     let ex =
         Assert.Throws<InvalidOperationException>(fun () -> LegateOptionsBinding.bind section |> ignore)
 
-    ex.Message.Contains("Legate:Turns:CrashResume") |> should equal true
-    ex.Message.Contains("unknown crash resume") |> should equal true
+    ex.Message.Contains("Legate:AskUser:Mode") |> should equal true
+    ex.Message.Contains("unknown ask-user mode") |> should equal true
+
+[<Fact>]
+let ``Binds the ask-user section with the canned answer`` () =
+    let section =
+        buildSection
+            [
+                "Legate:AskUser:Mode", "AnswerWith"
+                "Legate:AskUser:CannedAnswer", "canned-42"
+            ]
+
+    let options = LegateOptionsBinding.bind section
+
+    options.AskUser.Mode |> should equal AskUserMode.AnswerWith
+    options.AskUser.CannedAnswer |> should equal "canned-42"
+    options.Validate() |> should equal null
+
+[<Fact>]
+let ``AnswerWith without a canned answer fails validation`` () =
+    let section = buildSection [ "Legate:AskUser:Mode", "AnswerWith" ]
+
+    let ex =
+        Assert.Throws<InvalidOperationException>(fun () -> LegateOptionsBinding.bind section |> ignore)
+
+    ex.Message.Contains("AskUser") |> should equal true
+
+    ex.Message.Contains("CannedAnswer must be a non-empty string when Mode is AnswerWith.")
+    |> should equal true
 
 [<Fact>]
 let ``Binding then validating composes across nested sections`` () =

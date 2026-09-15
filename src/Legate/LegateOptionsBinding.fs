@@ -48,6 +48,7 @@ module internal LegateOptionsBinding =
             ]
             "Cluster:Mode", typeof<ClusterMode>, "cluster mode", [ "Local"; "Clustered" ]
             "Workspace:Mode", typeof<WorkspaceMode>, "workspace mode", [ "Process"; "HostDirectory"; "Docker" ]
+            "AskUser:Mode", typeof<AskUserMode>, "ask-user mode", [ "Fail"; "AnswerWith" ]
         ]
 
     // Parses a duration from the whitelisted forms (500ms, 30s, 15m, 1h,

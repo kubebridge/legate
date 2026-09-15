@@ -122,6 +122,7 @@ let ``SessionOptions defaults to an interactive session`` () =
     options.Outcome |> should equal SessionOutcomeMode.None
     options.Permissions |> should equal null
     options.CompletionSink |> should equal null
+    options.AskUser |> should equal null
     options.MaxIterations |> should equal 0
     options.Timeout.HasValue |> should equal false
     options.Metadata |> should equal null

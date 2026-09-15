@@ -225,6 +225,50 @@ type PermissionsOptions() =
 
             violation
 
+/// What a session does when the model asks the host a question through
+/// ask_user but no host can answer (a headless run). Bound from
+/// configuration; unknown values fail binding.
+type AskUserMode =
+
+    /// The turn fails fast instead of hallucinating user input. The
+    /// default: a question with no host to answer it is a turn failure,
+    /// never a silent empty answer.
+    | Fail = 0
+
+    /// The turn continues with the configured canned answer as the
+    /// question's tool result, without suspending.
+    | AnswerWith = 1
+
+/// The ask_user headless policy: what a session does with a question no
+/// host can answer. Bound from the <c>Legate</c> configuration section;
+/// mutable so hosts can set properties before registering. Defaults fail
+/// the turn fast.
+type AskUserOptions() =
+
+    /// What a session does with an unanswerable question. Default
+    /// <see cref="F:Legate.AskUserMode.Fail" />.
+    member val Mode: AskUserMode = AskUserMode.Fail with get, set
+
+    /// The answer an <c>AnswerWith</c> turn continues with, verbatim. Must
+    /// be a non-empty string when the mode is
+    /// <see cref="F:Legate.AskUserMode.AnswerWith" />; ignored otherwise.
+    /// Default null.
+    member val CannedAnswer: string | null = null with get, set
+
+    /// Returns null when every knob is in range, otherwise a message for the
+    /// first violation.
+    /// <returns>The first violation's message, or null when the settings are valid.</returns>
+    member this.Validate() : string | null =
+        if not (Enum.IsDefined(typeof<AskUserMode>, this.Mode)) then
+            "Mode has an unknown ask-user mode."
+        elif
+            this.Mode = AskUserMode.AnswerWith
+            && String.IsNullOrWhiteSpace this.CannedAnswer
+        then
+            "CannedAnswer must be a non-empty string when Mode is AnswerWith."
+        else
+            null
+
 /// LLM settings: the default model, the compaction model, the coordinator
 /// knobs, the per-provider settings keyed by provider id, and whether the
 /// coordinator uses distributed admission. Bound from the <c>Legate</c>
@@ -494,6 +538,9 @@ type LegateOptions() =
     /// Headless completion delivery. Never null.
     member val Completion: CompletionOptions = CompletionOptions() with get, set
 
+    /// The ask_user headless policy. Never null.
+    member val AskUser: AskUserOptions = AskUserOptions() with get, set
+
     /// Cluster settings. Never null.
     member val Cluster: ClusterOptions = ClusterOptions() with get, set
 
@@ -516,6 +563,8 @@ type LegateOptions() =
             "Workspace must not be null."
         elif isNull (box this.Completion) then
             "Completion must not be null."
+        elif isNull (box this.AskUser) then
+            "AskUser must not be null."
         elif isNull (box this.Cluster) then
             "Cluster must not be null."
         elif isNull (box this.Pruning) then
@@ -529,6 +578,7 @@ type LegateOptions() =
                     "Llm", (fun () -> this.Llm.Validate())
                     "Workspace", (fun () -> this.Workspace.Validate())
                     "Completion", (fun () -> this.Completion.Validate())
+                    "AskUser", (fun () -> this.AskUser.Validate())
                     "Cluster", (fun () -> this.Cluster.Validate())
                     "Pruning", (fun () -> this.Pruning.Validate())
                 ]

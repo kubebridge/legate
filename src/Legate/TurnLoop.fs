@@ -5,6 +5,7 @@ namespace Legate
 
 open System
 open System.Collections.Generic
+open System.Text.Json
 open System.Threading
 open System.Threading.Tasks
 open Microsoft.Extensions.AI
@@ -76,6 +77,9 @@ module internal TurnLoop =
     /// Compaction carries issue 45's per-iteration-boundary hook: Some runs
     /// one compaction pass after the lease and budget checks and before the
     /// provider call, None compacts nothing.
+    /// AskUser carries the ask_user headless policy (issue 64): None
+    /// suspends for a host answer (interactive), Some Fail fails the turn
+    /// fast, Some AnswerWith continues with the canned answer.
     type TurnLoopOptions =
         {
             /// Maximum tool-result chars before truncation with <see cref="TruncationMarker" />.
@@ -89,6 +93,9 @@ module internal TurnLoop =
             /// The per-iteration-boundary compaction hook, or None for no
             /// compaction.
             Compaction: CompactionHook option
+            /// The ask_user headless policy, or None to suspend for a host
+            /// answer.
+            AskUser: AskUserOptions option
         }
 
         /// Default tuning: 4000 chars before truncation with the iteration
@@ -102,6 +109,7 @@ module internal TurnLoop =
                 Timeout = TurnsOptions().DefaultTimeout
                 VerifyClaim = None
                 Compaction = None
+                AskUser = None
             }
 
     /// Resolves the effective per-turn budget: the session's explicit knobs
@@ -213,6 +221,9 @@ module internal TurnLoop =
             Kind: SuspensionKind
             /// The question the agent asked, or empty for permission suspensions.
             QuestionText: string
+            /// The options hint the ask_user call carried, or empty for
+            /// free-text questions and permission suspensions.
+            QuestionOptions: string list
             /// The history up to the suspend point, copied at suspend time.
             HistorySnapshot: IList<ChatMessage>
             /// Input tokens spent up to the suspend point.
@@ -766,6 +777,21 @@ module internal TurnLoop =
     [<Literal>]
     let AskUserToolName = "ask_user"
 
+    /// Reason carried by <see cref="T:Legate.TurnFailed" /> when the turn
+    /// calls ask_user under a Fail headless policy: the question has no
+    /// host to answer it. Never contains the question or the options hint.
+    [<Literal>]
+    let AskUserHeadlessFailMessage =
+        "The turn called ask_user, but this session cannot answer questions."
+
+    /// Reason carried by <see cref="T:Legate.TurnFailed" /> when the turn
+    /// calls ask_user under an AnswerWith headless policy whose canned
+    /// answer is missing: configuration promised an answer it did not
+    /// carry. Never contains the question or the options hint.
+    [<Literal>]
+    let AskUserCannedMissingMessage =
+        "The turn called ask_user, but the session's canned answer is missing."
+
     /// Prefix for the tool result appended when a permission policy denies
     /// a call: the model sees the denial and continues without the effect.
     [<Literal>]
@@ -826,6 +852,42 @@ module internal TurnLoop =
             else
                 ""
 
+    /// Extracts the options hint from an ask_user call: the "options"
+    /// string-array argument when present, otherwise empty (free text).
+    /// JSON string arrays and string enumerables become the hint; a lone
+    /// string violates the array schema and degrades to free text, and
+    /// non-string elements are skipped. Never includes tool arguments
+    /// beyond the hint itself.
+    /// <param name="call">The ask_user call.</param>
+    /// <returns>The hint, or empty when the call carries no usable hint.</returns>
+    let private extractOptions (call: FunctionCallContent) : string list =
+        if isNull (box call) || isNull (box call.Arguments) then
+            []
+        else
+            let mutable value: obj = null
+
+            if call.Arguments.TryGetValue("options", &value) && not (isNull (box value)) then
+                match value with
+                | :? JsonElement as element when element.ValueKind = JsonValueKind.Array ->
+                    [
+                        for item in element.EnumerateArray() do
+                            if item.ValueKind = JsonValueKind.String then
+                                match item.GetString() with
+                                | null -> ()
+                                | text -> yield text
+                    ]
+                | :? string -> []
+                | :? System.Collections.IEnumerable as items ->
+                    [
+                        for item in items do
+                            match item with
+                            | :? string as text when not (isNull text) -> yield text
+                            | _ -> ()
+                    ]
+                | _ -> []
+            else
+                []
+
     /// Builds the Suspended completion for one pending request: Result
     /// carries TurnStatus.Suspended with empty text, HasPendingInjects is
     /// false (a suspended turn never starts the new-turn signal), and
@@ -869,7 +931,9 @@ module internal TurnLoop =
     /// host already allowed for the session executes without calling the
     /// policy again, so a policy stays free to keep returning Ask. The
     /// ask_user tool bypasses the policy and suspends as a question with
-    /// the same carrier. The caller (SessionActor) journals the matching
+    /// the same carrier, unless TurnLoopOptions carries the headless
+    /// policy: Fail fails the turn fast and AnswerWith continues with the
+    /// canned answer, neither suspending. The caller (SessionActor) journals the matching
     /// PermissionRequestedEvent or QuestionAskedEvent and owns the
     /// store-first WaitingForInput transition; the loop only parks the
     /// cursor. Reply-never-starts-a-turn: a suspension never starts work.
@@ -1005,6 +1069,7 @@ module internal TurnLoop =
             (toolName: string)
             (kind: SuspensionKind)
             (questionText: string)
+            (questionOptions: string list)
             (iterations: int)
             (inputTokens: int64)
             (outputTokens: int64)
@@ -1018,6 +1083,7 @@ module internal TurnLoop =
                     ToolCallId = call.CallId
                     Kind = kind
                     QuestionText = questionText
+                    QuestionOptions = questionOptions
                     HistorySnapshot = snapshotHistory history
                     InputTokens = inputTokens
                     OutputTokens = outputTokens
@@ -1057,18 +1123,51 @@ module internal TurnLoop =
 
                         if String.Equals(toolName, AskUserToolName, StringComparison.Ordinal) then
                             let question = extractQuestion call
+                            let hint = extractOptions call
 
-                            return
-                                Some(
-                                    suspendFor
-                                        call
-                                        toolName
-                                        QuestionSuspension
-                                        question
-                                        roundIterations
-                                        roundInput
-                                        roundOutput
-                                )
+                            // Headless policy (issue 64): None suspends for
+                            // a host answer; AnswerWith continues with the
+                            // canned answer as the tool result; anything
+                            // else (Fail, or an unknown mode) fails closed
+                            // fast instead of hallucinating user input. The
+                            // failure reasons never carry the question.
+                            match options.AskUser with
+                            | None ->
+                                return
+                                    Some(
+                                        suspendFor
+                                            call
+                                            toolName
+                                            QuestionSuspension
+                                            question
+                                            hint
+                                            roundIterations
+                                            roundInput
+                                            roundOutput
+                                    )
+                            | Some ask when ask.Mode = AskUserMode.AnswerWith ->
+                                match Option.ofObj ask.CannedAnswer with
+                                | Some canned when not (String.IsNullOrWhiteSpace canned) ->
+                                    appendToolResult history call.CallId canned
+                                    return! runTools roundIterations roundInput roundOutput rest
+                                | _ ->
+                                    return
+                                        Some(
+                                            failedCompletion
+                                                roundIterations
+                                                roundInput
+                                                roundOutput
+                                                AskUserCannedMissingMessage
+                                        )
+                            | Some _ ->
+                                return
+                                    Some(
+                                        failedCompletion
+                                            roundIterations
+                                            roundInput
+                                            roundOutput
+                                            AskUserHeadlessFailMessage
+                                    )
                         else
                             let remembered = allowed.Contains(toolName)
 
@@ -1107,6 +1206,7 @@ module internal TurnLoop =
                                             ToolCallId = call.CallId
                                             Kind = PermissionSuspension
                                             QuestionText = ""
+                                            QuestionOptions = []
                                             HistorySnapshot = snapshotHistory history
                                             InputTokens = roundInput
                                             OutputTokens = roundOutput

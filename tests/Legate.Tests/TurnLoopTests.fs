@@ -1557,13 +1557,125 @@ let ``Resume with Deny skips the parked call`` () =
 
     suspended.Suspension.IsSome |> should equal true
 
+/// One scripted ask_user question step with an options hint: the
+/// question and options arguments flow into the suspension.
+let private questionStepWithOptions (callId: string) (question: string) (options: string list) : ScriptStep =
+    let args = Dictionary<string, obj>()
+    args["question"] <- question :> obj
+    args["options"] <- Array.ofList options :> obj
+
+    ScriptStep.ToolCall(callId, TurnLoop.AskUserToolName, args)
+
+/// Runs the suspendable loop with the given ask_user headless policy:
+/// None suspends for a host answer, Some answers headlessly.
+let private runSuspendableWith
+    (askUser: AskUserOptions option)
+    (client: ScriptedChatClient)
+    (history: IList<ChatMessage>)
+    (tools: IReadOnlyDictionary<string, AITool>)
+    (policy: IPermissionPolicy)
+    (newRequestId: unit -> string)
+    (allowed: HashSet<string>)
+    : TurnLoop.TurnLoopCompletion =
+    let options =
+        { TurnLoop.TurnLoopOptions.Default with
+            AskUser = askUser
+        }
+
+    TurnLoop.runSuspendableAsync
+        (client :> IChatClient)
+        history
+        tools
+        options
+        (NeverDelay() :> ILlmDelay)
+        CancellationToken.None
+        alwaysLeased
+        (fun () -> ResizeArray<InboxEntry>() :> IReadOnlyList<InboxEntry>)
+        ignore
+        ignore
+        policy
+        (SessionId.New())
+        (TurnId.New())
+        (Some newRequestId)
+        allowed
+    |> fun task -> task.GetAwaiter().GetResult()
+
+/// Reads the failure reason off a Failed turn result.
+let private failedReason (result: TurnResult) : string =
+    match result.Outcome with
+    | :? TurnFailed as failed when not (isNull (box failed)) -> failed.Reason
+    | _ -> raise (InvalidOperationException("The turn result is not a TurnFailed outcome."))
+
+[<Fact>]
+let ``ask_user carries the options hint with a stable id`` () =
+    let client =
+        scripted
+            [
+                questionStepWithOptions "q1" "Which region?" [ "east"; "west" ]
+                textStep "never"
+            ]
+
+    let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+    let policy = ScriptPolicy(Map.empty) :> IPermissionPolicy
+
+    let completion =
+        runSuspendable client history (makeTools []) policy (suspendIds ()) (HashSet<string>())
+
+    completion.Result.Status |> should equal TurnStatus.Suspended
+
+    let suspension = completion.Suspension.Value
+    suspension.RequestId |> should equal "req-1"
+    suspension.Kind |> should equal TurnLoop.QuestionSuspension
+    suspension.ToolName |> should equal TurnLoop.AskUserToolName
+    suspension.ToolCallId |> should equal "q1"
+    suspension.QuestionText |> should equal "Which region?"
+    suspension.QuestionOptions |> should equal [ "east"; "west" ]
+
+[<Fact>]
+let ``A question without options suspends as free text`` () =
+    let client =
+        scripted
+            [
+                questionStep "q1" "Which region?"
+                textStep "never"
+            ]
+
+    let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+    let policy = ScriptPolicy(Map.empty) :> IPermissionPolicy
+
+    let completion =
+        runSuspendable client history (makeTools []) policy (suspendIds ()) (HashSet<string>())
+
+    completion.Result.Status |> should equal TurnStatus.Suspended
+    completion.Suspension.Value.QuestionOptions |> List.isEmpty |> should equal true
+
+[<Fact>]
+let ``A matching QuestionAnswer resumes with the answer as the tool result`` () =
+    let client =
+        scripted
+            [
+                questionStepWithOptions "q1" "Which region?" [ "east"; "west" ]
+                textStep "done"
+            ]
+
+    let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+    let policy = ScriptPolicy(Map.empty) :> IPermissionPolicy
+    let allowed = HashSet<string>()
+
+    let suspended =
+        runSuspendable client history (makeTools []) policy (suspendIds ()) allowed
+
+    suspended.Suspension.IsSome |> should equal true
+
+    let answer = QuestionAnswer(suspended.Suspension.Value.RequestId, "east")
+
     let resumed =
-        TurnLoop.resumePermissionAsync
+        TurnLoop.resumeQuestionAsync
             suspended.Suspension.Value
-            PermissionDecisionKind.Deny
+            answer.Answer
             (client :> IChatClient)
             history
-            (makeTools [ "exec", fn ])
+            (makeTools [])
             TurnLoop.TurnLoopOptions.Default
             (NeverDelay() :> ILlmDelay)
             CancellationToken.None
@@ -1573,4 +1685,90 @@ let ``Resume with Deny skips the parked call`` () =
         |> fun task -> task.GetAwaiter().GetResult()
 
     resumed.Result.Status |> should equal TurnStatus.Completed
-    invocations.Value.Length |> should equal 0
+    resumed.Result.AssistantText |> should equal "done"
+    resumed.Suspension.IsNone |> should equal true
+
+    let results = toolMessages history |> List.map toolResultText
+    results |> should equal [ "east" ]
+
+[<Fact>]
+let ``Fail headless policy fails the turn fast without suspending`` () =
+    let client =
+        scripted
+            [
+                questionStep "q1" "Which region?"
+                textStep "never"
+            ]
+
+    let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+    let policy = ScriptPolicy(Map.empty) :> IPermissionPolicy
+
+    let completion =
+        runSuspendableWith
+            (Some(AskUserOptions()))
+            client
+            history
+            (makeTools [])
+            policy
+            (suspendIds ())
+            (HashSet<string>())
+
+    completion.Result.Status |> should equal TurnStatus.Failed
+    completion.Suspension.IsNone |> should equal true
+
+    failedReason completion.Result
+    |> should equal TurnLoop.AskUserHeadlessFailMessage
+
+    // Counts rather than `should equal []`: the matcher boxes a generic
+    // empty list, which does not compare equal to a typed empty list.
+    (toolMessages history).Length |> should equal 0
+    client.Calls |> should equal 1
+
+[<Fact>]
+let ``AnswerWith headless policy continues with the canned answer`` () =
+    let client =
+        scripted
+            [
+                questionStepWithOptions "q1" "Which region?" [ "east"; "west" ]
+                textStep "done"
+            ]
+
+    let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+    let policy = ScriptPolicy(Map.empty) :> IPermissionPolicy
+
+    let askUser =
+        AskUserOptions(Mode = AskUserMode.AnswerWith, CannedAnswer = "canned-7")
+
+    let completion =
+        runSuspendableWith (Some askUser) client history (makeTools []) policy (suspendIds ()) (HashSet<string>())
+
+    completion.Result.Status |> should equal TurnStatus.Completed
+    completion.Result.AssistantText |> should equal "done"
+    completion.Suspension.IsNone |> should equal true
+
+    let results = toolMessages history |> List.map toolResultText
+    results |> should equal [ "canned-7" ]
+    client.Calls |> should equal 2
+
+[<Fact>]
+let ``AnswerWith without a canned answer fails the turn`` () =
+    let client =
+        scripted
+            [
+                questionStep "q1" "Which region?"
+                textStep "never"
+            ]
+
+    let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+    let policy = ScriptPolicy(Map.empty) :> IPermissionPolicy
+
+    let askUser = AskUserOptions(Mode = AskUserMode.AnswerWith)
+
+    let completion =
+        runSuspendableWith (Some askUser) client history (makeTools []) policy (suspendIds ()) (HashSet<string>())
+
+    completion.Result.Status |> should equal TurnStatus.Failed
+    completion.Suspension.IsNone |> should equal true
+
+    failedReason completion.Result
+    |> should equal TurnLoop.AskUserCannedMissingMessage
