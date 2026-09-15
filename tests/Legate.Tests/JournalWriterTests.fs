@@ -924,6 +924,7 @@ let private spawnWriterActor
             RunTurn = (fun _ _ -> Task.FromResult(unusedResult))
             OnTurnSettled = Some(fun result -> lock settled (fun () -> settled.Add(result)))
             OnInjectJournaled = None
+            Compact = None
         }
 
     let runner: SessionActor.SuspendableRunner =

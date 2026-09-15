@@ -685,3 +685,126 @@ let ``Suspendable entry shares the same boundary mechanism`` () =
     journal.Count |> should equal 1
     (journal[0] :? CompactedEvent) |> should equal true
     history.Count |> should equal 5
+
+// ──────────────────────────────────────────────────────────────────────────
+// On-demand history rebuild and force hook (issue 46)
+
+/// Three short text turns: under every test threshold, but replaceable
+/// past keep two, so only a forced pass compacts it.
+let private forceHistory () : IList<ChatMessage> =
+    ResizeArray<ChatMessage>(
+        [|
+            userMessage "alpha"
+            assistantMessage "beta"
+            userMessage "gamma"
+        |]
+    )
+    :> IList<ChatMessage>
+
+[<Fact>]
+let ``messagesFromCells round-trips text histories through identical cells`` () =
+    for history in [ overHistory (); smallHistory () ] do
+        let cells = Compaction.toEstimateCells history sessionId turnId
+        let rebuilt = Compaction.messagesFromCells cells
+        let roundTripped = Compaction.toEstimateCells rebuilt sessionId turnId
+        roundTripped.Count |> should equal cells.Count
+
+        for index in 0 .. cells.Count - 1 do
+            roundTripped[index].Kind |> should equal cells[index].Kind
+            roundTripped[index].Content |> should equal cells[index].Content
+            roundTripped[index].ToolName |> should equal cells[index].ToolName
+
+        ContextPruning.Estimate(roundTripped)
+        |> should equal (ContextPruning.Estimate(cells))
+
+[<Fact>]
+let ``messagesFromCells preserves estimates over journal-shaped cells`` () =
+    let cell
+        (kind: SessionCellKind)
+        (content: string)
+        (toolName: string | null)
+        (toolCallId: string | null)
+        : SessionCell =
+        {
+            Id = Unchecked.defaultof<CellId>
+            SessionId = sessionId
+            TurnId = turnId
+            Kind = kind
+            Content = content
+            ToolName = toolName
+            ToolCallId = toolCallId
+            IsError = false
+            Iteration = 0
+            Metadata = Unchecked.defaultof<IReadOnlyDictionary<string, string>>
+            Artifacts = Unchecked.defaultof<IReadOnlyList<string>>
+            Timestamp = DateTimeOffset.UtcNow
+        }
+
+    let cells =
+        ResizeArray<SessionCell>(
+            [|
+                cell SessionCellKind.User "what is the refund policy?" null null
+                cell SessionCellKind.Assistant "Let me look that up." null null
+                cell SessionCellKind.ToolCall "" "lookup" "call-1"
+                cell SessionCellKind.ToolResult "30 days with receipt" "lookup" "call-1"
+                cell SessionCellKind.System "quota spent" null null
+            |]
+        )
+        :> IReadOnlyList<SessionCell>
+
+    let rebuilt = Compaction.messagesFromCells cells
+    rebuilt.Count |> should equal 5
+    rebuilt[0].Role |> should equal ChatRole.User
+    rebuilt[2].Role |> should equal ChatRole.Assistant
+    rebuilt[3].Role |> should equal ChatRole.Tool
+    rebuilt[4].Role |> should equal ChatRole.System
+
+    Compaction.estimateHistory rebuilt sessionId turnId
+    |> should equal (ContextPruning.Estimate(cells))
+
+[<Fact>]
+let ``createForceHook compacts an armed request once at the next boundary`` () =
+    let journal = ResizeArray<SessionEvent>()
+    let client = scripted [ ScriptStep.Text("forced gist") ]
+    let force = Compaction.CompactForce()
+
+    let hook =
+        Compaction.createForceHook force (baseDeps (client :> IChatClient) journal)
+
+    let history = forceHistory ()
+
+    force.Request()
+
+    let firstInput, firstOutput =
+        hook history 0L 0L CancellationToken.None
+        |> fun task -> task.GetAwaiter().GetResult()
+
+    let secondInput, secondOutput =
+        hook history 0L 0L CancellationToken.None
+        |> fun task -> task.GetAwaiter().GetResult()
+
+    // The armed boundary compacted past the threshold gate; the next
+    // boundary found the flag consumed and the history small, so the
+    // script kept exactly one summariser call.
+    client.Calls |> should equal 1
+    journal.Count |> should equal 1
+    (journal[0] :? CompactedEvent) |> should equal true
+    history.Count |> should equal 3
+    (firstInput, firstOutput) |> should equal (0L, 0L)
+    (secondInput, secondOutput) |> should equal (firstInput, firstOutput)
+
+[<Fact>]
+let ``createForceHook without an armed request behaves like createHook`` () =
+    let journal = ResizeArray<SessionEvent>()
+    let client = scripted [ ScriptStep.Text("unused gist") ]
+
+    let hook =
+        Compaction.createForceHook (Compaction.CompactForce()) (baseDeps (client :> IChatClient) journal)
+
+    let inputTokens, outputTokens =
+        hook (smallHistory ()) 3L 4L CancellationToken.None
+        |> fun task -> task.GetAwaiter().GetResult()
+
+    (inputTokens, outputTokens) |> should equal (3L, 4L)
+    client.Calls |> should equal 0
+    journal.Count |> should equal 0
