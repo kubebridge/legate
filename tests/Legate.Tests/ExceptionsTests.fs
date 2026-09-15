@@ -27,6 +27,7 @@ let ``Every subtype derives from LegateException`` () =
     assertDerived typeof<ReadOnlyAgentStoreException>
     assertDerived typeof<InvalidPackagePathException>
     assertDerived typeof<PackageLeaseException>
+    assertDerived typeof<ReplyMismatchException>
 
 [<Fact>]
 let ``SessionNotFoundException carries the session id and message`` () =
@@ -150,6 +151,15 @@ let ``PackageLeaseException carries the agent id, owner, and operation`` () =
     ex.Message |> should equal "The lease was lost."
 
 [<Fact>]
+let ``ReplyMismatchException carries the session id and request id`` () =
+    let ex =
+        ReplyMismatchException(session, "req-9", "The reply answered no pending request.")
+
+    ex.SessionId |> should equal session
+    ex.RequestId |> should equal "req-9"
+    ex.Message |> should equal "The reply answered no pending request."
+
+[<Fact>]
 let ``Messages are returned exactly as given without appended data`` () =
     let exs: exn list =
         [
@@ -170,6 +180,7 @@ let ``Messages are returned exactly as given without appended data`` () =
             ReadOnlyAgentStoreException("DeleteAgent", "msg-k")
             InvalidPackagePathException("../escape", "msg-l")
             PackageLeaseException(AgentId.New(), "sync-worker-1", "acquire", "msg-m")
+            ReplyMismatchException(session, "req-1", "msg-n")
         ]
 
     exs
@@ -190,6 +201,7 @@ let ``Messages are returned exactly as given without appended data`` () =
             "msg-k"
             "msg-l"
             "msg-m"
+            "msg-n"
         ]
 
 [<Fact>]

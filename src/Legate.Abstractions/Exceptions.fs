@@ -194,6 +194,26 @@ type InvalidPackagePathException(path: string, message: string) =
     /// The offending path exactly as passed, before normalisation.
     member _.Path = path
 
+/// Raised when a <see cref="T:Legate.Reply" /> answers no pending request:
+/// the request id is unknown or was already resolved. The request id travels
+/// on a property so hosts can report it without parsing messages; it never
+/// embeds secrets or tool arguments.
+/// <param name="sessionId">The id of the session the reply targeted.</param>
+/// <param name="requestId">The request or question id the reply carried, exactly as passed.</param>
+/// <param name="message">The exception message, without secrets or tool arguments.</param>
+[<Sealed>]
+type ReplyMismatchException(sessionId: SessionId, requestId: string, message: string) =
+    inherit LegateException(message)
+
+    /// The id of the session the reply targeted.
+    member _.SessionId = sessionId
+
+    /// The request or question id the reply carried, exactly as passed.
+    /// For a <see cref="T:Legate.PermissionDecision" /> this is the
+    /// permission request id; for a <see cref="T:Legate.QuestionAnswer" />
+    /// it is the question id.
+    member _.RequestId = requestId
+
 /// Raised when a <see cref="M:Legate.IAgentPackageLeaseService.WithLease*" />
 /// precondition fails: the lease could not be acquired, a renewal was lost
 /// or timed out, or the lease was lost during the work. The operation
