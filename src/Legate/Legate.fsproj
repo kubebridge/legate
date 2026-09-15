@@ -39,6 +39,10 @@
     <Compile Include="Agents/AgentFileParser.fs" />
     <Compile Include="Agents/SubAgents.fs" />
     <Compile Include="TaskTool.fs" />
+    <Compile Include="CustomTools/CustomToolNames.fs" />
+    <Compile Include="CustomTools/CustomToolSchema.fs" />
+    <Compile Include="CustomTools/CustomToolFunction.fs" />
+    <Compile Include="CustomTools/CustomToolSource.fs" />
     <Compile Include="LegateBuilder.fs" />
     <Compile Include="Agents/FileAgentStore.fs" />
     <Compile Include="AddLegate.fs" />

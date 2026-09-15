@@ -6,6 +6,7 @@ open System.Collections.Generic
 open Microsoft.Extensions.Configuration
 open Microsoft.Extensions.DependencyInjection
 open Microsoft.Extensions.DependencyInjection.Extensions
+open Microsoft.Extensions.Logging
 
 // Microsoft-style builder for services.AddLegate(configure). The builder and
 // its seven sub-builders live in Legate; only the registered interfaces live
@@ -140,6 +141,59 @@ type ToolsBuilder internal (services: IServiceCollection) as this =
     /// <returns>This builder, for chaining.</returns>
     member _.AddSource<'T when 'T :> IToolSource>() : ToolsBuilder =
         services.Add(ServiceDescriptor(typeof<IToolSource>, typeof<'T>, ServiceLifetime.Singleton))
+        |> ignore
+
+        this
+
+    /// Registers the agent custom HTTP tool source: per session it builds
+    /// one signed function per enabled custom tool, losing name collisions
+    /// to built-ins so built-ins keep first claim. Uses system DNS, the
+    /// default SSRF posture (reserved addresses denied), the 30 s call
+    /// bound, and the container's logger.
+    /// <param name="toolStore">The store listing the agent's enabled custom tools. Must not be null.</param>
+    /// <returns>This builder, for chaining.</returns>
+    member _.AddCustomTools(toolStore: IAgentCustomToolStore) : ToolsBuilder =
+        ArgumentNullException.ThrowIfNull(toolStore)
+        this.AddCustomTools(toolStore, null, null)
+
+    /// Registers the agent custom HTTP tool source with explicit
+    /// networking posture: per session it builds one signed function per
+    /// enabled custom tool, losing name collisions to built-ins so
+    /// built-ins keep first claim. Uses the 30 s call bound and the
+    /// container's logger.
+    /// <param name="toolStore">The store listing the agent's enabled custom tools. Must not be null.</param>
+    /// <param name="resolver">The address resolver the call-time SSRF guard resolves through, or null for system DNS.</param>
+    /// <param name="options">The host-level SSRF allow/deny lists, or null for deny-reserved only.</param>
+    /// <returns>This builder, for chaining.</returns>
+    member _.AddCustomTools
+        (toolStore: IAgentCustomToolStore, resolver: IHostAddressResolver | null, options: SsrfGuardOptions | null)
+        : ToolsBuilder =
+        ArgumentNullException.ThrowIfNull(toolStore)
+
+        let build (provider: IServiceProvider) : IToolSource =
+            let effectiveResolver =
+                match Option.ofObj resolver with
+                | Some live -> live
+                | None -> SystemHostAddressResolver() :> IHostAddressResolver
+
+            let effectiveOptions =
+                match Option.ofObj options with
+                | Some live -> live
+                | None -> SsrfGuardOptions()
+
+            let logger = provider.GetService<ILogger<CustomToolSource>>()
+
+            CustomToolSource(
+                toolStore,
+                effectiveResolver,
+                effectiveOptions,
+                null,
+                CustomToolFunction.DefaultTimeout,
+                logger
+            )
+            :> IToolSource
+
+        services.AddSingleton<IToolSource>(Func<IServiceProvider, IToolSource>(build))
         |> ignore
 
         this

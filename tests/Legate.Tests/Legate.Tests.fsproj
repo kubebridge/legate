@@ -88,6 +88,10 @@
     <Compile Include="McpConnectorTests.fs" />
     <Compile Include="McpToolSourceTests.fs" />
     <Compile Include="McpServiceExtensionsTests.fs" />
+    <Compile Include="CustomToolNamesTests.fs" />
+    <Compile Include="CustomToolSchemaTests.fs" />
+    <Compile Include="CustomToolFunctionTests.fs" />
+    <Compile Include="CustomToolSourceTests.fs" />
   </ItemGroup>
 
   <ItemGroup>
