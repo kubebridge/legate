@@ -14,10 +14,11 @@
     <Compile Include="Tools/FileTools.fs" />
     <Compile Include="BuiltinEditTools.fs" />
     <Compile Include="BuiltinSearchTools.fs" />
-    <Compile Include="LlmCoordinator.fs" />
     <Compile Include="ClaimHeartbeat.fs" />
     <Compile Include="ClaimFence.fs" />
     <Compile Include="JournalWriter.fs" />
+    <Compile Include="LoggingScopes.fs" />
+    <Compile Include="LlmCoordinator.fs" />
     <Compile Include="Transcripts.fs" />
     <Compile Include="SessionEventBus.fs" />
     <Compile Include="LlmStreaming.fs" />

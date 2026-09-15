@@ -10,6 +10,7 @@ open System.Runtime.ExceptionServices
 open System.Threading
 open System.Threading.Tasks
 open Microsoft.Extensions.AI
+open Microsoft.Extensions.Logging
 
 // Local per-identity LLM coordinator (issue 54). One coordinator serves
 // every provider and credential scope in the process: each coordinated call
@@ -271,6 +272,10 @@ module internal LlmCoordination =
             State: IdentityState
             /// This call's TPM ledger entry.
             Entry: TokenEntry
+            /// The resolved logger the retry loop reports through.
+            Log: ILogger
+            /// The six-key scope every coordinator log line carries.
+            LogScope: IReadOnlyList<KeyValuePair<string, obj>>
         }
 
     /// Reconciles the reservation with the actual usage and releases the
@@ -494,6 +499,13 @@ module internal LlmCoordination =
                             settleFailure context.Gate context.State context.Entry
                             ExceptionDispatchInfo.Capture(waitCanceled).Throw()
 
+                    use _scope = LoggingScopes.beginScope context.Log context.LogScope
+
+                    context.Log.LogInformation(
+                        "The coordinator retries the '{ProviderId}' provider call after a transient failure.",
+                        LoggingScopes.redactForLog context.ProviderId
+                    )
+
                     return! recurse (attempt + 1)
         }
 
@@ -598,6 +610,7 @@ module internal LlmCoordination =
     /// <param name="clock">The injected clock: admission instants, windows, and the deadline timer.</param>
     /// <param name="delay">The injected wait seam: rate, cooldown, and backoff waits.</param>
     /// <param name="random">The injected jitter seam: retry backoff.</param>
+    /// <param name="logger">The logger the coordinator reports admit/retry/reject points to, or null for no logging.</param>
     [<Sealed>]
     type LlmCoordinator
         (
@@ -606,7 +619,8 @@ module internal LlmCoordination =
             keyProvider: IApiKeyProvider | null,
             clock: TimeProvider,
             delay: ILlmDelay,
-            random: ILlmRandom
+            random: ILlmRandom,
+            logger: ILogger | null
         ) =
 
         do
@@ -618,6 +632,25 @@ module internal LlmCoordination =
 
         let gate = obj ()
         let states = Dictionary<string, IdentityState>(StringComparer.Ordinal)
+        let log = LoggingScopes.resolveLogger logger
+
+        /// Builds the coordinator with no logger.
+        /// <param name="options">The LLM section: coordination knobs, per-provider settings, and the distributed flag.</param>
+        /// <param name="registry">The registry the coordinator resolves providers through.</param>
+        /// <param name="keyProvider">The per-tenant key source, or null when the host keeps keys only in provider options.</param>
+        /// <param name="clock">The injected clock.</param>
+        /// <param name="delay">The injected wait seam.</param>
+        /// <param name="random">The injected jitter seam.</param>
+        new
+            (
+                options: LlmOptions,
+                registry: ILlmProviderRegistry,
+                keyProvider: IApiKeyProvider | null,
+                clock: TimeProvider,
+                delay: ILlmDelay,
+                random: ILlmRandom
+            ) =
+            LlmCoordinator(options, registry, keyProvider, clock, delay, random, null)
 
         /// Runs one provider call under the reference's identity: authorises
         /// the tenant-provider-model through the policy first (a deny
@@ -970,6 +1003,19 @@ module internal LlmCoordination =
 
                         raise (OperationCanceledException(linkedToken))
 
+                let callScope =
+                    LoggingScopes.createScope
+                        (tenant.ToString())
+                        (sessionId.ToString())
+                        (turnId.ToString())
+                        null
+                        attempt
+                        null
+
+                let logCall (message: string) : unit =
+                    use _scope = LoggingScopes.beginScope log callScope
+                    log.LogInformation("{Message}", LoggingScopes.redactForLog message)
+
                 try
                     let mutable admitted = false
 
@@ -979,6 +1025,7 @@ module internal LlmCoordination =
 
                         if now >= deadline then
                             removeWaiter ()
+                            logCall "The coordinator deadline fired before admission."
                             raise (deadlineEx ())
 
                         let step, signal = decide now
@@ -987,6 +1034,7 @@ module internal LlmCoordination =
                         | Admitted -> admitted <- true
                         | Rejected ->
                             removeWaiter ()
+                            logCall "The coordinator rejected the call: the queue is full."
                             raise (queueFullEx ())
                         | AwaitSignal ->
                             try
@@ -1040,7 +1088,11 @@ module internal LlmCoordination =
                         Gate = gate
                         State = ticketState
                         Entry = ticketEntry
+                        Log = log
+                        LogScope = callScope
                     }
+
+                logCall "The coordinator admitted the call."
 
                 try
                     let! terminal = attemptLoop context 0

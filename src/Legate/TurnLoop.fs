@@ -9,6 +9,7 @@ open System.Text.Json
 open System.Threading
 open System.Threading.Tasks
 open Microsoft.Extensions.AI
+open Microsoft.Extensions.Logging
 
 // Internal Akka-free ReAct loop core. Per iteration the loop drains pending
 // Inject inbox entries at the iteration boundary (after the prior tool
@@ -138,6 +139,15 @@ module internal TurnLoop =
             /// loop offers the finish/fail descriptors and populates
             /// TurnResult.Outcome. False runs the host tool map untouched.
             StructuredOutcome: bool
+            /// The logger the loop reports iteration/tool-call/failure
+            /// points to, or null for no logging (the CustomToolSource
+            /// precedent). Internal-only wiring.
+            Logger: Microsoft.Extensions.Logging.ILogger | null
+            /// The pre-built six-key logging scope every loop log line
+            /// carries, or null for an empty six-key scope. Built with
+            /// LoggingScopes.createScope by the caller.
+            LogScope:
+                System.Collections.Generic.IReadOnlyList<System.Collections.Generic.KeyValuePair<string, obj>> | null
         }
 
         /// Default tuning: 4000 chars before truncation with the iteration
@@ -155,6 +165,8 @@ module internal TurnLoop =
                 OnToolCall = None
                 TaskNested = None
                 StructuredOutcome = false
+                Logger = null
+                LogScope = null
             }
 
     /// One task-tool nested run: the parent call plus everything the
@@ -854,6 +866,29 @@ module internal TurnLoop =
         : Task<string> =
         task {
             let! text, error = invokeOneWithErrorAsync tools call cancellationToken
+
+            let log = LoggingScopes.resolveLogger options.Logger
+
+            let scope =
+                if isNull (box options.LogScope) then
+                    LoggingScopes.createScope null null null null 0 null
+                else
+                    options.LogScope
+
+            let name =
+                if isNull (box call) || isNull call.Name then
+                    ""
+                else
+                    call.Name
+
+            use _scope = LoggingScopes.beginScope log scope
+
+            log.LogInformation(
+                "The turn called the '{ToolName}' tool: {Result}",
+                LoggingScopes.redactForLog name,
+                LoggingScopes.redactForLog text
+            )
+
             do! observeToolCallAsync options call text error
             return text
         }
@@ -962,6 +997,23 @@ module internal TurnLoop =
         // finish/fail descriptors, or the host map passes through untouched.
         // A host collision raises here, before any provider call.
         let tools = effectiveTools options tools
+
+        let log = LoggingScopes.resolveLogger options.Logger
+
+        let scope =
+            if isNull (box options.LogScope) then
+                LoggingScopes.createScope null null null null 0 null
+            else
+                options.LogScope
+
+        /// Logs one loop point under the six canonical scopes, scoped to
+        /// the synchronous block only. Text travels redacted.
+        /// <param name="message">The fixed message.</param>
+        let logLoop (message: string) : unit =
+            use _scope = LoggingScopes.beginScope log scope
+            log.LogInformation("{Message}", LoggingScopes.redactForLog message)
+
+        logLoop "The turn started."
 
         let timeoutCts = new CancellationTokenSource()
 
@@ -1189,13 +1241,16 @@ module internal TurnLoop =
                 if not (isLeaseValid ()) then
                     return! Task.FromException<TurnLoopCompletion>(TurnLeaseLostException())
                 elif iterations >= options.MaxIterations then
+                    logLoop MaxIterationsExceededMessage
                     return failedCompletion iterations inputTokens outputTokens MaxIterationsExceededMessage
                 elif timeoutCts.IsCancellationRequested then
                     // The deadline fired before the next provider call:
                     // external cancellation already propagated above, so
                     // this is ours. Settle without calling the model again.
+                    logLoop TimeoutExceededMessage
                     return failedCompletion iterations inputTokens outputTokens TimeoutExceededMessage
                 else
+                    logLoop "The turn started an iteration."
                     foldInjects ()
 
                     // Compaction boundary (issue 45): one pass per
@@ -1242,16 +1297,20 @@ module internal TurnLoop =
                             if calls.IsEmpty then
                                 let assistantText = if isNull response.Text then "" else response.Text
 
+                                logLoop "The turn completed."
                                 return completedCompletion nextIterations nextInput nextOutput assistantText
                             else
                                 let! toolOutcome = runTools nextIterations nextInput nextOutput calls
 
                                 match toolOutcome with
-                                | Some timedOut -> return timedOut
+                                | Some timedOut ->
+                                    logLoop TimeoutExceededMessage
+                                    return timedOut
                                 | None -> return! loop nextIterations nextInput nextOutput
                     with :? OperationCanceledException when isTimeout () ->
                         // In-flight provider or tool work died to the
                         // deadline alone: the hard-deadline stop cause.
+                        logLoop TimeoutExceededMessage
                         return failedCompletion iterations inputTokens outputTokens TimeoutExceededMessage
             }
 

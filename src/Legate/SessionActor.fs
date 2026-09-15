@@ -8,6 +8,7 @@ open System.Threading.Tasks
 open Akka.Actor
 open Akka.FSharp
 open Microsoft.Extensions.AI
+open Microsoft.Extensions.Logging
 
 // Session actor: the Akka.FSharp child owning one session's
 // Idle -> Running -> (Idle | WaitingForInput | Closed) state machine with a
@@ -255,6 +256,10 @@ type internal SessionActorProps =
         /// configure compaction: CompactSession then answers without
         /// compacting and never starts a turn.
         Compact: CompactDeps option
+        /// The logger the actor reports prompt/reply/settle/suspend points
+        /// to, or null for no logging (the CustomToolSource precedent: a
+        /// null logger resolves to the NullLogger). Internal-only wiring.
+        Logger: Microsoft.Extensions.Logging.ILogger | null
     }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -984,6 +989,21 @@ module internal SessionActor =
         let initialState = recover props
         let self = mailbox.Self
 
+        let log = LoggingScopes.resolveLogger props.Logger
+
+        /// Logs one actor point under the six canonical scopes, scoped to
+        /// the synchronous handler block only (never across awaits). Text
+        /// travels redacted, so a prompt carrying a secret shape never
+        /// lands verbatim in the log.
+        /// <param name="turnId">The turn, or null for prompt receipt.</param>
+        /// <param name="message">The fixed message template.</param>
+        let logScoped (turnId: string | null) (message: string) : unit =
+            let scope =
+                LoggingScopes.createScope (props.Tenant.ToString()) (props.SessionId.ToString()) turnId null 0 null
+
+            use _scope = LoggingScopes.beginScope log scope
+            log.LogInformation("{Message}", LoggingScopes.redactForLog message)
+
         /// Starts a turn for an inbox entry: guards the runner call itself
         /// (a synchronously throwing or null-returning runner faults the
         /// turn, never the actor), then pipes the outcome back as a
@@ -1187,31 +1207,37 @@ module internal SessionActor =
                 | QueuePrompt(payload, cancellationToken) ->
                     match state with
                     | SessionState.Closed ->
+                        logScoped null "The session rejected a prompt: the session is closed."
                         mailbox.Sender() <! PromptRejected SessionState.Closed
                         return! loop state running arbitration pendingStop
                     | SessionState.Idle ->
                         let appended, next = startIdleTurn payload DeliveryMode.Queue cancellationToken
                         mailbox.Sender() <! PromptAccepted appended
+                        logScoped null "The session accepted a prompt and started a turn."
                         return! loop SessionState.Running (Some next) StopArbitration.Undecided None
                     | SessionState.Running
                     | SessionState.WaitingForInput ->
                         let appended = appendWaiting payload DeliveryMode.Queue cancellationToken
                         mailbox.Sender() <! PromptAccepted appended
+                        logScoped null "The session accepted a prompt while busy."
                         return! loop state running arbitration pendingStop
                     | _ ->
                         // Out-of-range stored state: stay durable but start
                         // nothing new.
                         let appended = appendWaiting payload DeliveryMode.Queue cancellationToken
                         mailbox.Sender() <! PromptAccepted appended
+                        logScoped null "The session accepted a prompt while out of range."
                         return! loop state running arbitration pendingStop
                 | InjectPrompt(payload, cancellationToken) ->
                     match state with
                     | SessionState.Closed ->
+                        logScoped null "The session rejected an injected prompt: the session is closed."
                         mailbox.Sender() <! PromptRejected SessionState.Closed
                         return! loop state running arbitration pendingStop
                     | SessionState.Idle ->
                         let appended, next = startIdleTurn payload DeliveryMode.Inject cancellationToken
                         mailbox.Sender() <! PromptAccepted appended
+                        logScoped null "The session accepted an injected prompt and started a turn."
                         return! loop SessionState.Running (Some next) StopArbitration.Undecided None
                     | SessionState.Running
                     | SessionState.WaitingForInput ->
@@ -1220,19 +1246,23 @@ module internal SessionActor =
                         // turn leaves it for the settle drain. Never aborts.
                         let appended = appendWaiting payload DeliveryMode.Inject cancellationToken
                         mailbox.Sender() <! PromptAccepted appended
+                        logScoped null "The session accepted an injected prompt while busy."
                         return! loop state running arbitration pendingStop
                     | _ ->
                         let appended = appendWaiting payload DeliveryMode.Inject cancellationToken
                         mailbox.Sender() <! PromptAccepted appended
+                        logScoped null "The session accepted an injected prompt while out of range."
                         return! loop state running arbitration pendingStop
                 | InterruptPrompt(payload, cancellationToken) ->
                     match state with
                     | SessionState.Closed ->
+                        logScoped null "The session rejected an interrupt prompt: the session is closed."
                         mailbox.Sender() <! PromptRejected SessionState.Closed
                         return! loop state running arbitration pendingStop
                     | SessionState.Idle ->
                         let appended, next = startIdleTurn payload DeliveryMode.Interrupt cancellationToken
                         mailbox.Sender() <! PromptAccepted appended
+                        logScoped null "The session accepted an interrupt prompt and started a turn."
                         return! loop SessionState.Running (Some next) StopArbitration.Undecided None
                     | SessionState.Running ->
                         // Pre-empt through the abort verb: the entry joins
@@ -1261,9 +1291,11 @@ module internal SessionActor =
                                 inFlight.Cts.Cancel()
 
                             mailbox.Sender() <! PromptAccepted appended
+                            logScoped null "The session accepted an interrupt prompt and pre-empted the running turn."
                             return! loop state running nextArbitration nextStop
                         | None ->
                             mailbox.Sender() <! PromptAccepted appended
+                            logScoped null "The session accepted an interrupt prompt with no turn in flight."
                             return! loop state running arbitration pendingStop
                     | SessionState.WaitingForInput ->
                         // Append-and-wait: suspended turns belong to issue
@@ -1271,6 +1303,7 @@ module internal SessionActor =
                         // resumes the suspended turn.
                         let appended = appendWaiting payload DeliveryMode.Interrupt cancellationToken
                         mailbox.Sender() <! PromptAccepted appended
+                        logScoped null "The session accepted an interrupt prompt while suspended."
                         return! loop state running arbitration pendingStop
                     | _ ->
                         let appended = appendWaiting payload DeliveryMode.Interrupt cancellationToken
@@ -1354,6 +1387,7 @@ module internal SessionActor =
                             inFlight.Cts.Dispose()
                             notifySettled result
                             dispatchCompletion props result |> ignore
+                            logScoped null "The session settled a turn."
 
                             if result.Status = TurnStatus.Completed && autoCloseEnabled props then
                                 // AutoClose (issue 82): the first Completed
@@ -1377,6 +1411,7 @@ module internal SessionActor =
                             let settled = mapAborted cause reason result
                             notifySettled settled
                             dispatchCompletion props settled |> ignore
+                            logScoped null "The session settled a turn under a stop cause."
                             let nextState, nextRunning = settle entry CancellationToken.None
                             return! loop nextState nextRunning StopArbitration.Undecided None
                         | StopArbitration.Decided StopArbitration.SettlementWins ->
@@ -1390,6 +1425,7 @@ module internal SessionActor =
                         match arbitration with
                         | StopArbitration.Undecided ->
                             inFlight.Cts.Dispose()
+                            logScoped null "The session turn faulted and its entry was consumed."
                             let nextState, nextRunning = settle entry CancellationToken.None
                             return! loop nextState nextRunning StopArbitration.Undecided None
                         | StopArbitration.Decided(StopArbitration.StopWins cause) ->
@@ -1400,6 +1436,7 @@ module internal SessionActor =
                             let reason = pendingStop |> Option.map snd |> Option.defaultValue ""
 
                             notifySettled (abortedResult cause reason)
+                            logScoped null "The session turn faulted under a stop cause."
                             let nextState, nextRunning = settle entry CancellationToken.None
                             return! loop nextState nextRunning StopArbitration.Undecided None
                         | StopArbitration.Decided StopArbitration.SettlementWins ->
@@ -1444,6 +1481,7 @@ module internal SessionActor =
                         OnTurnSettled = Some(fun result -> PromptWaitHubs.ObserveSettled captured result)
                         OnInjectJournaled = None
                         Compact = None
+                        Logger = null
                     }
 
                 spawn context name (behavior props)
@@ -3143,6 +3181,7 @@ module internal SessionActor =
                         OnTurnSettled = Some(fun result -> PromptWaitHubs.ObserveSettled captured result)
                         OnInjectJournaled = None
                         Compact = None
+                        Logger = null
                     }
 
                 let suspend: SuspendDeps =
