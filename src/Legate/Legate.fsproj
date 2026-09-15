@@ -17,6 +17,8 @@
     <Compile Include="SessionEventBus.fs" />
     <Compile Include="LlmStreaming.fs" />
     <Compile Include="StopArbitration.fs" />
+    <Compile Include="WorkspaceLayout.fs" />
+    <Compile Include="DownloadUrlTool.fs" />
     <Compile Include="TurnLoop.fs" />
     <Compile Include="ExecTool.fs" />
     <Compile Include="Compaction.fs" />
@@ -37,6 +39,7 @@
     <PackageReference Include="Akka" />
     <PackageReference Include="Akka.FSharp" />
     <PackageReference Include="FSharp.Core" />
+    <PackageReference Include="Microsoft.Extensions.AI.Abstractions" />
     <PackageReference Include="Microsoft.Extensions.Configuration" />
     <PackageReference Include="Microsoft.Extensions.Configuration.Abstractions" />
     <PackageReference Include="Microsoft.Extensions.Configuration.Binder" />
