@@ -417,3 +417,42 @@ let ``TurnResult carries the turn's terminal status and usage as-is`` () =
 
     restored.Status |> should equal TurnStatus.Aborted
     restored.Outcome |> should equal null
+
+// ───────────────────────────────────────────────────────────────────────────
+// TurnFinished.IsImplicit (issue 82)
+
+[<Fact>]
+let ``TurnFinished IsImplicit defaults to false for explicit outcomes`` () =
+    let outcome = TurnFinished("renamed the widget")
+    outcome.IsImplicit |> should equal false
+    outcome.Summary |> should equal "renamed the widget"
+
+[<Fact>]
+let ``TurnFinished IsImplicit round-trips true with a stable $type`` () =
+    let outcome = TurnFinished("all done")
+    outcome.IsImplicit <- true
+
+    let json = JsonSerializer.Serialize(outcome :> TurnOutcome, jsonOptions)
+    json.Contains("\"$type\":\"turnFinished\"") |> should equal true
+
+    match JsonSerializer.Deserialize<TurnOutcome>(json, jsonOptions) with
+    | null -> failwith "deserialised to null"
+    | restored ->
+        (restored :? TurnFinished) |> should equal true
+
+        let finished = restored :?> TurnFinished
+        finished.Summary |> should equal "all done"
+        finished.IsImplicit |> should equal true
+
+[<Fact>]
+let ``TurnFinished without the flag deserialises as explicit`` () =
+    let json = """{"$type":"turnFinished","Summary":"before the flag"}"""
+
+    match JsonSerializer.Deserialize<TurnOutcome>(json, jsonOptions) with
+    | null -> failwith "deserialised to null"
+    | restored ->
+        (restored :? TurnFinished) |> should equal true
+
+        let finished = restored :?> TurnFinished
+        finished.Summary |> should equal "before the flag"
+        finished.IsImplicit |> should equal false

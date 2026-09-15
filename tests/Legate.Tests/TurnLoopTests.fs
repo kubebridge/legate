@@ -1772,3 +1772,259 @@ let ``AnswerWith without a canned answer fails the turn`` () =
 
     failedReason completion.Result
     |> should equal TurnLoop.AskUserCannedMissingMessage
+
+// ───────────────────────────────────────────────────────────────────────────
+// Structured outcomes (issue 82)
+
+/// Turn loop tuning with the structured outcome mode on.
+let private structuredOptions () : TurnLoop.TurnLoopOptions =
+    { TurnLoop.TurnLoopOptions.Default with
+        StructuredOutcome = true
+    }
+
+/// One scripted finish step carrying the summary.
+let private finishStep (callId: string) (summary: string) : ScriptStep =
+    let args = Dictionary<string, obj>()
+    args["summary"] <- summary :> obj
+    ScriptStep.ToolCall(callId, TurnLoop.FinishToolName, args)
+
+/// One scripted fail step carrying the error.
+let private failStep (callId: string) (error: string) : ScriptStep =
+    let args = Dictionary<string, obj>()
+    args["error"] <- error :> obj
+    ScriptStep.ToolCall(callId, TurnLoop.FailToolName, args)
+
+/// Reads the summary and the implicit flag off a Finished turn result.
+let private finishedFlag (result: TurnResult) : string * bool =
+    match result.Outcome with
+    | :? TurnFinished as finished when not (isNull (box finished)) -> finished.Summary, finished.IsImplicit
+    | _ -> raise (InvalidOperationException("The turn result is not a TurnFinished outcome."))
+
+/// Runs the suspendable loop with the structured outcome mode on.
+let private runStructuredSuspendable
+    (client: ScriptedChatClient)
+    (history: IList<ChatMessage>)
+    (tools: IReadOnlyDictionary<string, AITool>)
+    (policy: IPermissionPolicy)
+    : TurnLoop.TurnLoopCompletion =
+    TurnLoop.runSuspendableAsync
+        (client :> IChatClient)
+        history
+        tools
+        (structuredOptions ())
+        (NeverDelay() :> ILlmDelay)
+        CancellationToken.None
+        alwaysLeased
+        (fun () -> ResizeArray<InboxEntry>() :> IReadOnlyList<InboxEntry>)
+        ignore
+        ignore
+        policy
+        (SessionId.New())
+        (TurnId.New())
+        (Some(suspendIds ()))
+        (HashSet<string>())
+    |> fun task -> task.GetAwaiter().GetResult()
+
+[<Fact>]
+let ``Structured finish ends the iteration immediately with an explicit Finished outcome`` () =
+    let client =
+        scripted
+            [
+                finishStep "c1" "migrated the schema"
+                textStep "never"
+            ]
+
+    let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+
+    let result =
+        runLoop client history (makeTools []) (structuredOptions ()) CancellationToken.None alwaysLeased
+
+    result.Status |> should equal TurnStatus.Completed
+    result.AssistantText |> should equal "migrated the schema"
+    result.Iterations |> should equal 1
+    finishedFlag result |> should equal ("migrated the schema", false)
+    // The trailing text step never ran: settlement ended the iteration now.
+    client.Calls |> should equal 1
+    // The finish call settled as the call's tool result.
+    toolMessages history |> List.length |> should equal 1
+
+    toolMessages history
+    |> List.head
+    |> toolResultText
+    |> should equal "migrated the schema"
+
+[<Fact>]
+let ``Structured fail ends the iteration immediately with a Failed outcome`` () =
+    let client =
+        scripted
+            [
+                failStep "c1" "the disk is full"
+                textStep "never"
+            ]
+
+    let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+
+    let result =
+        runLoop client history (makeTools []) (structuredOptions ()) CancellationToken.None alwaysLeased
+
+    result.Status |> should equal TurnStatus.Failed
+    result.Iterations |> should equal 1
+    failedReason result |> should equal "the disk is full"
+    client.Calls |> should equal 1
+
+[<Fact>]
+let ``Structured turn stopping without finish or fail yields an implicit Finished outcome`` () =
+    let client = scripted [ textStep "all done" ]
+    let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+
+    let result =
+        runLoop client history (makeTools []) (structuredOptions ()) CancellationToken.None alwaysLeased
+
+    result.Status |> should equal TurnStatus.Completed
+    result.AssistantText |> should equal "all done"
+    finishedFlag result |> should equal ("all done", true)
+
+[<Fact>]
+let ``resolveBudget carries the session outcome mode into the loop flag`` () =
+    let turns = TurnsOptions()
+
+    let structured = SessionOptions()
+    structured.Outcome <- SessionOutcomeMode.Structured
+
+    (TurnLoop.resolveBudget structured turns).StructuredOutcome |> should equal true
+
+    (TurnLoop.resolveBudget (SessionOptions()) turns).StructuredOutcome
+    |> should equal false
+
+[<Fact>]
+let ``Unstructured finish call reads as an unknown tool and continues`` () =
+    let client =
+        scripted
+            [
+                finishStep "c1" "sneaky"
+                textStep "done"
+            ]
+
+    let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+
+    let result =
+        runLoop client history (makeTools []) TurnLoop.TurnLoopOptions.Default CancellationToken.None alwaysLeased
+
+    result.Status |> should equal TurnStatus.Completed
+    result.AssistantText |> should equal "done"
+    result.Outcome |> should equal null
+    client.Calls |> should equal 2
+
+    toolMessages history
+    |> List.head
+    |> toolResultText
+    |> should equal TurnLoop.UnknownToolMessage
+
+[<Fact>]
+let ``Fenced-out finish call loses the lease with zero effects`` () =
+    let client =
+        scripted
+            [
+                finishStep "c1" "sneaky"
+                textStep "never"
+            ]
+
+    let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+
+    let options =
+        { structuredOptions () with
+            VerifyClaim = Some(fun () -> Task.FromResult false)
+        }
+
+    let outcome =
+        try
+            runLoop client history (makeTools []) options CancellationToken.None alwaysLeased
+            |> Choice1Of2
+        with ex ->
+            Choice2Of2 ex
+
+    match outcome with
+    | Choice2Of2(:? TurnLoop.TurnLeaseLostException) -> ()
+    | _ -> failwith "Expected the fenced-out finish call to lose the lease."
+
+    toolMessages history |> List.length |> should equal 0
+    client.Calls |> should equal 1
+
+[<Fact>]
+let ``Host tool colliding with a reserved name fails fast`` () =
+    let invocations = ref []
+    let fn = stubTool "finish" "out" invocations
+    let client = scripted [ textStep "never" ]
+    let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+
+    let ex =
+        Assert.Throws<ArgumentException>(fun () ->
+            runLoop
+                client
+                history
+                (makeTools [ "finish", fn ])
+                (structuredOptions ())
+                CancellationToken.None
+                alwaysLeased
+            |> ignore)
+
+    ex.Message.Contains("reserved") |> should equal true
+    client.Calls |> should equal 0
+    invocations.Value.Length |> should equal 0
+
+[<Fact>]
+let ``Malformed finish call continues without settling`` () =
+    let args = Dictionary<string, obj>()
+
+    let client =
+        scripted
+            [
+                ScriptStep.ToolCall("c1", TurnLoop.FinishToolName, args)
+                textStep "recovered"
+            ]
+
+    let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+
+    let result =
+        runLoop client history (makeTools []) (structuredOptions ()) CancellationToken.None alwaysLeased
+
+    result.Status |> should equal TurnStatus.Completed
+    result.AssistantText |> should equal "recovered"
+    finishedFlag result |> should equal ("recovered", true)
+    client.Calls |> should equal 2
+
+    toolMessages history
+    |> List.head
+    |> toolResultText
+    |> should equal TurnLoop.FinishMissingSummaryMessage
+
+[<Fact>]
+let ``Structured finish settles the suspendable loop immediately`` () =
+    let client =
+        scripted
+            [
+                finishStep "c1" "nested done"
+                textStep "never"
+            ]
+
+    let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+    let policy = ScriptPolicy(Map.empty) :> IPermissionPolicy
+
+    let completion = runStructuredSuspendable client history (makeTools []) policy
+
+    completion.Result.Status |> should equal TurnStatus.Completed
+    finishedFlag completion.Result |> should equal ("nested done", false)
+    completion.Suspension.IsNone |> should equal true
+    client.Calls |> should equal 1
+
+[<Fact>]
+let ``Suspendable structured turn stopping quietly yields an implicit Finished outcome`` () =
+    let client = scripted [ textStep "quiet done" ]
+    let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+    let policy = ScriptPolicy(Map.empty) :> IPermissionPolicy
+
+    let completion = runStructuredSuspendable client history (makeTools []) policy
+
+    completion.Result.Status |> should equal TurnStatus.Completed
+    finishedFlag completion.Result |> should equal ("quiet done", true)
+    completion.Suspension.IsNone |> should equal true

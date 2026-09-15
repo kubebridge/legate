@@ -863,6 +863,40 @@ module internal SessionActor =
         | :? TurnLoop.TurnLeaseLostException -> CompactFenced
         | :? OperationCanceledException -> CompactNotNeeded
 
+    // ────────────────── AutoClose (issue 82) ──────────────────
+
+    /// Reads whether the session closes itself after its first completed
+    /// turn: the AutoClose snapshot the session was opened with. A missing
+    /// row, missing options, or a store read failure reads as false, so the
+    /// close never fires spuriously.
+    /// <param name="props">The session actor dependencies.</param>
+    /// <returns>True when the session closes after its first Completed turn.</returns>
+    let private autoCloseEnabled (props: SessionActorProps) : bool =
+        try
+            match awaitTask (props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None)) with
+            | null -> false
+            | session when isNull (box session.Options) -> false
+            | session -> session.Options.AutoClose
+        with :? SessionNotFoundException ->
+            false
+
+    /// Consumes the settled entry and closes the session store-first for an
+    /// AutoClose turn: the entry leaves the pending set before the Closed
+    /// write lands, so a restart never redelivers a turn the close already
+    /// answered. CloseSession is idempotent, and the actor's single-threaded
+    /// sequencing keeps a second prompt from slipping between the consume
+    /// and the close.
+    /// <param name="props">The session actor dependencies.</param>
+    /// <param name="entry">The entry the AutoClose turn executed.</param>
+    let private consumeAndCloseSession (props: SessionActorProps) (entry: InboxEntry) : unit =
+        let positions = [| entry.Position |] :> IReadOnlyList<int64>
+
+        awaitTask (props.Store.MarkInboxConsumed(props.Tenant, props.SessionId, positions, CancellationToken.None))
+        |> ignore
+
+        awaitTask (props.Store.CloseSession(props.Tenant, props.SessionId, CancellationToken.None))
+        |> ignore
+
     /// The session actor: recovers from the store, then owns the state
     /// machine. The mailbox parameter is injected by the spawn functions;
     /// one message is processed fully before the next is received, so the
@@ -1253,8 +1287,18 @@ module internal SessionActor =
                             // Settlement wins: the carried result stands.
                             inFlight.Cts.Dispose()
                             notifySettled result
-                            let nextState, nextRunning = settle entry CancellationToken.None
-                            return! loop nextState nextRunning StopArbitration.Undecided None
+
+                            if result.Status = TurnStatus.Completed && autoCloseEnabled props then
+                                // AutoClose (issue 82): the first Completed
+                                // turn closes the session store-first instead
+                                // of draining. Aborted and Failed results
+                                // never take this path, so failed runs stay
+                                // open for inspection.
+                                consumeAndCloseSession props entry
+                                return! loop SessionState.Closed None StopArbitration.Undecided None
+                            else
+                                let nextState, nextRunning = settle entry CancellationToken.None
+                                return! loop nextState nextRunning StopArbitration.Undecided None
                         | StopArbitration.Decided(StopArbitration.StopWins cause) ->
                             // The stop landed first, so it wins even over a
                             // success: map to Aborted under the winning
@@ -2369,36 +2413,54 @@ module internal SessionActor =
 
                             notifySettled completion.Result
 
-                            let pending =
+                            if completion.Result.Status = TurnStatus.Completed && autoCloseEnabled props then
+                                // AutoClose (issue 82): the first Completed
+                                // turn closes the session store-first instead
+                                // of draining; the entry is already consumed
+                                // above. Aborted and Failed results never take
+                                // this path, so failed runs stay open for
+                                // inspection.
                                 awaitTask (
-                                    props.Store.ReadPendingInbox(props.Tenant, props.SessionId, CancellationToken.None)
-                                )
-
-                            let next =
-                                pending
-                                |> Seq.filter (fun candidate ->
-                                    not (isNull (box candidate))
-                                    && candidate.Delivery = DeliveryMode.Queue
-                                    && (candidate.Payload :? UserMessagePayload))
-                                |> Seq.sortBy (fun candidate -> candidate.Position)
-                                |> Seq.tryHead
-
-                            match next with
-                            | Some following ->
-                                startSuspendable following 1 (readGrantsNow ())
-                                return! loop SessionState.Running None resolved
-                            | None ->
-                                awaitTask (
-                                    props.Store.UpdateSessionState(
-                                        props.Tenant,
-                                        props.SessionId,
-                                        SessionState.Idle,
-                                        CancellationToken.None
-                                    )
+                                    props.Store.CloseSession(props.Tenant, props.SessionId, CancellationToken.None)
                                 )
                                 |> ignore
 
-                                return! loop SessionState.Idle None resolved
+                                return! loop SessionState.Closed None resolved
+                            else
+                                let pending =
+                                    awaitTask (
+                                        props.Store.ReadPendingInbox(
+                                            props.Tenant,
+                                            props.SessionId,
+                                            CancellationToken.None
+                                        )
+                                    )
+
+                                let next =
+                                    pending
+                                    |> Seq.filter (fun candidate ->
+                                        not (isNull (box candidate))
+                                        && candidate.Delivery = DeliveryMode.Queue
+                                        && (candidate.Payload :? UserMessagePayload))
+                                    |> Seq.sortBy (fun candidate -> candidate.Position)
+                                    |> Seq.tryHead
+
+                                match next with
+                                | Some following ->
+                                    startSuspendable following 1 (readGrantsNow ())
+                                    return! loop SessionState.Running None resolved
+                                | None ->
+                                    awaitTask (
+                                        props.Store.UpdateSessionState(
+                                            props.Tenant,
+                                            props.SessionId,
+                                            SessionState.Idle,
+                                            CancellationToken.None
+                                        )
+                                    )
+                                    |> ignore
+
+                                    return! loop SessionState.Idle None resolved
                         | Some cursor ->
                             awaitTask (
                                 props.Store.UpdateSessionState(

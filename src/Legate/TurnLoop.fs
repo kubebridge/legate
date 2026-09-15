@@ -109,6 +109,10 @@ module internal TurnLoop =
     /// TaskNested carries the task-tool nested runner (issue 72): Some
     /// runs the requested sub-agent through the nested loop, None reads a
     /// task call as an unknown tool.
+    /// StructuredOutcome carries the structured-outcome mode (issue 82):
+    /// true offers the finish/fail descriptors to the model and settles the
+    /// turn through them, false runs the host tool map untouched with a null
+    /// completion outcome.
     type TurnLoopOptions =
         {
             /// Maximum tool-result chars before truncation with <see cref="TruncationMarker" />.
@@ -130,6 +134,10 @@ module internal TurnLoop =
             /// The task-tool nested runner, or None when the turn offers no
             /// task tool.
             TaskNested: TaskNestedRun option
+            /// True when the turn runs with the structured outcome mode: the
+            /// loop offers the finish/fail descriptors and populates
+            /// TurnResult.Outcome. False runs the host tool map untouched.
+            StructuredOutcome: bool
         }
 
         /// Default tuning: 4000 chars before truncation with the iteration
@@ -146,6 +154,7 @@ module internal TurnLoop =
                 AskUser = None
                 OnToolCall = None
                 TaskNested = None
+                StructuredOutcome = false
             }
 
     /// One task-tool nested run: the parent call plus everything the
@@ -228,7 +237,9 @@ module internal TurnLoop =
 
     /// Resolves the effective per-turn budget: the session's explicit knobs
     /// win, unset knobs (0 iterations, empty timeout) fall back to the
-    /// configured <c>Turns</c> defaults. Raises
+    /// configured <c>Turns</c> defaults. The structured-outcome flag follows
+    /// the session's outcome mode, so whoever resolves the budget from the
+    /// session options carries the finish/fail interception with it. Raises
     /// <see cref="T:System.ArgumentOutOfRangeException" /> on any explicit
     /// or resolved non-positive value.
     let resolveBudget (sessionOptions: SessionOptions) (turns: TurnsOptions) : TurnLoopOptions =
@@ -270,6 +281,258 @@ module internal TurnLoop =
         { TurnLoopOptions.Default with
             MaxIterations = maxIterations
             Timeout = timeout
+            StructuredOutcome = (sessionOptions.Outcome = SessionOutcomeMode.Structured)
+        }
+
+    // ────────────────── Structured outcomes (issue 82) ──────────────────
+
+    /// The structured-outcome tool name that ends the turn with success:
+    /// reserved when TurnLoopOptions carries StructuredOutcome. A host tool
+    /// with this name collides: the loop raises ArgumentException naming the
+    /// reservation instead of shadowing either tool.
+    [<Literal>]
+    let FinishToolName = "finish"
+
+    /// The structured-outcome tool name that ends the turn with failure:
+    /// reserved when TurnLoopOptions carries StructuredOutcome, shadowing
+    /// neither the host tool nor the settlement: a collision raises like
+    /// FinishToolName.
+    [<Literal>]
+    let FailToolName = "fail"
+
+    /// Tool result text appended when a finish call carries no usable
+    /// summary: the model sees the error and continues without settling, so
+    /// a malformed call never ends the turn.
+    [<Literal>]
+    let FinishMissingSummaryMessage =
+        "Error: the finish tool needs a summary: pass what the turn accomplished in 'summary'."
+
+    /// Tool result text appended when a fail call carries no usable error:
+    /// the model sees the error and continues without settling, so a
+    /// malformed call never ends the turn.
+    [<Literal>]
+    let FailMissingErrorMessage =
+        "Error: the fail tool needs an error: pass why the turn failed in 'error'."
+
+    /// The JSON schema served on the finish tool: summary is a required
+    /// string, output_files an optional array of strings. Output files are
+    /// accepted for forward compatibility with the completion sink and are
+    /// not surfaced on the outcome.
+    let private finishSchemaJson =
+        """{"type":"object","description":"Arguments for the finish tool.","properties":{"summary":{"type":"string","description":"What the turn accomplished. Required."},"output_files":{"type":"array","items":{"type":"string"},"description":"Output files the turn produced. Optional; accepted for forward compatibility and not surfaced on the outcome."}},"required":["summary"],"additionalProperties":false}"""
+
+    /// The JSON schema served on the fail tool: error is a required string.
+    let private failSchemaJson =
+        """{"type":"object","description":"Arguments for the fail tool.","properties":{"error":{"type":"string","description":"Why the turn failed. Required."}},"required":["error"],"additionalProperties":false}"""
+
+    /// The parsed schema documents backing the structured-outcome tools:
+    /// the JsonSchema elements borrow them, so they live as long as the
+    /// process.
+    module private StructuredSchemas =
+
+        /// The parsed finish schema backing every finish tool instance.
+        let finishDocument = JsonDocument.Parse finishSchemaJson
+
+        /// The parsed fail schema backing every fail tool instance.
+        let failDocument = JsonDocument.Parse failSchemaJson
+
+    /// The finish function served to the model in structured turns.
+    /// Internal: the loop intercepts finish calls into immediate settlement
+    /// before any invocation, so a direct call is out of contract and raises.
+    [<Sealed>]
+    type internal FinishFunction() =
+        inherit AIFunction()
+
+        /// This tool's name for error text.
+        override _.Name = FinishToolName
+
+        /// This tool's description for the model.
+        override _.Description =
+            "Ends the turn with success (finish). Pass what the turn accomplished in 'summary' (required) and optional 'output_files'. The turn settles immediately with no further model calls."
+
+        /// This tool's argument schema.
+        override _.JsonSchema = StructuredSchemas.finishDocument.RootElement
+
+        /// Raises: execution belongs to the turn loop's structured-outcome
+        /// interception (settle on the call, never invoke), so a direct call
+        /// is out of contract.
+        /// Cancellation propagates as-is.
+        override _.InvokeCoreAsync
+            (args: AIFunctionArguments, cancellationToken: CancellationToken)
+            : ValueTask<obj | null> =
+            ValueTask<obj | null>(
+                task {
+                    cancellationToken.ThrowIfCancellationRequested()
+
+                    if not (isNull (box args)) then
+                        ()
+
+                    return
+                        raise (
+                            InvalidOperationException(
+                                "The finish tool runs through the turn loop's structured-outcome interception: invoke it through a turn, never directly."
+                            )
+                        )
+                }
+            )
+
+    /// The fail function served to the model in structured turns. Internal:
+    /// the loop intercepts fail calls into immediate settlement before any
+    /// invocation, so a direct call is out of contract and raises, like the
+    /// finish function.
+    [<Sealed>]
+    type internal FailFunction() =
+        inherit AIFunction()
+
+        /// This tool's name for error text.
+        override _.Name = FailToolName
+
+        /// This tool's description for the model.
+        override _.Description =
+            "Ends the turn with failure (fail). Pass why the turn failed in 'error' (required). The turn settles immediately with no further model calls."
+
+        /// This tool's argument schema.
+        override _.JsonSchema = StructuredSchemas.failDocument.RootElement
+
+        /// Raises: execution belongs to the turn loop's structured-outcome
+        /// interception (settle on the call, never invoke), so a direct call
+        /// is out of contract.
+        /// Cancellation propagates as-is.
+        override _.InvokeCoreAsync
+            (args: AIFunctionArguments, cancellationToken: CancellationToken)
+            : ValueTask<obj | null> =
+            ValueTask<obj | null>(
+                task {
+                    cancellationToken.ThrowIfCancellationRequested()
+
+                    if not (isNull (box args)) then
+                        ()
+
+                    return
+                        raise (
+                            InvalidOperationException(
+                                "The fail tool runs through the turn loop's structured-outcome interception: invoke it through a turn, never directly."
+                            )
+                        )
+                }
+            )
+
+    /// Builds the tool map the loop offers when the turn runs structured:
+    /// the host tools plus the finish/fail descriptors. Non-structured turns
+    /// run the host map untouched, so finish/fail never reach the model.
+    /// Raises ArgumentException when a host tool already claims a reserved
+    /// name: the loop fails fast naming the reservation instead of shadowing
+    /// either tool.
+    /// <param name="options">The turn loop tuning carrying the structured flag.</param>
+    /// <param name="tools">The host tool map. Must not be null.</param>
+    /// <returns>The map the loop offers and invokes through.</returns>
+    let internal effectiveTools
+        (options: TurnLoopOptions)
+        (tools: IReadOnlyDictionary<string, AITool>)
+        : IReadOnlyDictionary<string, AITool> =
+        ArgumentNullException.ThrowIfNull(tools)
+
+        if not options.StructuredOutcome then
+            tools
+        else
+            for reserved in [| FinishToolName; FailToolName |] do
+                if tools.ContainsKey(reserved) then
+                    raise (
+                        ArgumentException(
+                            sprintf
+                                "The tool name '%s' is reserved for the structured-outcome tool: rename the host tool."
+                                reserved,
+                            nameof tools
+                        )
+                    )
+
+            ToolNameRules.Validate(FinishToolName) |> ignore
+            ToolNameRules.Validate(FailToolName) |> ignore
+
+            let merged = Dictionary<string, AITool>(tools.Count + 2)
+
+            for entry in tools do
+                merged[entry.Key] <- entry.Value
+
+            merged[FinishToolName] <- FinishFunction() :> AITool
+            merged[FailToolName] <- FailFunction() :> AITool
+            merged :> IReadOnlyDictionary<string, AITool>
+
+    /// Reads one structured-outcome call argument as text: plain strings and
+    /// JSON string elements; anything else is not text.
+    /// <param name="args">The call's arguments.</param>
+    /// <param name="name">The argument to read.</param>
+    /// <returns>The text, or null when the argument is missing or not text.</returns>
+    let private structuredArgText (args: IDictionary<string, obj>) (name: string) : string | null =
+        if isNull (box args) || isNull (box name) then
+            null
+        else
+            let mutable value: obj = null
+
+            if args.TryGetValue(name, &value) && not (isNull (box value)) then
+                match value with
+                | :? string as text -> text
+                | :? JsonElement as element when element.ValueKind = JsonValueKind.String -> element.GetString()
+                | _ -> null
+            else
+                null
+
+    /// Builds the Completed TurnResult for an explicit finish call: the
+    /// spent iteration count and accumulated usage with a TurnFinished
+    /// outcome carrying the model's summary as an explicit (non-implicit)
+    /// outcome. AssistantText carries the summary too, so hosts that read
+    /// only the text see what the turn accomplished.
+    /// <param name="iterations">The model iterations the turn spent.</param>
+    /// <param name="inputTokens">The input tokens the turn spent.</param>
+    /// <param name="outputTokens">The output tokens the turn spent.</param>
+    /// <param name="summary">The model's finish summary. Must not be null.</param>
+    /// <returns>The settled explicit-finish result.</returns>
+    let private finishedResult
+        (iterations: int)
+        (inputTokens: int64)
+        (outputTokens: int64)
+        (summary: string)
+        : TurnResult =
+        {
+            AssistantText = summary
+            Status = TurnStatus.Completed
+            Iterations = iterations
+            Usage =
+                {
+                    InputTokens = inputTokens
+                    OutputTokens = outputTokens
+                }
+            Outcome = TurnFinished(summary) :> TurnOutcome
+        }
+
+    /// Builds the Completed TurnResult for a structured turn the model
+    /// stopped without calling finish or fail: a TurnFinished outcome
+    /// carrying the final assistant text with the implicit flag set.
+    /// <param name="iterations">The model iterations the turn spent.</param>
+    /// <param name="inputTokens">The input tokens the turn spent.</param>
+    /// <param name="outputTokens">The output tokens the turn spent.</param>
+    /// <param name="assistantText">The final assistant text.</param>
+    /// <returns>The settled implicit-finish result.</returns>
+    let private implicitFinishedResult
+        (iterations: int)
+        (inputTokens: int64)
+        (outputTokens: int64)
+        (assistantText: string)
+        : TurnResult =
+        let text = if isNull assistantText then "" else assistantText
+        let outcome = TurnFinished(text)
+        outcome.IsImplicit <- true
+
+        {
+            AssistantText = text
+            Status = TurnStatus.Completed
+            Iterations = iterations
+            Usage =
+                {
+                    InputTokens = inputTokens
+                    OutputTokens = outputTokens
+                }
+            Outcome = outcome :> TurnOutcome
         }
 
     /// Raised when the lease-check hook reports the turn lease is lost.
@@ -656,6 +919,11 @@ module internal TurnLoop =
     /// the deadline maps to the timeout reason and external cancellation
     /// still propagates. The
     /// lease hook stays first so a fenced loser still produces zero effects.
+    /// When TurnLoopOptions carries StructuredOutcome (issue 82), the loop
+    /// offers the finish/fail descriptors and a call to either settles the
+    /// turn immediately under the same fence; a structured turn the model
+    /// stops without calling either settles Completed with an implicit
+    /// TurnFinished outcome.
     let runAsyncWithDeltasAndInjects
         (client: IChatClient)
         (history: IList<ChatMessage>)
@@ -689,6 +957,11 @@ module internal TurnLoop =
 
         if options.Timeout <= TimeSpan.Zero then
             raise (ArgumentOutOfRangeException(nameof options, "Timeout must be positive."))
+
+        // Structured outcomes (issue 82): the offered map gains the
+        // finish/fail descriptors, or the host map passes through untouched.
+        // A host collision raises here, before any provider call.
+        let tools = effectiveTools options tools
 
         let timeoutCts = new CancellationTokenSource()
 
@@ -749,17 +1022,23 @@ module internal TurnLoop =
         let completedCompletion iterations inputTokens outputTokens assistantText : TurnLoopCompletion =
             {
                 Result =
-                    {
-                        AssistantText = assistantText
-                        Status = TurnStatus.Completed
-                        Iterations = iterations
-                        Usage =
-                            {
-                                InputTokens = inputTokens
-                                OutputTokens = outputTokens
-                            }
-                        Outcome = null
-                    }
+                    if options.StructuredOutcome then
+                        // No finish call ended this turn (a finish call
+                        // settles immediately), so the model stopped without
+                        // calling either: synthesize the implicit Finished.
+                        implicitFinishedResult iterations inputTokens outputTokens assistantText
+                    else
+                        {
+                            AssistantText = assistantText
+                            Status = TurnStatus.Completed
+                            Iterations = iterations
+                            Usage =
+                                {
+                                    InputTokens = inputTokens
+                                    OutputTokens = outputTokens
+                                }
+                            Outcome = null
+                        }
                 HasPendingInjects = hasPendingInjects ()
                 Suspension = None
             }
@@ -774,7 +1053,12 @@ module internal TurnLoop =
         // Runs one round of tool calls in order. Returns None when every
         // call ran, or the timeout settlement when the deadline fired
         // mid-round so no further tool runs.
-        let rec runTools roundIterations roundInput roundOutput pending : Task<TurnLoopCompletion option> =
+        let rec runTools
+            roundIterations
+            roundInput
+            roundOutput
+            (pending: FunctionCallContent list)
+            : Task<TurnLoopCompletion option> =
             task {
                 match pending with
                 | [] -> return None
@@ -800,18 +1084,102 @@ module internal TurnLoop =
                                 raise (TurnLeaseLostException())
                         | None -> ()
 
-                        let! rawText = invokeAndObserveAsync options tools call linkedToken
-                        let text = truncateToolResult options rawText
-                        let resultContent = FunctionResultContent(call.CallId, text)
+                        // Structured outcomes (issue 82): finish/fail calls
+                        // settle the turn immediately under the fence above,
+                        // so the takeover loser raises TurnLeaseLostException
+                        // there instead of settling. Malformed calls append
+                        // an Error: continuation and run on, so a bad call
+                        // never ends the turn. Calls after a settling call in
+                        // the same round never run.
+                        if
+                            options.StructuredOutcome
+                            && String.Equals(call.Name, FinishToolName, StringComparison.Ordinal)
+                        then
+                            match Option.ofObj (structuredArgText call.Arguments "summary") with
+                            | Some summary when not (String.IsNullOrWhiteSpace summary) ->
+                                let resultContent = FunctionResultContent(call.CallId, summary)
 
-                        let toolMessage =
-                            ChatMessage(
-                                ChatRole.Tool,
-                                ResizeArray<AIContent>([| resultContent :> AIContent |]) :> IList<AIContent>
-                            )
+                                let toolMessage =
+                                    ChatMessage(
+                                        ChatRole.Tool,
+                                        ResizeArray<AIContent>([| resultContent :> AIContent |]) :> IList<AIContent>
+                                    )
 
-                        history.Add(toolMessage)
-                        return! runTools roundIterations roundInput roundOutput rest
+                                history.Add(toolMessage)
+                                do! observeToolCallAsync options call summary None
+
+                                return
+                                    Some(
+                                        {
+                                            Result = finishedResult roundIterations roundInput roundOutput summary
+                                            HasPendingInjects = hasPendingInjects ()
+                                            Suspension = None
+                                        }
+                                    )
+                            | _ ->
+                                let text = FinishMissingSummaryMessage
+                                let resultContent = FunctionResultContent(call.CallId, text)
+
+                                let toolMessage =
+                                    ChatMessage(
+                                        ChatRole.Tool,
+                                        ResizeArray<AIContent>([| resultContent :> AIContent |]) :> IList<AIContent>
+                                    )
+
+                                history.Add(toolMessage)
+                                do! observeToolCallAsync options call text (Some text)
+                                return! runTools roundIterations roundInput roundOutput rest
+                        elif
+                            options.StructuredOutcome
+                            && String.Equals(call.Name, FailToolName, StringComparison.Ordinal)
+                        then
+                            match Option.ofObj (structuredArgText call.Arguments "error") with
+                            | Some error when not (String.IsNullOrWhiteSpace error) ->
+                                let resultContent = FunctionResultContent(call.CallId, error)
+
+                                let toolMessage =
+                                    ChatMessage(
+                                        ChatRole.Tool,
+                                        ResizeArray<AIContent>([| resultContent :> AIContent |]) :> IList<AIContent>
+                                    )
+
+                                history.Add(toolMessage)
+                                do! observeToolCallAsync options call error None
+
+                                return
+                                    Some(
+                                        {
+                                            Result = failedResult roundIterations roundInput roundOutput error
+                                            HasPendingInjects = false
+                                            Suspension = None
+                                        }
+                                    )
+                            | _ ->
+                                let text = FailMissingErrorMessage
+                                let resultContent = FunctionResultContent(call.CallId, text)
+
+                                let toolMessage =
+                                    ChatMessage(
+                                        ChatRole.Tool,
+                                        ResizeArray<AIContent>([| resultContent :> AIContent |]) :> IList<AIContent>
+                                    )
+
+                                history.Add(toolMessage)
+                                do! observeToolCallAsync options call text (Some text)
+                                return! runTools roundIterations roundInput roundOutput rest
+                        else
+                            let! rawText = invokeAndObserveAsync options tools call linkedToken
+                            let text = truncateToolResult options rawText
+                            let resultContent = FunctionResultContent(call.CallId, text)
+
+                            let toolMessage =
+                                ChatMessage(
+                                    ChatRole.Tool,
+                                    ResizeArray<AIContent>([| resultContent :> AIContent |]) :> IList<AIContent>
+                                )
+
+                            history.Add(toolMessage)
+                            return! runTools roundIterations roundInput roundOutput rest
             }
 
         let rec loop iterations inputTokens outputTokens : Task<TurnLoopCompletion> =
@@ -1165,6 +1533,11 @@ module internal TurnLoop =
     /// PermissionRequestedEvent or QuestionAskedEvent and owns the
     /// store-first WaitingForInput transition; the loop only parks the
     /// cursor. Reply-never-starts-a-turn: a suspension never starts work.
+    /// When TurnLoopOptions carries StructuredOutcome (issue 82), the loop
+    /// offers the finish/fail descriptors and a call to either settles the
+    /// turn immediately under the same fence; a structured turn the model
+    /// stops without calling either settles Completed with an implicit
+    /// TurnFinished outcome.
     /// <param name="client">The chat client the turn runs against.</param>
     /// <param name="history">The running history, mutated in place.</param>
     /// <param name="tools">The tools the turn may call.</param>
@@ -1215,6 +1588,11 @@ module internal TurnLoop =
 
         if options.Timeout <= TimeSpan.Zero then
             raise (ArgumentOutOfRangeException(nameof options, "Timeout must be positive."))
+
+        // Structured outcomes (issue 82): the offered map gains the
+        // finish/fail descriptors, or the host map passes through untouched.
+        // A host collision raises here, before any provider call.
+        let tools = effectiveTools options tools
 
         let mintId =
             match newRequestId with
@@ -1270,17 +1648,23 @@ module internal TurnLoop =
         let completedCompletion iterations inputTokens outputTokens assistantText : TurnLoopCompletion =
             {
                 Result =
-                    {
-                        AssistantText = assistantText
-                        Status = TurnStatus.Completed
-                        Iterations = iterations
-                        Usage =
-                            {
-                                InputTokens = inputTokens
-                                OutputTokens = outputTokens
-                            }
-                        Outcome = null
-                    }
+                    if options.StructuredOutcome then
+                        // No finish call ended this turn (a finish call
+                        // settles immediately), so the model stopped without
+                        // calling either: synthesize the implicit Finished.
+                        implicitFinishedResult iterations inputTokens outputTokens assistantText
+                    else
+                        {
+                            AssistantText = assistantText
+                            Status = TurnStatus.Completed
+                            Iterations = iterations
+                            Usage =
+                                {
+                                    InputTokens = inputTokens
+                                    OutputTokens = outputTokens
+                                }
+                            Outcome = null
+                        }
                 HasPendingInjects = hasPendingInjects ()
                 Suspension = None
             }
@@ -1515,7 +1899,71 @@ module internal TurnLoop =
 
                         let toolName = if isNull call.Name then "" else call.Name
 
-                        if String.Equals(toolName, AskUserToolName, StringComparison.Ordinal) then
+                        // Structured outcomes (issue 82): finish/fail settle
+                        // the turn immediately under the fence above, so the
+                        // takeover loser raises TurnLeaseLostException there
+                        // instead of settling. The permission gate never sees
+                        // them: they are runtime control calls like ask_user,
+                        // not host tools. Malformed calls append an Error:
+                        // continuation and run on; calls after a settling
+                        // call in the same round never run.
+                        if
+                            options.StructuredOutcome
+                            && String.Equals(toolName, FinishToolName, StringComparison.Ordinal)
+                        then
+                            match Option.ofObj (structuredArgText call.Arguments "summary") with
+                            | Some summary when not (String.IsNullOrWhiteSpace summary) ->
+                                appendToolResult history call.CallId summary
+                                do! observeToolCallAsync options call summary None
+
+                                return
+                                    Some(
+                                        {
+                                            Result = finishedResult roundIterations roundInput roundOutput summary
+                                            HasPendingInjects = hasPendingInjects ()
+                                            Suspension = None
+                                        }
+                                    )
+                            | _ ->
+                                appendToolResult history call.CallId FinishMissingSummaryMessage
+
+                                do!
+                                    observeToolCallAsync
+                                        options
+                                        call
+                                        FinishMissingSummaryMessage
+                                        (Some FinishMissingSummaryMessage)
+
+                                return! runTools roundIterations roundInput roundOutput rest
+                        elif
+                            options.StructuredOutcome
+                            && String.Equals(toolName, FailToolName, StringComparison.Ordinal)
+                        then
+                            match Option.ofObj (structuredArgText call.Arguments "error") with
+                            | Some error when not (String.IsNullOrWhiteSpace error) ->
+                                appendToolResult history call.CallId error
+                                do! observeToolCallAsync options call error None
+
+                                return
+                                    Some(
+                                        {
+                                            Result = failedResult roundIterations roundInput roundOutput error
+                                            HasPendingInjects = false
+                                            Suspension = None
+                                        }
+                                    )
+                            | _ ->
+                                appendToolResult history call.CallId FailMissingErrorMessage
+
+                                do!
+                                    observeToolCallAsync
+                                        options
+                                        call
+                                        FailMissingErrorMessage
+                                        (Some FailMissingErrorMessage)
+
+                                return! runTools roundIterations roundInput roundOutput rest
+                        elif String.Equals(toolName, AskUserToolName, StringComparison.Ordinal) then
                             let question = extractQuestion call
                             let hint = extractOptions call
 
