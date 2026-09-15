@@ -80,6 +80,7 @@
     <Compile Include="FileAgentStoreTests.fs" />
     <Compile Include="SubAgentsTests.fs" />
     <Compile Include="TaskToolTests.fs" />
+    <Compile Include="SsrfGuardTests.fs" />
   </ItemGroup>
 
   <ItemGroup>
