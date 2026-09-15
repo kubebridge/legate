@@ -24,6 +24,7 @@
     <Compile Include="Sessions.fs" />
     <Compile Include="WorkspaceRuntime.fs" />
     <Compile Include="Policies.fs" />
+    <Compile Include="PermissionPolicies.fs" />
     <Compile Include="ToolSources.fs" />
     <Compile Include="Events.fs" />
     <Compile Include="Cells.fs" />
