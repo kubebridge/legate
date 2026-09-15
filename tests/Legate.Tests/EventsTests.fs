@@ -2,6 +2,7 @@
 module Legate.Tests.EventsTests
 
 open System
+open System.Collections.Generic
 open System.Text.Json
 open System.Text.Json.Serialization
 open FsUnit.Xunit
@@ -76,9 +77,20 @@ let sampleEvents: (string * (unit -> SessionEvent)) list =
         fun () ->
             SkillInvalidEvent(sessionId, turnId, noSequence, stamp, "deploy", "the skill frontmatter has no 'name'")
             :> SessionEvent
+        "skillLoaded",
+        fun () ->
+            SkillLoadedEvent(
+                sessionId,
+                turnId,
+                noSequence,
+                stamp,
+                "deploy",
+                ResizeArray<string>([| ".agent/skills/deploy/refs/api.md" |]) :> IReadOnlyList<string>
+            )
+            :> SessionEvent
     ]
 
-// The 20 discriminator strings the base type's XML doc documents as the
+// The 21 discriminator strings the base type's XML doc documents as the
 // wire contract, in the same order as the JsonDerivedType attributes.
 let discriminatorContract =
     [|
@@ -102,6 +114,7 @@ let discriminatorContract =
         "userMessage"
         "contextPruned"
         "skillInvalid"
+        "skillLoaded"
     |]
 
 /// Reads the TypeDiscriminator values from the JsonDerivedType attributes
@@ -365,6 +378,38 @@ let ``SkillInvalid round-trips its skill name and reason`` () =
     invalid.SkillName |> should equal "deploy"
     invalid.Reason |> should equal "the skill frontmatter has no 'name'"
 
+[<Fact>]
+let ``SkillLoaded round-trips its skill name and companions`` () =
+    let restored =
+        roundTrip "skillLoaded" (fun () ->
+            SkillLoadedEvent(
+                sessionId,
+                turnId,
+                noSequence,
+                stamp,
+                "deploy",
+                ResizeArray<string>(
+                    [|
+                        ".agent/skills/deploy/refs/api.md"
+                        ".agent/skills/deploy/runbook.md"
+                    |]
+                )
+                :> IReadOnlyList<string>
+            )
+            :> SessionEvent)
+
+    let loaded = restored :?> SkillLoadedEvent
+    loaded.SkillName |> should equal "deploy"
+
+    loaded.Companions
+    |> List.ofSeq
+    |> should
+        equal
+        [
+            ".agent/skills/deploy/refs/api.md"
+            ".agent/skills/deploy/runbook.md"
+        ]
+
 // ───────────────────────────────────────────────────────────────────────────
 // Sequence and base-field nullability
 
@@ -411,7 +456,7 @@ let ``Base fields carry the constructor values the constructor set`` () =
 
 [<Fact>]
 let ``An undocumented $type value is rejected instead of guessed`` () =
-    // The 20 documented discriminators are the wire contract: anything
+    // The 21 documented discriminators are the wire contract: anything
     // outside the set must fail the read rather than deserialise to a base
     // instance. The BCL raises NotSupportedException for a discriminator
     // with no registered derived type (surfaced possibly wrapped in a

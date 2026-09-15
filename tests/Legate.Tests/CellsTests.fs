@@ -747,6 +747,7 @@ let expectedRules: (string * int * SessionCellKind) list =
         "userMessage", 1, SessionCellKind.User // one User cell per folded Inject message
         "contextPruned", 1, SessionCellKind.System // one System audit cell per prune event
         "skillInvalid", 1, SessionCellKind.System // one System failure cell per skipped skill
+        "skillLoaded", 0, SessionCellKind.User // progress marker: no cells, hosts read the event stream
     ]
 
 [<Fact>]
@@ -825,6 +826,17 @@ let ``The fold classifies a bare event of every kind per the mapped rule`` () =
                         stamp,
                         "deploy",
                         "the skill frontmatter has no 'name'"
+                    )
+                    :> SessionEvent
+            | "skillLoaded" ->
+                fun () ->
+                    SkillLoadedEvent(
+                        sessionId,
+                        turnId,
+                        noSequence,
+                        stamp,
+                        "deploy",
+                        ResizeArray<string>([| ".agent/skills/deploy/refs/api.md" |]) :> IReadOnlyList<string>
                     )
                     :> SessionEvent
             | _ -> failwith (sprintf "unmapped discriminator '%s' in the pin table" discriminator)

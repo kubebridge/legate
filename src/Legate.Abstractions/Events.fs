@@ -2,6 +2,7 @@
 namespace Legate
 
 open System
+open System.Collections.Generic
 open System.Text.Json.Serialization
 
 // Session event contracts. A SessionEvent is one entry of the fine-grained,
@@ -50,6 +51,7 @@ open System.Text.Json.Serialization
 /// <item><term>userMessage</term><description>an injected user message was folded into the running turn.</description></item>
 /// <item><term>contextPruned</term><description>old tool results were replaced with the prune marker.</description></item>
 /// <item><term>skillInvalid</term><description>a packaged skill was skipped during discovery with its reason.</description></item>
+/// <item><term>skillLoaded</term><description>a skill's content was loaded for the turn with its companion list.</description></item>
 /// </list>
 /// Every subtype is named <c>&lt;Kind&gt;Event</c> so no kind name collides
 /// with an existing Legate type (for example <see cref="T:Legate.TurnFailed" />
@@ -76,6 +78,7 @@ open System.Text.Json.Serialization
 [<JsonDerivedType(typeof<UserMessageEvent>, "userMessage")>]
 [<JsonDerivedType(typeof<ContextPrunedEvent>, "contextPruned")>]
 [<JsonDerivedType(typeof<SkillInvalidEvent>, "skillInvalid")>]
+[<JsonDerivedType(typeof<SkillLoadedEvent>, "skillLoaded")>]
 type SessionEvent(sessionId: SessionId, turnId: TurnId, sequence: Nullable<int64>, timestamp: DateTimeOffset) =
 
     /// The session the event belongs to. Sequence numbers are per-session,
@@ -528,3 +531,39 @@ and [<Sealed>] SkillInvalidEvent
     /// Why the skill was skipped: a missing SKILL.md, a frontmatter
     /// failure, or a staging failure. Never contains secrets.
     member _.Reason = reason
+
+/// A packaged skill's content was loaded for the turn through the built-in
+/// skill tool: the turn read the skill's SKILL.md from the active package
+/// version and the host can render which skills the turn used. The bus is a
+/// live fan-out of the same journal, not a separate event: hosts observe
+/// this event through Subscribe like every other journaled event.
+/// <param name="sessionId">The session the load ran for.</param>
+/// <param name="turnId">The turn the load ran inside.</param>
+/// <param name="sequence">The event's per-session sequence number, or empty while in flight.</param>
+/// <param name="timestamp">When the skill was loaded.</param>
+/// <param name="skillName">The name of the skill that was loaded, as listed by package info.</param>
+/// <param name="companions">The package-relative companion paths of the loaded skill, in ordinal order, excluding SKILL.md itself. Must not be null.</param>
+and [<Sealed>] SkillLoadedEvent
+    (
+        sessionId: SessionId,
+        turnId: TurnId,
+        sequence: Nullable<int64>,
+        timestamp: DateTimeOffset,
+        skillName: string,
+        companions: IReadOnlyList<string>
+    ) =
+    inherit SessionEvent(sessionId, turnId, sequence, timestamp)
+
+    do
+        if isNull (box skillName) then
+            raise (ArgumentNullException(nameof skillName))
+
+        if isNull (box companions) then
+            raise (ArgumentNullException(nameof companions))
+
+    /// The name of the skill that was loaded, as listed by package info.
+    member _.SkillName = skillName
+
+    /// The package-relative companion paths of the loaded skill, in ordinal
+    /// order, excluding SKILL.md itself. Never null.
+    member _.Companions: IReadOnlyList<string> = companions
