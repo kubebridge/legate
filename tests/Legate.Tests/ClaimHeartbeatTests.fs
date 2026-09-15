@@ -407,3 +407,87 @@ let ``Options reject a renewal interval at half the lease`` () =
 
     (fun () -> ClaimHeartbeat.fromSessions sessions |> ignore)
     |> should throw typeof<ArgumentOutOfRangeException>
+
+// ──────────────────────────────────────────────────────────────────────────
+// Renewal while suspended (issue 36)
+
+/// Reads a session's stored lifecycle state, blocking. Tests only read rows
+/// they created, so a missing row is a test bug.
+let private storedStateOf (store: ISessionStore) (sessionId: SessionId) : SessionState =
+    match store.GetSession(tenant, sessionId, CancellationToken.None).GetAwaiter().GetResult() with
+    | null -> failwith "Expected the session row to exist."
+    | session -> session.State
+
+[<Fact>]
+let ``Renewal continues while the session is suspended`` () =
+    // The heartbeat never consults session state: a session that suspended
+    // to WaitingForInput keeps renewing under the same claim, so no cancel
+    // fires on suspend. The loop below renews twice past a suspended row
+    // before the scripted missing branch stops it.
+    let clock = TestClock(DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero))
+    let database = InMemoryDatabase(clock)
+    let store = InMemorySessionStore(database) :> ISessionStore
+
+    let session =
+        store.CreateSession(tenant, sampleSession (), CancellationToken.None).GetAwaiter().GetResult()
+
+    store.UpdateSessionState(tenant, session.Id, SessionState.WaitingForInput, CancellationToken.None)
+    |> fun task -> task.GetAwaiter().GetResult()
+    |> ignore
+
+    let payload = UserMessagePayload(UserMessage.Text("run")) :> InboxPayload
+
+    store.AppendInboxMessage(tenant, session.Id, payload, DeliveryMode.Queue, CancellationToken.None)
+    |> fun task -> task.GetAwaiter().GetResult()
+    |> ignore
+
+    // A suspended session still holds pending inbox work; the heartbeat's
+    // renewals below land while the row reads WaitingForInput.
+    let claim =
+        match
+            store.ClaimNextTurn(tenant, session.Id, "owner-a", TimeSpan.FromSeconds 120.0, CancellationToken.None)
+            |> fun task -> task.GetAwaiter().GetResult()
+        with
+        | :? TurnLeaseRenewed as renewed -> renewed.Claim
+        | :? TurnLeaseHeld as held -> held.Claim
+        | _ -> failwith "Expected the suspend claim to be granted."
+
+    let log = ResizeArray<string>()
+
+    let renewedState = TurnLeaseRenewed(claim) :> TurnLeaseState
+    let remaining = ResizeArray<TurnLeaseState>([ renewedState; renewedState ])
+
+    let renew _ _ =
+        log.Add("renew")
+
+        if remaining.Count = 0 then
+            Task.FromResult(TurnLeaseMissing(claim.TurnId) :> TurnLeaseState)
+        else
+            let next = remaining[0]
+            remaining.RemoveAt(0)
+            Task.FromResult(next)
+
+    let delay = LoggingDelay(log, ignore) :> ILlmDelay
+
+    let decision =
+        ClaimHeartbeat.runAsync renew claim (heartbeatOptions ()) clock delay neverCancelled None CancellationToken.None
+        |> fun task -> task.GetAwaiter().GetResult()
+
+    decision |> should equal ClaimHeartbeat.StopLeaseLost
+
+    // Two renewals landed while the session stayed suspended, then the
+    // missing branch stopped the loop: suspension never cancels renewal.
+    (storedStateOf store session.Id) |> should equal SessionState.WaitingForInput
+
+    log
+    |> List.ofSeq
+    |> should
+        equal
+        [
+            "delay:30"
+            "renew"
+            "delay:30"
+            "renew"
+            "delay:30"
+            "renew"
+        ]

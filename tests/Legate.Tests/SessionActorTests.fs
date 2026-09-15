@@ -942,3 +942,688 @@ let ``Abort rejects a null reason`` () =
         |> ignore
     finally
         stopSystem system
+
+// ──────────────────────────────────────────────────────────────────────────
+// Suspend and resume (issue 36)
+
+/// In-memory journal fake without claim fencing: records appends and serves
+/// one replay page. The production fence lives in the real stores; these
+/// tests prove the actor's suspend bookkeeping, and the takeover test below
+/// proves the fenced store rejects the loser with zero writes.
+type RecordingEventStore() =
+    let events = ResizeArray<SessionEvent>()
+
+    /// Every appended event, in append order.
+    member _.Appended = events :> IReadOnlyList<SessionEvent>
+
+    interface ISessionEventStore with
+        member _.Append(_, _, _, batch, _) =
+            if isNull (box batch) then
+                raise (ArgumentNullException(nameof batch))
+
+            for event in batch do
+                events.Add(event)
+
+            let stamped = ResizeArray<SessionEvent>(events) :> IReadOnlyList<SessionEvent>
+            Task.FromResult(EventAppended(stamped) :> EventAppendOutcome)
+
+        member _.Replay(_, sessionId, fromSequence, _, _) =
+            if fromSequence = 0L && events.Count > 0 then
+                let page = ResizeArray<SessionEvent>(events) :> IReadOnlyList<SessionEvent>
+                Task.FromResult(EventReplayPage(sessionId, page, Nullable<int64>()) :> EventReplayOutcome)
+            else
+                Task.FromResult(EventReplayEndOfStream(sessionId) :> EventReplayOutcome)
+
+        member _.TryClaimCleanup(_, sessionId, _, _, _) =
+            Task.FromResult(EventCleanupNotClaimable(sessionId, "notSupported") :> EventCleanupState)
+
+        member _.CompleteCleanup(_, sessionId, _, _) =
+            Task.FromResult(EventCleanupRejected(sessionId, "staleClaim") :> EventCleanupSettlement)
+
+        member _.DeferCleanup(_, sessionId, _, _) =
+            Task.FromResult(EventCleanupRejected(sessionId, "staleClaim") :> EventCleanupSettlement)
+
+/// Delay seam that fires only when the test releases it: AskTimeout tests
+/// prove the Failed settle at the seam boundary without sleeping.
+type ManualDelay() =
+    let gate = new TaskCompletionSource<unit>()
+
+    /// Releases the waiting AskTimeout delay.
+    member _.Fire() = gate.TrySetResult() |> ignore
+
+    interface ILlmDelay with
+        member _.Delay(_, cancellationToken) =
+            task {
+                do! gate.Task
+                cancellationToken.ThrowIfCancellationRequested()
+            }
+            :> Task
+
+/// Builds one suspend cursor for the scripted runner.
+let private suspendCursor
+    (requestId: string)
+    (toolName: string)
+    (callId: string)
+    (kind: TurnLoop.SuspensionKind)
+    : TurnLoop.TurnLoopSuspension =
+    let args = Dictionary<string, obj>() :> IDictionary<string, obj>
+    let pendingCall = FunctionCallContent(callId, toolName, args)
+
+    {
+        RequestId = requestId
+        ToolName = toolName
+        ToolCallId = callId
+        Kind = kind
+        QuestionText =
+            if kind = TurnLoop.QuestionSuspension then
+                "Which region?"
+            else
+                ""
+        HistorySnapshot = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+        InputTokens = 3L
+        OutputTokens = 5L
+        Iterations = 1
+        PendingCall = pendingCall
+    }
+
+/// A Suspended completion parking on the given cursor.
+let private suspendedCompletion (cursor: TurnLoop.TurnLoopSuspension) : TurnLoop.TurnLoopCompletion =
+    {
+        Result =
+            {
+                AssistantText = ""
+                Status = TurnStatus.Suspended
+                Iterations = cursor.Iterations
+                Usage =
+                    {
+                        InputTokens = cursor.InputTokens
+                        OutputTokens = cursor.OutputTokens
+                    }
+                Outcome = null
+            }
+        HasPendingInjects = false
+        Suspension = Some cursor
+    }
+
+/// A settled completion with no suspension.
+let private settledCompletion (text: string) : TurnLoop.TurnLoopCompletion =
+    {
+        Result = completed text
+        HasPendingInjects = false
+        Suspension = None
+    }
+
+/// Scripted suspendable runner: answers per attempt, recording attempts,
+/// cursors, and replies in call order.
+type private ScriptSuspendRunner(first: TurnLoop.TurnLoopCompletion, second: TurnLoop.TurnLoopCompletion) =
+    let attempts = ResizeArray<int>()
+    let cursors = ResizeArray<TurnLoop.TurnLoopSuspension option>()
+    let replies = ResizeArray<Reply option>()
+
+    /// Attempts in call order.
+    member _.Attempts = attempts :> IReadOnlyList<int>
+
+    /// The runner as the suspendable delegate.
+    member _.Func
+        : (InboxEntry
+              -> int
+              -> HashSet<string>
+              -> TurnLoop.TurnLoopSuspension option
+              -> Reply option
+              -> CancellationToken
+              -> Task<TurnLoop.TurnLoopCompletion>) =
+        fun _ attempt _ cursor reply _ ->
+            attempts.Add(attempt)
+            cursors.Add(cursor)
+            replies.Add(reply)
+
+            if attempt = 1 then
+                Task.FromResult(first)
+            else
+                Task.FromResult(second)
+
+    /// Cursors in call order.
+    member _.Cursors = cursors :> IReadOnlyList<TurnLoop.TurnLoopSuspension option>
+
+    /// Replies in call order.
+    member _.Replies = replies :> IReadOnlyList<Reply option>
+
+/// Spawns a suspendable session actor on a test system.
+let private spawnSuspendable
+    (system: ActorSystem)
+    (store: ISessionStore)
+    (journal: RecordingEventStore)
+    (delay: ILlmDelay)
+    (askTimeout: TimeSpan)
+    (sessionId: SessionId)
+    (runner: ScriptSuspendRunner)
+    (settled: ResizeArray<TurnResult>)
+    : IActorRef =
+    let baseProps: SessionActorProps =
+        {
+            Store = store
+            Tenant = tenant
+            SessionId = sessionId
+            RunTurn = (fun _ _ -> Task.FromResult(completed "unused"))
+            OnTurnSettled = Some(fun result -> lock settled (fun () -> settled.Add(result)))
+        }
+
+    let deps: SessionActor.SuspendDeps =
+        {
+            EventStore = journal :> ISessionEventStore
+            Delay = delay
+            AskTimeout = askTimeout
+            JournalToken = "test-token"
+            RunSuspendable = runner.Func
+        }
+
+    spawn system $"suspend-{Guid.NewGuid():N}" (SessionActor.behaviorWithSuspend baseProps deps)
+
+/// Prompts a suspendable actor, blocking for the ack.
+let private promptSuspendable (store: ISessionStore) (sessionId: SessionId) (session: IActorRef) (text: string) =
+    SessionActor.promptSuspendableAsync store tenant sessionId session (UserMessage.Text text) CancellationToken.None
+    |> fun task -> task.GetAwaiter().GetResult()
+
+/// Replies to a suspendable actor, blocking for the ack.
+let private reply (store: ISessionStore) (sessionId: SessionId) (session: IActorRef) (answer: Reply) =
+    SessionActor.replyAsync store tenant sessionId session answer CancellationToken.None
+    |> fun task -> task.GetAwaiter().GetResult()
+
+/// Reads a suspendable actor's snapshot, blocking.
+let private suspendSnapshotOf (session: IActorRef) : SessionSnapshot =
+    SessionActor.getSuspendSnapshotAsync session CancellationToken.None
+    |> fun task -> task.GetAwaiter().GetResult()
+
+let private requestedOf (journal: RecordingEventStore) : PermissionRequestedEvent list =
+    [
+        for event in journal.Appended do
+            match event with
+            | :? PermissionRequestedEvent as asked when not (isNull (box asked)) -> yield asked
+            | _ -> ()
+    ]
+
+let private resolvedOf (journal: RecordingEventStore) : PermissionResolvedEvent list =
+    [
+        for event in journal.Appended do
+            match event with
+            | :? PermissionResolvedEvent as resolved when not (isNull (box resolved)) -> yield resolved
+            | _ -> ()
+    ]
+
+[<Fact>]
+let ``Suspend persists WaitingForInput with the pending id`` () =
+    use system = createSystem ()
+    let store = createStore ()
+    let created = createSession store
+    let journal = RecordingEventStore()
+
+    let runner =
+        ScriptSuspendRunner(
+            suspendedCompletion (suspendCursor "req-1" "exec" "c1" TurnLoop.PermissionSuspension),
+            settledCompletion "done"
+        )
+
+    let settled = ResizeArray<TurnResult>()
+
+    let session =
+        spawnSuspendable
+            system
+            store
+            journal
+            (TurnLoopTests.NeverDelay() :> ILlmDelay)
+            (TimeSpan.FromMinutes 5.0)
+            created.Id
+            runner
+            settled
+
+    try
+        promptSuspendable store created.Id session "run" |> ignore
+
+        let suspended =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () ->
+                (storedOf store created.Id).State = SessionState.WaitingForInput)
+
+        suspended |> should equal true
+
+        let snapshot = suspendSnapshotOf session
+        snapshot.State |> should equal SessionState.WaitingForInput
+        snapshot.PendingRequestId |> should equal "req-1"
+
+        let asked = requestedOf journal
+        asked.Length |> should equal 1
+        asked[0].RequestId |> should equal "req-1"
+        asked[0].ToolName |> should equal "exec"
+
+        runner.Attempts |> List.ofSeq |> should equal [ 1 ]
+        settled.Count |> should equal 0
+    finally
+        stopSystem system
+
+[<Fact>]
+let ``Matching Reply resumes from the cursor with attempt plus 1`` () =
+    use system = createSystem ()
+    let store = createStore ()
+    let created = createSession store
+    let journal = RecordingEventStore()
+    let cursor = suspendCursor "req-2" "exec" "c1" TurnLoop.PermissionSuspension
+
+    let runner =
+        ScriptSuspendRunner(suspendedCompletion cursor, settledCompletion "finished")
+
+    let settled = ResizeArray<TurnResult>()
+
+    let session =
+        spawnSuspendable
+            system
+            store
+            journal
+            (TurnLoopTests.NeverDelay() :> ILlmDelay)
+            (TimeSpan.FromMinutes 5.0)
+            created.Id
+            runner
+            settled
+
+    try
+        promptSuspendable store created.Id session "run" |> ignore
+
+        let suspended =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () ->
+                (storedOf store created.Id).State = SessionState.WaitingForInput)
+
+        suspended |> should equal true
+
+        reply store created.Id session (PermissionDecision("req-2", PermissionDecisionKind.AllowOnce))
+        |> ignore
+
+        let resumed =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () ->
+                settled.Count = 1 && (storedOf store created.Id).State = SessionState.Idle)
+
+        resumed |> should equal true
+        runner.Attempts |> List.ofSeq |> should equal [ 1; 2 ]
+        settled[0].Status |> should equal TurnStatus.Completed
+        settled[0].AssistantText |> should equal "finished"
+
+        // The resume carried the live cursor and the matching reply.
+        runner.Cursors[1].IsSome |> should equal true
+        runner.Cursors[1].Value.RequestId |> should equal "req-2"
+        runner.Cursors[1].Value.ToolCallId |> should equal "c1"
+
+        match runner.Replies[1] with
+        | Some(:? PermissionDecision as decision) ->
+            decision.RequestId |> should equal "req-2"
+            decision.Decision |> should equal PermissionDecisionKind.AllowOnce
+        | _ -> failwith "Expected the resume to carry the PermissionDecision."
+
+        let resolved = resolvedOf journal
+        resolved.Length |> should equal 1
+        resolved[0].RequestId |> should equal "req-2"
+        resolved[0].Decision |> should equal PermissionDecisionKind.AllowOnce
+
+        (pendingOf store created.Id).Count |> should equal 0
+    finally
+        stopSystem system
+
+[<Fact>]
+let ``Unknown Reply rejects with ReplyMismatchException`` () =
+    use system = createSystem ()
+    let store = createStore ()
+    let created = createSession store
+    let journal = RecordingEventStore()
+
+    let runner =
+        ScriptSuspendRunner(
+            suspendedCompletion (suspendCursor "req-3" "exec" "c1" TurnLoop.PermissionSuspension),
+            settledCompletion "done"
+        )
+
+    let settled = ResizeArray<TurnResult>()
+
+    let session =
+        spawnSuspendable
+            system
+            store
+            journal
+            (TurnLoopTests.NeverDelay() :> ILlmDelay)
+            (TimeSpan.FromMinutes 5.0)
+            created.Id
+            runner
+            settled
+
+    try
+        promptSuspendable store created.Id session "run" |> ignore
+
+        let suspended =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () ->
+                (storedOf store created.Id).State = SessionState.WaitingForInput)
+
+        suspended |> should equal true
+
+        let ex =
+            Assert.Throws<ReplyMismatchException>(fun () ->
+                reply store created.Id session (PermissionDecision("req-unknown", PermissionDecisionKind.AllowOnce))
+                |> ignore)
+
+        ex.SessionId |> should equal created.Id
+        ex.RequestId |> should equal "req-unknown"
+
+        // Still suspended on the original request; nothing resolved.
+        (suspendSnapshotOf session).PendingRequestId |> should equal "req-3"
+        runner.Attempts |> List.ofSeq |> should equal [ 1 ]
+        settled.Count |> should equal 0
+        resolvedOf journal |> List.isEmpty |> should equal true
+    finally
+        stopSystem system
+
+[<Fact>]
+let ``Already-resolved Reply rejects with ReplyMismatchException`` () =
+    use system = createSystem ()
+    let store = createStore ()
+    let created = createSession store
+    let journal = RecordingEventStore()
+    let cursor = suspendCursor "req-4" "exec" "c1" TurnLoop.PermissionSuspension
+
+    let runner =
+        ScriptSuspendRunner(suspendedCompletion cursor, settledCompletion "done")
+
+    let settled = ResizeArray<TurnResult>()
+
+    let session =
+        spawnSuspendable
+            system
+            store
+            journal
+            (TurnLoopTests.NeverDelay() :> ILlmDelay)
+            (TimeSpan.FromMinutes 5.0)
+            created.Id
+            runner
+            settled
+
+    try
+        promptSuspendable store created.Id session "run" |> ignore
+
+        let suspended =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () ->
+                (storedOf store created.Id).State = SessionState.WaitingForInput)
+
+        suspended |> should equal true
+
+        reply store created.Id session (PermissionDecision("req-4", PermissionDecisionKind.AllowOnce))
+        |> ignore
+
+        let resumed = waitFor (TimeSpan.FromSeconds 10.0) (fun () -> settled.Count = 1)
+
+        resumed |> should equal true
+
+        // The turn settled; the same reply appended again answers nothing.
+        let payload =
+            ReplyPayload(PermissionDecision("req-4", PermissionDecisionKind.AllowOnce)) :> InboxPayload
+
+        let appended =
+            store.AppendInboxMessage(tenant, created.Id, payload, DeliveryMode.Queue, CancellationToken.None)
+            |> fun task -> task.GetAwaiter().GetResult()
+
+        let answer: SessionActor.SessionReplyReply =
+            session.Ask<SessionActor.SessionReplyReply>(SessionActor.ReplyEntry appended, TimeSpan.FromSeconds 10.0)
+            |> Async.RunSynchronously
+
+        match answer with
+        | SessionActor.ReplyRejected error -> error.RequestId |> should equal "req-4"
+        | SessionActor.ReplyAccepted _ -> failwith "Expected the already-resolved reply to reject."
+    finally
+        stopSystem system
+
+[<Fact>]
+let ``Question suspend answers through the same carrier`` () =
+    use system = createSystem ()
+    let store = createStore ()
+    let created = createSession store
+    let journal = RecordingEventStore()
+
+    let cursor =
+        suspendCursor "q-1" TurnLoop.AskUserToolName "qcall-1" TurnLoop.QuestionSuspension
+
+    let runner =
+        ScriptSuspendRunner(suspendedCompletion cursor, settledCompletion "answered")
+
+    let settled = ResizeArray<TurnResult>()
+
+    let session =
+        spawnSuspendable
+            system
+            store
+            journal
+            (TurnLoopTests.NeverDelay() :> ILlmDelay)
+            (TimeSpan.FromMinutes 5.0)
+            created.Id
+            runner
+            settled
+
+    try
+        promptSuspendable store created.Id session "run" |> ignore
+
+        let suspended =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () ->
+                (storedOf store created.Id).State = SessionState.WaitingForInput)
+
+        suspended |> should equal true
+        (suspendSnapshotOf session).PendingRequestId |> should equal "q-1"
+
+        reply store created.Id session (QuestionAnswer("q-1", "west")) |> ignore
+
+        let resumed =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () ->
+                settled.Count = 1 && (storedOf store created.Id).State = SessionState.Idle)
+
+        resumed |> should equal true
+        runner.Attempts |> List.ofSeq |> should equal [ 1; 2 ]
+        settled[0].AssistantText |> should equal "answered"
+
+        let answered =
+            [
+                for event in journal.Appended do
+                    match event with
+                    | :? QuestionAnsweredEvent as answered when not (isNull (box answered)) -> yield answered
+                    | _ -> ()
+            ]
+
+        answered.Length |> should equal 1
+        answered[0].QuestionId |> should equal "q-1"
+        answered[0].Answer |> should equal "west"
+    finally
+        stopSystem system
+
+[<Fact>]
+let ``AskTimeout settles Failed with TurnFailed`` () =
+    use system = createSystem ()
+    let store = createStore ()
+    let created = createSession store
+    let journal = RecordingEventStore()
+    let delay = ManualDelay()
+
+    let runner =
+        ScriptSuspendRunner(
+            suspendedCompletion (suspendCursor "req-5" "exec" "c1" TurnLoop.PermissionSuspension),
+            settledCompletion "never"
+        )
+
+    let settled = ResizeArray<TurnResult>()
+
+    let session =
+        spawnSuspendable system store journal (delay :> ILlmDelay) (TimeSpan.FromMinutes 5.0) created.Id runner settled
+
+    try
+        promptSuspendable store created.Id session "run" |> ignore
+
+        let suspended =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () ->
+                (storedOf store created.Id).State = SessionState.WaitingForInput)
+
+        suspended |> should equal true
+
+        delay.Fire()
+
+        let timedOut =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () ->
+                settled.Count = 1 && (storedOf store created.Id).State = SessionState.Idle)
+
+        timedOut |> should equal true
+        settled[0].Status |> should equal TurnStatus.Failed
+
+        match settled[0].Outcome with
+        | :? TurnFailed as failed -> failed.Reason |> should equal SessionActor.AskTimeoutReason
+        | _ -> failwith "Expected a TurnFailed outcome, not Aborted."
+
+        runner.Attempts |> List.ofSeq |> should equal [ 1 ]
+    finally
+        stopSystem system
+
+[<Fact>]
+let ``Crash rebuilds the pending request from the journal and resumes`` () =
+    let store = createStore ()
+    let journal = RecordingEventStore()
+    let created = createSession store
+    let cursor = suspendCursor "req-6" "exec" "c1" TurnLoop.PermissionSuspension
+
+    let runner =
+        ScriptSuspendRunner(suspendedCompletion cursor, settledCompletion "recovered")
+
+    let settled = ResizeArray<TurnResult>()
+
+    use firstSystem = createSystem ()
+
+    let first =
+        spawnSuspendable
+            firstSystem
+            store
+            journal
+            (TurnLoopTests.NeverDelay() :> ILlmDelay)
+            (TimeSpan.FromMinutes 5.0)
+            created.Id
+            runner
+            settled
+
+    try
+        promptSuspendable store created.Id first "run" |> ignore
+
+        let suspended =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () ->
+                (storedOf store created.Id).State = SessionState.WaitingForInput)
+
+        suspended |> should equal true
+    finally
+        stopSystem firstSystem
+
+    // Crash: a fresh actor over the same store and journal rebuilds the
+    // pending request and resumes from the same tool call under attempt 2.
+    use secondSystem = createSystem ()
+
+    let second =
+        spawnSuspendable
+            secondSystem
+            store
+            journal
+            (TurnLoopTests.NeverDelay() :> ILlmDelay)
+            (TimeSpan.FromMinutes 5.0)
+            created.Id
+            runner
+            settled
+
+    try
+        let rebuilt =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () ->
+                try
+                    (suspendSnapshotOf second).PendingRequestId = "req-6"
+                with _ ->
+                    false)
+
+        rebuilt |> should equal true
+        (storedOf store created.Id).State |> should equal SessionState.WaitingForInput
+
+        reply store created.Id second (PermissionDecision("req-6", PermissionDecisionKind.AllowOnce))
+        |> ignore
+
+        let resumed =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () ->
+                settled.Count = 1 && (storedOf store created.Id).State = SessionState.Idle)
+
+        resumed |> should equal true
+        runner.Attempts |> List.ofSeq |> should equal [ 1; 2 ]
+        settled[0].AssistantText |> should equal "recovered"
+    finally
+        stopSystem secondSystem
+
+[<Fact>]
+let ``Takeover while suspended leaves the loser with zero journal effects`` () =
+    use system = createSystem ()
+    let database = InMemoryDatabase()
+    let store = InMemorySessionStore(database) :> ISessionStore
+    let journal = InMemorySessionEventStore(database) :> ISessionEventStore
+    let created = createSession store
+
+    // The suspended turn holds its claim; a takeover re-claims under a new
+    // owner once the lease lapses, and the loser's journal token rejects
+    // with zero writes.
+    let payload = UserMessagePayload(UserMessage.Text("run")) :> InboxPayload
+
+    store.AppendInboxMessage(tenant, created.Id, payload, DeliveryMode.Queue, CancellationToken.None)
+    |> fun task -> task.GetAwaiter().GetResult()
+    |> ignore
+
+    let claim =
+        match
+            store.ClaimNextTurn(tenant, created.Id, "owner-a", TimeSpan.FromMinutes 5.0, CancellationToken.None)
+            |> fun task -> task.GetAwaiter().GetResult()
+        with
+        | :? TurnLeaseRenewed as renewed -> renewed.Claim
+        | :? TurnLeaseHeld as held -> held.Claim
+        | _ -> failwith "Expected the suspend claim to be granted."
+
+    try
+        let turnId = TurnId.New()
+        let stamp = DateTimeOffset.UtcNow
+
+        let asked =
+            PermissionRequestedEvent(created.Id, turnId, Nullable<int64>(), stamp, "req-takeover", "exec")
+            :> SessionEvent
+
+        let appended =
+            journal.Append(
+                tenant,
+                created.Id,
+                claim.Token,
+                (ResizeArray<SessionEvent>([| asked |]) :> IReadOnlyList<SessionEvent>),
+                CancellationToken.None
+            )
+            |> fun task -> task.GetAwaiter().GetResult()
+
+        match appended with
+        | :? EventAppended -> ()
+        | _ -> failwith "Expected the live claim's journal append to land."
+
+        // Takeover: the loser stops renewing, the lease lapses on the test
+        // clock path is simulated by verifying with an unknown token, which
+        // the fence rejects the same way an expired claim rejects.
+        let loser =
+            journal.Append(
+                tenant,
+                created.Id,
+                "stale-token",
+                (ResizeArray<SessionEvent>([| asked |]) :> IReadOnlyList<SessionEvent>),
+                CancellationToken.None
+            )
+            |> fun task -> task.GetAwaiter().GetResult()
+
+        match loser with
+        | :? EventAppendRejected as rejected -> rejected.Reason |> should equal "staleClaim"
+        | _ -> failwith "Expected the loser's journal append to reject with zero writes."
+
+        let replayed =
+            journal.Replay(tenant, created.Id, 0L, 10, CancellationToken.None)
+            |> fun task -> task.GetAwaiter().GetResult()
+
+        match replayed with
+        | :? EventReplayPage as page -> page.Events.Count |> should equal 1
+        | _ -> failwith "Expected the winner's single write to replay."
+    finally
+        stopSystem system

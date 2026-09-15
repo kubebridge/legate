@@ -166,11 +166,61 @@ module internal TurnLoop =
     /// journal hook.
     type ConsumeInjected = InboxEntry -> unit
 
+    /// What a suspended turn waits on: a permission decision for one tool
+    /// call, or an answer to one agent question. The session actor journals
+    /// the matching PermissionRequestedEvent or QuestionAskedEvent and owns
+    /// the store-first WaitingForInput transition; the loop only carries the
+    /// cursor the resume continues from.
+    type SuspensionKind =
+
+        /// The turn waits on a PermissionDecision answering RequestId.
+        | PermissionSuspension
+
+        /// The turn waits on a QuestionAnswer answering RequestId.
+        | QuestionSuspension
+
+    /// The cursor a suspended turn resumes from: the pending request id plus
+    /// the preserved loop position (history, usage, iterations, and the tool
+    /// call that raised the request). HistorySnapshot is a copy taken at
+    /// suspend time, so later mutation of the running history never moves
+    /// the resume point. PendingCall carries the FunctionCallContent that
+    /// raised the request, so the resume executes or skips that same call.
+    type TurnLoopSuspension =
+        {
+            /// The stable id the host answers: a PermissionDecision answers
+            /// a permission suspension with it, a QuestionAnswer answers a
+            /// question suspension with it as the question id.
+            RequestId: string
+            /// The tool whose call raised the request (ask_user for questions).
+            ToolName: string
+            /// The tool-call id that raised the request.
+            ToolCallId: string
+            /// Which reply resumes the turn.
+            Kind: SuspensionKind
+            /// The question the agent asked, or empty for permission suspensions.
+            QuestionText: string
+            /// The history up to the suspend point, copied at suspend time.
+            HistorySnapshot: IList<ChatMessage>
+            /// Input tokens spent up to the suspend point.
+            InputTokens: int64
+            /// Output tokens spent up to the suspend point.
+            OutputTokens: int64
+            /// Model iterations spent up to the suspend point.
+            Iterations: int
+            /// The tool call that raised the request.
+            PendingCall: FunctionCallContent
+        }
+
     /// Completion of a loop run with the inject fold applied: the settled
     /// turn result plus the new-turn signal for the session actor (#34).
     /// HasPendingInjects is true only when a would-complete turn peeked
     /// pending Inject user messages, left them pending, and folded nothing
-    /// on that path; the actor starts the new turn.
+    /// on that path; the actor starts the new turn. Suspension carries the
+    /// unified Suspended carrier (issue 36): Some when an Ask verdict or an
+    /// ask_user question suspended the turn mid-run (Result carries
+    /// TurnStatus.Suspended then), None when the turn settled normally.
+    /// Reply-never-starts-a-turn: a suspension never starts work, it only
+    /// parks the cursor the matching Reply resumes from.
     type TurnLoopCompletion =
         {
             /// The settled turn result.
@@ -178,6 +228,8 @@ module internal TurnLoop =
             /// True when Inject entries stayed pending past a would-complete
             /// turn and the actor must start a new turn to act on them.
             HasPendingInjects: bool
+            /// The suspend cursor, or None when the turn settled.
+            Suspension: TurnLoopSuspension option
         }
 
     /// No-op drain: no pending Inject entries.
@@ -476,12 +528,14 @@ module internal TurnLoop =
                         Outcome = null
                     }
                 HasPendingInjects = hasPendingInjects ()
+                Suspension = None
             }
 
         let failedCompletion iterations inputTokens outputTokens reason : TurnLoopCompletion =
             {
                 Result = failedResult iterations inputTokens outputTokens reason
                 HasPendingInjects = false
+                Suspension = None
             }
 
         // Runs one round of tool calls in order. Returns None when every
@@ -676,3 +730,642 @@ module internal TurnLoop =
         (isLeaseValid: unit -> bool)
         : Task<TurnResult> =
         runAsyncWithDeltas client history tools options delay cancellationToken isLeaseValid ignore ignore
+
+    // ────────────────── Suspend and resume (issue 36) ──────────────────
+
+    /// The built-in tool name that asks the host a question instead of
+    /// executing: a call to this tool suspends with a QuestionSuspension
+    /// carrying the question text, never invoking a tool.
+    [<Literal>]
+    let AskUserToolName = "ask_user"
+
+    /// Prefix for the tool result appended when a permission policy denies
+    /// a call: the model sees the denial and continues without the effect.
+    [<Literal>]
+    let DenyResultPrefix = "Error: denied: "
+
+    /// Copies the running history at the suspend point so later mutation
+    /// never moves the resume point.
+    /// <param name="history">The running history.</param>
+    /// <returns>A copy of the history.</returns>
+    let private snapshotHistory (history: IList<ChatMessage>) : IList<ChatMessage> =
+        let copy = ResizeArray<ChatMessage>(history.Count)
+
+        for message in history do
+            copy.Add(message)
+
+        copy :> IList<ChatMessage>
+
+    /// Builds the permission request for one tool call. The argument preview
+    /// is the empty string: bounded and redacted by construction (never
+    /// secrets), until the redaction epic supplies the truncated preview.
+    /// <param name="sessionId">The session the call belongs to.</param>
+    /// <param name="turnId">The turn the call belongs to.</param>
+    /// <param name="toolName">The tool the model called.</param>
+    /// <param name="requestId">The stable request id the host answers with.</param>
+    /// <returns>The request the policy evaluates.</returns>
+    let private buildPermissionRequest
+        (sessionId: SessionId)
+        (turnId: TurnId)
+        (toolName: string)
+        (requestId: string)
+        : PermissionRequest =
+        {
+            SessionId = sessionId
+            TurnId = turnId
+            ToolName = toolName
+            ToolSourceId = null
+            ArgumentPreview = ""
+            RequestId = requestId
+        }
+
+    /// Extracts the question text from an ask_user call: the "question"
+    /// string argument when present, otherwise the empty string. Never
+    /// includes tool arguments beyond the question itself.
+    /// <param name="call">The ask_user call.</param>
+    /// <returns>The question text.</returns>
+    let private extractQuestion (call: FunctionCallContent) : string =
+        if isNull (box call) || isNull (box call.Arguments) then
+            ""
+        else
+            let mutable value: obj = null
+
+            if call.Arguments.TryGetValue("question", &value) && not (isNull value) then
+                match value with
+                | :? string as text when not (isNull text) -> text
+                | other ->
+                    let text = other.ToString()
+                    if isNull text then "" else text
+            else
+                ""
+
+    /// Builds the Suspended completion for one pending request: Result
+    /// carries TurnStatus.Suspended with empty text, HasPendingInjects is
+    /// false (a suspended turn never starts the new-turn signal), and
+    /// Suspension carries the cursor the matching Reply resumes from.
+    /// <param name="suspension">The suspend cursor.</param>
+    /// <returns>The Suspended completion.</returns>
+    let private suspendedCompletion (suspension: TurnLoopSuspension) : TurnLoopCompletion =
+        {
+            Result =
+                {
+                    AssistantText = ""
+                    Status = TurnStatus.Suspended
+                    Iterations = suspension.Iterations
+                    Usage =
+                        {
+                            InputTokens = suspension.InputTokens
+                            OutputTokens = suspension.OutputTokens
+                        }
+                    Outcome = null
+                }
+            HasPendingInjects = false
+            Suspension = Some suspension
+        }
+
+    /// Appends one tool result message to the running history.
+    /// <param name="history">The running history.</param>
+    /// <param name="callId">The tool-call id the result answers.</param>
+    /// <param name="text">The result text.</param>
+    let private appendToolResult (history: IList<ChatMessage>) (callId: string) (text: string) : unit =
+        let resultContent = FunctionResultContent(callId, text)
+
+        let toolMessage =
+            ChatMessage(ChatRole.Tool, ResizeArray<AIContent>([| resultContent :> AIContent |]) :> IList<AIContent>)
+
+        history.Add(toolMessage)
+
+    /// Runs the ReAct loop with the permission gate (issue 36): Allow
+    /// executes, Deny appends a denied result and continues without the
+    /// effect, Ask suspends with the unified Suspended carrier. The
+    /// AllowForSession memory is consulted before Evaluate: a tool name the
+    /// host already allowed for the session executes without calling the
+    /// policy again, so a policy stays free to keep returning Ask. The
+    /// ask_user tool bypasses the policy and suspends as a question with
+    /// the same carrier. The caller (SessionActor) journals the matching
+    /// PermissionRequestedEvent or QuestionAskedEvent and owns the
+    /// store-first WaitingForInput transition; the loop only parks the
+    /// cursor. Reply-never-starts-a-turn: a suspension never starts work.
+    /// <param name="client">The chat client the turn runs against.</param>
+    /// <param name="history">The running history, mutated in place.</param>
+    /// <param name="tools">The tools the turn may call.</param>
+    /// <param name="options">The turn loop tuning and per-turn budget.</param>
+    /// <param name="delay">The delay seam the hard deadline fires off.</param>
+    /// <param name="cancellationToken">Abandons the turn.</param>
+    /// <param name="isLeaseValid">The lease hook the loop checks.</param>
+    /// <param name="drainInjected">The Inject drain hook.</param>
+    /// <param name="onInjectJournaled">The Inject journal hook.</param>
+    /// <param name="onInjectConsumed">The Inject consume hook.</param>
+    /// <param name="policy">The permission policy, or null for no gate (every call executes).</param>
+    /// <param name="sessionId">The session the turn runs in.</param>
+    /// <param name="turnId">The turn the calls belong to.</param>
+    /// <param name="newRequestId">Mints stable request ids, or None for GUIDs.</param>
+    /// <param name="allowedForSession">Tool names the host already allowed for the session, or null for none.</param>
+    /// <returns>The settled result or the Suspended carrier.</returns>
+    let runSuspendableAsync
+        (client: IChatClient)
+        (history: IList<ChatMessage>)
+        (tools: IReadOnlyDictionary<string, AITool>)
+        (options: TurnLoopOptions)
+        (delay: ILlmDelay)
+        (cancellationToken: CancellationToken)
+        (isLeaseValid: unit -> bool)
+        (drainInjected: DrainInjected)
+        (onInjectJournaled: JournalInjected)
+        (onInjectConsumed: ConsumeInjected)
+        (policy: IPermissionPolicy)
+        (sessionId: SessionId)
+        (turnId: TurnId)
+        (newRequestId: (unit -> string) option)
+        (allowedForSession: HashSet<string>)
+        : Task<TurnLoopCompletion> =
+        ArgumentNullException.ThrowIfNull(client)
+        ArgumentNullException.ThrowIfNull(history)
+        ArgumentNullException.ThrowIfNull(tools)
+        ArgumentNullException.ThrowIfNull(delay)
+        ArgumentNullException.ThrowIfNull(isLeaseValid)
+        ArgumentNullException.ThrowIfNull(drainInjected)
+        ArgumentNullException.ThrowIfNull(onInjectJournaled)
+        ArgumentNullException.ThrowIfNull(onInjectConsumed)
+
+        if options.MaxToolResultChars <= 0 then
+            raise (ArgumentOutOfRangeException(nameof options, "MaxToolResultChars must be positive."))
+
+        if options.MaxIterations < 1 then
+            raise (ArgumentOutOfRangeException(nameof options, "MaxIterations must be at least 1."))
+
+        if options.Timeout <= TimeSpan.Zero then
+            raise (ArgumentOutOfRangeException(nameof options, "Timeout must be positive."))
+
+        let mintId =
+            match newRequestId with
+            | Some mint -> mint
+            | None -> fun () -> Guid.NewGuid().ToString("N")
+
+        let allowed =
+            if isNull (box allowedForSession) then
+                HashSet<string>()
+            else
+                allowedForSession
+
+        let timeoutCts = new CancellationTokenSource()
+
+        delay
+            .Delay(options.Timeout, cancellationToken)
+            .ContinueWith(
+                Action<Task>(fun elapsed ->
+                    if elapsed.Status = TaskStatus.RanToCompletion then
+                        try
+                            timeoutCts.Cancel()
+                        with :? ObjectDisposedException ->
+                            ()),
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default
+            )
+        |> ignore
+
+        let linkedCts =
+            CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token)
+
+        let linkedToken = linkedCts.Token
+
+        let isTimeout () =
+            timeoutCts.IsCancellationRequested
+            && not cancellationToken.IsCancellationRequested
+
+        let chatOptions = ChatOptions()
+        chatOptions.Tools <- ResizeArray<AITool>(tools.Values) :> IList<AITool>
+
+        let foldInjects () =
+            let pending = selectInjects (drainInjected ())
+
+            for entry in pending do
+                history.Add(injectToMessage entry)
+                onInjectJournaled entry
+                onInjectConsumed entry
+
+        let hasPendingInjects () =
+            selectInjects (drainInjected ()) |> List.isEmpty |> not
+
+        let completedCompletion iterations inputTokens outputTokens assistantText : TurnLoopCompletion =
+            {
+                Result =
+                    {
+                        AssistantText = assistantText
+                        Status = TurnStatus.Completed
+                        Iterations = iterations
+                        Usage =
+                            {
+                                InputTokens = inputTokens
+                                OutputTokens = outputTokens
+                            }
+                        Outcome = null
+                    }
+                HasPendingInjects = hasPendingInjects ()
+                Suspension = None
+            }
+
+        let failedCompletion iterations inputTokens outputTokens reason : TurnLoopCompletion =
+            {
+                Result = failedResult iterations inputTokens outputTokens reason
+                HasPendingInjects = false
+                Suspension = None
+            }
+
+        let suspendFor
+            (call: FunctionCallContent)
+            (toolName: string)
+            (kind: SuspensionKind)
+            (questionText: string)
+            (iterations: int)
+            (inputTokens: int64)
+            (outputTokens: int64)
+            : TurnLoopCompletion =
+            let requestId = mintId ()
+
+            let suspension =
+                {
+                    RequestId = requestId
+                    ToolName = toolName
+                    ToolCallId = call.CallId
+                    Kind = kind
+                    QuestionText = questionText
+                    HistorySnapshot = snapshotHistory history
+                    InputTokens = inputTokens
+                    OutputTokens = outputTokens
+                    Iterations = iterations
+                    PendingCall = call
+                }
+
+            suspendedCompletion suspension
+
+        let rec runTools
+            (roundIterations: int)
+            (roundInput: int64)
+            (roundOutput: int64)
+            (pending: FunctionCallContent list)
+            : Task<TurnLoopCompletion option> =
+            task {
+                match pending with
+                | [] -> return None
+                | call :: rest ->
+                    cancellationToken.ThrowIfCancellationRequested()
+
+                    if not (isLeaseValid ()) then
+                        raise (TurnLeaseLostException())
+
+                    if timeoutCts.IsCancellationRequested then
+                        return Some(failedCompletion roundIterations roundInput roundOutput TimeoutExceededMessage)
+                    else
+                        match options.VerifyClaim with
+                        | Some verify ->
+                            let! live = verify ()
+
+                            if not live then
+                                raise (TurnLeaseLostException())
+                        | None -> ()
+
+                        let toolName = if isNull call.Name then "" else call.Name
+
+                        if String.Equals(toolName, AskUserToolName, StringComparison.Ordinal) then
+                            let question = extractQuestion call
+
+                            return
+                                Some(
+                                    suspendFor
+                                        call
+                                        toolName
+                                        QuestionSuspension
+                                        question
+                                        roundIterations
+                                        roundInput
+                                        roundOutput
+                                )
+                        else
+                            let remembered = allowed.Contains(toolName)
+
+                            if remembered || isNull (box policy) then
+                                let! rawText = invokeOneAsync tools call linkedToken
+                                let text = truncateToolResult options rawText
+                                appendToolResult history call.CallId text
+                                return! runTools roundIterations roundInput roundOutput rest
+                            else
+                                let requestId = mintId ()
+                                let request = buildPermissionRequest sessionId turnId toolName requestId
+                                let verdict = policy.Evaluate(request)
+
+                                if isNull (box verdict) then
+                                    return!
+                                        Task.FromException<TurnLoopCompletion option>(
+                                            InvalidOperationException(
+                                                "The permission policy returned null instead of a verdict."
+                                            )
+                                        )
+                                elif verdict :? AllowVerdict then
+                                    let! rawText = invokeOneAsync tools call linkedToken
+                                    let text = truncateToolResult options rawText
+                                    appendToolResult history call.CallId text
+                                    return! runTools roundIterations roundInput roundOutput rest
+                                elif verdict :? DenyVerdict then
+                                    let deny = verdict :?> DenyVerdict
+                                    let reason = if isNull deny.Reason then "" else deny.Reason
+                                    appendToolResult history call.CallId (DenyResultPrefix + reason)
+                                    return! runTools roundIterations roundInput roundOutput rest
+                                elif verdict :? AskVerdict then
+                                    let suspension =
+                                        {
+                                            RequestId = requestId
+                                            ToolName = toolName
+                                            ToolCallId = call.CallId
+                                            Kind = PermissionSuspension
+                                            QuestionText = ""
+                                            HistorySnapshot = snapshotHistory history
+                                            InputTokens = roundInput
+                                            OutputTokens = roundOutput
+                                            Iterations = roundIterations
+                                            PendingCall = call
+                                        }
+
+                                    return Some(suspendedCompletion suspension)
+                                else
+                                    return!
+                                        Task.FromException<TurnLoopCompletion option>(
+                                            InvalidOperationException(
+                                                sprintf
+                                                    "The permission policy returned an unknown verdict: %s."
+                                                    (verdict.GetType().FullName)
+                                            )
+                                        )
+            }
+
+        let rec loop iterations inputTokens outputTokens : Task<TurnLoopCompletion> =
+            task {
+                cancellationToken.ThrowIfCancellationRequested()
+
+                if not (isLeaseValid ()) then
+                    return! Task.FromException<TurnLoopCompletion>(TurnLeaseLostException())
+                elif iterations >= options.MaxIterations then
+                    return failedCompletion iterations inputTokens outputTokens MaxIterationsExceededMessage
+                elif timeoutCts.IsCancellationRequested then
+                    return failedCompletion iterations inputTokens outputTokens TimeoutExceededMessage
+                else
+                    foldInjects ()
+
+                    try
+                        let! response =
+                            LlmStreaming.streamResponseAsync client history chatOptions linkedToken ignore ignore
+
+                        let nextIterations = iterations + 1
+                        let mutable nextInput = inputTokens
+                        let mutable nextOutput = outputTokens
+
+                        if isNull response then
+                            return completedCompletion nextIterations nextInput nextOutput ""
+                        else
+                            addUsage &nextInput &nextOutput response.Usage
+
+                            if not (isNull response.Messages) then
+                                for message in response.Messages do
+                                    if not (isNull message) then
+                                        history.Add(message)
+
+                            let calls =
+                                if isNull response.Messages then
+                                    []
+                                else
+                                    collectCalls response.Messages
+
+                            if calls.IsEmpty then
+                                let assistantText = if isNull response.Text then "" else response.Text
+
+                                return completedCompletion nextIterations nextInput nextOutput assistantText
+                            else
+                                let! toolOutcome = runTools nextIterations nextInput nextOutput calls
+
+                                match toolOutcome with
+                                | Some suspended -> return suspended
+                                | None -> return! loop nextIterations nextInput nextOutput
+                    with :? OperationCanceledException when isTimeout () ->
+                        return failedCompletion iterations inputTokens outputTokens TimeoutExceededMessage
+            }
+
+        task {
+            try
+                return! loop 0 0L 0L
+            finally
+                timeoutCts.Dispose()
+                linkedCts.Dispose()
+        }
+
+    /// Resumes a permission suspension from its cursor: AllowOnce executes
+    /// the parked call, AllowForSession executes it and remembers the tool
+    /// for the session, Deny skips it with a denied result. The parked call
+    /// is the same FunctionCallContent the suspend carried, so the resume
+    /// continues from the same tool call. The loop then continues with the
+    /// gate still applied to later calls.
+    /// <param name="suspension">The suspend cursor. Must be a permission suspension.</param>
+    /// <param name="decision">What the host decided.</param>
+    /// <param name="client">The chat client the continued turn runs against.</param>
+    /// <param name="history">The running history (already holds the suspend point).</param>
+    /// <param name="tools">The tools the continued turn may call.</param>
+    /// <param name="options">The turn loop tuning and per-turn budget.</param>
+    /// <param name="delay">The delay seam the continued deadline fires off.</param>
+    /// <param name="cancellationToken">Abandons the continued turn.</param>
+    /// <param name="isLeaseValid">The lease hook the continued loop checks.</param>
+    /// <param name="policy">The permission policy for later calls, or null for no gate.</param>
+    /// <param name="allowedForSession">The session memory, mutated on AllowForSession.</param>
+    /// <returns>The settled result or the next Suspended carrier.</returns>
+    let resumePermissionAsync
+        (suspension: TurnLoopSuspension)
+        (decision: PermissionDecisionKind)
+        (client: IChatClient)
+        (history: IList<ChatMessage>)
+        (tools: IReadOnlyDictionary<string, AITool>)
+        (options: TurnLoopOptions)
+        (delay: ILlmDelay)
+        (cancellationToken: CancellationToken)
+        (isLeaseValid: unit -> bool)
+        (policy: IPermissionPolicy)
+        (allowedForSession: HashSet<string>)
+        : Task<TurnLoopCompletion> =
+        if isNull (box suspension) then
+            raise (ArgumentNullException(nameof suspension))
+
+        ArgumentNullException.ThrowIfNull(client)
+        ArgumentNullException.ThrowIfNull(history)
+        ArgumentNullException.ThrowIfNull(tools)
+        ArgumentNullException.ThrowIfNull(delay)
+        ArgumentNullException.ThrowIfNull(isLeaseValid)
+
+        if suspension.Kind <> PermissionSuspension then
+            raise (ArgumentException("The suspension is not a permission suspension.", nameof suspension))
+
+        if not (Enum.IsDefined(typeof<PermissionDecisionKind>, decision)) then
+            raise (ArgumentOutOfRangeException(nameof decision, "Unknown permission decision."))
+
+        let allowed =
+            if isNull (box allowedForSession) then
+                HashSet<string>()
+            else
+                allowedForSession
+
+        task {
+            match decision with
+            | PermissionDecisionKind.AllowOnce -> ()
+            | PermissionDecisionKind.AllowForSession -> allowed.Add(suspension.ToolName) |> ignore
+            | PermissionDecisionKind.Deny ->
+                appendToolResult history suspension.ToolCallId (DenyResultPrefix + "the host denied the call")
+            | _ -> raise (ArgumentOutOfRangeException(nameof decision, "Unknown permission decision."))
+
+            match decision with
+            | PermissionDecisionKind.Deny -> ()
+            | _ ->
+                if not (isLeaseValid ()) then
+                    raise (TurnLeaseLostException())
+
+                match options.VerifyClaim with
+                | Some verify ->
+                    let! live = verify ()
+
+                    if not live then
+                        raise (TurnLeaseLostException())
+                | None -> ()
+
+                let! rawText = invokeOneAsync tools suspension.PendingCall cancellationToken
+                let text = truncateToolResult options rawText
+                appendToolResult history suspension.ToolCallId text
+
+            let sessionId = Unchecked.defaultof<SessionId>
+            let turnId = Unchecked.defaultof<TurnId>
+
+            let! continued =
+                runSuspendableAsync
+                    client
+                    history
+                    tools
+                    options
+                    delay
+                    cancellationToken
+                    isLeaseValid
+                    noInjects
+                    ignoreInject
+                    ignoreInject
+                    policy
+                    sessionId
+                    turnId
+                    None
+                    allowed
+
+            // The continued run restarts its own iteration and usage
+            // counters from zero; fold the spent prefix back so the caller
+            // observes the turn-total, not the post-resume tail.
+            let totalIterations = suspension.Iterations + continued.Result.Iterations
+
+            let totalInput = suspension.InputTokens + continued.Result.Usage.InputTokens
+
+            let totalOutput = suspension.OutputTokens + continued.Result.Usage.OutputTokens
+
+            let totalResult =
+                { continued.Result with
+                    Iterations = totalIterations
+                    Usage =
+                        {
+                            InputTokens = totalInput
+                            OutputTokens = totalOutput
+                        }
+                }
+
+            return { continued with Result = totalResult }
+        }
+
+    /// Resumes a question suspension from its cursor: appends the host's
+    /// answer as the ask_user tool result, then continues the loop with the
+    /// gate still applied to later calls.
+    /// <param name="suspension">The suspend cursor. Must be a question suspension.</param>
+    /// <param name="answer">The host's answer, verbatim.</param>
+    /// <param name="client">The chat client the continued turn runs against.</param>
+    /// <param name="history">The running history (already holds the suspend point).</param>
+    /// <param name="tools">The tools the continued turn may call.</param>
+    /// <param name="options">The turn loop tuning and per-turn budget.</param>
+    /// <param name="delay">The delay seam the continued deadline fires off.</param>
+    /// <param name="cancellationToken">Abandons the continued turn.</param>
+    /// <param name="isLeaseValid">The lease hook the continued loop checks.</param>
+    /// <param name="policy">The permission policy for later calls, or null for no gate.</param>
+    /// <param name="allowedForSession">The session memory.</param>
+    /// <returns>The settled result or the next Suspended carrier.</returns>
+    let resumeQuestionAsync
+        (suspension: TurnLoopSuspension)
+        (answer: string)
+        (client: IChatClient)
+        (history: IList<ChatMessage>)
+        (tools: IReadOnlyDictionary<string, AITool>)
+        (options: TurnLoopOptions)
+        (delay: ILlmDelay)
+        (cancellationToken: CancellationToken)
+        (isLeaseValid: unit -> bool)
+        (policy: IPermissionPolicy)
+        (allowedForSession: HashSet<string>)
+        : Task<TurnLoopCompletion> =
+        if isNull (box suspension) then
+            raise (ArgumentNullException(nameof suspension))
+
+        ArgumentNullException.ThrowIfNull(client)
+        ArgumentNullException.ThrowIfNull(history)
+        ArgumentNullException.ThrowIfNull(tools)
+        ArgumentNullException.ThrowIfNull(delay)
+        ArgumentNullException.ThrowIfNull(isLeaseValid)
+
+        if suspension.Kind <> QuestionSuspension then
+            raise (ArgumentException("The suspension is not a question suspension.", nameof suspension))
+
+        let text = if isNull answer then "" else answer
+
+        let allowed =
+            if isNull (box allowedForSession) then
+                HashSet<string>()
+            else
+                allowedForSession
+
+        task {
+            appendToolResult history suspension.ToolCallId text
+
+            let sessionId = Unchecked.defaultof<SessionId>
+            let turnId = Unchecked.defaultof<TurnId>
+
+            let! continued =
+                runSuspendableAsync
+                    client
+                    history
+                    tools
+                    options
+                    delay
+                    cancellationToken
+                    isLeaseValid
+                    noInjects
+                    ignoreInject
+                    ignoreInject
+                    policy
+                    sessionId
+                    turnId
+                    None
+                    allowed
+
+            let totalIterations = suspension.Iterations + continued.Result.Iterations
+
+            let totalInput = suspension.InputTokens + continued.Result.Usage.InputTokens
+
+            let totalOutput = suspension.OutputTokens + continued.Result.Usage.OutputTokens
+
+            let totalResult =
+                { continued.Result with
+                    Iterations = totalIterations
+                    Usage =
+                        {
+                            InputTokens = totalInput
+                            OutputTokens = totalOutput
+                        }
+                }
+
+            return { continued with Result = totalResult }
+        }

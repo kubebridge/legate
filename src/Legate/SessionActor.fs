@@ -114,6 +114,10 @@ type internal SessionSnapshot =
         /// The position of the entry the running turn executes, or None
         /// when no turn is in flight.
         RunningPosition: int64 option
+        /// The pending suspend request id while WaitingForInput, or null
+        /// when no turn is suspended. The journal is the normative resume
+        /// source; this is the observable projection of it.
+        PendingRequestId: string | null
     }
 
 /// A turn in flight: the inbox entry it executes plus the source Close
@@ -422,6 +426,7 @@ module internal SessionActor =
                 State = state
                 PendingCount = pendingCount props
                 RunningPosition = running |> Option.map (fun inFlight -> inFlight.Entry.Position)
+                PendingRequestId = null
             }
 
         /// Observes a settled turn result through the props hook. Guarded: a
@@ -886,3 +891,1124 @@ module internal SessionActor =
             else
                 return snapshot
         }
+
+    // ────────────────── Suspend and resume (issue 36) ──────────────────
+
+    /// How a suspendable turn runs: the first run carries no cursor and no
+    /// reply, a resume carries both. Attempt is 1-based and incremented on
+    /// every resume, so a resumed run continues the same turn id. The
+    /// session memory of AllowForSession decisions travels with the turn.
+    /// Tests inject scripted runners; the TurnLoop-backed runner wires
+    /// TurnLoop.runSuspendableAsync plus the resume continuations.
+    type SuspendableRunner =
+        InboxEntry
+            -> int
+            -> HashSet<string>
+            -> TurnLoop.TurnLoopSuspension option
+            -> Reply option
+            -> CancellationToken
+            -> Task<TurnLoop.TurnLoopCompletion>
+
+    /// What a suspendable session actor is built from: the base actor
+    /// dependencies plus the journal, the AskTimeout seam, the journal
+    /// token, and the suspendable runner. The journal token fences journal
+    /// appends; tests prime it with ISessionStore.ClaimNextTurn so the
+    /// in-memory journal lands, and a takeover re-claims so the loser
+    /// appends nothing. The heartbeat is not cancelled on suspend: renewal
+    /// continues while suspended under the same claim, bounded by lease
+    /// expiry and AskTimeout.
+    type SuspendDeps =
+        {
+            /// The journal suspend and resolve events append to.
+            EventStore: ISessionEventStore
+            /// The seam the AskTimeout deadline fires off. Never the clock.
+            Delay: ILlmDelay
+            /// How long a suspension waits for its Reply before settling Failed.
+            AskTimeout: TimeSpan
+            /// The claim token fencing journal appends.
+            JournalToken: string
+            /// Runs one suspendable attempt. Never null.
+            RunSuspendable: SuspendableRunner
+        }
+
+    /// A rebuilt pending request from the journal: the crash path carries
+    /// no in-memory cursor (history, tool call), so the matching Reply
+    /// retries the turn from its inbox entry with attempt plus 1 instead of
+    /// resuming from the cursor. The journal is the normative resume source.
+    type RebuiltPending =
+        {
+            /// The pending request or question id the Reply must carry.
+            RequestId: string
+            /// The tool whose call raised the request.
+            ToolName: string
+            /// Which reply resumes the turn.
+            Kind: TurnLoop.SuspensionKind
+            /// The question text, or empty for permission suspensions.
+            QuestionText: string
+        }
+
+    /// A suspended turn: the inbox entry it parked on, either the live
+    /// cursor (in-memory resume) or the rebuilt pending (crash retry), the
+    /// session AllowForSession memory, the attempt the parked run used, and
+    /// the source the AskTimeout delay pipes through. The source is
+    /// cancelled on Reply and never disposed on the timeout path.
+    type private SuspendedTurn =
+        {
+            /// The inbox entry the parked turn executes.
+            Entry: InboxEntry
+            /// The live cursor, or None after a crash rebuild.
+            Cursor: TurnLoop.TurnLoopSuspension option
+            /// The rebuilt pending, or None for a live suspension.
+            Rebuilt: RebuiltPending option
+            /// Tool names the host already allowed for the session.
+            Allowed: HashSet<string>
+            /// The 1-based attempt the parked run used.
+            Attempt: int
+            /// The source the AskTimeout delay cancels through.
+            TimeoutCts: CancellationTokenSource
+        }
+
+    /// How the suspendable actor answers a Reply. The actor never throws
+    /// ReplyMismatchException: an unknown or already-resolved request id is
+    /// rejected with the exception and the client boundary throws it.
+    type internal SessionReplyReply =
+
+        /// The reply matched the pending request: carries the appended Reply
+        /// inbox entry. The turn resumes under attempt plus 1.
+        | ReplyAccepted of entry: InboxEntry
+
+        /// The reply answered nothing pending: unknown or already-resolved.
+        /// Carries the typed error the boundary throws.
+        | ReplyRejected of error: ReplyMismatchException
+
+    /// The suspendable session actor protocol extension. QueuePrompt,
+    /// CloseSession, AbortSession, and GetSnapshot keep their base meaning;
+    /// the completions below carry suspendable outcomes back to the actor.
+    type internal SuspendableActorMessage =
+
+        /// Queue a user message on the suspendable actor: appends to the
+        /// durable inbox, starts a suspendable turn when Idle, waits when
+        /// Running or WaitingForInput. Answered with SessionPromptReply.
+        | SuspendableQueuePrompt of payload: InboxPayload * cancellationToken: CancellationToken
+
+        /// The suspendable turn finished: settled (Suspension None) or
+        /// suspended (Suspension Some). One-way from the turn task.
+        | SuspendableFinished of
+            entry: InboxEntry *
+            completion: TurnLoop.TurnLoopCompletion *
+            attempt: int *
+            allowed: HashSet<string>
+
+        /// The suspendable turn faulted. One-way from the turn task.
+        | SuspendableFaulted of entry: InboxEntry * error: Exception * attempt: int
+
+        /// A Reply inbox entry arrived for the suspended turn. Answered with
+        /// SessionReplyReply; a mismatch rejects with ReplyMismatchException.
+        | ReplyEntry of entry: InboxEntry
+
+        /// Reads the suspendable actor's snapshot. Answered with SessionSnapshot.
+        | SuspendableGetSnapshot
+
+        /// The AskTimeout deadline fired for the pending request id.
+        /// One-way from the delay seam.
+        | SuspendTimedOut of requestId: string
+
+    /// Reason carried by TurnFailed when AskTimeout fires while suspended.
+    /// Never contains secrets or tool arguments.
+    [<Literal>]
+    let AskTimeoutReason = "The suspended turn timed out waiting for a host reply."
+
+    /// Extracts the request id a Reply answers: the permission request id
+    /// or the question id. Returns None when the reply carries no id.
+    /// <param name="reply">The reply.</param>
+    /// <returns>The id the reply answers, or None.</returns>
+    let private replyRequestId (reply: Reply) : string option =
+        match reply with
+        | :? PermissionDecision as decision when not (isNull (box decision)) ->
+            if isNull (box decision.RequestId) then
+                None
+            else
+                Some decision.RequestId
+        | :? QuestionAnswer as answer when not (isNull (box answer)) ->
+            if isNull (box answer.QuestionId) then
+                None
+            else
+                Some answer.QuestionId
+        | _ -> None
+
+    /// Rebuilds the pending request from the journal: replays from the
+    /// start and returns the latest PermissionRequested or QuestionAsked
+    /// with no matching resolve after it. A resolve matches when its
+    /// request id equals the ask id. Returns None when nothing is pending.
+    /// <param name="eventStore">The journal to replay.</param>
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="sessionId">The session to rebuild.</param>
+    /// <returns>The rebuilt pending, or None.</returns>
+    let rebuildPendingFromJournal
+        (eventStore: ISessionEventStore)
+        (tenant: TenantId)
+        (sessionId: SessionId)
+        : RebuiltPending option =
+        ArgumentNullException.ThrowIfNull(eventStore)
+
+        let rec replay cursor (pending: RebuiltPending option) =
+            let outcome =
+                awaitTask (eventStore.Replay(tenant, sessionId, cursor, 100, CancellationToken.None))
+
+            match outcome with
+            | :? EventReplayPage as page when not (isNull (box page)) ->
+                let mutable current = pending
+                let mutable nextCursor = cursor
+
+                if not (isNull (box page.Events)) then
+                    for event in page.Events do
+                        if not (isNull (box event)) then
+                            match event with
+                            | :? PermissionRequestedEvent as asked when not (isNull (box asked)) ->
+                                current <-
+                                    Some
+                                        {
+                                            RequestId = asked.RequestId
+                                            ToolName = asked.ToolName
+                                            Kind = TurnLoop.PermissionSuspension
+                                            QuestionText = ""
+                                        }
+                            | :? QuestionAskedEvent as asked when not (isNull (box asked)) ->
+                                current <-
+                                    Some
+                                        {
+                                            RequestId = asked.QuestionId
+                                            ToolName = TurnLoop.AskUserToolName
+                                            Kind = TurnLoop.QuestionSuspension
+                                            QuestionText = asked.Question
+                                        }
+                            | :? PermissionResolvedEvent as resolved when not (isNull (box resolved)) ->
+                                match current with
+                                | Some awaiting when
+                                    String.Equals(awaiting.RequestId, resolved.RequestId, StringComparison.Ordinal)
+                                    ->
+                                    current <- None
+                                | _ -> ()
+                            | :? QuestionAnsweredEvent as answered when not (isNull (box answered)) ->
+                                match current with
+                                | Some awaiting when
+                                    String.Equals(awaiting.RequestId, answered.QuestionId, StringComparison.Ordinal)
+                                    ->
+                                    current <- None
+                                | _ -> ()
+                            | _ -> ()
+
+                    if page.NextCursor.HasValue then
+                        nextCursor <- page.NextCursor.Value
+
+                if page.NextCursor.HasValue then
+                    replay nextCursor current
+                else
+                    current
+            | _ -> pending
+
+        replay 0L None
+
+    /// The suspendable session actor: like behavior but driving the
+    /// suspendable runner, entering WaitingForInput store-first on suspend,
+    /// matching Reply ids with the typed error, resuming from the cursor
+    /// with attempt plus 1, settling Failed with TurnFailed on AskTimeout,
+    /// and rebuilding the pending request from the journal on restart. The
+    /// claim heartbeat is never cancelled on suspend: renewal continues
+    /// while suspended under the same claim (proven by test; no new
+    /// background work, bounded by lease expiry and AskTimeout). Reply
+    /// never starts a turn: it only resumes the suspended one, and
+    /// Inject/Interrupt routing stays with #34. Abort on WaitingForInput
+    /// stays a no-op per #35.
+    /// <param name="props">The base session actor dependencies.</param>
+    /// <param name="suspend">The suspend dependencies.</param>
+    /// <param name="mailbox">The actor mailbox, injected by spawn.</param>
+    /// <returns>The Akka.FSharp actor computation to spawn.</returns>
+    let behaviorWithSuspend
+        (props: SessionActorProps)
+        (suspend: SuspendDeps)
+        (mailbox: Actor<SuspendableActorMessage>)
+        =
+        if isNull (box props.Store) then
+            raise (ArgumentNullException(nameof props))
+
+        if isNull (box props.RunTurn) then
+            raise (ArgumentNullException(nameof props))
+
+        if isNull (box suspend.EventStore) then
+            raise (ArgumentNullException(nameof suspend))
+
+        if isNull (box suspend.Delay) then
+            raise (ArgumentNullException(nameof suspend))
+
+        if isNull (box suspend.JournalToken) then
+            raise (ArgumentNullException(nameof suspend))
+
+        if isNull (box suspend.RunSuspendable) then
+            raise (ArgumentNullException(nameof suspend))
+
+        if suspend.AskTimeout <= TimeSpan.Zero then
+            raise (ArgumentOutOfRangeException(nameof suspend, "SuspendDeps.AskTimeout must be positive."))
+
+        let suspendSelf = mailbox.Self
+
+        let initialRecovered: SessionState * RebuiltPending option =
+            let found =
+                awaitTask (props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
+
+            match found with
+            | null -> SessionState.Idle, None
+            | session ->
+                match session.State with
+                | SessionState.Running ->
+                    awaitTask (
+                        props.Store.UpdateSessionState(
+                            props.Tenant,
+                            props.SessionId,
+                            SessionState.Idle,
+                            CancellationToken.None
+                        )
+                    )
+                    |> ignore
+
+                    SessionState.Idle, None
+                | SessionState.WaitingForInput ->
+                    let rebuilt =
+                        rebuildPendingFromJournal suspend.EventStore props.Tenant props.SessionId
+
+                    SessionState.WaitingForInput, rebuilt
+                | SessionState.Idle -> SessionState.Idle, None
+                | SessionState.Closed -> SessionState.Closed, None
+                | unknown -> unknown, None
+
+        let initialState, initialRebuilt = initialRecovered
+
+        let initialSuspended: SuspendedTurn option =
+            match initialState, initialRebuilt with
+            | SessionState.WaitingForInput, Some rebuilt ->
+                // Crash rebuild: no cursor and no running task; the matching
+                // Reply retries from the oldest pending Queue entry. The
+                // timeout is not restarted here: the AskTimeout bound restarts
+                // when the retried turn suspends again, so a restarted host
+                // never inherits a fired deadline.
+                let queueEntry =
+                    try
+                        let pending =
+                            awaitTask (
+                                props.Store.ReadPendingInbox(props.Tenant, props.SessionId, CancellationToken.None)
+                            )
+
+                        pending
+                        |> Seq.filter (fun entry ->
+                            not (isNull (box entry))
+                            && entry.Delivery = DeliveryMode.Queue
+                            && (entry.Payload :? UserMessagePayload))
+                        |> Seq.sortBy (fun entry -> entry.Position)
+                        |> Seq.tryHead
+                    with _ ->
+                        None
+
+                match queueEntry with
+                | Some entry ->
+                    Some
+                        {
+                            Entry = entry
+                            Cursor = None
+                            Rebuilt = Some rebuilt
+                            Allowed = HashSet<string>()
+                            Attempt = 1
+                            TimeoutCts = new CancellationTokenSource()
+                        }
+                | None -> None
+            | _ -> None
+
+        let pendingCountNow () : int =
+            try
+                let pending =
+                    awaitTask (props.Store.ReadPendingInbox(props.Tenant, props.SessionId, CancellationToken.None))
+
+                if isNull (box pending) then 0 else pending.Count
+            with :? SessionNotFoundException ->
+                0
+
+        let takeSuspendSnapshot (state: SessionState) (suspended: SuspendedTurn option) : SessionSnapshot =
+            let pendingId: string | null =
+                match suspended with
+                | Some parked ->
+                    match parked.Cursor with
+                    | Some cursor -> cursor.RequestId
+                    | None ->
+                        match parked.Rebuilt with
+                        | Some rebuilt -> rebuilt.RequestId
+                        | None -> null
+                | None -> null
+
+            {
+                SessionId = props.SessionId
+                State = state
+                PendingCount = pendingCountNow ()
+                RunningPosition = None
+                PendingRequestId = pendingId
+            }
+
+        let notifySettled (result: TurnResult) : unit =
+            match props.OnTurnSettled with
+            | Some observe ->
+                try
+                    observe result
+                with _ ->
+                    ()
+            | None -> ()
+
+        let journalSuspend (suspension: TurnLoop.TurnLoopSuspension) : unit =
+            let turnId = TurnId.New()
+            let stamp = DateTimeOffset.UtcNow
+
+            let event =
+                match suspension.Kind with
+                | TurnLoop.PermissionSuspension ->
+                    PermissionRequestedEvent(
+                        props.SessionId,
+                        turnId,
+                        Nullable<int64>(),
+                        stamp,
+                        suspension.RequestId,
+                        suspension.ToolName
+                    )
+                    :> SessionEvent
+                | TurnLoop.QuestionSuspension ->
+                    QuestionAskedEvent(
+                        props.SessionId,
+                        turnId,
+                        Nullable<int64>(),
+                        stamp,
+                        suspension.RequestId,
+                        suspension.QuestionText
+                    )
+                    :> SessionEvent
+
+            let events = ResizeArray<SessionEvent>([| event |]) :> IReadOnlyList<SessionEvent>
+
+            try
+                awaitTask (
+                    suspend.EventStore.Append(
+                        props.Tenant,
+                        props.SessionId,
+                        suspend.JournalToken,
+                        events,
+                        CancellationToken.None
+                    )
+                )
+                |> ignore
+            with _ ->
+                ()
+
+        let journalResolve (reply: Reply) : unit =
+            let turnId = TurnId.New()
+            let stamp = DateTimeOffset.UtcNow
+
+            let eventOpt: SessionEvent option =
+                match reply with
+                | :? PermissionDecision as decision when not (isNull (box decision)) ->
+                    PermissionResolvedEvent(
+                        props.SessionId,
+                        turnId,
+                        Nullable<int64>(),
+                        stamp,
+                        decision.RequestId,
+                        decision.Decision
+                    )
+                    :> SessionEvent
+                    |> Some
+                | :? QuestionAnswer as answer when not (isNull (box answer)) ->
+                    QuestionAnsweredEvent(
+                        props.SessionId,
+                        turnId,
+                        Nullable<int64>(),
+                        stamp,
+                        answer.QuestionId,
+                        answer.Answer
+                    )
+                    :> SessionEvent
+                    |> Some
+                | _ -> None
+
+            match eventOpt with
+            | None -> ()
+            | Some event ->
+                let events = ResizeArray<SessionEvent>([| event |]) :> IReadOnlyList<SessionEvent>
+
+                try
+                    awaitTask (
+                        suspend.EventStore.Append(
+                            props.Tenant,
+                            props.SessionId,
+                            suspend.JournalToken,
+                            events,
+                            CancellationToken.None
+                        )
+                    )
+                    |> ignore
+                with _ ->
+                    ()
+
+        let journalTimeout () : unit =
+            let turnId = TurnId.New()
+            let stamp = DateTimeOffset.UtcNow
+
+            let event =
+                TurnFailedEvent(props.SessionId, turnId, Nullable<int64>(), stamp, AskTimeoutReason) :> SessionEvent
+
+            let events = ResizeArray<SessionEvent>([| event |]) :> IReadOnlyList<SessionEvent>
+
+            try
+                awaitTask (
+                    suspend.EventStore.Append(
+                        props.Tenant,
+                        props.SessionId,
+                        suspend.JournalToken,
+                        events,
+                        CancellationToken.None
+                    )
+                )
+                |> ignore
+            with _ ->
+                ()
+
+        let startSuspendable (entry: InboxEntry) (attempt: int) (allowed: HashSet<string>) : unit =
+            let runTask =
+                try
+                    let started =
+                        suspend.RunSuspendable entry attempt allowed None None CancellationToken.None
+
+                    if isNull (box started) then
+                        Task.FromException<TurnLoop.TurnLoopCompletion>(
+                            InvalidOperationException("The suspendable turn runner returned null.")
+                        )
+                    else
+                        started
+                with ex ->
+                    Task.FromException<TurnLoop.TurnLoopCompletion>(ex)
+
+            runTask.ContinueWith(fun (completed: Task<TurnLoop.TurnLoopCompletion>) ->
+                if completed.IsCanceled then
+                    suspendSelf.Tell(
+                        SuspendableFaulted(
+                            entry,
+                            OperationCanceledException("The suspendable turn was aborted."),
+                            attempt
+                        )
+                    )
+                elif completed.IsFaulted then
+                    let error =
+                        match completed.Exception with
+                        | null ->
+                            InvalidOperationException("The suspendable turn faulted without an exception.")
+                            :> Exception
+                        | aggregate -> aggregate.GetBaseException()
+
+                    suspendSelf.Tell(SuspendableFaulted(entry, error, attempt))
+                else
+                    suspendSelf.Tell(SuspendableFinished(entry, completed.Result, attempt, allowed)))
+            |> ignore
+
+        let resumeSuspendable (parked: SuspendedTurn) (reply: Reply) (nextAttempt: int) : unit =
+            let cursor =
+                match parked.Cursor with
+                | Some live -> Some live
+                | None -> None
+
+            let runTask =
+                try
+                    let started =
+                        suspend.RunSuspendable
+                            parked.Entry
+                            nextAttempt
+                            parked.Allowed
+                            cursor
+                            (Some reply)
+                            CancellationToken.None
+
+                    if isNull (box started) then
+                        Task.FromException<TurnLoop.TurnLoopCompletion>(
+                            InvalidOperationException("The suspendable turn runner returned null.")
+                        )
+                    else
+                        started
+                with ex ->
+                    Task.FromException<TurnLoop.TurnLoopCompletion>(ex)
+
+            runTask.ContinueWith(fun (completed: Task<TurnLoop.TurnLoopCompletion>) ->
+                if completed.IsCanceled then
+                    suspendSelf.Tell(
+                        SuspendableFaulted(
+                            parked.Entry,
+                            OperationCanceledException("The resumed turn was aborted."),
+                            nextAttempt
+                        )
+                    )
+                elif completed.IsFaulted then
+                    let error =
+                        match completed.Exception with
+                        | null ->
+                            InvalidOperationException("The resumed turn faulted without an exception.") :> Exception
+                        | aggregate -> aggregate.GetBaseException()
+
+                    suspendSelf.Tell(SuspendableFaulted(parked.Entry, error, nextAttempt))
+                else
+                    suspendSelf.Tell(SuspendableFinished(parked.Entry, completed.Result, nextAttempt, parked.Allowed)))
+            |> ignore
+
+        let armTimeout (requestId: string) (timeoutCts: CancellationTokenSource) : unit =
+            let delayTask =
+                try
+                    suspend.Delay.Delay(suspend.AskTimeout, timeoutCts.Token)
+                with ex ->
+                    Task.FromException(ex)
+
+            delayTask.ContinueWith(fun (elapsed: Task) ->
+                if elapsed.Status = TaskStatus.RanToCompletion then
+                    suspendSelf.Tell(SuspendTimedOut requestId))
+            |> ignore
+
+        let timeoutResult () : TurnResult =
+            {
+                AssistantText = ""
+                Status = TurnStatus.Failed
+                Iterations = 0
+                Usage = { InputTokens = 0L; OutputTokens = 0L }
+                Outcome = TurnFailed(AskTimeoutReason) :> TurnOutcome
+            }
+
+        let rec loop (state: SessionState) (suspended: SuspendedTurn option) (resolved: HashSet<string>) =
+            actor {
+                let! message = mailbox.Receive()
+
+                match message with
+                | SuspendableQueuePrompt(payload, cancellationToken) ->
+                    match state with
+                    | SessionState.Closed ->
+                        mailbox.Sender() <! PromptRejected SessionState.Closed
+                        return! loop state suspended resolved
+                    | SessionState.Idle ->
+                        let appended =
+                            awaitTask (
+                                props.Store.AppendInboxMessage(
+                                    props.Tenant,
+                                    props.SessionId,
+                                    payload,
+                                    DeliveryMode.Queue,
+                                    cancellationToken
+                                )
+                            )
+
+                        awaitTask (
+                            props.Store.UpdateSessionState(
+                                props.Tenant,
+                                props.SessionId,
+                                SessionState.Running,
+                                cancellationToken
+                            )
+                        )
+                        |> ignore
+
+                        let pending =
+                            awaitTask (props.Store.ReadPendingInbox(props.Tenant, props.SessionId, cancellationToken))
+
+                        let first =
+                            pending
+                            |> Seq.filter (fun candidate ->
+                                not (isNull (box candidate))
+                                && candidate.Delivery = DeliveryMode.Queue
+                                && (candidate.Payload :? UserMessagePayload))
+                            |> Seq.sortBy (fun candidate -> candidate.Position)
+                            |> Seq.tryHead
+                            |> Option.defaultValue appended
+
+                        startSuspendable first 1 (HashSet<string>())
+                        mailbox.Sender() <! PromptAccepted appended
+                        return! loop SessionState.Running None resolved
+                    | SessionState.Running
+                    | SessionState.WaitingForInput ->
+                        let appended =
+                            awaitTask (
+                                props.Store.AppendInboxMessage(
+                                    props.Tenant,
+                                    props.SessionId,
+                                    payload,
+                                    DeliveryMode.Queue,
+                                    cancellationToken
+                                )
+                            )
+
+                        mailbox.Sender() <! PromptAccepted appended
+                        return! loop state suspended resolved
+                    | _ ->
+                        let appended =
+                            awaitTask (
+                                props.Store.AppendInboxMessage(
+                                    props.Tenant,
+                                    props.SessionId,
+                                    payload,
+                                    DeliveryMode.Queue,
+                                    cancellationToken
+                                )
+                            )
+
+                        mailbox.Sender() <! PromptAccepted appended
+                        return! loop state suspended resolved
+                | SuspendableFinished(entry, completion, attempt, allowed) ->
+                    match state, suspended with
+                    | SessionState.Running, None ->
+                        match completion.Suspension with
+                        | None ->
+                            let positions = [| entry.Position |] :> IReadOnlyList<int64>
+
+                            awaitTask (
+                                props.Store.MarkInboxConsumed(
+                                    props.Tenant,
+                                    props.SessionId,
+                                    positions,
+                                    CancellationToken.None
+                                )
+                            )
+                            |> ignore
+
+                            notifySettled completion.Result
+
+                            let pending =
+                                awaitTask (
+                                    props.Store.ReadPendingInbox(props.Tenant, props.SessionId, CancellationToken.None)
+                                )
+
+                            let next =
+                                pending
+                                |> Seq.filter (fun candidate ->
+                                    not (isNull (box candidate))
+                                    && candidate.Delivery = DeliveryMode.Queue
+                                    && (candidate.Payload :? UserMessagePayload))
+                                |> Seq.sortBy (fun candidate -> candidate.Position)
+                                |> Seq.tryHead
+
+                            match next with
+                            | Some following ->
+                                startSuspendable following 1 (HashSet<string>())
+                                return! loop SessionState.Running None resolved
+                            | None ->
+                                awaitTask (
+                                    props.Store.UpdateSessionState(
+                                        props.Tenant,
+                                        props.SessionId,
+                                        SessionState.Idle,
+                                        CancellationToken.None
+                                    )
+                                )
+                                |> ignore
+
+                                return! loop SessionState.Idle None resolved
+                        | Some cursor ->
+                            awaitTask (
+                                props.Store.UpdateSessionState(
+                                    props.Tenant,
+                                    props.SessionId,
+                                    SessionState.WaitingForInput,
+                                    CancellationToken.None
+                                )
+                            )
+                            |> ignore
+
+                            journalSuspend cursor
+
+                            let timeoutCts = new CancellationTokenSource()
+
+                            let carried = if isNull (box allowed) then HashSet<string>() else allowed
+
+                            let parked =
+                                {
+                                    Entry = entry
+                                    Cursor = Some cursor
+                                    Rebuilt = None
+                                    Allowed = carried
+                                    Attempt = attempt
+                                    TimeoutCts = timeoutCts
+                                }
+
+                            armTimeout cursor.RequestId timeoutCts
+                            return! loop SessionState.WaitingForInput (Some parked) resolved
+                    | SessionState.WaitingForInput, Some parked when parked.Cursor.IsNone && parked.Rebuilt.IsSome ->
+                        // Crash-retry path should never produce a running
+                        // finish while still parked; ignore stale completions.
+                        return! loop state suspended resolved
+                    | _ -> return! loop state suspended resolved
+                | SuspendableFaulted(entry, _, _) ->
+                    match state, suspended with
+                    | SessionState.Running, None ->
+                        let positions = [| entry.Position |] :> IReadOnlyList<int64>
+
+                        awaitTask (
+                            props.Store.MarkInboxConsumed(
+                                props.Tenant,
+                                props.SessionId,
+                                positions,
+                                CancellationToken.None
+                            )
+                        )
+                        |> ignore
+
+                        awaitTask (
+                            props.Store.UpdateSessionState(
+                                props.Tenant,
+                                props.SessionId,
+                                SessionState.Idle,
+                                CancellationToken.None
+                            )
+                        )
+                        |> ignore
+
+                        return! loop SessionState.Idle None resolved
+                    | _ -> return! loop state suspended resolved
+                | ReplyEntry replyEntry ->
+                    match state, suspended with
+                    | SessionState.WaitingForInput, Some parked ->
+                        let replyOpt: Reply option =
+                            match replyEntry.Payload with
+                            | :? ReplyPayload as payload when not (isNull (box payload)) ->
+                                if isNull (box payload.Reply) then
+                                    None
+                                else
+                                    Some payload.Reply
+                            | _ -> None
+
+                        match replyOpt with
+                        | None ->
+                            let error =
+                                ReplyMismatchException(
+                                    props.SessionId,
+                                    "",
+                                    "The reply carried no answer for the pending request."
+                                )
+
+                            mailbox.Sender() <! ReplyRejected error
+                            return! loop state suspended resolved
+                        | Some reply ->
+                            let requestOpt = replyRequestId reply
+
+                            let expectedOpt: string option =
+                                match parked.Cursor with
+                                | Some cursor -> Some cursor.RequestId
+                                | None ->
+                                    match parked.Rebuilt with
+                                    | Some rebuilt -> Some rebuilt.RequestId
+                                    | None -> None
+
+                            match requestOpt, expectedOpt with
+                            | Some requestId, Some expected when
+                                String.Equals(requestId, expected, StringComparison.Ordinal)
+                                ->
+                                if resolved.Contains(requestId) then
+                                    let error =
+                                        ReplyMismatchException(
+                                            props.SessionId,
+                                            requestId,
+                                            "The reply answers an already-resolved request."
+                                        )
+
+                                    mailbox.Sender() <! ReplyRejected error
+                                    return! loop state suspended resolved
+                                else
+                                    try
+                                        parked.TimeoutCts.Cancel()
+                                    with _ ->
+                                        ()
+
+                                    let positions = [| replyEntry.Position |] :> IReadOnlyList<int64>
+
+                                    awaitTask (
+                                        props.Store.MarkInboxConsumed(
+                                            props.Tenant,
+                                            props.SessionId,
+                                            positions,
+                                            CancellationToken.None
+                                        )
+                                    )
+                                    |> ignore
+
+                                    journalResolve reply
+                                    resolved.Add(requestId) |> ignore
+
+                                    awaitTask (
+                                        props.Store.UpdateSessionState(
+                                            props.Tenant,
+                                            props.SessionId,
+                                            SessionState.Running,
+                                            CancellationToken.None
+                                        )
+                                    )
+                                    |> ignore
+
+                                    // AllowForSession memory: remember the tool
+                                    // before resuming so the continued run skips
+                                    // Evaluate for it.
+                                    match reply with
+                                    | :? PermissionDecision as decision when
+                                        not (isNull (box decision))
+                                        && decision.Decision = PermissionDecisionKind.AllowForSession
+                                        ->
+                                        let toolName =
+                                            match parked.Cursor with
+                                            | Some cursor -> cursor.ToolName
+                                            | None ->
+                                                match parked.Rebuilt with
+                                                | Some rebuilt -> rebuilt.ToolName
+                                                | None -> ""
+
+                                        if not (String.IsNullOrEmpty toolName) then
+                                            parked.Allowed.Add(toolName) |> ignore
+                                    | _ -> ()
+
+                                    mailbox.Sender() <! ReplyAccepted replyEntry
+
+                                    let nextAttempt = parked.Attempt + 1
+
+                                    match parked.Cursor with
+                                    | Some _ ->
+                                        resumeSuspendable parked reply nextAttempt
+                                        return! loop SessionState.Running None resolved
+                                    | None ->
+                                        // Crash-retry: no cursor, so retry the
+                                        // parked entry from scratch under the new
+                                        // attempt. The retried run suspends again
+                                        // or settles; either path re-enters this
+                                        // loop.
+                                        startSuspendable parked.Entry nextAttempt parked.Allowed
+                                        return! loop SessionState.Running None resolved
+                            | Some requestId, _ ->
+                                let error =
+                                    ReplyMismatchException(
+                                        props.SessionId,
+                                        requestId,
+                                        "The reply answered no pending request."
+                                    )
+
+                                mailbox.Sender() <! ReplyRejected error
+                                return! loop state suspended resolved
+                            | None, _ ->
+                                let error =
+                                    ReplyMismatchException(
+                                        props.SessionId,
+                                        "",
+                                        "The reply carried no answer for the pending request."
+                                    )
+
+                                mailbox.Sender() <! ReplyRejected error
+                                return! loop state suspended resolved
+                    | _ ->
+                        let requestId: string =
+                            match replyEntry.Payload with
+                            | :? ReplyPayload as payload when not (isNull (box payload)) ->
+                                match replyRequestId payload.Reply with
+                                | Some id -> id
+                                | None -> ""
+                            | _ -> ""
+
+                        let error =
+                            ReplyMismatchException(
+                                props.SessionId,
+                                requestId,
+                                "The session has no pending request for the reply."
+                            )
+
+                        mailbox.Sender() <! ReplyRejected error
+                        return! loop state suspended resolved
+                | SuspendTimedOut requestId ->
+                    match state, suspended with
+                    | SessionState.WaitingForInput, Some parked ->
+                        let expectedOpt: string option =
+                            match parked.Cursor with
+                            | Some cursor -> Some cursor.RequestId
+                            | None ->
+                                match parked.Rebuilt with
+                                | Some rebuilt -> Some rebuilt.RequestId
+                                | None -> None
+
+                        match expectedOpt with
+                        | Some expected when String.Equals(requestId, expected, StringComparison.Ordinal) ->
+                            try
+                                parked.TimeoutCts.Cancel()
+                            with _ ->
+                                ()
+
+                            journalTimeout ()
+
+                            let result = timeoutResult ()
+                            notifySettled result
+
+                            let positions = [| parked.Entry.Position |] :> IReadOnlyList<int64>
+
+                            awaitTask (
+                                props.Store.MarkInboxConsumed(
+                                    props.Tenant,
+                                    props.SessionId,
+                                    positions,
+                                    CancellationToken.None
+                                )
+                            )
+                            |> ignore
+
+                            awaitTask (
+                                props.Store.UpdateSessionState(
+                                    props.Tenant,
+                                    props.SessionId,
+                                    SessionState.Idle,
+                                    CancellationToken.None
+                                )
+                            )
+                            |> ignore
+
+                            return! loop SessionState.Idle None resolved
+                        | _ -> return! loop state suspended resolved
+                    | _ -> return! loop state suspended resolved
+                | SuspendableGetSnapshot ->
+                    mailbox.Sender() <! takeSuspendSnapshot state suspended
+                    return! loop state suspended resolved
+            }
+
+        loop initialState initialSuspended (HashSet<string>())
+
+    /// Asks a suspendable actor with the shared timeout, honouring the
+    /// caller's cancellation. Mirrors askAsync for the suspendable protocol.
+    /// <param name="session">The suspendable session actor.</param>
+    /// <param name="message">The message to ask with.</param>
+    /// <param name="cancellationToken">Cancels the ask.</param>
+    /// <returns>The actor's reply.</returns>
+    let private askSuspendableAsync<'Reply>
+        (session: IActorRef)
+        (message: SuspendableActorMessage)
+        (cancellationToken: CancellationToken)
+        : Task<'Reply> =
+        task {
+            use timeoutCts = new CancellationTokenSource(askTimeout)
+
+            use linkedCts =
+                CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token)
+
+            let! reply = session.Ask<'Reply>(message, linkedCts.Token)
+            return reply
+        }
+
+    /// Prompts a suspendable session actor: appends the Queue inbox entry
+    /// and starts a suspendable turn when Idle. Validates the session is
+    /// present and not Closed before touching the actor.
+    /// <param name="store">The durable store.</param>
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="sessionId">The session to prompt.</param>
+    /// <param name="session">The suspendable session actor.</param>
+    /// <param name="message">The user message. Must not be null.</param>
+    /// <param name="cancellationToken">Cancels the prompt.</param>
+    /// <returns>The appended inbox entry.</returns>
+    let promptSuspendableAsync
+        (store: ISessionStore)
+        (tenant: TenantId)
+        (sessionId: SessionId)
+        (session: IActorRef)
+        (message: UserMessage)
+        (cancellationToken: CancellationToken)
+        : Task<InboxEntry> =
+        ArgumentNullException.ThrowIfNull(store)
+        ArgumentNullException.ThrowIfNull(session)
+
+        if isNull (box message) then
+            raise (ArgumentNullException(nameof message))
+
+        task {
+            let! current = requireSessionAsync store tenant sessionId cancellationToken
+
+            if current.State = SessionState.Closed then
+                raise (
+                    InvalidSessionStateException(
+                        sessionId,
+                        current.State.ToString(),
+                        "The session is closed and accepts no further prompts."
+                    )
+                )
+
+            // The suspendable actor owns its queue wire: the suspendable
+            // behavior starts its suspendable runner for it.
+            let payload = UserMessagePayload(message) :> InboxPayload
+
+            let! reply =
+                askSuspendableAsync<SessionPromptReply>
+                    session
+                    (SuspendableQueuePrompt(payload, cancellationToken))
+                    cancellationToken
+
+            match reply with
+            | PromptAccepted entry -> return entry
+            | PromptRejected rejectedState ->
+                return
+                    raise (
+                        InvalidSessionStateException(
+                            sessionId,
+                            rejectedState.ToString(),
+                            "The session closed before the prompt was accepted."
+                        )
+                    )
+        }
+
+    /// Replies to a suspended turn: appends the Reply inbox entry, matches
+    /// it against the pending request id, and resumes from the cursor with
+    /// attempt plus 1. An unknown or already-resolved request id throws the
+    /// typed ReplyMismatchException; a matching one consumes the Reply entry
+    /// and resumes. Reply never starts a turn.
+    /// <param name="store">The durable store.</param>
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="sessionId">The session to reply to.</param>
+    /// <param name="session">The suspendable session actor.</param>
+    /// <param name="reply">The host reply. Must not be null.</param>
+    /// <param name="cancellationToken">Cancels the reply.</param>
+    /// <returns>The consumed Reply inbox entry.</returns>
+    let replyAsync
+        (store: ISessionStore)
+        (tenant: TenantId)
+        (sessionId: SessionId)
+        (session: IActorRef)
+        (reply: Reply)
+        (cancellationToken: CancellationToken)
+        : Task<InboxEntry> =
+        ArgumentNullException.ThrowIfNull(store)
+        ArgumentNullException.ThrowIfNull(session)
+
+        if isNull (box reply) then
+            raise (ArgumentNullException(nameof reply))
+
+        task {
+            let! current = requireSessionAsync store tenant sessionId cancellationToken
+
+            if current.State = SessionState.Closed then
+                raise (
+                    InvalidSessionStateException(
+                        sessionId,
+                        current.State.ToString(),
+                        "The session is closed and accepts no reply."
+                    )
+                )
+
+            let payload = ReplyPayload(reply) :> InboxPayload
+
+            let! appended = store.AppendInboxMessage(tenant, sessionId, payload, DeliveryMode.Queue, cancellationToken)
+
+            let! answer = askSuspendableAsync<SessionReplyReply> session (ReplyEntry appended) cancellationToken
+
+            match answer with
+            | ReplyAccepted entry -> return entry
+            | ReplyRejected error -> return raise error
+        }
+
+    /// Reads a suspendable actor's snapshot: its lifecycle state, the
+    /// store's pending inbox count, and the pending suspend request id.
+    /// <param name="session">The suspendable session actor.</param>
+    /// <param name="cancellationToken">Cancels the read.</param>
+    /// <returns>The actor's current snapshot.</returns>
+    let getSuspendSnapshotAsync (session: IActorRef) (cancellationToken: CancellationToken) : Task<SessionSnapshot> =
+        ArgumentNullException.ThrowIfNull(session)
+        askSuspendableAsync<SessionSnapshot> session SuspendableGetSnapshot cancellationToken

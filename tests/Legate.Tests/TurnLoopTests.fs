@@ -1349,3 +1349,265 @@ let ``Inject appends raw parts verbatim and ignores metadata`` () =
     userTextsOf history |> should equal [ "first"; "second" ]
     journaled |> List.ofSeq |> should equal [ entry ]
     consumed |> List.ofSeq |> should equal [ entry ]
+
+// ──────────────────────────────────────────────────────────────────────────
+// Suspend and resume (issue 36)
+
+/// Scripted permission policy: answers per tool name, counting evaluations.
+type ScriptPolicy(verdicts: Map<string, PermissionVerdict>) =
+    let mutable evaluations = 0
+    let seen = ResizeArray<string>()
+
+    interface IPermissionPolicy with
+        member _.Evaluate(request) =
+            evaluations <- evaluations + 1
+            seen.Add(request.ToolName)
+
+            match verdicts.TryFind(request.ToolName) with
+            | Some verdict -> verdict
+            | None -> PermissionVerdict.Allow
+
+    member _.Evaluations = evaluations
+    member _.Seen = seen :> IReadOnlyList<string>
+
+let private suspendIds () =
+    let mutable next = 0
+
+    fun () ->
+        next <- next + 1
+        $"req-%d{next}"
+
+let private runSuspendable
+    (client: ScriptedChatClient)
+    (history: IList<ChatMessage>)
+    (tools: IReadOnlyDictionary<string, AITool>)
+    (policy: IPermissionPolicy)
+    (newRequestId: unit -> string)
+    (allowed: HashSet<string>)
+    : TurnLoop.TurnLoopCompletion =
+    TurnLoop.runSuspendableAsync
+        (client :> IChatClient)
+        history
+        tools
+        TurnLoop.TurnLoopOptions.Default
+        (NeverDelay() :> ILlmDelay)
+        CancellationToken.None
+        alwaysLeased
+        (fun () -> ResizeArray<InboxEntry>() :> IReadOnlyList<InboxEntry>)
+        ignore
+        ignore
+        policy
+        (SessionId.New())
+        (TurnId.New())
+        (Some newRequestId)
+        allowed
+    |> fun task -> task.GetAwaiter().GetResult()
+
+let private questionCallMessage (callId: string) (question: string) : ChatMessage =
+    let args = Dictionary<string, obj>()
+    args["question"] <- question :> obj
+
+    let contents =
+        ResizeArray<AIContent>(
+            [|
+                new FunctionCallContent(callId, TurnLoop.AskUserToolName, args) :> AIContent
+            |]
+        )
+        :> IList<AIContent>
+
+    new ChatMessage(ChatRole.Assistant, contents)
+
+[<Fact>]
+let ``Ask suspends with the unified carrier and invokes nothing`` () =
+    let invocations = ref []
+    let fn = stubTool "exec" "out" invocations
+
+    let first =
+        new ChatResponse(ResizeArray<ChatMessage>([| callMessage [ "c1", "exec" ] |]))
+
+    let client = new ScriptedChatClient([ first; textResponse "never" ])
+    let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+
+    let policy =
+        ScriptPolicy(Map.ofList [ "exec", PermissionVerdict.Ask ]) :> IPermissionPolicy
+
+    let completion =
+        runSuspendable client history (makeTools [ "exec", fn ]) policy (suspendIds ()) (HashSet<string>())
+
+    completion.Result.Status |> should equal TurnStatus.Suspended
+    completion.HasPendingInjects |> should equal false
+    completion.Suspension.IsSome |> should equal true
+
+    let suspension = completion.Suspension.Value
+    suspension.RequestId |> should equal "req-1"
+    suspension.ToolName |> should equal "exec"
+    suspension.ToolCallId |> should equal "c1"
+    suspension.Kind |> should equal TurnLoop.PermissionSuspension
+    suspension.PendingCall.CallId |> should equal "c1"
+    invocations.Value.Length |> should equal 0
+    client.Calls |> should equal 1
+
+[<Fact>]
+let ``Deny continues without the tool effect`` () =
+    let invocations = ref []
+    let fn = stubTool "exec" "out" invocations
+
+    let first =
+        new ChatResponse(ResizeArray<ChatMessage>([| callMessage [ "c1", "exec" ] |]))
+
+    let client = new ScriptedChatClient([ first; textResponse "done" ])
+    let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+
+    let policy =
+        ScriptPolicy(
+            Map.ofList
+                [
+                    "exec", PermissionVerdict.Deny("no writes")
+                ]
+        )
+        :> IPermissionPolicy
+
+    let completion =
+        runSuspendable client history (makeTools [ "exec", fn ]) policy (suspendIds ()) (HashSet<string>())
+
+    completion.Result.Status |> should equal TurnStatus.Completed
+    completion.Suspension.IsNone |> should equal true
+    invocations.Value.Length |> should equal 0
+    completion.Result.AssistantText |> should equal "done"
+
+    let denied =
+        toolMessages history
+        |> List.tryHead
+        |> Option.map toolResultText
+        |> Option.defaultValue ""
+
+    denied.Contains("no writes") |> should equal true
+
+[<Fact>]
+let ``AllowForSession memory skips Evaluate`` () =
+    let invocations = ref []
+    let fn = stubTool "exec" "out" invocations
+
+    let first =
+        new ChatResponse(ResizeArray<ChatMessage>([| callMessage [ "c1", "exec" ] |]))
+
+    let client = new ScriptedChatClient([ first; textResponse "done" ])
+    let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+    let scripted = ScriptPolicy(Map.ofList [ "exec", PermissionVerdict.Ask ])
+    let allowed = HashSet<string>()
+    allowed.Add("exec") |> ignore
+
+    let completion =
+        runSuspendable client history (makeTools [ "exec", fn ]) (scripted :> IPermissionPolicy) (suspendIds ()) allowed
+
+    completion.Result.Status |> should equal TurnStatus.Completed
+    scripted.Evaluations |> should equal 0
+    invocations.Value |> should equal [ "exec" ]
+
+[<Fact>]
+let ``ask_user suspends as a question through the same carrier`` () =
+    let first =
+        new ChatResponse(
+            ResizeArray<ChatMessage>(
+                [|
+                    questionCallMessage "q1" "Which region?"
+                |]
+            )
+        )
+
+    let client = new ScriptedChatClient([ first; textResponse "never" ])
+    let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+    let policy = ScriptPolicy(Map.empty) :> IPermissionPolicy
+
+    let completion =
+        runSuspendable client history (makeTools []) policy (suspendIds ()) (HashSet<string>())
+
+    completion.Result.Status |> should equal TurnStatus.Suspended
+    completion.Suspension.IsSome |> should equal true
+
+    let suspension = completion.Suspension.Value
+    suspension.Kind |> should equal TurnLoop.QuestionSuspension
+    suspension.ToolName |> should equal TurnLoop.AskUserToolName
+    suspension.QuestionText |> should equal "Which region?"
+    suspension.ToolCallId |> should equal "q1"
+
+[<Fact>]
+let ``Resume with AllowOnce executes the same parked call`` () =
+    let invocations = ref []
+    let fn = stubTool "exec" "out" invocations
+
+    let first =
+        new ChatResponse(ResizeArray<ChatMessage>([| callMessage [ "c1", "exec" ] |]))
+
+    let client = new ScriptedChatClient([ first; textResponse "finished" ])
+    let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+
+    let policy =
+        ScriptPolicy(Map.ofList [ "exec", PermissionVerdict.Ask ]) :> IPermissionPolicy
+
+    let allowed = HashSet<string>()
+
+    let suspended =
+        runSuspendable client history (makeTools [ "exec", fn ]) policy (suspendIds ()) allowed
+
+    suspended.Suspension.IsSome |> should equal true
+    invocations.Value.Length |> should equal 0
+
+    let resumed =
+        TurnLoop.resumePermissionAsync
+            suspended.Suspension.Value
+            PermissionDecisionKind.AllowOnce
+            (client :> IChatClient)
+            history
+            (makeTools [ "exec", fn ])
+            TurnLoop.TurnLoopOptions.Default
+            (NeverDelay() :> ILlmDelay)
+            CancellationToken.None
+            alwaysLeased
+            policy
+            allowed
+        |> fun task -> task.GetAwaiter().GetResult()
+
+    resumed.Result.Status |> should equal TurnStatus.Completed
+    resumed.Result.AssistantText |> should equal "finished"
+    invocations.Value |> should equal [ "exec" ]
+    client.Calls |> should equal 2
+
+[<Fact>]
+let ``Resume with Deny skips the parked call`` () =
+    let invocations = ref []
+    let fn = stubTool "exec" "out" invocations
+
+    let first =
+        new ChatResponse(ResizeArray<ChatMessage>([| callMessage [ "c1", "exec" ] |]))
+
+    let client = new ScriptedChatClient([ first; textResponse "finished" ])
+    let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+
+    let policy =
+        ScriptPolicy(Map.ofList [ "exec", PermissionVerdict.Ask ]) :> IPermissionPolicy
+
+    let allowed = HashSet<string>()
+
+    let suspended =
+        runSuspendable client history (makeTools [ "exec", fn ]) policy (suspendIds ()) allowed
+
+    suspended.Suspension.IsSome |> should equal true
+
+    let resumed =
+        TurnLoop.resumePermissionAsync
+            suspended.Suspension.Value
+            PermissionDecisionKind.Deny
+            (client :> IChatClient)
+            history
+            (makeTools [ "exec", fn ])
+            TurnLoop.TurnLoopOptions.Default
+            (NeverDelay() :> ILlmDelay)
+            CancellationToken.None
+            alwaysLeased
+            policy
+            allowed
+        |> fun task -> task.GetAwaiter().GetResult()
+
+    resumed.Result.Status |> should equal TurnStatus.Completed
+    invocations.Value.Length |> should equal 0
