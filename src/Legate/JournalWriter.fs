@@ -522,6 +522,37 @@ module internal JournalWriter =
 
         prepared :> IReadOnlyList<SessionEvent>
 
+    // ────────────────── Live publish ──────────────────
+
+    /// The live publish notification the session event bus observes: every
+    /// stamped batch that lands triggers it synchronously before the append
+    /// returns, so a subscriber attached before the trigger never misses the
+    /// batch. Fenced-out and failed writes trigger nothing. Internal: hosts
+    /// never publish; only the bus subscribes.
+    let private published = Event<TenantId * SessionId * IReadOnlyList<SessionEvent>>()
+
+    /// The live publish notification the session event bus observes.
+    /// <returns>The publish event.</returns>
+    let internal Published: IEvent<TenantId * SessionId * IReadOnlyList<SessionEvent>> =
+        published.Publish
+
+    /// Notifies live subscribers of one stamped batch. No-ops on empty
+    /// batches; never throws past the caller (a throwing subscriber must
+    /// not fail the turn): handler faults are swallowed.
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="sessionId">The session whose journal appended.</param>
+    /// <param name="stamped">The stamped events, in append order.</param>
+    let private notifyPublished
+        (tenant: TenantId)
+        (sessionId: SessionId)
+        (stamped: IReadOnlyList<SessionEvent>)
+        : unit =
+        if not (isNull (box stamped)) && stamped.Count > 0 then
+            try
+                published.Trigger(tenant, sessionId, stamped)
+            with _ ->
+                ()
+
     /// Runs one prepared append with bounded retries: rejections propagate
     /// without retry or write, transient failures retry to MaxAppendAttempts
     /// and then fail with the typed reason, and cancellation propagates
@@ -577,7 +608,9 @@ module internal JournalWriter =
     /// through ClaimFence.appendEventsAsync, so a fenced-out append is
     /// skipped with zero effects before the store is even called, and
     /// branches the store's outcome the same way. Transient failures retry
-    /// bounded, then fail with the typed reason.
+    /// bounded, then fail with the typed reason. A landed batch publishes
+    /// its stamped events to live subscribers before returning; fenced-out
+    /// and failed writes publish nothing.
     /// <param name="sessionStore">The session store verifying the claim. Must not be null.</param>
     /// <param name="eventStore">The journal the events append to. Must not be null.</param>
     /// <param name="tenant">The tenant the session belongs to.</param>
@@ -603,35 +636,47 @@ module internal JournalWriter =
 
         let prepared = prepareBatch events
 
-        appendWithRetry
-            (fun cancellationToken ->
-                task {
-                    let! gated =
-                        ClaimFence.appendEventsAsync
-                            sessionStore
-                            eventStore
-                            tenant
-                            sessionId
-                            claim
-                            prepared
-                            cancellationToken
+        task {
+            let! result =
+                appendWithRetry
+                    (fun cancellationToken ->
+                        task {
+                            let! gated =
+                                ClaimFence.appendEventsAsync
+                                    sessionStore
+                                    eventStore
+                                    tenant
+                                    sessionId
+                                    claim
+                                    prepared
+                                    cancellationToken
 
-                    // A fenced-out gate surfaces as the same stale-claim
-                    // rejection the store would have returned: both mean the
-                    // claim no longer owns the journal, so the caller
-                    // branches once.
-                    match gated with
-                    | Some outcome -> return outcome
-                    | None -> return EventAppendRejected(sessionId, StaleClaimReason) :> EventAppendOutcome
-                })
-            cancellationToken
+                            // A fenced-out gate surfaces as the same stale-claim
+                            // rejection the store would have returned: both mean the
+                            // claim no longer owns the journal, so the caller
+                            // branches once.
+                            match gated with
+                            | Some outcome -> return outcome
+                            | None -> return EventAppendRejected(sessionId, StaleClaimReason) :> EventAppendOutcome
+                        })
+                    cancellationToken
+
+            match result with
+            | JournalAppended stamped -> notifyPublished tenant sessionId stamped
+            | JournalRejected _ -> ()
+            | JournalFailed _ -> ()
+
+            return result
+        }
 
     /// Appends prepared events under the journal token's store-side fence:
     /// the store verifies the token at the last moment and rejects a stale
     /// one with zero writes. The session actor routes through this overload
     /// because it carries the token string, not the claim object; the fence
     /// still guarantees a takeover loser appends nothing. Transient failures
-    /// retry bounded, then fail with the typed reason.
+    /// retry bounded, then fail with the typed reason. A landed batch
+    /// publishes its stamped events to live subscribers before returning;
+    /// fenced-out and failed writes publish nothing.
     /// <param name="eventStore">The journal the events append to. Must not be null.</param>
     /// <param name="tenant">The tenant the session belongs to.</param>
     /// <param name="sessionId">The session whose journal appends.</param>
@@ -654,6 +699,17 @@ module internal JournalWriter =
 
         let prepared = prepareBatch events
 
-        appendWithRetry
-            (fun cancellationToken -> eventStore.Append(tenant, sessionId, claimToken, prepared, cancellationToken))
-            cancellationToken
+        task {
+            let! result =
+                appendWithRetry
+                    (fun cancellationToken ->
+                        eventStore.Append(tenant, sessionId, claimToken, prepared, cancellationToken))
+                    cancellationToken
+
+            match result with
+            | JournalAppended stamped -> notifyPublished tenant sessionId stamped
+            | JournalRejected _ -> ()
+            | JournalFailed _ -> ()
+
+            return result
+        }

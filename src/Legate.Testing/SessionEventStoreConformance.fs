@@ -242,3 +242,68 @@ type SessionEventStoreConformance
 
             Assert.True(expired :? EventReplayJournalExpired)
         }
+
+    [<Fact>]
+    member this.``UserMessageEvent stamps and replays``() =
+        task {
+            let! sessionId, claim = this.ClaimedSession()
+
+            let message = UserMessage.Text("injected")
+
+            let injected =
+                UserMessageEvent(sessionId, claim.TurnId, Nullable(), DateTimeOffset.MinValue, message) :> SessionEvent
+
+            let! outcome = eventStore.Append(tenant, sessionId, claim.Token, [ injected ], CancellationToken.None)
+
+            match outcome with
+            | :? EventAppended as appended ->
+                Assert.Equal(1, appended.Events.Count)
+                Assert.Equal(1L, appended.Events[0].Sequence.Value)
+
+                let! replayed = eventStore.Replay(tenant, sessionId, 0L, 10, CancellationToken.None)
+
+                match replayed with
+                | :? EventReplayPage as page ->
+                    Assert.Equal(1, page.Events.Count)
+
+                    match page.Events[0] with
+                    | :? UserMessageEvent as roundTripped ->
+                        Assert.Equal(1L, roundTripped.Sequence.Value)
+                        Assert.Equal(sessionId, roundTripped.SessionId)
+                    | _ -> failwith "expected the user message event"
+                | _ -> failwith "expected the replay page"
+            | _ -> failwith "expected the appended outcome"
+        }
+
+    [<Fact>]
+    member this.``ContextPrunedEvent stamps and replays``() =
+        task {
+            let! sessionId, claim = this.ClaimedSession()
+
+            let pruned =
+                ContextPrunedEvent(sessionId, claim.TurnId, Nullable(), DateTimeOffset.MinValue, 2, 100L, 60L)
+                :> SessionEvent
+
+            let! outcome = eventStore.Append(tenant, sessionId, claim.Token, [ pruned ], CancellationToken.None)
+
+            match outcome with
+            | :? EventAppended as appended ->
+                Assert.Equal(1, appended.Events.Count)
+                Assert.Equal(1L, appended.Events[0].Sequence.Value)
+
+                let! replayed = eventStore.Replay(tenant, sessionId, 0L, 10, CancellationToken.None)
+
+                match replayed with
+                | :? EventReplayPage as page ->
+                    Assert.Equal(1, page.Events.Count)
+
+                    match page.Events[0] with
+                    | :? ContextPrunedEvent as roundTripped ->
+                        Assert.Equal(1L, roundTripped.Sequence.Value)
+                        Assert.Equal(2, roundTripped.PrunedCount)
+                        Assert.Equal(100L, roundTripped.BeforeEstimate)
+                        Assert.Equal(60L, roundTripped.AfterEstimate)
+                    | _ -> failwith "expected the context pruned event"
+                | _ -> failwith "expected the replay page"
+            | _ -> failwith "expected the appended outcome"
+        }

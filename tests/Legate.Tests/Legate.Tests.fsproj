@@ -55,6 +55,7 @@
     <Compile Include="ClaimFenceTests.fs" />
     <Compile Include="JournalWriterTests.fs" />
     <Compile Include="CompactionTests.fs" />
+    <Compile Include="SessionEventBusTests.fs" />
   </ItemGroup>
 
   <ItemGroup>

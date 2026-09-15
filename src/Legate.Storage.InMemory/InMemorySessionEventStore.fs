@@ -284,6 +284,20 @@ type InMemorySessionEventStore(database: InMemoryDatabase) =
                                     :> SessionEvent
                                 | :? SessionClosedEvent ->
                                     SessionClosedEvent(sessionId, turnId, sequence, timestamp) :> SessionEvent
+                                | :? UserMessageEvent as source ->
+                                    UserMessageEvent(sessionId, turnId, sequence, timestamp, source.Message)
+                                    :> SessionEvent
+                                | :? ContextPrunedEvent as source ->
+                                    ContextPrunedEvent(
+                                        sessionId,
+                                        turnId,
+                                        sequence,
+                                        timestamp,
+                                        source.PrunedCount,
+                                        source.BeforeEstimate,
+                                        source.AfterEstimate
+                                    )
+                                    :> SessionEvent
                                 | _ ->
                                     raise (
                                         ArgumentException(
