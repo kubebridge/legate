@@ -10,6 +10,7 @@
     <Compile Include="AssemblyInfo.fs" />
     <Compile Include="Seams.fs" />
     <Compile Include="SkillDiscovery.fs" />
+    <Compile Include="PromptComposition.fs" />
     <Compile Include="Tools/FileTools.fs" />
     <Compile Include="BuiltinEditTools.fs" />
     <Compile Include="BuiltinSearchTools.fs" />

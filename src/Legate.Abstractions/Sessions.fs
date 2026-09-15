@@ -108,6 +108,16 @@ type SessionOptions() =
     /// id), or null when the session has none. Never logged.
     member val Metadata: IReadOnlyDictionary<string, string> | null = null with get, set
 
+    /// Host instruction file paths appended to every turn's composed
+    /// system prompt (issue 66), or null when the session adds none. The
+    /// paths are a per-session snapshot taken when the session opens (see
+    /// <see cref="P:Legate.Session.Options" />): hosts mutate this list
+    /// before opening. Files read in the listed order and land after the
+    /// package instructions, the agent prompt, and the skills block; each
+    /// missing, unreadable, blank, or over-bound file is skipped, so one
+    /// bad path never fails a turn.
+    member val HostInstructionFiles: IReadOnlyList<string> | null = null with get, set
+
 /// The durable state of one conversation with one agent: what the runtime
 /// journals and what the store epic persists. Options is the snapshot taken
 /// when the session opened, never a live view of host configuration; hosts
