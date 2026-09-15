@@ -48,10 +48,15 @@ type internal ScriptedSession(serverName: string, tools: McpDiscovery.McpDiscove
 
         member _.CallToolAsync
             (toolName: string, _arguments: IReadOnlyDictionary<string, obj>, _cancellationToken: CancellationToken)
-            : Task<string> =
+            : Task<McpCallResult> =
             task {
                 calls <- toolName :: calls
-                return $"called:{toolName}"
+
+                return
+                    {
+                        Text = $"called:{toolName}"
+                        IsError = false
+                    }
             }
 
     interface IAsyncDisposable with
@@ -384,3 +389,107 @@ let ``StopAsync disposes sessions`` () =
     resolve source |> namesOf |> should equal [ "alpha_read" ]
     (source :> IToolSourceLifecycle).StopAsync(CancellationToken.None).GetAwaiter().GetResult()
     scripted["alpha"].Disposed |> should equal true
+
+// ──────────────────────────
+// Overrides and observations
+
+/// One stdio server carrying the given overrides.
+let private overriddenServer (name: string) (overrides: McpServerOverrides) : McpServerOptions =
+    McpServerOptions(Name = name, Command = "npx", Overrides = overrides)
+
+[<Fact>]
+let ``Disabled tools are skipped at projection`` () =
+    let messages = ResizeArray<string>()
+    let overrides = McpServerOverrides()
+    overrides.DisabledTools.Add("write")
+
+    let source, _scripted, _connector =
+        sourceFor
+            (optionsFor [ overriddenServer "alpha" overrides ])
+            messages
+            [
+                "alpha",
+                [
+                    discovered "alpha" "read" false
+                    discovered "alpha" "write" false
+                ],
+                false
+            ]
+            Set.empty
+
+    resolve source |> namesOf |> should equal [ "alpha_read" ]
+    messages.Count |> should equal 0
+
+[<Fact>]
+let ``Description rewrites land before projection`` () =
+    let messages = ResizeArray<string>()
+    let overrides = McpServerOverrides()
+    overrides.DescriptionOverrides["read"] <- "Rewritten."
+
+    let source, _scripted, _connector =
+        sourceFor
+            (optionsFor [ overriddenServer "alpha" overrides ])
+            messages
+            [
+                "alpha", [ discovered "alpha" "read" false ], false
+            ]
+            Set.empty
+
+    let tools = resolve source
+    tools.Count |> should equal 1
+    (tools[0] :?> AIFunction).Description |> should equal "Rewritten."
+    messages.Count |> should equal 0
+
+[<Fact>]
+let ``Unknown override names are ignored`` () =
+    let messages = ResizeArray<string>()
+    let overrides = McpServerOverrides()
+    overrides.DisabledTools.Add("nope")
+    overrides.DescriptionOverrides["nope"] <- "Rewritten."
+
+    let source, _scripted, _connector =
+        sourceFor
+            (optionsFor [ overriddenServer "alpha" overrides ])
+            messages
+            [
+                "alpha", [ discovered "alpha" "read" false ], false
+            ]
+            Set.empty
+
+    let tools = resolve source
+    tools.Count |> should equal 1
+    (tools[0] :?> AIFunction).Description |> should equal "Tool read on alpha."
+    messages.Count |> should equal 0
+
+[<Fact>]
+let ``Invoking a projected tool stamps a call observation`` () =
+    let messages = ResizeArray<string>()
+    let observations = ResizeArray<McpInvocation.McpCallObservation>()
+
+    let scripted =
+        Map.ofList
+            [
+                "alpha", ScriptedSession("alpha", [ discovered "alpha" "read" false ], false)
+            ]
+
+    let connector = ScriptedConnector(scripted, Set.empty)
+
+    let source =
+        McpToolSource(
+            optionsFor [ stdioServer "alpha" ],
+            degradeSink messages,
+            connector :> IMcpServerConnector,
+            Action<McpInvocation.McpCallObservation>(fun observation -> observations.Add(observation))
+        )
+
+    let tools = resolve source
+    tools.Count |> should equal 1
+
+    (tools[0] :?> AIFunction).InvokeAsync(AIFunctionArguments(), CancellationToken.None).GetAwaiter().GetResult()
+    |> ignore
+
+    observations.Count |> should equal 1
+    observations[0].ToolName |> should equal "alpha_read"
+    observations[0].Text |> should equal "called:read"
+    observations[0].IsError |> should equal false
+    (observations[0].Duration >= TimeSpan.Zero) |> should equal true

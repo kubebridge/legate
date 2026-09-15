@@ -3,9 +3,11 @@ module Legate.Tests.McpConnectorTests
 
 open System
 open System.Collections.Generic
+open System.Threading
 open FsUnit.Xunit
 open Legate.Mcp
 open ModelContextProtocol.Client
+open ModelContextProtocol.Protocol
 open Xunit
 
 /// One stdio server with arguments and environment.
@@ -91,3 +93,19 @@ let ``HTTP options reject stdio servers and bad urls`` () =
         SdkTransportOptions.buildHttpOptions (McpServerOptions(Name = "bad", Url = "not-a-uri"))
         |> ignore)
     |> should throw typeof<InvalidOperationException>
+
+[<Fact>]
+let ``Client options decline every elicitation request`` () =
+    let options = McpElicitation.buildClientOptions ()
+    options |> should not' (be null)
+    options.Handlers |> should not' (be null)
+    options.Handlers.ElicitationHandler |> should not' (be null)
+
+    let result =
+        options.Handlers.ElicitationHandler
+            .Invoke(ElicitRequestParams(Message = "confirm"), CancellationToken.None)
+            .Result
+
+    unbox<string> (box result.Action) |> should equal McpElicitation.DeclineAction
+    unbox<string> (box result.Action) |> should equal "decline"
+    result.IsAccepted |> should equal false

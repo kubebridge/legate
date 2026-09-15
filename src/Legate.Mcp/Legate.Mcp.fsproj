@@ -13,6 +13,7 @@
     <Compile Include="McpDiscovery.fs" />
     <Compile Include="McpProjection.fs" />
     <Compile Include="McpConnector.fs" />
+    <Compile Include="McpInvocation.fs" />
     <Compile Include="McpToolSource.fs" />
     <Compile Include="McpServiceExtensions.fs" />
   </ItemGroup>

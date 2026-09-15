@@ -27,6 +27,24 @@ type McpNameCollisionPolicy =
     /// re-validated; a residual collision still degrades to zero tools.
     | Suffix = 1
 
+/// Per-server tool overrides: hiding tools and rewriting descriptions.
+/// Bound from <c>Legate:Tools:Mcp:Servers:&lt;name&gt;:Overrides</c>
+/// through standard nested binding, with no custom binder. Unknown tool
+/// names are ignored, never an error, since servers evolve independently.
+/// Mutable so configuration binding and object initialisers both work.
+[<Sealed>]
+type McpServerOverrides() =
+
+    /// Server tool names hidden from the model. Null reads as empty;
+    /// names no server tool carries are ignored.
+    member val DisabledTools: IList<string> = ResizeArray<string>() :> IList<string> with get, set
+
+    /// Replacement descriptions by server tool name, applied before
+    /// projection. Null reads as empty; names no server tool carries are
+    /// ignored.
+    member val DescriptionOverrides: IDictionary<string, string> =
+        Dictionary<string, string>(StringComparer.Ordinal) :> IDictionary<string, string> with get, set
+
 /// One MCP server: a name plus exactly one transport. Stdio servers carry
 /// a command with optional arguments and environment variables; HTTP
 /// servers carry a URL with optional headers. Mutable so configuration
@@ -60,6 +78,12 @@ type McpServerOptions() =
     /// logged.
     member val Headers: IDictionary<string, string> =
         Dictionary<string, string>(StringComparer.Ordinal) :> IDictionary<string, string> with get, set
+
+    /// Per-server tool overrides: disabled tools and description rewrites
+    /// applied at projection. Null means none; bound from
+    /// <c>Legate:Tools:Mcp:Servers:&lt;name&gt;:Overrides</c>. Overrides
+    /// never invalidate a server: unknown tool names are ignored.
+    member val Overrides: McpServerOverrides | null = null with get, set
 
     /// Whether this server dials stdio: a non-empty command with no URL.
     /// <returns>True for stdio servers; otherwise false.</returns>

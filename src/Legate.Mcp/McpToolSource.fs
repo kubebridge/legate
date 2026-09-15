@@ -36,7 +36,8 @@ type McpToolSource
         options: McpOptions,
         logDegrade: Action<string | null>,
         connector: IMcpServerConnector,
-        httpClient: HttpClient | null
+        httpClient: HttpClient | null,
+        observeCall: Action<McpInvocation.McpCallObservation> | null
     ) =
 
     do
@@ -68,14 +69,32 @@ type McpToolSource
             options.Value,
             logDegrade,
             SdkMcpServerConnector(logger :> ILogger, owned) :> IMcpServerConnector,
-            owned
+            owned,
+            null
         )
 
     /// Creates the source over an explicit degrade sink and connector.
     /// Internal: tests capture the sink and script the connector, so no
-    /// test spawns a subprocess or opens a socket.
+    /// test spawns a subprocess or opens a socket. Call observations go
+    /// nowhere.
     internal new(options: McpOptions, logDegrade: Action<string | null>, connector: IMcpServerConnector) =
-        McpToolSource(options, logDegrade, connector, Unchecked.defaultof<HttpClient>)
+        McpToolSource(options, logDegrade, connector, Unchecked.defaultof<HttpClient>, null)
+
+    /// Creates the source over an explicit degrade sink, connector, and
+    /// call-observation sink. Internal: tests capture the observation sink
+    /// to assert per-call stamping; a null sink observes nothing.
+    /// <param name="options">The bound MCP options. Must not be null.</param>
+    /// <param name="logDegrade">The degrade sink. Must not be null.</param>
+    /// <param name="connector">The scripted or SDK connector. Must not be null.</param>
+    /// <param name="observeCall">The call-observation sink, or null to observe nothing.</param>
+    internal new
+        (
+            options: McpOptions,
+            logDegrade: Action<string | null>,
+            connector: IMcpServerConnector,
+            observeCall: Action<McpInvocation.McpCallObservation> | null
+        ) =
+        McpToolSource(options, logDegrade, connector, Unchecked.defaultof<HttpClient>, observeCall)
 
     /// The degrade reason, or null while healthy. Internal: tests assert
     /// the logged reason through the capturing logger instead.
@@ -121,6 +140,54 @@ type McpToolSource
         }
         :> Task
 
+    /// The overrides for the named server, or null when the server is
+    /// unconfigured or carries none. Lookup misses yield null: unknown
+    /// names are ignored, never an error.
+    /// <param name="serverName">The configured server name.</param>
+    /// <returns>The server's overrides, or null.</returns>
+    member private _.OverridesFor(serverName: string) : McpServerOverrides | null =
+        if isNull (box options) || isNull (box options.Servers) || isNull (box serverName) then
+            null
+        else
+            match
+                options.Servers
+                |> Seq.tryFind (fun server -> not (isNull (box server)) && server.Name = serverName)
+            with
+            | Some server -> server.Overrides
+            | None -> null
+
+    /// Whether the server tool is disabled by its server's overrides.
+    /// Unknown servers and unknown tool names read as enabled.
+    /// <param name="serverName">The configured server name.</param>
+    /// <param name="toolName">The server's tool name.</param>
+    /// <returns>True when the tool is disabled; otherwise false.</returns>
+    member private this.IsDisabled(serverName: string, toolName: string) : bool =
+        match box (this.OverridesFor(serverName)) with
+        | :? McpServerOverrides as overrides when not (isNull (box overrides.DisabledTools)) ->
+            overrides.DisabledTools
+            |> Seq.exists (fun name -> String.Equals(name, toolName, StringComparison.Ordinal))
+        | _ -> false
+
+    /// Applies the server's description rewrite, when it names this tool.
+    /// Unknown names keep the discovered description.
+    /// <param name="discovered">The discovered tool.</param>
+    /// <returns>The tool with the rewritten description, or unchanged.</returns>
+    member private this.WithDescription(discovered: McpDiscovery.McpDiscoveredTool) : McpDiscovery.McpDiscoveredTool =
+        match box (this.OverridesFor(discovered.ServerName)) with
+        | :? McpServerOverrides as overrides when not (isNull (box overrides.DescriptionOverrides)) ->
+            let mutable rewrite = Unchecked.defaultof<string>
+
+            if
+                overrides.DescriptionOverrides.TryGetValue(discovered.ToolName, &rewrite)
+                && not (isNull (box rewrite))
+            then
+                { discovered with
+                    Description = rewrite
+                }
+            else
+                discovered
+        | _ -> discovered
+
     /// Lists one session's tools, projecting each onto its assigned name.
     /// Any failure degrades the whole source to zero tools.
     /// <param name="pairs">The session/discovered pairs.</param>
@@ -146,7 +213,14 @@ type McpToolSource
                                     // annotation here rather than copying the table.
                                     unbox<IReadOnlyDictionary<string, obj>> (box arguments)
 
-                            return! session.CallToolAsync(discovered.ToolName, args, cancellationToken)
+                            return!
+                                McpInvocation.invokeAsync
+                                    session
+                                    name
+                                    discovered.ToolName
+                                    args
+                                    cancellationToken
+                                    observeCall
                         })
 
                 tools.Add(McpProjectionFactory.create name discovered invoke :> AITool))
@@ -184,14 +258,20 @@ type McpToolSource
                             logDegrade.Invoke(error)
                             return ResizeArray<AITool>() :> IReadOnlyList<AITool>
                         else
-                            let sanitized =
+                            let effective =
                                 pairs
-                                |> Seq.map (fun (_, discovered) ->
-                                    McpNaming.buildServerToolName discovered.ServerName discovered.ToolName)
                                 |> Seq.toList
+                                |> List.filter (fun (session, discovered) ->
+                                    not (this.IsDisabled(session.ServerName, discovered.ToolName)))
+                                |> List.map (fun (session, discovered) -> session, this.WithDescription(discovered))
+
+                            let sanitized =
+                                effective
+                                |> List.map (fun (_, discovered) ->
+                                    McpNaming.buildServerToolName discovered.ServerName discovered.ToolName)
 
                             match McpNaming.resolve options.CollisionPolicy sanitized with
-                            | Ok assigned -> return this.ProjectTools(pairs |> Seq.toList, assigned)
+                            | Ok assigned -> return this.ProjectTools(effective, assigned)
                             | Error message ->
                                 logDegrade.Invoke(message)
                                 return ResizeArray<AITool>() :> IReadOnlyList<AITool>
