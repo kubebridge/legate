@@ -105,7 +105,11 @@ type FakeClock(start: DateTimeOffset) =
         if isNull (box callback) then
             raise (ArgumentNullException(nameof callback))
 
-        if period < TimeSpan.Zero then
+        // BCL TimeProvider contract: Timeout.InfiniteTimeSpan disables
+        // periodic signaling (a one-shot); Task.Delay over this clock
+        // passes it as the period, so only values below it are out of
+        // range.
+        if period <> Timeout.InfiniteTimeSpan && period < TimeSpan.Zero then
             raise (ArgumentOutOfRangeException(nameof period, "The timer period must not be negative."))
 
         let entry: FakeClockTimer =
