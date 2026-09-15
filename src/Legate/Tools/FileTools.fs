@@ -106,14 +106,17 @@ module internal FileTools =
 
         path
 
-    /// Refuses writes under the read-only input/ area with a hint.
+    /// Refuses writes under the read-only input/ area with a hint. The
+    /// first-segment comparison is ordinal-ignore-case: Windows
+    /// filesystems resolve INPUT/ onto input/, so a case-sensitive guard
+    /// would let a case variant through.
     /// <param name="toolName">The calling tool, carried on the ToolException.</param>
     /// <param name="relativePath">The validated workspace-relative path.</param>
     /// <exception cref="T:Legate.ToolException">The path is the input/ area.</exception>
     let refuseInputWrite (toolName: string) (relativePath: string) : unit =
         if
-            relativePath = "input"
-            || relativePath.StartsWith("input/", StringComparison.Ordinal)
+            relativePath.Equals("input", StringComparison.OrdinalIgnoreCase)
+            || relativePath.StartsWith("input/", StringComparison.OrdinalIgnoreCase)
         then
             raise (
                 ToolException(
@@ -121,6 +124,45 @@ module internal FileTools =
                     "The input/ area is read-only: file tools can read and list it, but writes must go under a different path such as output/."
                 )
             )
+
+    /// Reports whether a resolved absolute path lies under the resolved
+    /// input/ directory. The comparison is ordinal-ignore-case on every
+    /// platform: the sound rule for a read-only area on case-insensitive
+    /// filesystems, conservative elsewhere.
+    /// <param name="resolvedPath">The resolved absolute target path.</param>
+    /// <param name="resolvedRoot">The resolved absolute workspace root.</param>
+    /// <returns>True when the target is the input/ area.</returns>
+    let isUnderInputDir (resolvedPath: string) (resolvedRoot: string) : bool =
+        let inputDir = Path.GetFullPath(Path.Combine(resolvedRoot, "input"))
+
+        resolvedPath.Equals(inputDir, StringComparison.OrdinalIgnoreCase)
+        || resolvedPath.StartsWith(inputDir + string Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
+
+    /// Refuses writes whose resolved target lands under the read-only
+    /// input/ area. The lexical guard cannot see through a symlink that
+    /// points at input/, so this runs after resolveHostPath against the
+    /// resolved absolute target. No-op when the runtime exposes no
+    /// filesystem path: the lexical guard already ran.
+    /// <param name="toolName">The calling tool, carried on the ToolException.</param>
+    /// <param name="workspace">The bound workspace.</param>
+    /// <param name="resolvedPath">The resolved absolute target, or null.</param>
+    /// <exception cref="T:Legate.ToolException">The resolved target is the input/ area.</exception>
+    let refuseResolvedInputWrite (toolName: string) (workspace: IWorkspace) (resolvedPath: string | null) : unit =
+        match resolvedPath with
+        | null -> ()
+        | resolved ->
+            match workspace.Root.Path with
+            | null -> ()
+            | rootPath ->
+                let resolvedRoot = Path.GetFullPath rootPath
+
+                if isUnderInputDir resolved resolvedRoot then
+                    raise (
+                        ToolException(
+                            toolName,
+                            "The input/ area is read-only: file tools can read and list it, but writes must go under a different path such as output/."
+                        )
+                    )
 
     /// Resolves one link component to an absolute path when the path is a
     /// symbolic link, or null when it is not a link, does not exist, or
@@ -264,6 +306,98 @@ module internal FileTools =
             return (memory.ToArray(), truncated)
         }
 
+    /// Decodes base64 text up to the cap, aborting early once the decoded
+    /// size would exceed the cap so memory never grows past the cap. A
+    /// length pre-check rejects obviously over-cap payloads before
+    /// decoding a single quad; the quad-by-quad loop then enforces the cap
+    /// during decode, mirroring readCapped's early abort.
+    /// <param name="toolName">The calling tool, carried on the ToolException.</param>
+    /// <param name="base64Content">The base64 text to decode. Must not be null.</param>
+    /// <param name="capBytes">How many decoded bytes to accept; must be at least 1.</param>
+    /// <returns>The decoded bytes, at most capBytes long.</returns>
+    /// <exception cref="T:Legate.ToolException">The text is not valid base64, or decodes past the cap.</exception>
+    let decodeCappedBase64 (toolName: string) (base64Content: string) (capBytes: int) : byte[] =
+        let isWhitespace (c: char) =
+            c = ' ' || c = '\t' || c = '\r' || c = '\n' || c = '\f'
+
+        let rejectOverCap () =
+            raise (
+                ToolException(toolName, "The payload exceeds the binary size cap: writes over the cap are rejected.")
+            )
+
+        let rejectInvalid () =
+            raise (ToolException(toolName, sprintf "The %s content is not valid base64." toolName))
+
+        let mutable effectiveLen = 0
+
+        for c in base64Content do
+            if not (isWhitespace c) then
+                effectiveLen <- effectiveLen + 1
+
+        let mutable padding = 0
+        let mutable index = base64Content.Length - 1
+        let mutable scanning = true
+
+        while index >= 0 && scanning do
+            let c = base64Content[index]
+
+            if isWhitespace c then
+                index <- index - 1
+            elif c = '=' then
+                padding <- padding + 1
+                index <- index - 1
+            else
+                scanning <- false
+
+        if effectiveLen % 4 = 0 && padding <= 2 then
+            let estimated = effectiveLen / 4 * 3 - padding
+
+            if estimated > capBytes then
+                rejectOverCap ()
+
+        use memory = new MemoryStream()
+        let quad = Array.zeroCreate<char> 4
+        let mutable quadPos = 0
+        let mutable total = 0
+        let mutable seenPadding = false
+
+        let flushQuad () =
+            if quad[0] = '=' || quad[1] = '=' || (quad[2] = '=' && quad[3] <> '=') then
+                rejectInvalid ()
+
+            let bytes =
+                try
+                    Convert.FromBase64CharArray(quad, 0, 4)
+                with :? FormatException ->
+                    rejectInvalid ()
+
+            if total + bytes.Length > capBytes then
+                rejectOverCap ()
+
+            memory.Write(bytes, 0, bytes.Length)
+            total <- total + bytes.Length
+
+        for c in base64Content do
+            if isWhitespace c then
+                ()
+            else
+                if c = '=' then
+                    seenPadding <- true
+                elif seenPadding then
+                    rejectInvalid ()
+
+                quad[quadPos] <- c
+                quadPos <- quadPos + 1
+
+                if quadPos = 4 then
+                    flushQuad ()
+                    quadPos <- 0
+
+        if quadPos <> 0 then
+            rejectInvalid ()
+
+        memory.ToArray()
+
     /// The method holding one tool's implementation, bound to a workspace.
     /// Methods stay instance members with stable names so the factories can
     /// resolve them by name; F# optional arguments surface as optional
@@ -350,7 +484,9 @@ module internal FileTools =
             task {
                 let relative = validatePath writeFileName path
                 refuseInputWrite writeFileName relative
-                resolveHostPath writeFileName workspace relative |> ignore
+
+                let resolved = resolveHostPath writeFileName workspace relative
+                refuseResolvedInputWrite writeFileName workspace resolved
 
                 if isNull (box content) then
                     raise (ToolException(writeFileName, "The write_file content must not be null."))
@@ -473,7 +609,9 @@ module internal FileTools =
             task {
                 let relative = validatePath writeBinaryName path
                 refuseInputWrite writeBinaryName relative
-                resolveHostPath writeBinaryName workspace relative |> ignore
+
+                let resolved = resolveHostPath writeBinaryName workspace relative
+                refuseResolvedInputWrite writeBinaryName workspace resolved
 
                 if isNull (box base64Content) then
                     raise (ToolException(writeBinaryName, "The write_binary_base64 content must not be null."))
@@ -483,19 +621,7 @@ module internal FileTools =
                 if cap < 1 then
                     raise (ToolException(writeBinaryName, "The size cap must be at least 1 byte."))
 
-                let bytes =
-                    try
-                        Convert.FromBase64String base64Content
-                    with :? FormatException ->
-                        raise (ToolException(writeBinaryName, "The write_binary_base64 content is not valid base64."))
-
-                if bytes.Length > cap then
-                    raise (
-                        ToolException(
-                            writeBinaryName,
-                            "The payload exceeds the binary size cap: writes over the cap are rejected."
-                        )
-                    )
+                let bytes = decodeCappedBase64 writeBinaryName base64Content cap
 
                 try
                     do! workspace.WriteFile(relative, bytes, cancellationToken)

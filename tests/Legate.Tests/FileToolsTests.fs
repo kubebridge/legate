@@ -300,6 +300,139 @@ module FileToolsTests =
         }
 
     [<Fact>]
+    let ``WriteFile refuses case variants of the read-only input area`` () =
+        task {
+            use workspace = bindTempWorkspace ()
+            let tool = FileTools.createWriteFileTool workspace
+
+            for bad in
+                [
+                    "INPUT/notes.txt"
+                    "Input/notes.txt"
+                    "iNpUt/notes.txt"
+                    "INPUT"
+                    "Input"
+                ] do
+                let! ex = invokeFails tool [ "path", box bad; "content", box "hi" ]
+                Assert.Equal(FileTools.writeFileName, ex.ToolName)
+                Assert.Contains("read-only", ex.Message)
+        }
+
+    [<Fact>]
+    let ``WriteBinary refuses case variants of the read-only input area`` () =
+        task {
+            use workspace = bindTempWorkspace ()
+            let tool = FileTools.createWriteBinaryTool workspace
+
+            for bad in
+                [
+                    "INPUT/blob.bin"
+                    "Input/blob.bin"
+                    "iNpUt/blob.bin"
+                ] do
+                let! ex =
+                    invokeFails
+                        tool
+                        [
+                            "path", box bad
+                            "base64Content", box "aGk="
+                        ]
+
+                Assert.Equal(FileTools.writeBinaryName, ex.ToolName)
+                Assert.Contains("read-only", ex.Message)
+        }
+
+    [<Fact>]
+    let ``WriteFile refuses a symlink resolving into the input area`` () =
+        task {
+            use workspace = bindTempWorkspace ()
+            let root = rootOf workspace
+            do! workspace.WriteFile("input/seed.txt", Encoding.UTF8.GetBytes "seed", CancellationToken.None)
+
+            try
+                Directory.CreateSymbolicLink(Path.Combine(root, "linkToInput"), Path.Combine(root, "input"))
+                |> ignore
+
+                let! ex =
+                    invokeFails
+                        (FileTools.createWriteFileTool workspace)
+                        [
+                            "path", box "linkToInput/seed.txt"
+                            "content", box "hi"
+                        ]
+
+                Assert.Equal(FileTools.writeFileName, ex.ToolName)
+                Assert.Contains("read-only", ex.Message)
+            with :? UnauthorizedAccessException ->
+                // The environment forbids symlinks: nothing to assert.
+                ()
+        }
+
+    [<Fact>]
+    let ``WriteBinary refuses a symlink resolving into the input area`` () =
+        task {
+            use workspace = bindTempWorkspace ()
+            let root = rootOf workspace
+            do! workspace.WriteFile("input/seed.bin", Encoding.UTF8.GetBytes "seed", CancellationToken.None)
+
+            try
+                Directory.CreateSymbolicLink(Path.Combine(root, "linkToInput2"), Path.Combine(root, "input"))
+                |> ignore
+
+                let! ex =
+                    invokeFails
+                        (FileTools.createWriteBinaryTool workspace)
+                        [
+                            "path", box "linkToInput2/seed.txt"
+                            "base64Content", box "aGk="
+                        ]
+
+                Assert.Equal(FileTools.writeBinaryName, ex.ToolName)
+                Assert.Contains("read-only", ex.Message)
+                Assert.False(File.Exists(Path.Combine(root, "input", "seed.txt")))
+            with :? UnauthorizedAccessException ->
+                // The environment forbids symlinks: nothing to assert.
+                ()
+        }
+
+    [<Fact>]
+    let ``DecodeCappedBase64 enforces the cap during decode`` () =
+        // A 1 KiB payload against an 8-byte cap must fail with the cap
+        // message after decoding only a few quads, not after buffering
+        // the whole payload.
+        let payload = Convert.ToBase64String(Array.zeroCreate<byte> 1024)
+
+        let ex =
+            Assert.Throws<ToolException>(fun () ->
+                FileTools.decodeCappedBase64 "write_binary_base64" payload 8 |> ignore)
+
+        Assert.Equal(FileTools.writeBinaryName, ex.ToolName)
+        Assert.Contains("exceeds", ex.Message)
+
+        let small = Convert.ToBase64String([| 1uy; 2uy; 3uy |])
+        Assert.Equal<byte>([| 1uy; 2uy; 3uy |], FileTools.decodeCappedBase64 "write_binary_base64" small 8)
+
+    [<Fact>]
+    let ``WriteBinary rejects an 11 MiB payload without creating the file`` () =
+        task {
+            use workspace = bindTempWorkspace ()
+            let root = rootOf workspace
+            let oversized = Convert.ToBase64String(Array.zeroCreate<byte> (11 * 1024 * 1024))
+
+            let! ex =
+                invokeFails
+                    (FileTools.createWriteBinaryTool workspace)
+                    [
+                        "path", box "big.bin"
+                        "base64Content", box oversized
+                    ]
+
+            Assert.Equal(FileTools.writeBinaryName, ex.ToolName)
+            Assert.Contains("exceeds", ex.Message)
+            Assert.False(File.Exists(Path.Combine(root, "big.bin")))
+        }
+
+    [<Fact>]
     let ``WriteFile rejects traversal paths`` () =
         task {
             use workspace = bindTempWorkspace ()
