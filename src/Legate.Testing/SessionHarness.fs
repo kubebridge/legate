@@ -507,7 +507,16 @@ type SessionHarness
                         Tenant = resolved.Tenant
                         SessionId = created.Id
                         RunTurn = (fun _ _ -> Task.FromResult(unusedResult))
-                        OnTurnSettled = Some signals.ObserveSettled
+                        // The harness signals own the test wait; the shared
+                        // PromptWaitHubs fan-out lets PromptAndWait-style
+                        // clients (issue 85) wait on the same settle through
+                        // their FIFO waiter queue, mirroring the production
+                        // spawn sites. Hubs are keyed by the globally unique
+                        // session id, so harnesses never share one.
+                        OnTurnSettled =
+                            Some(fun result ->
+                                signals.ObserveSettled result
+                                PromptWaitHubs.ObserveSettled created.Id result)
                         OnInjectJournaled = None
                         Compact = None
                     }
@@ -586,6 +595,16 @@ type SessionHarness
 
     /// Every settled turn result, in settle order.
     member _.SettledResults: IReadOnlyList<TurnResult> = signals.Settled
+
+    /// The session actor PromptAndWait-style clients resolve. Internal so
+    /// no Akka type crosses the public API.
+    member internal _.Actor: IActorRef = actor
+
+    /// The durable store the session persists through.
+    member internal _.Store: ISessionStore = store
+
+    /// The journal suspend and resolve events append to.
+    member internal _.Journal: ISessionEventStore = journal
 
     /// Prompts the session with one text message.
     /// <param name="text">The user text. Must be a non-empty string.</param>
@@ -690,6 +709,14 @@ type SessionHarness
     /// <returns>The consumed Reply inbox entry.</returns>
     member _.ReplyAsync(reply: Reply, cancellationToken: CancellationToken) : Task<InboxEntry> =
         SessionActor.replyAsync store tenant sessionId actor reply cancellationToken
+
+    /// Closes the harness session: the lifecycle boundary. Valid in every
+    /// state and idempotent; a turn running while the session closes keeps
+    /// its detached task under the claim fence.
+    /// <param name="cancellationToken">Cancels the close.</param>
+    /// <returns>The closed session.</returns>
+    member _.CloseAsync(cancellationToken: CancellationToken) : Task<Session> =
+        SessionActor.closeSuspendableAsync store tenant sessionId actor cancellationToken
 
     /// Replies to the suspended turn and waits for the resumed turn to
     /// settle.

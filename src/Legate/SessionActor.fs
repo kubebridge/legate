@@ -1364,13 +1364,15 @@ module internal SessionActor =
             let mutable parsed = Unchecked.defaultof<SessionId>
 
             if SessionId.TryParse(sessionId, &parsed) then
+                let captured = parsed
+
                 let props =
                     {
                         Store = store
                         Tenant = tenant
-                        SessionId = parsed
+                        SessionId = captured
                         RunTurn = runTurn
-                        OnTurnSettled = None
+                        OnTurnSettled = Some(fun result -> PromptWaitHubs.ObserveSettled captured result)
                         OnInjectJournaled = None
                         Compact = None
                     }
@@ -3058,13 +3060,15 @@ module internal SessionActor =
             let mutable parsed = Unchecked.defaultof<SessionId>
 
             if SessionId.TryParse(sessionId, &parsed) then
+                let captured = parsed
+
                 let props: SessionActorProps =
                     {
                         Store = store
                         Tenant = tenant
-                        SessionId = parsed
+                        SessionId = captured
                         RunTurn = unusedRunTurn
-                        OnTurnSettled = None
+                        OnTurnSettled = Some(fun result -> PromptWaitHubs.ObserveSettled captured result)
                         OnInjectJournaled = None
                         Compact = None
                     }
@@ -3074,7 +3078,7 @@ module internal SessionActor =
                         EventStore = eventStore
                         Delay = delay
                         AskTimeout = askTimeout
-                        JournalToken = primeToken parsed
+                        JournalToken = primeToken captured
                         RunSuspendable = runSuspendable
                     }
 

@@ -307,3 +307,33 @@ type ModelDeniedException(providerId: string, model: string, message: string) =
 
     /// The model id the denied call named.
     member _.Model = model
+
+/// Raised when a PromptAndWait turn suspends on a permission request the
+/// configured policy could not decide alone: the turn waits on a host
+/// reply instead of settling, so the wait surfaces the suspension as a
+/// typed exception rather than hanging. Properties only, no resume-handle
+/// object: the host catches, replies with a PermissionDecision carrying the
+/// request id, then calls PromptAndWaitAsync again. The message is
+/// secret-free: it names the session, turn, request, and tool, never tool
+/// arguments.
+/// <param name="sessionId">The id of the session whose turn suspended.</param>
+/// <param name="turnId">The id of the turn waiting on the decision.</param>
+/// <param name="requestId">The id the host answers a PermissionDecision with.</param>
+/// <param name="toolName">The name of the tool awaiting permission.</param>
+/// <param name="message">The exception message, without secrets or tool arguments.</param>
+[<Sealed>]
+type PermissionApprovalRequiredException
+    (sessionId: SessionId, turnId: TurnId, requestId: string, toolName: string, message: string) =
+    inherit LegateException(message)
+
+    /// The id of the session whose turn suspended.
+    member _.SessionId = sessionId
+
+    /// The id of the turn waiting on the decision.
+    member _.TurnId = turnId
+
+    /// The id the host answers a PermissionDecision with.
+    member _.RequestId = requestId
+
+    /// The name of the tool awaiting permission.
+    member _.ToolName = toolName

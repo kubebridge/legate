@@ -29,6 +29,7 @@ let ``Every subtype derives from LegateException`` () =
     assertDerived typeof<PackageLeaseException>
     assertDerived typeof<ReplyMismatchException>
     assertDerived typeof<ModelDeniedException>
+    assertDerived typeof<PermissionApprovalRequiredException>
 
 [<Fact>]
 let ``SessionNotFoundException carries the session id and message`` () =
@@ -170,6 +171,50 @@ let ``ModelDeniedException carries the provider id, model, and client-safe messa
     ex.Message |> should equal "Model is not on your plan."
 
 [<Fact>]
+let ``PermissionApprovalRequiredException carries session, turn, request, and tool`` () =
+    let turn = TurnId.New()
+
+    let ex =
+        PermissionApprovalRequiredException(
+            session,
+            turn,
+            "req-7",
+            "exec",
+            "The turn needs approval for tool 'exec' (request req-7)."
+        )
+
+    ex.SessionId |> should equal session
+    ex.TurnId |> should equal turn
+    ex.RequestId |> should equal "req-7"
+    ex.ToolName |> should equal "exec"
+
+    ex.Message
+    |> should equal "The turn needs approval for tool 'exec' (request req-7)."
+
+[<Fact>]
+let ``PermissionApprovalRequiredException exposes only the four correlation properties`` () =
+    let names =
+        typeof<PermissionApprovalRequiredException>
+            .GetProperties(
+                System.Reflection.BindingFlags.DeclaredOnly
+                ||| System.Reflection.BindingFlags.Instance
+                ||| System.Reflection.BindingFlags.Public
+            )
+        |> Seq.map (fun property -> property.Name)
+        |> Set.ofSeq
+
+    names
+    |> should
+        equal
+        (Set.ofList
+            [
+                "SessionId"
+                "TurnId"
+                "RequestId"
+                "ToolName"
+            ])
+
+[<Fact>]
 let ``Messages are returned exactly as given without appended data`` () =
     let exs: exn list =
         [
@@ -192,6 +237,7 @@ let ``Messages are returned exactly as given without appended data`` () =
             PackageLeaseException(AgentId.New(), "sync-worker-1", "acquire", "msg-m")
             ReplyMismatchException(session, "req-1", "msg-n")
             ModelDeniedException("anthropic", "claude-sonnet", "msg-o")
+            PermissionApprovalRequiredException(session, TurnId.New(), "req-2", "exec", "msg-p")
         ]
 
     exs
@@ -214,6 +260,7 @@ let ``Messages are returned exactly as given without appended data`` () =
             "msg-m"
             "msg-n"
             "msg-o"
+            "msg-p"
         ]
 
 [<Fact>]
