@@ -111,8 +111,12 @@ type SessionOptions() =
 /// string (auto-titles are the runtime's concern). WorkspaceBinding is an
 /// opaque reference the host uses to locate the session's workspace; the
 /// runtime never interprets it, and the workspace contract issue defines
-/// the shape it points at. Constructible from C# through property setters
-/// and serialises with System.Text.Json.
+/// the shape it points at. PermissionGrants names the tools the host already
+/// allowed for the whole session (an AllowForSession decision per tool
+/// name): the runtime consults it before evaluating the policy again, the
+/// store persists it with the session so grants survive a restart, and
+/// closing the session evicts it. Constructible from C# through property
+/// setters and serialises with System.Text.Json.
 [<CLIMutable; NoComparison>]
 type Session =
     {
@@ -143,4 +147,9 @@ type Session =
         /// The options the session was opened with: the snapshot taken at
         /// open, not a live view.
         Options: SessionOptions
+        /// The tool names the host already allowed for the whole session,
+        /// one entry per AllowForSession decision. Empty when nothing is
+        /// granted yet; never null on a stored row (a null deserialised
+        /// value reads as empty). Evicted when the session closes.
+        PermissionGrants: IReadOnlyList<string>
     }

@@ -2,6 +2,7 @@
 namespace Legate.Tests
 
 open System
+open System.Collections.Generic
 open System.IO
 open System.Threading
 open System.Threading.Tasks
@@ -34,6 +35,7 @@ module ProcessWorkspaceRuntimeTests =
             ClosedAt = Nullable()
             WorkspaceBinding = null
             Options = SessionOptions()
+            PermissionGrants = ResizeArray<string>() :> IReadOnlyList<string>
         }
 
     [<Fact>]

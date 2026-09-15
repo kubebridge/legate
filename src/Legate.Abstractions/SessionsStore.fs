@@ -323,6 +323,8 @@ type DispatchBatch =
 /// turn's terminal status land together or not at all.</description></item>
 /// <item><description><b>UpdateSessionState</b> is atomic: the state
 /// change and its timestamp land together or not at all.</description></item>
+/// <item><description><b>GrantSessionTool</b> is atomic: the grant and its
+/// timestamp land together or not at all.</description></item>
 /// </list>
 ///
 /// <para>Fencing rules implementations and callers must honour: every side
@@ -392,9 +394,12 @@ type ISessionStore =
             Task<Session>
 
     /// Closes a session: state becomes Closed and
-    /// <see cref="T:Legate.Session" />.ClosedAt is stamped. Idempotent:
-    /// closing an already-closed session is a no-op returning the stored
-    /// shape.
+    /// <see cref="T:Legate.Session" />.ClosedAt is stamped. The session's
+    /// <see cref="P:Legate.Session.PermissionGrants" /> are evicted: the
+    /// stored row carries an empty grant list afterwards, so a closed
+    /// session never resumes with stale AllowForSession memory.
+    /// Idempotent: closing an already-closed session is a no-op returning
+    /// the stored shape.
     /// <param name="tenant">The tenant the session belongs to.</param>
     /// <param name="sessionId">The session to close.</param>
     /// <param name="cancellationToken">Token that abandons the close.</param>
@@ -402,6 +407,26 @@ type ISessionStore =
     /// <exception cref="T:Legate.SessionNotFoundException">The session id does not exist in this tenant.</exception>
     abstract CloseSession:
         tenant: TenantId * sessionId: SessionId * cancellationToken: CancellationToken -> Task<Session>
+
+    /// Records an AllowForSession grant: the tool name joins the session's
+    /// <see cref="P:Legate.Session.PermissionGrants" /> and stays there
+    /// across restarts, so the runtime keeps skipping the policy for it
+    /// without re-asking the host. Idempotent: granting a tool name twice
+    /// stores it once. Atomic: the grant and the
+    /// <see cref="T:Legate.Session" />.UpdatedAt stamp land together.
+    /// A grant on a Closed session is rejected: closed sessions carry no
+    /// grant memory.
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="sessionId">The session to grant the tool for.</param>
+    /// <param name="toolName">The tool name the host allowed for the session. Must be a non-empty string.</param>
+    /// <param name="cancellationToken">Token that abandons the grant.</param>
+    /// <returns>The stored session after the grant.</returns>
+    /// <exception cref="T:System.ArgumentException">The tool name is null, empty, or whitespace.</exception>
+    /// <exception cref="T:Legate.SessionNotFoundException">The session id does not exist in this tenant.</exception>
+    /// <exception cref="T:Legate.InvalidSessionStateException">The session is Closed.</exception>
+    abstract GrantSessionTool:
+        tenant: TenantId * sessionId: SessionId * toolName: string * cancellationToken: CancellationToken ->
+            Task<Session>
 
     /// Rebinds the agent a session converses with. Only while no turn is
     /// running: the state rules are

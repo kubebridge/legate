@@ -2,6 +2,7 @@
 namespace Legate.Tests
 
 open System
+open System.Collections.Generic
 open System.IO
 open System.Text
 open System.Threading
@@ -82,6 +83,7 @@ module WorkspaceLayoutTests =
             ClosedAt = Nullable()
             WorkspaceBinding = null
             Options = SessionOptions()
+            PermissionGrants = ResizeArray<string>() :> IReadOnlyList<string>
         }
 
     let private readText (workspace: IWorkspace) (path: string) : Task<string> =

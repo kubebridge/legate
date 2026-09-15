@@ -35,6 +35,7 @@ module ProcessWorkspaceTests =
                 ClosedAt = Nullable()
                 WorkspaceBinding = null
                 Options = SessionOptions()
+                PermissionGrants = ResizeArray<string>() :> IReadOnlyList<string>
             }
 
         runtime.Bind(session, null, CancellationToken.None).GetAwaiter().GetResult()
@@ -254,6 +255,7 @@ module ProcessWorkspaceTests =
                     ClosedAt = Nullable()
                     WorkspaceBinding = null
                     Options = SessionOptions()
+                    PermissionGrants = ResizeArray<string>() :> IReadOnlyList<string>
                 }
 
             let! bound = runtime.Bind(session, null, CancellationToken.None)

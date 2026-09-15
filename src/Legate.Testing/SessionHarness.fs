@@ -359,6 +359,7 @@ type SessionHarness
                         ClosedAt = Unchecked.defaultof<Nullable<DateTimeOffset>>
                         WorkspaceBinding = null
                         Options = SessionOptions()
+                        PermissionGrants = ResizeArray<string>() :> IReadOnlyList<string>
                     }
 
                 let! created = store.CreateSession(resolved.Tenant, session, cancellationToken)

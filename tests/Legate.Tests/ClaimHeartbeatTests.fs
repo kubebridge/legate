@@ -2,6 +2,7 @@
 module Legate.Tests.ClaimHeartbeatTests
 
 open System
+open System.Collections.Generic
 open System.Threading
 open System.Threading.Tasks
 open FsUnit.Xunit
@@ -327,6 +328,7 @@ let private sampleSession () =
         ClosedAt = Unchecked.defaultof<Nullable<DateTimeOffset>>
         WorkspaceBinding = null
         Options = SessionOptions()
+        PermissionGrants = ResizeArray<string>() :> IReadOnlyList<string>
     }
 
 [<Fact>]

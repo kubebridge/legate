@@ -59,6 +59,21 @@ type InMemorySessionStore(database: InMemoryDatabase) =
                     entries[index] <- { entries[index] with Consumed = true }
         | false, _ -> ()
 
+    /// The stored grant list, normalised: a null deserialised value reads
+    /// as empty, and duplicates collapse, so every stored row carries a
+    /// distinct, non-null grant set.
+    let storedGrants (session: Session) : IReadOnlyList<string> =
+        if isNull (box session.PermissionGrants) then
+            ResizeArray<string>() :> IReadOnlyList<string>
+        else
+            let distinct = ResizeArray<string>()
+
+            for grant in session.PermissionGrants do
+                if not (isNull (box grant)) && not (distinct.Contains grant) then
+                    distinct.Add grant
+
+            distinct :> IReadOnlyList<string>
+
     /// What a fenced call against the claim's turn resolved to: the live
     /// claim the token still matches with its session key, an open turn
     /// the token no longer owns (taken over), or nothing (settled or
@@ -139,6 +154,7 @@ type InMemorySessionStore(database: InMemoryDatabase) =
                             CreatedAt = now
                             UpdatedAt = now
                             ClosedAt = Nullable()
+                            PermissionGrants = storedGrants session
                         }
 
                     database.Sessions[(tenant, session.Id)] <- stored
@@ -226,10 +242,42 @@ type InMemorySessionStore(database: InMemoryDatabase) =
                             State = SessionState.Closed
                             UpdatedAt = now
                             ClosedAt = Nullable now
+                            PermissionGrants = ResizeArray<string>() :> IReadOnlyList<string>
                         }
 
                     database.Sessions[(tenant, sessionId)] <- updated
                     updated)
+            |> ok
+
+        member _.GrantSessionTool(tenant, sessionId, toolName, _) =
+            if String.IsNullOrWhiteSpace toolName then
+                raise (ArgumentException("The tool name must be a non-empty string.", nameof toolName))
+
+            lock database.Gate (fun () ->
+                let session = requireSession tenant sessionId
+
+                if session.State = SessionState.Closed then
+                    raise (
+                        InvalidSessionStateException(
+                            sessionId,
+                            nameof session.State,
+                            "A closed session carries no grant memory."
+                        )
+                    )
+
+                let grants = ResizeArray<string>(storedGrants session)
+
+                if not (grants.Contains toolName) then
+                    grants.Add toolName
+
+                let updated =
+                    { session with
+                        PermissionGrants = grants :> IReadOnlyList<string>
+                        UpdatedAt = database.UtcNow
+                    }
+
+                database.Sessions[(tenant, sessionId)] <- updated
+                updated)
             |> ok
 
         member _.SetSessionAgent(tenant, sessionId, agentId, _) =

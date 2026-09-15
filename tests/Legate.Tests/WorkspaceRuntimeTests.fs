@@ -28,6 +28,7 @@ let session () =
         ClosedAt = Unchecked.defaultof<Nullable<DateTimeOffset>>
         WorkspaceBinding = nullString
         Options = SessionOptions()
+        PermissionGrants = ResizeArray<string>() :> IReadOnlyList<string>
     }
 
 /// A workspace fake over one dictionary, proving IWorkspace is implementable
