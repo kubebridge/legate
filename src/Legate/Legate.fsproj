@@ -14,6 +14,7 @@
     <Compile Include="Tools/FileTools.fs" />
     <Compile Include="BuiltinEditTools.fs" />
     <Compile Include="BuiltinSearchTools.fs" />
+    <Compile Include="Telemetry.fs" />
     <Compile Include="ClaimHeartbeat.fs" />
     <Compile Include="ClaimFence.fs" />
     <Compile Include="JournalWriter.fs" />

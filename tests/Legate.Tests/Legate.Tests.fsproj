@@ -57,6 +57,7 @@
     <Compile Include="ClaimFenceTests.fs" />
     <Compile Include="JournalWriterTests.fs" />
     <Compile Include="LoggingScopesTests.fs" />
+    <Compile Include="TelemetryTests.fs" />
     <Compile Include="CompactionTests.fs" />
     <Compile Include="SessionEventBusTests.fs" />
     <Compile Include="LlmCoordinatorTests.fs" />
