@@ -57,11 +57,15 @@
     <Compile Include="CompactionTests.fs" />
     <Compile Include="SessionEventBusTests.fs" />
     <Compile Include="LlmCoordinatorTests.fs" />
+    <Compile Include="GoogleLlmOptionsTests.fs" />
+    <Compile Include="GoogleProviderTests.fs" />
+    <Compile Include="RegistrationTests.fs" />
   </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="../../src/Legate.Abstractions/Legate.Abstractions.fsproj" />
     <ProjectReference Include="../../src/Legate/Legate.fsproj" />
+    <ProjectReference Include="../../src/Legate.Llm.Google/Legate.Llm.Google.fsproj" />
     <ProjectReference Include="../../src/Legate.Storage.InMemory/Legate.Storage.InMemory.fsproj" />
     <ProjectReference Include="../../src/Legate.Testing/Legate.Testing.fsproj" />
     <ProjectReference Include="../../src/Legate.Workspace.Process/Legate.Workspace.Process.fsproj" />
@@ -72,6 +76,7 @@
     <PackageReference Include="Akka.FSharp" />
     <PackageReference Include="FSharp.Core" />
     <PackageReference Include="FsUnit.xUnit" />
+    <PackageReference Include="Google.GenAI" />
     <PackageReference Include="Microsoft.Extensions.Configuration" />
     <PackageReference Include="Microsoft.Extensions.Configuration.EnvironmentVariables" />
     <PackageReference Include="Microsoft.Extensions.DependencyInjection" />
