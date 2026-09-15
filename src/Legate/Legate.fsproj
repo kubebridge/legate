@@ -11,6 +11,7 @@
     <Compile Include="Seams.fs" />
     <Compile Include="ClaimHeartbeat.fs" />
     <Compile Include="ClaimFence.fs" />
+    <Compile Include="JournalWriter.fs" />
     <Compile Include="LlmStreaming.fs" />
     <Compile Include="StopArbitration.fs" />
     <Compile Include="TurnLoop.fs" />
