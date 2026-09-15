@@ -1217,3 +1217,667 @@ let ``Distributed coordination fails fast`` () =
     caught.IsSome |> should equal true
     caught.Value.Message.Contains("DistributedCoordination") |> should equal true
     provider.Builds |> should equal 0
+
+// ───────────────────────────────────────────────────────────────────────────
+// Model policy and usage observation (issue 55)
+
+/// A model policy that returns the configured decision and records the
+/// calls it saw. A null decision exercises the null-guard.
+type ScriptedModelPolicy(decision: ModelPolicyDecision) =
+    let calls = ResizeArray<TenantId * string * string>()
+
+    interface IModelPolicy with
+        member _.Authorize(tenant: TenantId, provider: string, model: string) =
+            calls.Add((tenant, provider, model))
+            decision
+
+    /// The calls Authorize received, oldest first.
+    member _.Calls = calls |> List.ofSeq
+
+/// A model decision shape the coordinator does not know: the
+/// unknown-shape guard must reject it.
+type UnknownModelDecision() =
+    inherit ModelPolicyDecision()
+
+/// A usage observer that records every delivery in arrival order.
+type RecordingUsageObserver() =
+    let checkpoints = ResizeArray<UsageCheckpoint>()
+    let settlements = ResizeArray<UsageSettlement>()
+
+    interface IUsageObserver with
+        member _.OnCheckpoint(usage: UsageCheckpoint) = checkpoints.Add(usage)
+        member _.OnSettled(usage: UsageSettlement) = settlements.Add(usage)
+
+    /// The checkpoints in arrival order.
+    member _.Checkpoints = checkpoints |> List.ofSeq
+
+    /// The settlements in arrival order.
+    member _.Settlements = settlements |> List.ofSeq
+
+/// A usage observer that always throws: guarded delivery must never fail
+/// the call.
+type ThrowingUsageObserver() =
+    interface IUsageObserver with
+        member _.OnCheckpoint(_: UsageCheckpoint) =
+            raise (InvalidOperationException("observer boom"))
+
+        member _.OnSettled(_: UsageSettlement) =
+            raise (InvalidOperationException("observer boom"))
+
+/// A usage observer that deduplicates at-least-once redeliveries on the
+/// idempotency key: the second delivery with the same key has no effect.
+type DedupUsageObserver() =
+    let seen = HashSet<string>()
+    let mutable effects = 0
+
+    interface IUsageObserver with
+        member _.OnCheckpoint(usage: UsageCheckpoint) =
+            if seen.Add("checkpoint:" + usage.IdempotencyKey) then
+                effects <- effects + 1
+
+        member _.OnSettled(usage: UsageSettlement) =
+            if seen.Add("settled:" + usage.IdempotencyKey) then
+                effects <- effects + 1
+
+    /// The deduplicated effect count.
+    member _.Effects = effects
+
+let private executeObserved
+    (coordinator: LlmCoordination.LlmCoordinator)
+    (reference: string)
+    (tenant: TenantId)
+    (estimate: int64)
+    (invoke: Func<IChatClient, CancellationToken, Task<StringOutcome>>)
+    (policy: #IModelPolicy)
+    (observer: #IUsageObserver)
+    (sessionId: SessionId)
+    (turnId: TurnId)
+    (attempt: int)
+    : Task<string> =
+    coordinator.ExecuteAsync(
+        ModelReference.Parse(reference),
+        tenant,
+        estimate,
+        invoke,
+        CancellationToken.None,
+        policy,
+        observer,
+        sessionId,
+        turnId,
+        attempt
+    )
+
+let private observedCoordinator
+    (providers: ILlmProvider list)
+    (staticKeys: (string * string) list)
+    (keys: Map<string * string, string>)
+    (setupCoordination: LlmCoordinationOptions -> unit)
+    : LlmCoordination.LlmCoordinator * FakeTimeProvider =
+    let registry = makeRegistry providers
+    let options = makeOptions setupCoordination staticKeys false
+    let clock = FakeTimeProvider()
+
+    makeCoordinator options registry keys clock (NeverDelay() :> ILlmDelay) (SeededRandom(1) :> ILlmRandom), clock
+
+[<Fact>]
+let ``Deny throws before provider build with the client-safe message`` () =
+    let provider = StubProvider("acme", "fast")
+
+    let coordinator, _ =
+        observedCoordinator [ provider :> ILlmProvider ] [ "acme", "sk-static" ] Map.empty ignore
+
+    let policy =
+        ScriptedModelPolicy(ModelPolicyDecision.Deny("Model is not on your plan."))
+
+    let observer = RecordingUsageObserver()
+    let sessionId = SessionId.New()
+    let turnId = TurnId.New()
+    let tracker = ParallelTracker()
+
+    let caught =
+        try
+            executeObserved
+                coordinator
+                "acme/fast"
+                tenantA
+                10L
+                (instantInvoke tracker (usageOf 1L 1L) "unreached")
+                policy
+                observer
+                sessionId
+                turnId
+                1
+            |> fun task -> task.GetAwaiter().GetResult() |> ignore
+
+            None
+        with :? ModelDeniedException as denied ->
+            Some denied
+
+    caught.IsSome |> should equal true
+    caught.Value.ProviderId |> should equal "acme"
+    caught.Value.Model |> should equal "fast"
+    caught.Value.Message |> should equal "Model is not on your plan."
+    // Denied calls never reach the network: no client is built.
+    provider.Builds |> should equal 0
+    // The client-safe message carries no topology or secrets.
+    caught.Value.Message.Contains("sk-static") |> should equal false
+    caught.Value.Message.Contains("Registered providers") |> should equal false
+    // Deny reports nothing.
+    observer.Checkpoints.Length |> should equal 0
+    observer.Settlements.Length |> should equal 0
+    // The policy saw the tenant, provider, and model.
+    policy.Calls |> should equal [ (tenantA, "acme", "fast") ]
+
+[<Fact>]
+let ``Deny outranks unregistered provider`` () =
+    let coordinator, _ = observedCoordinator [] [ "acme", "sk-static" ] Map.empty ignore
+
+    let policy =
+        ScriptedModelPolicy(ModelPolicyDecision.Deny("Model is not on your plan."))
+
+    let observer = RecordingUsageObserver()
+
+    let caught =
+        try
+            executeObserved
+                coordinator
+                "missing/model"
+                tenantA
+                10L
+                (instantInvoke (ParallelTracker()) (usageOf 1L 1L) "unreached")
+                policy
+                observer
+                (SessionId.New())
+                (TurnId.New())
+                1
+            |> fun task -> task.GetAwaiter().GetResult() |> ignore
+
+            None
+        with :? ModelDeniedException as denied ->
+            Some denied
+
+    caught.IsSome |> should equal true
+    caught.Value.ProviderId |> should equal "missing"
+    caught.Value.Message |> should equal "Model is not on your plan."
+    // The registered-id list never leaks through a deny.
+    caught.Value.Message.Contains("acme") |> should equal false
+    observer.Checkpoints.Length |> should equal 0
+    observer.Settlements.Length |> should equal 0
+
+[<Fact>]
+let ``Deny outranks missing key`` () =
+    let provider = StubProvider("acme", "fast")
+
+    let coordinator, _ =
+        observedCoordinator [ provider :> ILlmProvider ] [] Map.empty ignore
+
+    let policy =
+        ScriptedModelPolicy(ModelPolicyDecision.Deny("Model is not on your plan."))
+
+    let observer = RecordingUsageObserver()
+
+    let caught =
+        try
+            executeObserved
+                coordinator
+                "acme/fast"
+                tenantA
+                10L
+                (instantInvoke (ParallelTracker()) (usageOf 1L 1L) "unreached")
+                policy
+                observer
+                (SessionId.New())
+                (TurnId.New())
+                1
+            |> fun task -> task.GetAwaiter().GetResult() |> ignore
+
+            None
+        with :? ModelDeniedException as denied ->
+            Some denied
+
+    caught.IsSome |> should equal true
+    caught.Value.Message |> should equal "Model is not on your plan."
+    provider.Builds |> should equal 0
+    observer.Checkpoints.Length |> should equal 0
+    observer.Settlements.Length |> should equal 0
+
+[<Fact>]
+let ``Null and unknown policy decisions fail loudly without contacting the provider`` () =
+    let provider = StubProvider("acme", "fast")
+
+    let coordinator, _ =
+        observedCoordinator [ provider :> ILlmProvider ] [ "acme", "sk-static" ] Map.empty ignore
+
+    let observer = RecordingUsageObserver()
+
+    (fun () ->
+        executeObserved
+            coordinator
+            "acme/fast"
+            tenantA
+            10L
+            (instantInvoke (ParallelTracker()) (usageOf 1L 1L) "unreached")
+            (ScriptedModelPolicy(Unchecked.defaultof<ModelPolicyDecision>))
+            observer
+            (SessionId.New())
+            (TurnId.New())
+            1
+        |> fun task -> task.GetAwaiter().GetResult() |> ignore)
+    |> should throw typeof<InvalidOperationException>
+
+    (fun () ->
+        executeObserved
+            coordinator
+            "acme/fast"
+            tenantA
+            10L
+            (instantInvoke (ParallelTracker()) (usageOf 1L 1L) "unreached")
+            (ScriptedModelPolicy(UnknownModelDecision() :> ModelPolicyDecision))
+            observer
+            (SessionId.New())
+            (TurnId.New())
+            1
+        |> fun task -> task.GetAwaiter().GetResult() |> ignore)
+    |> should throw typeof<InvalidOperationException>
+
+    provider.Builds |> should equal 0
+    observer.Checkpoints.Length |> should equal 0
+    observer.Settlements.Length |> should equal 0
+
+[<Fact>]
+let ``Success emits exactly one checkpoint with outcome tokens and a fresh key`` () =
+    let provider = StubProvider("acme", "fast")
+
+    let coordinator, _ =
+        observedCoordinator [ provider :> ILlmProvider ] [ "acme", "sk-static" ] Map.empty ignore
+
+    let policy = ScriptedModelPolicy(ModelPolicyDecision.Allow)
+    let observer = RecordingUsageObserver()
+    let sessionId = SessionId.New()
+    let turnId = TurnId.New()
+    let tracker = ParallelTracker()
+
+    let result =
+        executeObserved
+            coordinator
+            "acme/fast"
+            tenantA
+            10L
+            (instantInvoke tracker (usageOf 7L 5L) "ok")
+            policy
+            observer
+            sessionId
+            turnId
+            2
+        |> fun task -> task.GetAwaiter().GetResult()
+
+    result |> should equal "ok"
+    observer.Checkpoints.Length |> should equal 1
+    observer.Settlements.Length |> should equal 0
+
+    let checkpoint = observer.Checkpoints.Head
+    checkpoint.Tenant |> should equal tenantA
+    checkpoint.SessionId |> should equal sessionId
+    checkpoint.TurnId |> should equal turnId
+    checkpoint.Attempt |> should equal 2
+    checkpoint.Provider |> should equal "acme"
+    checkpoint.Model |> should equal "fast"
+    checkpoint.InputTokens |> should equal 7L
+    checkpoint.OutputTokens |> should equal 5L
+    String.IsNullOrWhiteSpace(checkpoint.IdempotencyKey) |> should equal false
+
+[<Fact>]
+let ``Null usage reports as zero`` () =
+    let provider = StubProvider("acme", "fast")
+
+    let coordinator, _ =
+        observedCoordinator [ provider :> ILlmProvider ] [ "acme", "sk-static" ] Map.empty ignore
+
+    let observer = RecordingUsageObserver()
+
+    let invoke =
+        Func<IChatClient, CancellationToken, Task<StringOutcome>>(fun _ _ ->
+            Task.FromResult(
+                {
+                    Value = "ok"
+                    Usage = Unchecked.defaultof<UsageSummary>
+                }
+            ))
+
+    let result =
+        executeObserved
+            coordinator
+            "acme/fast"
+            tenantA
+            10L
+            invoke
+            (ScriptedModelPolicy(ModelPolicyDecision.Allow))
+            observer
+            (SessionId.New())
+            (TurnId.New())
+            1
+        |> fun task -> task.GetAwaiter().GetResult()
+
+    result |> should equal "ok"
+    observer.Checkpoints.Length |> should equal 1
+    observer.Checkpoints.Head.InputTokens |> should equal 0L
+    observer.Checkpoints.Head.OutputTokens |> should equal 0L
+    observer.Settlements.Length |> should equal 0
+
+[<Fact>]
+let ``Terminal post-send failure emits exactly one zero-token settlement`` () =
+    let provider = StubProvider("acme", "fast")
+
+    let coordinator, _ =
+        observedCoordinator [ provider :> ILlmProvider ] [ "acme", "sk-static" ] Map.empty ignore
+
+    let observer = RecordingUsageObserver()
+    let sessionId = SessionId.New()
+    let turnId = TurnId.New()
+
+    let plan = ResizeArray<PlannedOutcome>([ FailWith(providerFailure 400) ])
+    let attempts = ResizeArray<int>()
+
+    let caught =
+        try
+            executeObserved
+                coordinator
+                "acme/fast"
+                tenantA
+                10L
+                (runPlan plan attempts)
+                (ScriptedModelPolicy(ModelPolicyDecision.Allow))
+                observer
+                sessionId
+                turnId
+                3
+            |> fun task -> task.GetAwaiter().GetResult() |> ignore
+
+            None
+        with :? ProviderException as failure ->
+            Some failure
+
+    caught.IsSome |> should equal true
+    caught.Value.Status |> should equal (Nullable 400)
+    attempts |> List.ofSeq |> should equal [ 1 ]
+    // The abandoned call settles exactly once with zero tokens; the host
+    // correlates the settlement via the propagated exception.
+    observer.Checkpoints.Length |> should equal 0
+    observer.Settlements.Length |> should equal 1
+
+    let settlement = observer.Settlements.Head
+    settlement.Tenant |> should equal tenantA
+    settlement.SessionId |> should equal sessionId
+    settlement.TurnId |> should equal turnId
+    settlement.Attempt |> should equal 3
+    settlement.Provider |> should equal "acme"
+    settlement.Model |> should equal "fast"
+    settlement.InputTokens |> should equal 0L
+    settlement.OutputTokens |> should equal 0L
+    String.IsNullOrWhiteSpace(settlement.IdempotencyKey) |> should equal false
+
+[<Fact>]
+let ``Pre-send failures report nothing`` () =
+    let provider = StubProvider("acme", "fast")
+    // No keys: the allow-policy call fails on the missing key before send.
+    let coordinator, _ =
+        observedCoordinator [ provider :> ILlmProvider ] [] Map.empty ignore
+
+    let observer = RecordingUsageObserver()
+
+    (fun () ->
+        executeObserved
+            coordinator
+            "acme/fast"
+            tenantA
+            10L
+            (instantInvoke (ParallelTracker()) (usageOf 1L 1L) "unreached")
+            (ScriptedModelPolicy(ModelPolicyDecision.Allow))
+            observer
+            (SessionId.New())
+            (TurnId.New())
+            1
+        |> fun task -> task.GetAwaiter().GetResult() |> ignore)
+    |> should throw typeof<ProviderException>
+
+    provider.Builds |> should equal 0
+    observer.Checkpoints.Length |> should equal 0
+    observer.Settlements.Length |> should equal 0
+
+[<Fact>]
+let ``Throwing observer never fails the call`` () =
+    let provider = StubProvider("acme", "fast")
+
+    let coordinator, _ =
+        observedCoordinator [ provider :> ILlmProvider ] [ "acme", "sk-static" ] Map.empty ignore
+
+    let policy = ScriptedModelPolicy(ModelPolicyDecision.Allow)
+    let throwing = ThrowingUsageObserver()
+
+    let result =
+        executeObserved
+            coordinator
+            "acme/fast"
+            tenantA
+            10L
+            (instantInvoke (ParallelTracker()) (usageOf 2L 3L) "ok")
+            policy
+            throwing
+            (SessionId.New())
+            (TurnId.New())
+            1
+        |> fun task -> task.GetAwaiter().GetResult()
+
+    result |> should equal "ok"
+
+    // A throwing observer never masks the original post-send failure either.
+    let plan = ResizeArray<PlannedOutcome>([ FailWith(providerFailure 400) ])
+
+    let caught =
+        try
+            executeObserved
+                coordinator
+                "acme/fast"
+                tenantA
+                10L
+                (runPlan plan (ResizeArray<int>()))
+                policy
+                throwing
+                (SessionId.New())
+                (TurnId.New())
+                1
+            |> fun task -> task.GetAwaiter().GetResult() |> ignore
+
+            None
+        with :? ProviderException as failure ->
+            Some failure
+
+    caught.IsSome |> should equal true
+    caught.Value.Status |> should equal (Nullable 400)
+    caught.Value.Message.Contains("observer boom") |> should equal false
+
+[<Fact>]
+let ``Null policy allows and null observer skips`` () =
+    let provider = StubProvider("acme", "fast")
+
+    let coordinator, _ =
+        observedCoordinator [ provider :> ILlmProvider ] [ "acme", "sk-static" ] Map.empty ignore
+
+    let result =
+        coordinator.ExecuteAsync(
+            ModelReference.Parse("acme/fast"),
+            tenantA,
+            10L,
+            (instantInvoke (ParallelTracker()) (usageOf 1L 2L) "ok"),
+            CancellationToken.None,
+            null,
+            null,
+            SessionId.New(),
+            TurnId.New(),
+            1
+        )
+        |> fun task -> task.GetAwaiter().GetResult()
+
+    result |> should equal "ok"
+    provider.Builds |> should equal 1
+
+[<Fact>]
+let ``Retried then succeeded call still emits exactly once`` () =
+    let provider = StubProvider("acme", "fast")
+    let registry = makeRegistry [ provider :> ILlmProvider ]
+
+    let options =
+        makeOptions (fun coordination -> coordination.RetryCount <- 2) [ "acme", "sk-static" ] false
+
+    let clock = FakeTimeProvider()
+
+    let coordinator =
+        makeCoordinator options registry Map.empty clock (RecordingDelay() :> ILlmDelay) (SeededRandom(1) :> ILlmRandom)
+
+    let observer = RecordingUsageObserver()
+
+    let plan =
+        ResizeArray<PlannedOutcome>(
+            [
+                FailWith(providerFailure 500)
+                SucceedWith(usageOf 3L 4L, "ok")
+            ]
+        )
+
+    let attempts = ResizeArray<int>()
+
+    let result =
+        executeObserved
+            coordinator
+            "acme/fast"
+            tenantA
+            10L
+            (runPlan plan attempts)
+            (ScriptedModelPolicy(ModelPolicyDecision.Allow))
+            observer
+            (SessionId.New())
+            (TurnId.New())
+            1
+        |> fun task -> task.GetAwaiter().GetResult()
+
+    result |> should equal "ok"
+    attempts |> List.ofSeq |> should equal [ 1; 2 ]
+    // The transient retry emits nothing: the terminal outcome reports once.
+    observer.Checkpoints.Length |> should equal 1
+    observer.Checkpoints.Head.InputTokens |> should equal 3L
+    observer.Checkpoints.Head.OutputTokens |> should equal 4L
+    observer.Settlements.Length |> should equal 0
+
+[<Fact>]
+let ``Streaming shaped invoke reports once on completion`` () =
+    let provider = StubProvider("acme", "fast")
+
+    let coordinator, _ =
+        observedCoordinator [ provider :> ILlmProvider ] [ "acme", "sk-static" ] Map.empty ignore
+
+    let observer = RecordingUsageObserver()
+    let deltas = ResizeArray<string>()
+
+    // One invoke that emits several streaming chunks internally before it
+    // returns its single terminal outcome.
+    let invoke =
+        Func<IChatClient, CancellationToken, Task<StringOutcome>>(fun _ _ ->
+            for chunk in [ "he"; "ll"; "o" ] do
+                deltas.Add(chunk)
+
+            Task.FromResult(
+                {
+                    Value = "hello"
+                    Usage = usageOf 9L 6L
+                }
+            ))
+
+    let result =
+        executeObserved
+            coordinator
+            "acme/fast"
+            tenantA
+            10L
+            invoke
+            (ScriptedModelPolicy(ModelPolicyDecision.Allow))
+            observer
+            (SessionId.New())
+            (TurnId.New())
+            1
+        |> fun task -> task.GetAwaiter().GetResult()
+
+    result |> should equal "hello"
+    deltas |> List.ofSeq |> should equal [ "he"; "ll"; "o" ]
+    observer.Checkpoints.Length |> should equal 1
+    observer.Checkpoints.Head.InputTokens |> should equal 9L
+    observer.Checkpoints.Head.OutputTokens |> should equal 6L
+    observer.Settlements.Length |> should equal 0
+
+[<Fact>]
+let ``Duplicate settlement with the same key dedups`` () =
+    let dedup = DedupUsageObserver()
+    let observer = dedup :> IUsageObserver
+    let sessionId = SessionId.Parse "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+    let turnId = TurnId.Parse "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+
+    let settlement: UsageSettlement =
+        {
+            Tenant = tenantA
+            SessionId = sessionId
+            TurnId = turnId
+            Attempt = 1
+            Provider = "acme"
+            Model = "fast"
+            InputTokens = 0L
+            OutputTokens = 0L
+            IdempotencyKey = "abandoned-1"
+        }
+
+    // At-least-once redelivery of the same settlement has no second effect.
+    observer.OnSettled(settlement)
+    observer.OnSettled(settlement)
+    dedup.Effects |> should equal 1
+
+    // A fresh key is a distinct delivery.
+    observer.OnSettled(
+        { settlement with
+            IdempotencyKey = "abandoned-2"
+        }
+    )
+
+    dedup.Effects |> should equal 2
+
+[<Fact>]
+let ``Deliveries carry fresh distinct idempotency keys`` () =
+    let provider = StubProvider("acme", "fast")
+
+    let coordinator, _ =
+        observedCoordinator [ provider :> ILlmProvider ] [ "acme", "sk-static" ] Map.empty ignore
+
+    let observer = RecordingUsageObserver()
+    let policy = ScriptedModelPolicy(ModelPolicyDecision.Allow)
+
+    for _ in [ 1; 2 ] do
+        executeObserved
+            coordinator
+            "acme/fast"
+            tenantA
+            10L
+            (instantInvoke (ParallelTracker()) (usageOf 1L 1L) "ok")
+            policy
+            observer
+            (SessionId.New())
+            (TurnId.New())
+            1
+        |> fun task -> task.GetAwaiter().GetResult() |> ignore
+
+    observer.Checkpoints.Length |> should equal 2
+
+    let keys =
+        observer.Checkpoints |> List.map (fun checkpoint -> checkpoint.IdempotencyKey)
+
+    keys
+    |> List.forall (fun key -> String.IsNullOrWhiteSpace(key) |> not)
+    |> should equal true
+
+    keys[0] |> should not' (equal keys[1])

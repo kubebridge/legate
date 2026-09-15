@@ -288,3 +288,22 @@ type SessionSubscriptionLimitExceededException(sessionId: SessionId, limit: int,
 
     /// The maximum live subscribers the session holds.
     member _.Limit = limit
+
+/// Raised when a host model policy denies a tenant-provider-model call
+/// before the runtime contacts the provider. Control-plane precondition
+/// failure: nothing was sent to the provider, no key was derived, and no
+/// client was built. The message is the policy's client-safe text, so it
+/// never contains secrets, keys, or internal topology; hosts never parse
+/// it, and the provider and model travel on properties.
+/// <param name="providerId">The id of the provider the denied call targeted.</param>
+/// <param name="model">The model id the denied call named.</param>
+/// <param name="message">The client-safe reason the policy denied the call, without secrets, keys, or internal topology.</param>
+[<Sealed>]
+type ModelDeniedException(providerId: string, model: string, message: string) =
+    inherit LegateException(message)
+
+    /// The id of the provider the denied call targeted.
+    member _.ProviderId = providerId
+
+    /// The model id the denied call named.
+    member _.Model = model

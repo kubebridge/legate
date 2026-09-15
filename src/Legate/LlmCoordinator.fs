@@ -296,6 +296,130 @@ module internal LlmCoordination =
             state.Active <- state.Active - 1
             state.Signal.Signal())
 
+    /// Authorises one tenant-provider-model call before the runtime
+    /// resolves the provider: a deny throws
+    /// <see cref="T:Legate.ModelDeniedException" /> carrying the policy's
+    /// client-safe message, so deny outranks
+    /// <see cref="T:Legate.ProviderNotRegisteredException" /> and the
+    /// missing-key <see cref="T:Legate.ProviderException" />, and no key
+    /// derivation or client build happens on deny. A null policy allows;
+    /// a null decision or an unknown decision shape is a host bug and
+    /// throws InvalidOperationException.
+    /// <param name="policy">The host model policy, or null for no gate.</param>
+    /// <param name="tenant">The tenant making the call.</param>
+    /// <param name="providerId">The provider segment of the model reference.</param>
+    /// <param name="model">The model segment of the model reference.</param>
+    let private authorizeFirst
+        (policy: IModelPolicy | null)
+        (tenant: TenantId)
+        (providerId: string)
+        (model: string)
+        : unit =
+        match box policy with
+        | null -> ()
+        | :? IModelPolicy as live ->
+            let decision = live.Authorize(tenant, providerId, model)
+
+            if isNull (box decision) then
+                raise (InvalidOperationException("The model policy returned null instead of a decision."))
+            else
+                match decision with
+                | :? ModelAllowed -> ()
+                | :? ModelDenied as denied ->
+                    let message =
+                        if isNull (box denied.Message) then
+                            "The model call was denied by the model policy."
+                        else
+                            denied.Message
+
+                    raise (ModelDeniedException(providerId, model, message))
+                | _ ->
+                    raise (
+                        InvalidOperationException(
+                            sprintf "The model policy returned an unknown decision: %s." (decision.GetType().FullName)
+                        )
+                    )
+        | _ -> raise (InvalidOperationException("The model policy has an unknown shape."))
+
+    /// Reports one successful call as a single usage checkpoint carrying
+    /// the terminal outcome usage. Guarded: a throwing observer never
+    /// kills the call (the Compaction.reportCheckpoint precedent).
+    /// <param name="observer">The host usage observer, or null for no observation.</param>
+    /// <param name="tenant">The tenant the call belongs to.</param>
+    /// <param name="sessionId">The session the call runs in.</param>
+    /// <param name="turnId">The turn the call runs under.</param>
+    /// <param name="attempt">The 1-based attempt the call runs under.</param>
+    /// <param name="reference">The model reference the call targeted.</param>
+    /// <param name="inputTokens">The outcome input tokens, already normalised (null usage counts as zero).</param>
+    /// <param name="outputTokens">The outcome output tokens, already normalised.</param>
+    let private reportSuccessCheckpoint
+        (observer: IUsageObserver | null)
+        (tenant: TenantId)
+        (sessionId: SessionId)
+        (turnId: TurnId)
+        (attempt: int)
+        (reference: ModelReference)
+        (inputTokens: int64)
+        (outputTokens: int64)
+        : unit =
+        if not (isNull (box observer)) then
+            match box observer with
+            | :? IUsageObserver as live ->
+                try
+                    live.OnCheckpoint
+                        {
+                            Tenant = tenant
+                            SessionId = sessionId
+                            TurnId = turnId
+                            Attempt = attempt
+                            Provider = reference.Provider
+                            Model = reference.Model
+                            InputTokens = max 0L inputTokens
+                            OutputTokens = max 0L outputTokens
+                            IdempotencyKey = Guid.NewGuid().ToString("N")
+                        }
+                with _ ->
+                    ()
+            | _ -> ()
+
+    /// Reports one terminal post-send failure as an abandoned zero-token
+    /// settlement with a fresh idempotency key. The host correlates the
+    /// settlement via the propagated exception. Guarded: a throwing
+    /// observer never masks the original failure.
+    /// <param name="observer">The host usage observer, or null for no observation.</param>
+    /// <param name="tenant">The tenant the call belongs to.</param>
+    /// <param name="sessionId">The session the call runs in.</param>
+    /// <param name="turnId">The turn the call runs under.</param>
+    /// <param name="attempt">The 1-based attempt the call runs under.</param>
+    /// <param name="reference">The model reference the call targeted.</param>
+    let private reportAbandonedSettlement
+        (observer: IUsageObserver | null)
+        (tenant: TenantId)
+        (sessionId: SessionId)
+        (turnId: TurnId)
+        (attempt: int)
+        (reference: ModelReference)
+        : unit =
+        if not (isNull (box observer)) then
+            match box observer with
+            | :? IUsageObserver as live ->
+                try
+                    live.OnSettled
+                        {
+                            Tenant = tenant
+                            SessionId = sessionId
+                            TurnId = turnId
+                            Attempt = attempt
+                            Provider = reference.Provider
+                            Model = reference.Model
+                            InputTokens = 0L
+                            OutputTokens = 0L
+                            IdempotencyKey = Guid.NewGuid().ToString("N")
+                        }
+                with _ ->
+                    ()
+            | _ -> ()
+
     /// Runs one attempt and, on transient failure, hands off to
     /// <c>retryOrRaise</c>. Transient failures are 408, 429, 5xx, and
     /// network errors; an OperationCanceledException the deadline scope
@@ -316,13 +440,13 @@ module internal LlmCoordination =
     /// <param name="context">The per-call parameters.</param>
     /// <param name="attempt">The zero-based attempt number that just failed.</param>
     /// <param name="mapped">The transient failure, already mapped to ProviderException.</param>
-    /// <returns>The value the retried call produced.</returns>
+    /// <returns>The terminal outcome the retried call produced.</returns>
     let retryOrRaise<'T>
-        (recurse: int -> Task<'T>)
+        (recurse: int -> Task<LlmCallOutcome<'T>>)
         (context: AttemptContext<'T>)
         (attempt: int)
         (mapped: ProviderException)
-        : Task<'T> =
+        : Task<LlmCallOutcome<'T>> =
         task {
             let now = context.Clock.GetUtcNow()
 
@@ -343,7 +467,7 @@ module internal LlmCoordination =
 
             if attempt >= context.RetryCount then
                 settleFailure context.Gate context.State context.Entry
-                return! Task.FromException<'T>(mapped)
+                return! Task.FromException<LlmCallOutcome<'T>>(mapped)
             else
                 let backoff = jitteredBackoff context.Random context.MinBackoff context.MaxBackoff
 
@@ -358,7 +482,7 @@ module internal LlmCoordination =
 
                 if context.Clock.GetUtcNow() + wait >= context.Deadline then
                     settleFailure context.Gate context.State context.Entry
-                    return! Task.FromException<'T>(context.DeadlineEx())
+                    return! Task.FromException<LlmCallOutcome<'T>>(context.DeadlineEx())
                 else
                     try
                         do! context.Delay.Delay(wait, context.LinkedToken)
@@ -375,8 +499,8 @@ module internal LlmCoordination =
 
     /// <param name="context">The per-call parameters.</param>
     /// <param name="attempt">The zero-based attempt number.</param>
-    /// <returns>The value the provider call produced.</returns>
-    let rec attemptLoop<'T> (context: AttemptContext<'T>) (attempt: int) : Task<'T> =
+    /// <returns>The terminal outcome the provider call produced, with null usage normalised to zero.</returns>
+    let rec attemptLoop<'T> (context: AttemptContext<'T>) (attempt: int) : Task<LlmCallOutcome<'T>> =
         task {
             if context.Clock.GetUtcNow() >= context.Deadline then
                 settleFailure context.Gate context.State context.Entry
@@ -389,7 +513,7 @@ module internal LlmCoordination =
                     settleFailure context.Gate context.State context.Entry
 
                     return!
-                        Task.FromException<'T>(
+                        Task.FromException<LlmCallOutcome<'T>>(
                             InvalidOperationException(
                                 sprintf "The '%s' provider call returned null instead of a result." context.ProviderId
                             )
@@ -407,7 +531,7 @@ module internal LlmCoordination =
                         context.Entry
                         (max 0L (usage.InputTokens + usage.OutputTokens))
 
-                    return outcome.Value
+                    return { Value = outcome.Value; Usage = usage }
             with
             | :? ProviderException as providerFailure when
                 providerFailure.Status.HasValue
@@ -445,10 +569,10 @@ module internal LlmCoordination =
             | :? OperationCanceledException as canceled ->
                 if context.IsDeadlineFired() then
                     settleFailure context.Gate context.State context.Entry
-                    return! Task.FromException<'T>(context.DeadlineEx())
+                    return! Task.FromException<LlmCallOutcome<'T>>(context.DeadlineEx())
                 elif context.CallerToken.IsCancellationRequested then
                     settleFailure context.Gate context.State context.Entry
-                    return! Task.FromException<'T>(canceled)
+                    return! Task.FromException<LlmCallOutcome<'T>>(canceled)
                 else
                     return!
                         retryOrRaise
@@ -458,7 +582,7 @@ module internal LlmCoordination =
                             (wrapProviderError context.ProviderId (canceled :> exn))
             | ex ->
                 settleFailure context.Gate context.State context.Entry
-                return! Task.FromException<'T>(ex)
+                return! Task.FromException<LlmCallOutcome<'T>>(ex)
         }
 
     /// Local per-identity coordinator: concurrency gate, RPM/TPM windows,
@@ -495,7 +619,12 @@ module internal LlmCoordination =
         let gate = obj ()
         let states = Dictionary<string, IdentityState>(StringComparer.Ordinal)
 
-        /// Runs one provider call under the reference's identity: resolves
+        /// Runs one provider call under the reference's identity: authorises
+        /// the tenant-provider-model through the policy first (a deny
+        /// throws <see cref="T:Legate.ModelDeniedException" /> before the
+        /// registry resolve, key lookup, or client build, so deny outranks
+        /// <see cref="T:Legate.ProviderNotRegisteredException" /> and the
+        /// missing-key <see cref="T:Legate.ProviderException" />), resolves
         /// the provider, derives providerId/scope (failing fast with
         /// <see cref="T:Legate.ProviderException" /> when neither key source
         /// has a key, before anything queues), builds the chat client with
@@ -513,15 +642,30 @@ module internal LlmCoordination =
         /// larger than the whole TPM budget admits immediately: waiting
         /// could never free enough room. Waits that would cross the deadline
         /// raise <see cref="T:Legate.DeadlineExceededException" /> instead of
-        /// sleeping past it.
+        /// sleeping past it. Usage is reported once per call at this
+        /// boundary, never inside the retry loop: one
+        /// <see cref="M:Legate.IUsageObserver.OnCheckpoint(Legate.UsageCheckpoint)" />
+        /// checkpoint carrying the terminal outcome usage on success (null
+        /// usage counts as zero), one zero-token
+        /// <see cref="M:Legate.IUsageObserver.OnSettled(Legate.UsageSettlement)" />
+        /// settlement with a fresh key on terminal post-send failure (the
+        /// host correlates it via the propagated exception); deny and
+        /// pre-send failures report nothing. Observer calls are guarded: a
+        /// throwing observer never fails the call.
         /// <param name="reference">The model to call, resolved through the registry.</param>
         /// <param name="tenant">The session tenant: the credential scope when no static key is set.</param>
         /// <param name="estimatedInputTokens">The caller's deterministic estimate of the request tokens. Must not be negative.</param>
         /// <param name="invoke">The provider call, receiving the bound chat client and the deadline-linked token.</param>
         /// <param name="cancellationToken">Abandons the call: queued waits reject and in-flight work observes it.</param>
+        /// <param name="policy">Authorises the tenant-provider-model call before the registry resolve, or null to allow every call.</param>
+        /// <param name="observer">Receives the single terminal usage delivery, or null for no observation.</param>
+        /// <param name="sessionId">The session the call runs in.</param>
+        /// <param name="turnId">The turn the call runs under.</param>
+        /// <param name="attempt">The 1-based attempt the call runs under.</param>
         /// <returns>The value the provider call produced.</returns>
         /// <exception cref="T:System.ArgumentException">The coordination knobs do not validate.</exception>
-        /// <exception cref="T:System.InvalidOperationException">Distributed coordination is on, or the provider returned null instead of a client or result.</exception>
+        /// <exception cref="T:System.InvalidOperationException">Distributed coordination is on, the provider returned null instead of a client or result, or the policy returned null or an unknown decision shape.</exception>
+        /// <exception cref="T:Legate.ModelDeniedException">The model policy denied the call.</exception>
         /// <exception cref="T:Legate.ProviderNotRegisteredException">No provider is registered under the reference's provider segment.</exception>
         /// <exception cref="T:Legate.ProviderException">Neither key source has a key, or the provider call failed.</exception>
         /// <exception cref="T:Legate.AdmissionRejectedException">The FIFO queue is full.</exception>
@@ -532,7 +676,12 @@ module internal LlmCoordination =
                 tenant: TenantId,
                 estimatedInputTokens: int64,
                 invoke: Func<IChatClient, CancellationToken, Task<LlmCallOutcome<'T>>>,
-                cancellationToken: CancellationToken
+                cancellationToken: CancellationToken,
+                policy: IModelPolicy | null,
+                observer: IUsageObserver | null,
+                sessionId: SessionId,
+                turnId: TurnId,
+                attempt: int
             ) : Task<'T> =
             task {
                 // ── Gate: knobs valid, local admission only.
@@ -562,6 +711,10 @@ module internal LlmCoordination =
                     )
 
                 ArgumentNullException.ThrowIfNull(invoke)
+
+                // ── Authorize first: deny throws before the registry
+                // resolve, key lookup, or client build.
+                authorizeFirst policy tenant reference.Provider reference.Model
 
                 let maxConcurrency = coordination.MaxConcurrentRequests
                 let rpm = coordination.RequestsPerMinute
@@ -889,5 +1042,62 @@ module internal LlmCoordination =
                         Entry = ticketEntry
                     }
 
-                return! attemptLoop context 0
+                try
+                    let! terminal = attemptLoop context 0
+
+                    let inputTokens =
+                        if isNull (box terminal.Usage) then
+                            0L
+                        else
+                            terminal.Usage.InputTokens
+
+                    let outputTokens =
+                        if isNull (box terminal.Usage) then
+                            0L
+                        else
+                            terminal.Usage.OutputTokens
+
+                    reportSuccessCheckpoint observer tenant sessionId turnId attempt reference inputTokens outputTokens
+
+                    return terminal.Value
+                with ex ->
+                    reportAbandonedSettlement observer tenant sessionId turnId attempt reference
+                    return! Task.FromException<'T>(ex)
             }
+
+        /// Runs one provider call with no model policy and no usage
+        /// observation: every call is allowed and nothing is reported. The
+        /// policy-aware overload is the contract for hosted turns; this
+        /// overload keeps single-call hosts free of session context.
+        /// <param name="reference">The model to call, resolved through the registry.</param>
+        /// <param name="tenant">The session tenant: the credential scope when no static key is set.</param>
+        /// <param name="estimatedInputTokens">The caller's deterministic estimate of the request tokens. Must not be negative.</param>
+        /// <param name="invoke">The provider call, receiving the bound chat client and the deadline-linked token.</param>
+        /// <param name="cancellationToken">Abandons the call: queued waits reject and in-flight work observes it.</param>
+        /// <returns>The value the provider call produced.</returns>
+        /// <exception cref="T:System.ArgumentException">The coordination knobs do not validate.</exception>
+        /// <exception cref="T:System.InvalidOperationException">Distributed coordination is on, or the provider returned null instead of a client or result.</exception>
+        /// <exception cref="T:Legate.ProviderNotRegisteredException">No provider is registered under the reference's provider segment.</exception>
+        /// <exception cref="T:Legate.ProviderException">Neither key source has a key, or the provider call failed.</exception>
+        /// <exception cref="T:Legate.AdmissionRejectedException">The FIFO queue is full.</exception>
+        /// <exception cref="T:Legate.DeadlineExceededException">The turn deadline fired.</exception>
+        member this.ExecuteAsync<'T>
+            (
+                reference: ModelReference,
+                tenant: TenantId,
+                estimatedInputTokens: int64,
+                invoke: Func<IChatClient, CancellationToken, Task<LlmCallOutcome<'T>>>,
+                cancellationToken: CancellationToken
+            ) : Task<'T> =
+            this.ExecuteAsync(
+                reference,
+                tenant,
+                estimatedInputTokens,
+                invoke,
+                cancellationToken,
+                null,
+                null,
+                SessionId.New(),
+                TurnId.New(),
+                1
+            )
