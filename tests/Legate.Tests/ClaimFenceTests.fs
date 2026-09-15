@@ -549,11 +549,13 @@ let ``First claim stamps attempt one`` () =
 /// Runs the loop with scripted provider answers and the given per-tool
 /// fence, blocking for the settled result.
 let private runFenced
-    (responses: ChatResponse list)
+    (steps: ScriptStep list)
     (tools: IReadOnlyDictionary<string, AITool>)
     (verifyClaim: (unit -> Task<bool>) option)
     : TurnResult =
-    let client = new TurnLoopTests.ScriptedChatClient(responses) :> IChatClient
+    let client =
+        new ScriptedChatClient(ResizeArray<ScriptStep>(steps) :> IReadOnlyList<ScriptStep>) :> IChatClient
+
     let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
 
     let options =
@@ -571,9 +573,16 @@ let private runFenced
         TurnLoopTests.alwaysLeased
     |> fun task -> task.GetAwaiter().GetResult()
 
-/// One assistant turn calling the named tools in order.
-let private callResponse (calls: (string * string) list) : ChatResponse =
-    new ChatResponse(ResizeArray<ChatMessage>([| TurnLoopTests.callMessage calls |]))
+/// One scripted turn calling the named tools in order.
+let private callSteps (calls: (string * string) list) : ScriptStep =
+    ScriptStep.ToolCalls(
+        ResizeArray<ScriptToolCall>(
+            calls
+            |> List.map (fun (callId, name) -> ScriptToolCall(callId, name))
+            |> Array.ofList
+        )
+        :> IReadOnlyList<ScriptToolCall>
+    )
 
 [<Fact>]
 let ``Fenced-out tool call never invokes the tool and loses the lease`` () =
@@ -583,8 +592,8 @@ let ``Fenced-out tool call never invokes the tool and loses the lease`` () =
 
     let responses =
         [
-            callResponse [ "c1", "lookup" ]
-            TurnLoopTests.textResponse "finished"
+            callSteps [ "c1", "lookup" ]
+            ScriptStep.Text "finished"
         ]
 
     let outcome =
@@ -609,8 +618,8 @@ let ``Live fence lets the tool call through`` () =
 
     let responses =
         [
-            callResponse [ "c1", "lookup" ]
-            TurnLoopTests.textResponse "finished"
+            callSteps [ "c1", "lookup" ]
+            ScriptStep.Text "finished"
         ]
 
     let result = runFenced responses tools (Some(fun () -> Task.FromResult true))
@@ -621,7 +630,7 @@ let ``Live fence lets the tool call through`` () =
 [<Fact>]
 let ``Actor runner with a dead lease faults without calling the provider`` () =
     let client =
-        new TurnLoopTests.ScriptedChatClient([ TurnLoopTests.textResponse "done" ])
+        new ScriptedChatClient(ResizeArray<ScriptStep>([ ScriptStep.Text "done" ]) :> IReadOnlyList<ScriptStep>)
 
     let tools = TurnLoopTests.makeTools []
 
@@ -664,7 +673,7 @@ let ``Actor runner with a dead lease faults without calling the provider`` () =
 [<Fact>]
 let ``Actor runner keeps its always-live default`` () =
     let client =
-        new TurnLoopTests.ScriptedChatClient([ TurnLoopTests.textResponse "done" ])
+        new ScriptedChatClient(ResizeArray<ScriptStep>([ ScriptStep.Text "done" ]) :> IReadOnlyList<ScriptStep>)
 
     let tools = TurnLoopTests.makeTools []
 
