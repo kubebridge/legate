@@ -88,6 +88,12 @@ type InMemoryDatabase(timeProvider: TimeProvider, options: InMemoryStoreOptions)
     // The structured outcome recorded at settlement, per settled turn.
     let outcomes = Dictionary<(TenantId * SessionId * TurnId), TurnOutcome | null>()
 
+    // Completion outbox rows keyed by (tenant, idempotency key): the
+    // pending deliveries the re-drive service claims under a lease and the
+    // delivered rows the retention purge removes. One row per key per
+    // tenant: enqueueing the same key twice observes the first row.
+    let outbox = Dictionary<(TenantId * string), OutboxRow>()
+
     // Journals per (tenant, session id): the ordered events and the flag
     // telling replay the journal was archived away.
     let journals = Dictionary<(TenantId * SessionId), JournalRow>()
@@ -149,6 +155,10 @@ type InMemoryDatabase(timeProvider: TimeProvider, options: InMemoryStoreOptions)
     /// The structured outcome recorded at settlement, per settled turn.
     member internal _.Outcomes = outcomes
 
+    /// The completion outbox rows keyed by (tenant, idempotency key).
+    /// Internal: stores mutate through the gate only.
+    member internal _.Outbox = outbox
+
     /// The journals per (tenant, session id).
     member internal _.Journals = journals
 
@@ -187,6 +197,34 @@ and internal OpenTurnRow(turnId: TurnId, attempt: int) =
 
     /// The attempt number the next claim of this turn carries.
     member val Attempt = attempt with get, set
+
+/// One completion outbox row: the settlement's pending delivery plus its
+/// delivery lease and delivery stamp. A row is pending from enqueue until
+/// the mark lands; a delivered row stays until the retention purge removes
+/// it. The lease owner and expiry fence Notify: only the live owner
+/// delivers and marks.
+and internal OutboxRow(tenant: TenantId, completion: SessionCompletion, createdAt: DateTimeOffset) =
+
+    /// The tenant the session belongs to.
+    member val Tenant = tenant with get, set
+
+    /// The session's structured completion, carrying the stable key.
+    member val Completion = completion with get, set
+
+    /// When the row was enqueued.
+    member val CreatedAt = createdAt with get, set
+
+    /// Whether the row was delivered and marked.
+    member val Delivered = false with get, set
+
+    /// When the row was marked delivered.
+    member val DeliveredAt = Nullable<DateTimeOffset>() with get, set
+
+    /// The owner holding the delivery lease, or null when unleased.
+    member val LeaseOwner: string | null = null with get, set
+
+    /// When the delivery lease expires.
+    member val LeaseExpiresAt = Nullable<DateTimeOffset>() with get, set
 
 /// One journal row: the ordered events, the archived flag, and the running
 /// byte total.

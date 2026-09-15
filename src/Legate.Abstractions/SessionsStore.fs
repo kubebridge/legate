@@ -290,15 +290,60 @@ type DispatchBatch =
     }
 
 // ───────────────────────────────────────────────────────────────────────────
+// Completion outbox
+
+/// One pending completion delivery of a session: the envelope the store
+/// persists at settlement and the re-drive service delivers. The
+/// <see cref="P:Legate.SessionCompletion.IdempotencyKey" /> is the stable
+/// key minted once at settlement and shared with the inline fenced
+/// <c>Notify</c>, so an inline delivery and a re-drive of the same row
+/// deduplicate on the receiver. Delivered rows stay readable until the
+/// retention window purges them, so a re-drive that races a slow receiver
+/// still observes the key; pending rows are never purged. Constructible
+/// from C# through property setters and serialises with System.Text.Json.
+[<CLIMutable; NoComparison>]
+type CompletionOutboxEntry =
+    {
+        /// The tenant the session belongs to.
+        Tenant: TenantId
+        /// The session that completed.
+        SessionId: SessionId
+        /// The stable key the runtime minted at settlement; sinks
+        /// deduplicate on it because delivery is at-least-once. Never null.
+        IdempotencyKey: string
+        /// The session's structured completion. Never null.
+        Completion: SessionCompletion
+        /// When the row was enqueued.
+        CreatedAt: DateTimeOffset
+        /// Whether the row was delivered and marked. A delivered row is
+        /// never claimed again.
+        Delivered: bool
+        /// When the row was marked delivered, or empty while pending.
+        DeliveredAt: Nullable<DateTimeOffset>
+        /// The owner holding the delivery lease, or null when the row is
+        /// unleased.
+        LeaseOwner: string | null
+        /// When the delivery lease expires, or empty when the row is
+        /// unleased.
+        LeaseExpiresAt: Nullable<DateTimeOffset>
+    }
+
+// ───────────────────────────────────────────────────────────────────────────
 // The store contract
 
 /// The durable store contract for sessions: session CRUD and list paging,
 /// the session inbox in front of the turn queue, turn claims under a
-/// lease, dispatch candidates, and the capacity count queries the
+/// lease, dispatch candidates, the completion outbox the re-drive service
+/// delivers, and the capacity count queries the
 /// dispatcher enforces per-agent, per-tenant, and per-process limits with.
-/// Every method takes the tenant the data belongs to and must not see or
-/// touch another tenant's rows (isolation is enforced here, not only in
-/// the host).
+/// Every tenant-scoped method takes the tenant the data belongs to and must
+/// not see or touch another tenant's rows (isolation is enforced here, not
+/// only in the host); the two process-wide scans
+/// (<see cref="M:Legate.ISessionStore.ClaimCompletionOutbox*" />,
+/// <see cref="M:Legate.ISessionStore.PurgeDeliveredCompletions*" />, and
+/// <see cref="M:Legate.ISessionStore.CountRunningSessions*" />) deliberately
+/// take no tenant because the background services driving them span every
+/// tenant the process serves.
 ///
 /// <para>Control-plane precondition failures throw
 /// <see cref="T:Legate.LegateException" /> subtypes: an unknown session id
@@ -320,7 +365,15 @@ type DispatchBatch =
 /// observation) and <b>CheckpointUsage</b> are atomic: the new expiry and
 /// the usage snapshot each land in one transaction.</description></item>
 /// <item><description><b>SettleTurn</b> is atomic: the outcome and the
-/// turn's terminal status land together or not at all.</description></item>
+/// terminal status land together or not at all.</description></item>
+/// <item><description><b>EnqueueCompletionOutbox</b> is atomic and
+/// idempotent by key: the row and its stamp become visible together, and
+/// a retry of the same key observes the first row.</description></item>
+/// <item><description><b>ClaimCompletionOutbox</b> is atomic: exactly one
+/// owner wins a row; a loser never observes the same row leased to
+/// itself.</description></item>
+/// <item><description><b>MarkCompletionDelivered</b> is atomic: the
+/// delivered flag and its stamp land together or not at all.</description></item>
 /// <item><description><b>UpdateSessionState</b> is atomic: the state
 /// change and its timestamp land together or not at all.</description></item>
 /// <item><description><b>GrantSessionTool</b> is atomic: the grant and its
@@ -334,7 +387,13 @@ type DispatchBatch =
 /// effect. A correlation id is evidence, not authority; only
 /// <see cref="T:Legate.TurnClaim" />.Token is. A stale token must never
 /// produce an effect: renew, checkpoint, settle, and abort return the
-/// lost/rejected outcomes instead of acting.</para>
+/// lost/rejected outcomes instead of acting. Completion delivery is fenced
+/// the same way on the outbox lease: the re-driver claims a row, verifies
+/// the lease owner at the last moment before
+/// <see cref="M:Legate.ISessionCompletionSink.Notify*" />, notifies, then
+/// marks delivered under the same owner; a stale owner notifies nothing
+/// and marks nothing, and an inline delivery overlapping a re-drive
+/// deduplicates on the shared idempotency key.</para>
 type ISessionStore =
 
     // ── Sessions ──
@@ -603,6 +662,84 @@ type ISessionStore =
     /// <exception cref="T:System.ArgumentNullException">The claim is null.</exception>
     abstract AbortTurn:
         tenant: TenantId * claim: TurnClaim * cancellationToken: CancellationToken -> Task<TurnLeaseState>
+
+    // ── Completion outbox ──
+
+    /// Enqueues one completion delivery at settlement: the row carries the
+    /// stable idempotency key the settlement minted, shared with the inline
+    /// fenced <c>Notify</c>. Atomic and idempotent by key: the row and its
+    /// stamp become visible together, and enqueueing the same key twice
+    /// observes the first row with zero further effects, so a settlement
+    /// retry never duplicates the delivery.
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="completion">The session's structured completion, carrying the idempotency key sinks deduplicate on. Must not be null and its key must be a non-empty string.</param>
+    /// <param name="cancellationToken">Token that abandons the enqueue.</param>
+    /// <returns>The stored row: pending, unleased, and stamped by the store.</returns>
+    /// <exception cref="T:System.ArgumentNullException">The completion is null.</exception>
+    /// <exception cref="T:System.ArgumentException">The completion's idempotency key is null, empty, or whitespace.</exception>
+    /// <exception cref="T:Legate.SessionNotFoundException">The session id does not exist in this tenant.</exception>
+    abstract EnqueueCompletionOutbox:
+        tenant: TenantId * completion: SessionCompletion * cancellationToken: CancellationToken ->
+            Task<CompletionOutboxEntry>
+
+    /// Claims pending completion rows under a delivery lease, oldest first,
+    /// bounded to one batch the re-driver may act on at once. Process-wide
+    /// across every tenant the process serves, like
+    /// <see cref="M:Legate.ISessionStore.CountRunningSessions*" />: the
+    /// re-drive service spans tenants. Atomic: exactly one owner wins a
+    /// row; delivered rows and rows leased to a live owner are never
+    /// returned. Bounded: the list holds at most the asked-for batch size.
+    /// <param name="owner">The delivery owner identity. Must not be null.</param>
+    /// <param name="maxBatch">The maximum number of rows in the batch; must be positive.</param>
+    /// <param name="leaseDuration">How long the delivery lease lasts before it expires.</param>
+    /// <param name="cancellationToken">Token that abandons the claim.</param>
+    /// <returns>The claimed rows, oldest first; empty when nothing is claimable.</returns>
+    /// <exception cref="T:System.ArgumentNullException">The owner is null.</exception>
+    /// <exception cref="T:System.ArgumentOutOfRangeException">The batch size is not positive or the lease duration is not positive.</exception>
+    abstract ClaimCompletionOutbox:
+        owner: string * maxBatch: int * leaseDuration: TimeSpan * cancellationToken: CancellationToken ->
+            Task<IReadOnlyList<CompletionOutboxEntry>>
+
+    /// Verifies a delivery lease without changing anything: the re-driver
+    /// fences its imminent <c>Notify</c> by checking the lease owner at the
+    /// last moment. Side-effect free: never mutates the lease. Fail-closed:
+    /// a missing row, a delivered row, an unleased row, or an owner or
+    /// expiry mismatch all read as false, so a fence that cannot prove
+    /// liveness denies the delivery.
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="idempotencyKey">The stable key minted at settlement. Must be a non-empty string.</param>
+    /// <param name="owner">The delivery owner identity. Must not be null.</param>
+    /// <param name="cancellationToken">Token that abandons the verification.</param>
+    /// <returns>True while the owner holds a live lease on a pending row.</returns>
+    /// <exception cref="T:System.ArgumentException">The idempotency key is null, empty, or whitespace.</exception>
+    /// <exception cref="T:System.ArgumentNullException">The owner is null.</exception>
+    abstract VerifyCompletionClaim:
+        tenant: TenantId * idempotencyKey: string * owner: string * cancellationToken: CancellationToken -> Task<bool>
+
+    /// Marks a claimed row delivered after its <c>Notify</c> ran. Fenced:
+    /// only the lease owner with a live lease may mark, and a stale owner
+    /// returns false with zero effects; marking an already-delivered row is
+    /// a no-op returning true. Atomic: the delivered flag and its stamp
+    /// land together.
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="idempotencyKey">The stable key minted at settlement. Must be a non-empty string.</param>
+    /// <param name="owner">The delivery owner identity. Must not be null.</param>
+    /// <param name="cancellationToken">Token that abandons the mark.</param>
+    /// <returns>True when the row is delivered (now or already), false when the lease was lost or the row is missing.</returns>
+    /// <exception cref="T:System.ArgumentException">The idempotency key is null, empty, or whitespace.</exception>
+    /// <exception cref="T:System.ArgumentNullException">The owner is null.</exception>
+    abstract MarkCompletionDelivered:
+        tenant: TenantId * idempotencyKey: string * owner: string * cancellationToken: CancellationToken -> Task<bool>
+
+    /// Purges delivered rows whose delivery stamp falls at or before the
+    /// cutoff, bounding outbox growth. Process-wide across every tenant the
+    /// process serves: retention is a storage janitor, not a tenant read.
+    /// Pending rows are never removed, however old.
+    /// <param name="deliveredBefore">Removes delivered rows stamped at or before this instant.</param>
+    /// <param name="cancellationToken">Token that abandons the purge.</param>
+    /// <returns>How many rows were removed.</returns>
+    abstract PurgeDeliveredCompletions:
+        deliveredBefore: DateTimeOffset * cancellationToken: CancellationToken -> Task<int>
 
     // ── Dispatch and capacity ──
 

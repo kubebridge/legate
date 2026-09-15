@@ -84,6 +84,7 @@ type LegateServiceCollectionExtensions =
         LegateDefaultRegistration.register services
         LegateStartupChecks.register services
         LocalActorSystemRegistration.register services
+        CompletionRedriverRegistration.register services
         services
 
 // ──────────────────────────────────────────────────────────────────────────

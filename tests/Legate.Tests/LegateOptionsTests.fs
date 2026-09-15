@@ -38,6 +38,12 @@ let ``Defaults validate to null and describe a single node`` () =
     options.Cluster.Mode |> should equal ClusterMode.Local
     options.Workspace.Mode |> should equal WorkspaceMode.Process
     options.Completion.MaxDeliveryAttempts |> should equal 3
+    options.Completion.RetryDelay |> should equal (TimeSpan.FromSeconds 30.0)
+    options.Completion.DeliveredRetention |> should equal (TimeSpan.FromDays 7.0)
+    options.Completion.RedriveInterval |> should equal (TimeSpan.FromSeconds 30.0)
+
+    options.Completion.ClaimLeaseDuration
+    |> should equal (TimeSpan.FromSeconds 60.0)
 
     options.Pruning.ReservedBufferTokens |> should equal 10_000
     options.Pruning.KeepLastAssistantTurns |> should equal 2
@@ -253,6 +259,15 @@ let ``Completion Validate flags attempts and negative delay`` () =
 
     CompletionOptions(RetryDelay = TimeSpan.FromSeconds(-1.0)).Validate()
     |> should equal "RetryDelay must not be negative."
+
+    CompletionOptions(DeliveredRetention = TimeSpan.Zero).Validate()
+    |> should equal "DeliveredRetention must be positive."
+
+    CompletionOptions(RedriveInterval = TimeSpan.Zero).Validate()
+    |> should equal "RedriveInterval must be positive."
+
+    CompletionOptions(ClaimLeaseDuration = TimeSpan.Zero).Validate()
+    |> should equal "ClaimLeaseDuration must be positive."
 
     CompletionOptions().Validate() |> should equal null
 

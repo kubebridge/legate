@@ -897,6 +897,72 @@ module internal SessionActor =
         awaitTask (props.Store.CloseSession(props.Tenant, props.SessionId, CancellationToken.None))
         |> ignore
 
+    // ────────────────── Completion outbox (issue 84) ──────────────────
+
+    /// Mints the stable idempotency key one settlement shares between its
+    /// outbox row and its inline Notify: random 32-hex per settlement, so
+    /// an inline delivery overlapping a re-drive deduplicates on the
+    /// receiver's Idempotency-Key.
+    /// <returns>A fresh stable key for one settlement.</returns>
+    let private mintCompletionKey () : string = Guid.NewGuid().ToString("N")
+
+    /// Enqueues the settlement's completion row and notifies the session's
+    /// sink inline with the same stored key, in the actor's settlement
+    /// step. Only sessions carrying a CompletionSink enqueue: sinkless
+    /// sessions notify nothing and store nothing. Best-effort and guarded:
+    /// a store failure skips the Notify (no key was shared, so the
+    /// re-drive has nothing to duplicate), a throwing sink never kills the
+    /// actor, and the actor-thread sequencing is the fence: this actor
+    /// holds no TurnClaim, so ClaimFence.notifyIfLiveAsync has nothing to
+    /// verify, and the re-drive deduplicates on the shared key.
+    /// <param name="props">The session actor dependencies.</param>
+    /// <param name="result">The settled turn result to deliver.</param>
+    /// <returns>The delivered completion, or None when sinkless or best-effort failed.</returns>
+    let private dispatchCompletion (props: SessionActorProps) (result: TurnResult) : SessionCompletion option =
+        try
+            if isNull (box result) then
+                None
+            else
+                match awaitTask (props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None)) with
+                | null -> None
+                | session when isNull (box session.Options) -> None
+                | session ->
+                    match session.Options.CompletionSink with
+                    | null -> None
+                    | sink ->
+                        let completion =
+                            {
+                                SessionId = props.SessionId
+                                TurnResult = result
+                                Metadata = session.Options.Metadata
+                                IdempotencyKey = mintCompletionKey ()
+                            }
+
+                        let stored =
+                            try
+                                awaitTask (
+                                    props.Store.EnqueueCompletionOutbox(
+                                        props.Tenant,
+                                        completion,
+                                        CancellationToken.None
+                                    )
+                                )
+                                |> Some
+                            with _ ->
+                                None
+
+                        match stored with
+                        | None -> None
+                        | Some row ->
+                            try
+                                sink.Notify(row.Completion)
+                            with _ ->
+                                ()
+
+                            Some row.Completion
+        with _ ->
+            None
+
     /// The session actor: recovers from the store, then owns the state
     /// machine. The mailbox parameter is injected by the spawn functions;
     /// one message is processed fully before the next is received, so the
@@ -1287,6 +1353,7 @@ module internal SessionActor =
                             // Settlement wins: the carried result stands.
                             inFlight.Cts.Dispose()
                             notifySettled result
+                            dispatchCompletion props result |> ignore
 
                             if result.Status = TurnStatus.Completed && autoCloseEnabled props then
                                 // AutoClose (issue 82): the first Completed
@@ -1307,7 +1374,9 @@ module internal SessionActor =
 
                             let reason = pendingStop |> Option.map snd |> Option.defaultValue ""
 
-                            notifySettled (mapAborted cause reason result)
+                            let settled = mapAborted cause reason result
+                            notifySettled settled
+                            dispatchCompletion props settled |> ignore
                             let nextState, nextRunning = settle entry CancellationToken.None
                             return! loop nextState nextRunning StopArbitration.Undecided None
                         | StopArbitration.Decided StopArbitration.SettlementWins ->
@@ -2085,6 +2154,7 @@ module internal SessionActor =
                 }
 
             notifySettled result
+            dispatchCompletion props result |> ignore
 
             let positions = [| entry.Position |] :> IReadOnlyList<int64>
 
@@ -2414,6 +2484,7 @@ module internal SessionActor =
                             |> ignore
 
                             notifySettled completion.Result
+                            dispatchCompletion props completion.Result |> ignore
 
                             if completion.Result.Status = TurnStatus.Completed && autoCloseEnabled props then
                                 // AutoClose (issue 82): the first Completed
@@ -2746,6 +2817,7 @@ module internal SessionActor =
 
                             let result = timeoutResult ()
                             notifySettled result
+                            dispatchCompletion props result |> ignore
 
                             let positions = [| parked.Entry.Position |] :> IReadOnlyList<int64>
 
