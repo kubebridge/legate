@@ -33,9 +33,11 @@
     <Compile Include="LegateOptionsBinding.fs" />
     <Compile Include="LegateDefaults.fs" />
     <Compile Include="LegateStartupValidation.fs" />
+    <Compile Include="PromptWaitHub.fs" />
     <Compile Include="SessionActor.fs" />
     <Compile Include="SessionPermissions.fs" />
     <Compile Include="LocalActorSystem.fs" />
+    <Compile Include="SessionClient.fs" />
     <Compile Include="Agents/AgentFileParser.fs" />
     <Compile Include="Agents/SubAgents.fs" />
     <Compile Include="TaskTool.fs" />

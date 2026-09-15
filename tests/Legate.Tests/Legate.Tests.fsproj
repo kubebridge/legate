@@ -96,6 +96,8 @@
     <Compile Include="CustomToolFunctionTests.fs" />
     <Compile Include="CustomToolSourceTests.fs" />
     <Compile Include="WebhookCompletionSinkTests.fs" />
+    <Compile Include="PromptWaitHubTests.fs" />
+    <Compile Include="PromptAndWaitTests.fs" />
   </ItemGroup>
 
   <ItemGroup>

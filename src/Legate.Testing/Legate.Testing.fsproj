@@ -8,6 +8,7 @@
 
   <!-- Compile order is explicit: register every new file here, in dependency order. -->
   <ItemGroup>
+    <Compile Include="AssemblyInfo.fs" />
     <Compile Include="TestClock.fs" />
     <Compile Include="FakeClock.fs" />
     <Compile Include="SeamFakes.fs" />
