@@ -24,6 +24,7 @@
     <Compile Include="StopArbitration.fs" />
     <Compile Include="WorkspaceLayout.fs" />
     <Compile Include="DownloadUrlTool.fs" />
+    <Compile Include="SsrfGuard.fs" />
     <Compile Include="TurnLoop.fs" />
     <Compile Include="AskUserTool.fs" />
     <Compile Include="SkillTool.fs" />

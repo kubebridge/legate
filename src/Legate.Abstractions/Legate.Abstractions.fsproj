@@ -34,6 +34,7 @@
     <Compile Include="SessionEventStore.fs" />
     <Compile Include="AgentStore.fs" />
     <Compile Include="AgentPackages.fs" />
+    <Compile Include="SsrfGuard.fs" />
   </ItemGroup>
 
   <ItemGroup>
