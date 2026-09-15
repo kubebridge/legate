@@ -435,3 +435,119 @@ type SessionStoreConformance(store: ISessionStore, clock: TestClock, tenant: Ten
             | null -> failwith "expected the session"
             | session -> Assert.Empty(session.PermissionGrants)
         }
+
+    // ── Completion outbox (issue 84) ──
+
+    /// Builds a completion carrying the key, the shape settlement enqueues.
+    member this.SampleCompletion(sessionId: SessionId, idempotencyKey: string) =
+        {
+            SessionId = sessionId
+            TurnResult =
+                {
+                    AssistantText = "done"
+                    Status = TurnStatus.Completed
+                    Iterations = 1
+                    Usage = { InputTokens = 1L; OutputTokens = 2L }
+                    Outcome = null
+                }
+            Metadata = null
+            IdempotencyKey = idempotencyKey
+        }
+
+    [<Fact>]
+    member this.``EnqueueCompletionOutbox is idempotent and claimable under a lease``() =
+        task {
+            let! created = store.CreateSession(tenant, this.SampleSession(), CancellationToken.None)
+
+            let! first =
+                store.EnqueueCompletionOutbox(
+                    tenant,
+                    this.SampleCompletion(created.Id, "key-1"),
+                    CancellationToken.None
+                )
+
+            Assert.False(first.Delivered)
+
+            let! retry =
+                store.EnqueueCompletionOutbox(
+                    tenant,
+                    this.SampleCompletion(created.Id, "key-1"),
+                    CancellationToken.None
+                )
+
+            Assert.Equal(first.CreatedAt, retry.CreatedAt)
+
+            let! claimed = store.ClaimCompletionOutbox("owner-a", 10, TimeSpan.FromMinutes 5., CancellationToken.None)
+
+            Assert.Single(claimed) |> ignore
+
+            let! live = store.VerifyCompletionClaim(tenant, "key-1", "owner-a", CancellationToken.None)
+            Assert.True(live)
+
+            let! marked = store.MarkCompletionDelivered(tenant, "key-1", "owner-a", CancellationToken.None)
+            Assert.True(marked)
+
+            let! again = store.ClaimCompletionOutbox("owner-b", 10, TimeSpan.FromMinutes 5., CancellationToken.None)
+
+            Assert.Empty(again)
+        }
+
+    [<Fact>]
+    member this.``A stale outbox owner marks nothing: the retake winner owns the row``() =
+        task {
+            let! created = store.CreateSession(tenant, this.SampleSession(), CancellationToken.None)
+
+            let! _ =
+                store.EnqueueCompletionOutbox(
+                    tenant,
+                    this.SampleCompletion(created.Id, "key-1"),
+                    CancellationToken.None
+                )
+
+            let! _ = store.ClaimCompletionOutbox("owner-a", 10, TimeSpan.FromMinutes 5., CancellationToken.None)
+
+            this.Clock.Advance(TimeSpan.FromMinutes 6.)
+
+            let! stale = store.MarkCompletionDelivered(tenant, "key-1", "owner-a", CancellationToken.None)
+            Assert.False(stale)
+
+            let! retaken = store.ClaimCompletionOutbox("owner-b", 10, TimeSpan.FromMinutes 5., CancellationToken.None)
+
+            Assert.Single(retaken) |> ignore
+
+            let! winner = store.MarkCompletionDelivered(tenant, "key-1", "owner-b", CancellationToken.None)
+            Assert.True(winner)
+        }
+
+    [<Fact>]
+    member this.``PurgeDeliveredCompletions keeps pending rows and recent deliveries``() =
+        task {
+            let! created = store.CreateSession(tenant, this.SampleSession(), CancellationToken.None)
+
+            let! _ =
+                store.EnqueueCompletionOutbox(tenant, this.SampleCompletion(created.Id, "old"), CancellationToken.None)
+
+            this.Clock.Advance(TimeSpan.FromSeconds 1.)
+
+            let! _ = store.ClaimCompletionOutbox("owner-a", 10, TimeSpan.FromHours 1., CancellationToken.None)
+            let! _ = store.MarkCompletionDelivered(tenant, "old", "owner-a", CancellationToken.None)
+
+            let! _ =
+                store.EnqueueCompletionOutbox(
+                    tenant,
+                    this.SampleCompletion(created.Id, "pending"),
+                    CancellationToken.None
+                )
+
+            this.Clock.Advance(TimeSpan.FromDays 8.)
+
+            let cutoff = this.Clock.Instant - TimeSpan.FromDays 7.
+            let! purged = store.PurgeDeliveredCompletions(cutoff, CancellationToken.None)
+
+            Assert.Equal(1, purged)
+
+            let! pending = store.ClaimCompletionOutbox("owner-b", 10, TimeSpan.FromMinutes 5., CancellationToken.None)
+
+            Assert.Single(pending) |> ignore
+            Assert.Equal("pending", pending |> Seq.head |> (fun row -> row.IdempotencyKey))
+        }

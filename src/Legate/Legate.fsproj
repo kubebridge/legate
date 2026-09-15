@@ -46,6 +46,7 @@
     <Compile Include="CustomTools/CustomToolFunction.fs" />
     <Compile Include="CustomTools/CustomToolSource.fs" />
     <Compile Include="WebhookCompletionSink.fs" />
+    <Compile Include="CompletionRedriver.fs" />
     <Compile Include="LegateBuilder.fs" />
     <Compile Include="Agents/FileAgentStore.fs" />
     <Compile Include="AddLegate.fs" />

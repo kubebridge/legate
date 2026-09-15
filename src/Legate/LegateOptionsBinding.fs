@@ -29,6 +29,9 @@ module internal LegateOptionsBinding =
             "Llm:Coordination:RateLimitCooldown"
             "Workspace:IdleTeardownAfter"
             "Completion:RetryDelay"
+            "Completion:DeliveredRetention"
+            "Completion:RedriveInterval"
+            "Completion:ClaimLeaseDuration"
             "Cluster:ShutdownGraceSeconds"
         ]
 

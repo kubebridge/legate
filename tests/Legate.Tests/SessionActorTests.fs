@@ -2999,3 +2999,93 @@ let ``AutoClose closes a suspendable session after its first Completed turn`` ()
         (pendingOf store created.Id).Count |> should equal 0
     finally
         stopSystem system
+
+// ──────────────────────────────────────────────────────────────────────────
+// Completion outbox (issue 84)
+
+/// Recording completion sink: keeps every Notify payload in call order.
+type FakeCompletionSink() =
+    let completions = ResizeArray<SessionCompletion>()
+
+    interface ISessionCompletionSink with
+        member _.Notify(completion: SessionCompletion) = completions.Add(completion)
+
+    /// Every Notify payload, in call order.
+    member _.Completions: IReadOnlyList<SessionCompletion> =
+        completions :> IReadOnlyList<SessionCompletion>
+
+/// Creates a session row carrying the completion sink, mirroring
+/// createAutoCloseSession.
+let private createSinkSession (store: ISessionStore) (sink: ISessionCompletionSink) : Session =
+    let options = SessionOptions(CompletionSink = sink)
+
+    let template = sampleSession ()
+    let session = { template with Options = options }
+
+    store.CreateSession(tenant, session, CancellationToken.None).GetAwaiter().GetResult()
+
+[<Fact>]
+let ``Settlement writes the outbox row in the same step under the shared inline key`` () =
+    use system = createSystem ()
+    let store = createStore ()
+    let sink = FakeCompletionSink()
+    let created = createSinkSession store (sink :> ISessionCompletionSink)
+    let runner = ScriptedRunner([ "hello" ])
+    let session = spawnSession system store created.Id runner.Func
+
+    try
+        prompt store created.Id session "hello" |> ignore
+
+        let settled =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () -> (snapshotOf session).State = SessionState.Idle)
+
+        settled |> should equal true
+
+        // The settlement step consumed the entry, stored the outbox row,
+        // and notified inline together: no intermediate state is
+        // observable afterwards.
+        (pendingOf store created.Id).Count |> should equal 0
+        sink.Completions.Count |> should equal 1
+
+        let rows =
+            store
+                .ClaimCompletionOutbox("probe", 10, TimeSpan.FromMinutes 5., CancellationToken.None)
+                .GetAwaiter()
+                .GetResult()
+
+        rows.Count |> should equal 1
+        rows[0].IdempotencyKey |> should equal sink.Completions[0].IdempotencyKey
+        rows[0].Completion.TurnResult.Status |> should equal TurnStatus.Completed
+        rows[0].Delivered |> should equal false
+
+        let delivered = sink.Completions[0]
+        delivered.SessionId |> should equal created.Id
+        String.IsNullOrWhiteSpace(delivered.IdempotencyKey) |> should equal false
+    finally
+        stopSystem system
+
+[<Fact>]
+let ``Settlement without a sink stores no outbox row`` () =
+    use system = createSystem ()
+    let store = createStore ()
+    let created = createSession store
+    let runner = ScriptedRunner([ "hello" ])
+    let session = spawnSession system store created.Id runner.Func
+
+    try
+        prompt store created.Id session "hello" |> ignore
+
+        let settled =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () -> (snapshotOf session).State = SessionState.Idle)
+
+        settled |> should equal true
+
+        let rows =
+            store
+                .ClaimCompletionOutbox("probe", 10, TimeSpan.FromMinutes 5., CancellationToken.None)
+                .GetAwaiter()
+                .GetResult()
+
+        rows.Count |> should equal 0
+    finally
+        stopSystem system

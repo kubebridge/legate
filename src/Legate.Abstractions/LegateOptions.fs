@@ -438,10 +438,14 @@ type WorkspaceSectionOptions() =
         else
             Array.head violations
 
-/// Headless completion delivery: how many attempts a completion gets and
-/// how long the runtime waits between them. Bound from the <c>Legate</c>
+/// Headless completion delivery: how many attempts a completion gets,
+/// how long the runtime waits between them, how long delivered outbox rows
+/// are retained for idempotency before the purge removes them, and how the
+/// re-drive service polls and leases. Bound from the <c>Legate</c>
 /// configuration section; mutable so hosts can set properties before
-/// registering. Defaults deliver 3 attempts with a 30 s retry delay.
+/// registering. Defaults deliver 3 attempts with a 30 s retry delay, retain
+/// delivered rows for 7 days, re-drive every 30 s, and lease deliveries for
+/// 60 s.
 type CompletionOptions() =
 
     /// The delivery attempts a headless completion gets. Default 3.
@@ -449,6 +453,21 @@ type CompletionOptions() =
 
     /// How long the runtime waits between delivery attempts. Default 30 s.
     member val RetryDelay: TimeSpan = TimeSpan.FromSeconds 30.0 with get, set
+
+    /// How long a delivered outbox row is retained for idempotency before
+    /// the re-drive purge removes it. Default 7 days: covers weekend-long
+    /// outages and crash recovery with bounded storage. Pending rows are
+    /// never purged, however old.
+    member val DeliveredRetention: TimeSpan = TimeSpan.FromDays 7.0 with get, set
+
+    /// How often the re-drive service polls the outbox for pending rows.
+    /// Default 30 s, the <see cref="P:Legate.CompletionOptions.RetryDelay" />
+    /// cadence.
+    member val RedriveInterval: TimeSpan = TimeSpan.FromSeconds 30.0 with get, set
+
+    /// How long a re-drive delivery lease lasts before it expires and
+    /// another owner may claim the row. Default 60 s.
+    member val ClaimLeaseDuration: TimeSpan = TimeSpan.FromSeconds 60.0 with get, set
 
     /// Returns null when every knob is in range, otherwise a message for the
     /// first violation.
@@ -460,6 +479,12 @@ type CompletionOptions() =
                     "MaxDeliveryAttempts must be at least 1."
                 if this.RetryDelay < TimeSpan.Zero then
                     "RetryDelay must not be negative."
+                if this.DeliveredRetention <= TimeSpan.Zero then
+                    "DeliveredRetention must be positive."
+                if this.RedriveInterval <= TimeSpan.Zero then
+                    "RedriveInterval must be positive."
+                if this.ClaimLeaseDuration <= TimeSpan.Zero then
+                    "ClaimLeaseDuration must be positive."
             |]
 
         if violations.Length = 0 then

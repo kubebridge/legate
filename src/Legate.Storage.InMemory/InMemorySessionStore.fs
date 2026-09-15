@@ -127,6 +127,20 @@ type InMemorySessionStore(database: InMemoryDatabase) =
         database.CurrentTurnIds.Remove((tenant, sessionId)) |> ignore
         stampCurrentTurn tenant sessionId None
 
+    /// Projects a stored outbox row to its contract entry.
+    let outboxEntry (row: OutboxRow) : CompletionOutboxEntry =
+        {
+            Tenant = row.Tenant
+            SessionId = row.Completion.SessionId
+            IdempotencyKey = row.Completion.IdempotencyKey
+            Completion = row.Completion
+            CreatedAt = row.CreatedAt
+            Delivered = row.Delivered
+            DeliveredAt = row.DeliveredAt
+            LeaseOwner = row.LeaseOwner
+            LeaseExpiresAt = row.LeaseExpiresAt
+        }
+
     interface ISessionStore with
 
         member _.CreateSession(tenant, session, _) =
@@ -608,6 +622,116 @@ type InMemorySessionStore(database: InMemoryDatabase) =
                     TurnLeaseHeld live :> TurnLeaseState
                 | Choice2Of3() -> TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState
                 | Choice3Of3() -> TurnLeaseMissing claim.TurnId :> TurnLeaseState)
+            |> ok
+
+        member _.EnqueueCompletionOutbox(tenant, completion, _) =
+            if isNull (box completion) then
+                raise (ArgumentNullException(nameof completion))
+
+            if String.IsNullOrWhiteSpace completion.IdempotencyKey then
+                raise (
+                    ArgumentException("The completion's idempotency key must be a non-empty string.", nameof completion)
+                )
+
+            lock database.Gate (fun () ->
+                requireSession tenant completion.SessionId |> ignore
+
+                match database.Outbox.TryGetValue((tenant, completion.IdempotencyKey)) with
+                | true, row -> outboxEntry row
+                | false, _ ->
+                    let row = OutboxRow(tenant, completion, database.UtcNow)
+                    database.Outbox[(tenant, completion.IdempotencyKey)] <- row
+                    outboxEntry row)
+            |> ok
+
+        member _.ClaimCompletionOutbox(owner, maxBatch, leaseDuration, _) =
+            if isNull (box owner) then
+                raise (ArgumentNullException(nameof owner))
+
+            if maxBatch <= 0 then
+                raise (ArgumentOutOfRangeException(nameof maxBatch, "The batch size must be positive."))
+
+            if leaseDuration <= TimeSpan.Zero then
+                raise (ArgumentOutOfRangeException(nameof leaseDuration, "The lease duration must be positive."))
+
+            lock database.Gate (fun () ->
+                let now = database.UtcNow
+
+                database.Outbox.Values
+                |> Seq.filter (fun row -> not row.Delivered)
+                |> Seq.filter (fun row ->
+                    isNull (box row.LeaseOwner)
+                    || not row.LeaseExpiresAt.HasValue
+                    || row.LeaseExpiresAt.Value <= now)
+                |> Seq.sortBy (fun row -> row.CreatedAt)
+                |> Seq.truncate maxBatch
+                |> Seq.map (fun row ->
+                    row.LeaseOwner <- owner
+                    row.LeaseExpiresAt <- Nullable(now + leaseDuration)
+                    outboxEntry row)
+                |> Seq.toList
+                :> IReadOnlyList<CompletionOutboxEntry>)
+            |> ok
+
+        member _.VerifyCompletionClaim(tenant, idempotencyKey, owner, _) =
+            if String.IsNullOrWhiteSpace idempotencyKey then
+                raise (ArgumentException("The idempotency key must be a non-empty string.", nameof idempotencyKey))
+
+            if isNull (box owner) then
+                raise (ArgumentNullException(nameof owner))
+
+            lock database.Gate (fun () ->
+                match database.Outbox.TryGetValue((tenant, idempotencyKey)) with
+                | false, _ -> false
+                | true, row ->
+                    not row.Delivered
+                    && not (isNull (box row.LeaseOwner))
+                    && String.Equals(row.LeaseOwner, owner, StringComparison.Ordinal)
+                    && row.LeaseExpiresAt.HasValue
+                    && row.LeaseExpiresAt.Value > database.UtcNow)
+            |> ok
+
+        member _.MarkCompletionDelivered(tenant, idempotencyKey, owner, _) =
+            if String.IsNullOrWhiteSpace idempotencyKey then
+                raise (ArgumentException("The idempotency key must be a non-empty string.", nameof idempotencyKey))
+
+            if isNull (box owner) then
+                raise (ArgumentNullException(nameof owner))
+
+            lock database.Gate (fun () ->
+                match database.Outbox.TryGetValue((tenant, idempotencyKey)) with
+                | false, _ -> false
+                | true, row when row.Delivered -> true
+                | true, row ->
+                    if isNull (box row.LeaseOwner) then
+                        false
+                    elif not (String.Equals(row.LeaseOwner, owner, StringComparison.Ordinal)) then
+                        false
+                    elif not row.LeaseExpiresAt.HasValue || row.LeaseExpiresAt.Value <= database.UtcNow then
+                        false
+                    else
+                        row.Delivered <- true
+                        row.DeliveredAt <- Nullable(database.UtcNow)
+                        row.LeaseOwner <- Unchecked.defaultof<string>
+                        row.LeaseExpiresAt <- Nullable()
+                        true)
+            |> ok
+
+        member _.PurgeDeliveredCompletions(deliveredBefore, _) =
+            lock database.Gate (fun () ->
+                let victims =
+                    database.Outbox
+                    |> Seq.filter (fun pair ->
+                        pair.Value.Delivered
+                        && pair.Value.DeliveredAt.HasValue
+                        && pair.Value.DeliveredAt.Value <= deliveredBefore)
+                    |> Seq.map (fun pair -> pair.Key)
+                    |> Seq.toList
+
+                for key in victims do
+                    database.Outbox.Remove(key) |> ignore
+
+                victims.Length)
             |> ok
 
         member _.GetDispatchCandidates(tenant, maxBatch, _) =
