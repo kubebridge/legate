@@ -404,6 +404,54 @@ type ClusterOptions() =
 // ──────────────────────────────────────────────────────────────────────────
 // Root
 
+/// Context-pruning settings: how much of the model's context window pruning
+/// holds back beyond the reserved output, how many recent assistant turns
+/// pruning never touches, and the marker pruning writes into replaced tool
+/// results. Bound from the <c>Legate</c> configuration section; mutable so
+/// hosts can set properties before registering. Defaults reserve 10,000
+/// tokens of buffer and protect the last 2 assistant turns.
+type ContextPruningOptions() =
+
+    /// The marker text pruning writes into an eligible tool-result cell's
+    /// content. Hosts can filter on this single detectable constant.
+    static member DefaultPrunedMarker = "[legate-pruned-tool-result]"
+
+    /// The tokens pruning holds back beyond the model's reserved output
+    /// when deriving the prune threshold from the catalog entry. Default
+    /// 10,000.
+    member val ReservedBufferTokens: int = 10_000 with get, set
+
+    /// How many of the most recent assistant turns pruning never touches.
+    /// A turn counts as recent when its assistant cell is among the last
+    /// this many assistant cells in transcript order. Default 2.
+    member val KeepLastAssistantTurns: int = 2 with get, set
+
+    /// The replacement text pruning writes into an eligible tool-result
+    /// cell. Default <see cref="P:Legate.ContextPruningOptions.DefaultPrunedMarker" />.
+    member val PrunedMarker: string = ContextPruningOptions.DefaultPrunedMarker with get, set
+
+    /// Returns null when every knob is in range, otherwise a message for the
+    /// first violation.
+    /// <returns>The first violation's message, or null when the settings are valid.</returns>
+    member this.Validate() : string | null =
+        let violations =
+            [|
+                if this.ReservedBufferTokens < 0 then
+                    "ReservedBufferTokens must be at least 0."
+                if this.KeepLastAssistantTurns < 0 then
+                    "KeepLastAssistantTurns must be at least 0."
+                if String.IsNullOrWhiteSpace this.PrunedMarker then
+                    "PrunedMarker must be a non-empty string."
+            |]
+
+        if violations.Length = 0 then
+            null
+        else
+            Array.head violations
+
+// ──────────────────────────────────────────────────────────────────────────
+// Root
+
 /// The Legate configuration root, bound from the <c>Legate</c>
 /// configuration section. Hosts set section properties before registering;
 /// the binder validates the composite and throws on the first violation.
@@ -432,6 +480,9 @@ type LegateOptions() =
     /// Cluster settings. Never null.
     member val Cluster: ClusterOptions = ClusterOptions() with get, set
 
+    /// Context-pruning settings. Never null.
+    member val Pruning: ContextPruningOptions = ContextPruningOptions() with get, set
+
     /// Returns null when every section is in range, otherwise the first
     /// violation prefixed with its section path.
     /// <returns>The first violation's message, or null when the settings are valid.</returns>
@@ -450,6 +501,8 @@ type LegateOptions() =
             "Completion must not be null."
         elif isNull (box this.Cluster) then
             "Cluster must not be null."
+        elif isNull (box this.Pruning) then
+            "Pruning must not be null."
         else
             let sections: (string * (unit -> string | null)) list =
                 [
@@ -460,6 +513,7 @@ type LegateOptions() =
                     "Workspace", (fun () -> this.Workspace.Validate())
                     "Completion", (fun () -> this.Completion.Validate())
                     "Cluster", (fun () -> this.Cluster.Validate())
+                    "Pruning", (fun () -> this.Pruning.Validate())
                 ]
 
             let mutable violation: string | null = null
