@@ -424,3 +424,216 @@ let ``AddLegate without file layers keeps the backing registration`` () =
     let store = provider.GetRequiredService<IAgentStore>()
 
     store |> should equal backing
+
+// ──────────────────────────────────────────────────────────────────────────
+// Tools allowlist mapping
+
+/// Reads the single agent in the directory store.
+let private singleAgent (store: IAgentStore) : Agent =
+    let agents =
+        store.ListAgents(TenantId.Default, CancellationToken.None).GetAwaiter().GetResult()
+
+    agents.Count |> should equal 1
+    agents[0]
+
+/// The built-in names of one agent's tool selection; empty reads as none
+/// (the absent-tools null default and an empty list both surface here, so
+/// null-default assertions use the selection itself).
+let private builtInsOf (agent: Agent) : string list =
+    match agent.ToolSelection with
+    | null -> []
+    | selection -> selection.BuiltIns |> Seq.toList
+
+[<Fact>]
+let ``Tools allowlist maps to ToolSelection BuiltIns`` () =
+    let dir = freshDir ()
+
+    try
+        writeAgent dir "agent.md" "---\nname: helper\ntools:\n  - read_file\n  - glob\n---\nPrompt.\n"
+        |> ignore
+
+        let store = composite (InMemoryDatabase()) [ dir ] []
+        let agent = singleAgent store
+
+        builtInsOf agent |> should equal [ "read_file"; "glob" ]
+    finally
+        Directory.Delete(dir, true)
+
+[<Fact>]
+let ``Absent tools map to the null runtime default`` () =
+    let dir = freshDir ()
+
+    try
+        writeAgent dir "agent.md" "---\nname: helper\n---\nPrompt.\n" |> ignore
+
+        let store = composite (InMemoryDatabase()) [ dir ] []
+        let agent = singleAgent store
+
+        isNull (box agent.ToolSelection) |> should equal true
+    finally
+        Directory.Delete(dir, true)
+
+[<Fact>]
+let ``Later files win the tools allowlist`` () =
+    let dir = freshDir ()
+
+    try
+        writeAgent dir "a-first.md" "---\nname: shared\ntools: [read_file]\n---\nFirst.\n"
+        |> ignore
+
+        writeAgent dir "b-second.md" "---\nname: shared\ntools:\n  - glob\n  - grep\n---\nSecond.\n"
+        |> ignore
+
+        let store = composite (InMemoryDatabase()) [ dir ] []
+        let agent = singleAgent store
+
+        agent.SystemPrompt |> should equal "Second.\n"
+        builtInsOf agent |> should equal [ "glob"; "grep" ]
+    finally
+        Directory.Delete(dir, true)
+
+[<Fact>]
+let ``Code entries win the tools allowlist`` () =
+    let dir = freshDir ()
+
+    try
+        writeAgent dir "shared.md" "---\nname: shared\ntools: [read_file]\n---\nDirectory.\n"
+        |> ignore
+
+        let coded =
+            { codeAgent "shared" "Code." with
+                ToolSelection =
+                    let selection = ToolSelection()
+                    selection.BuiltIns <- ResizeArray<string>([| "grep" |]) :> IReadOnlyList<string>
+                    selection.ToolSources <- ResizeArray<string>() :> IReadOnlyList<string>
+                    selection
+            }
+
+        let store = composite (InMemoryDatabase()) [ dir ] [ coded ]
+        let agent = singleAgent store
+
+        agent.SystemPrompt |> should equal "Code."
+        builtInsOf agent |> should equal [ "grep" ]
+    finally
+        Directory.Delete(dir, true)
+
+// ──────────────────────────────────────────────────────────────────────────
+// Diagnostics
+
+[<Fact>]
+let ``Valid definitions carry no diagnostics`` () =
+    let dir = freshDir ()
+
+    try
+        writeAgent dir "agent.md" "---\nname: helper\ndescription: Helps out\ntools: [read_file]\n---\nPrompt.\n"
+        |> ignore
+
+        let store = composite (InMemoryDatabase()) [ dir ] []
+
+        let fileStore = store :?> FileAgentStore
+
+        let events =
+            fileStore.ListDiagnostics(SessionId.New(), TurnId.New(), DateTimeOffset.UtcNow)
+
+        events.Count |> should equal 0
+    finally
+        Directory.Delete(dir, true)
+
+[<Fact>]
+let ``Missing description emits one diagnostic and keeps the agent`` () =
+    let dir = freshDir ()
+
+    try
+        writeAgent dir "agent.md" "---\nname: helper\ntools: [read_file]\n---\nPrompt.\n"
+        |> ignore
+
+        let store = composite (InMemoryDatabase()) [ dir ] []
+
+        let fileStore = store :?> FileAgentStore
+        let sessionId = SessionId.New()
+        let turnId = TurnId.New()
+        let stamp = DateTimeOffset.UtcNow
+        let events = fileStore.ListDiagnostics(sessionId, turnId, stamp)
+
+        events.Count |> should equal 1
+
+        let flagged = events[0] :?> AgentInvalidEvent
+        flagged.AgentName |> should equal "helper"
+        flagged.SessionId |> should equal sessionId
+        flagged.TurnId |> should equal turnId
+        flagged.Timestamp |> should equal stamp
+
+        let agent = singleAgent store
+        agent.Name |> should equal "helper"
+    finally
+        Directory.Delete(dir, true)
+
+[<Fact>]
+let ``Unknown tools emit one diagnostic and keep the agent`` () =
+    let dir = freshDir ()
+
+    try
+        writeAgent
+            dir
+            "agent.md"
+            "---\nname: helper\ndescription: Helps out\ntools: [read_file, turbo_laser]\n---\nPrompt.\n"
+        |> ignore
+
+        let store = composite (InMemoryDatabase()) [ dir ] []
+
+        let fileStore = store :?> FileAgentStore
+
+        let events =
+            fileStore.ListDiagnostics(SessionId.New(), TurnId.New(), DateTimeOffset.UtcNow)
+
+        events.Count |> should equal 1
+
+        let flagged = events[0] :?> AgentInvalidEvent
+        flagged.AgentName |> should equal "helper"
+        flagged.Reason.Contains("turbo_laser") |> should equal true
+
+        let agent = singleAgent store
+        builtInsOf agent |> should equal [ "read_file"; "turbo_laser" ]
+    finally
+        Directory.Delete(dir, true)
+
+[<Fact>]
+let ``Diagnostics run over the merge winner only`` () =
+    let dir = freshDir ()
+
+    try
+        writeAgent dir "a-first.md" "---\nname: shared\ntools: [turbo_laser]\n---\nFirst.\n"
+        |> ignore
+
+        writeAgent dir "b-second.md" "---\nname: shared\ndescription: Winner\ntools: [read_file]\n---\nSecond.\n"
+        |> ignore
+
+        let store = composite (InMemoryDatabase()) [ dir ] []
+
+        let fileStore = store :?> FileAgentStore
+
+        let events =
+            fileStore.ListDiagnostics(SessionId.New(), TurnId.New(), DateTimeOffset.UtcNow)
+
+        events.Count |> should equal 0
+    finally
+        Directory.Delete(dir, true)
+
+[<Fact>]
+let ``Bad YAML stays fatal instead of a diagnostic`` () : Task =
+    task {
+        let dir = freshDir ()
+
+        try
+            writeAgent dir "broken.md" "---\nname: [unclosed\n---\nBody\n" |> ignore
+
+            let store = composite (InMemoryDatabase()) [ dir ] []
+
+            let! _ =
+                Assert.ThrowsAsync<InvalidOperationException>(fun () ->
+                    store.ListAgents(TenantId.Default, CancellationToken.None))
+
+            return ()
+        finally
+            Directory.Delete(dir, true)
+    }

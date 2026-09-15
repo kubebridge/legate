@@ -270,9 +270,9 @@ type AgentsBuilder internal (services: IServiceCollection) as this =
 
     /// Registers a directory of agent definition files (`.agent/agents`
     /// for CLI hosts): every top-level `*.md` file contributes one agent
-    /// whose frontmatter (`name`, `description`, `model`, `enabled`) plus
-    /// body-as-system-prompt merge over the backing store with later files
-    /// winning in sorted file order. The directory is re-read on every
+    /// whose frontmatter (`name`, `description`, `model`, `tools`,
+    /// `enabled`) plus body-as-system-prompt merge over the backing store
+    /// with later files winning in sorted file order. The directory is re-read on every
     /// store read, so disk changes apply on the next open with no watcher;
     /// a missing directory reads as empty. Writes always throw
     /// <see cref="T:Legate.ReadOnlyAgentStoreException" />.

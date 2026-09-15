@@ -57,7 +57,9 @@ type internal FileAgentStore
             []
 
     /// Builds the stored agent for one parsed definition, reusing the
-    /// name's stable id across reloads.
+    /// name's stable id across reloads. The definition's allowlist maps
+    /// through SubAgents.toToolSelection: absent means the runtime default,
+    /// present names travel verbatim (unknown names diagnose, never fail).
     /// <param name="tenant">The tenant the agent is served under.</param>
     /// <param name="definition">The parsed file definition.</param>
     /// <param name="stamp">The file's last-write stamp.</param>
@@ -80,7 +82,7 @@ type internal FileAgentStore
             SystemPrompt = definition.SystemPrompt
             EnvironmentVariables = null
             PermissionDefaults = null
-            ToolSelection = null
+            ToolSelection = SubAgents.toToolSelection definition.Tools
             PackageReference = null
             Enabled = definition.Enabled
             Schedule = null
@@ -116,6 +118,35 @@ type internal FileAgentStore
 
             return merged.Values |> Seq.sortBy (fun agent -> agent.Name) |> Seq.toList :> IReadOnlyList<Agent>
         }
+
+    /// Lists the load-time diagnostics for the merged directory definitions:
+    /// one AgentInvalidEvent per missing description and per unknown-tools
+    /// allowlist, over the later-definitions-win winners only. The agents
+    /// themselves always stay listed: diagnostics explain, never exclude, so
+    /// an invalid definition is never a silent drop and never fails the
+    /// load. Missing names and bad YAML stay fatal in the parser and surface
+    /// as throws from the reads, never as events here. Backing-store and
+    /// code-defined entries are host-constructed, never parsed, so they
+    /// carry no diagnostics.
+    /// <param name="sessionId">The session the diagnostics run for.</param>
+    /// <param name="turnId">The turn the diagnostics run inside.</param>
+    /// <param name="timestamp">When the diagnostics ran: the stamp every event carries.</param>
+    /// <returns>The diagnostic events for the merged definitions; empty when all parse clean.</returns>
+    member _.ListDiagnostics
+        (sessionId: SessionId, turnId: TurnId, timestamp: DateTimeOffset)
+        : IReadOnlyList<SessionEvent> =
+        let merged =
+            Dictionary<string, AgentFileParser.AgentFileDefinition>(StringComparer.Ordinal)
+
+        for directory in directories do
+            for definition, _stamp in readDirectory directory do
+                merged[definition.Name] <- definition
+
+        merged.Values
+        |> Seq.sortBy (fun definition -> definition.Name)
+        |> Seq.collect (fun definition -> SubAgents.diagnoseDefinition definition sessionId turnId timestamp)
+        |> Seq.toList
+        :> IReadOnlyList<SessionEvent>
 
     interface IAgentStore with
 
