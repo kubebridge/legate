@@ -501,6 +501,105 @@ module internal SessionActor =
             isLeaseValid
             None
 
+    // ────────────────── Compaction wiring (issue 45) ──────────────────
+
+    /// Store-backed compaction wiring for one turn: what the TurnLoop
+    /// iteration-boundary hook closes over to compact at each boundary
+    /// (issue 45 over issue 44's threshold). The hook resolves the catalog
+    /// entry for the session model once here, journals through
+    /// JournalWriter.appendWithTokenAsync under the wiring's journal token,
+    /// and checks the lease hook at the last moment before every journal
+    /// write, so the takeover loser journals nothing. Sub-agent turns share
+    /// the TurnLoop entry and its options-carried hook, so they inherit the
+    /// same mechanism with no separate code.
+    type internal CompactionWiring =
+        {
+            /// LLM settings carrying the Compaction model override and the
+            /// CompactionKeepMessages tail. Never null.
+            Llm: LlmOptions
+            /// The tokens held back beyond the reserved output when deriving
+            /// the threshold.
+            ReservedBufferTokens: int
+            /// The session's model: the threshold lookup and default
+            /// summariser model.
+            SessionModel: ModelReference
+            /// Resolves the session model to its catalog entry, or null
+            /// when the host keeps no catalog (the threshold falls back to
+            /// the catalog defaults).
+            Catalog: ILlmModelCatalog | null
+            /// The chat client the turn runs against. Never null.
+            Client: IChatClient
+            /// Receives the summariser usage checkpoint, or null.
+            Observer: IUsageObserver | null
+            /// Authorises the summariser model call, or null.
+            Policy: IModelPolicy | null
+            /// The tenant the session belongs to.
+            Tenant: TenantId
+            /// The session the turn runs in.
+            SessionId: SessionId
+            /// The turn compacting.
+            TurnId: TurnId
+            /// The 1-based attempt the turn runs under.
+            Attempt: int
+            /// The journal the compaction events append to. Never null.
+            EventStore: ISessionEventStore
+            /// The claim token fencing the journal appends. Never null.
+            JournalToken: string
+            /// The last-moment claim fence the journal writes check. Never
+            /// null.
+            IsLeaseValid: unit -> bool
+        }
+
+    /// Builds the per-turn compaction hook from the store-backed wiring:
+    /// one summarise-and-rewrite pass per iteration boundary, journaled
+    /// under the wiring's token and fenced by its lease hook.
+    /// <param name="wiring">The store-backed compaction wiring for the turn.</param>
+    /// <returns>The boundary hook for TurnLoopOptions.</returns>
+    let buildCompactionHook (wiring: CompactionWiring) : TurnLoop.CompactionHook =
+        if isNull (box wiring) then
+            raise (ArgumentNullException(nameof wiring))
+
+        ArgumentNullException.ThrowIfNull(wiring.Llm)
+        ArgumentNullException.ThrowIfNull(wiring.Client)
+        ArgumentNullException.ThrowIfNull(wiring.EventStore)
+        ArgumentNullException.ThrowIfNull(wiring.JournalToken)
+        ArgumentNullException.ThrowIfNull(wiring.IsLeaseValid)
+
+        let entry: ModelCatalogEntry | null =
+            match box wiring.Catalog with
+            | null -> Unchecked.defaultof<ModelCatalogEntry>
+            | :? ILlmModelCatalog as catalog -> catalog.GetEntry(wiring.SessionModel)
+            | _ -> Unchecked.defaultof<ModelCatalogEntry>
+
+        let journalAsync (event: SessionEvent) : Task<JournalWriter.JournalWriteResult> =
+            let events = ResizeArray<SessionEvent>([| event |]) :> IReadOnlyList<SessionEvent>
+
+            JournalWriter.appendWithTokenAsync
+                wiring.EventStore
+                wiring.Tenant
+                wiring.SessionId
+                wiring.JournalToken
+                events
+                CancellationToken.None
+
+        Compaction.createHook
+            {
+                Client = wiring.Client
+                SessionModel = wiring.SessionModel
+                CompactionModel = wiring.Llm.Compaction
+                KeepMessages = wiring.Llm.CompactionKeepMessages
+                CatalogEntry = entry
+                ReservedBufferTokens = wiring.ReservedBufferTokens
+                Observer = wiring.Observer
+                ModelPolicy = wiring.Policy
+                Tenant = wiring.Tenant
+                SessionId = wiring.SessionId
+                TurnId = wiring.TurnId
+                Attempt = wiring.Attempt
+                JournalAsync = journalAsync
+                IsLeaseValid = wiring.IsLeaseValid
+            }
+
     /// The session actor: recovers from the store, then owns the state
     /// machine. The mailbox parameter is injected by the spawn functions;
     /// one message is processed fully before the next is received, so the

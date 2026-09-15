@@ -57,6 +57,13 @@ module internal TurnLoop =
     [<Literal>]
     let TimeoutExceededMessage = "The turn exceeded its timeout."
 
+    /// Per-iteration-boundary compaction hook (issue 45): receives the
+    /// running history plus the turn's accumulated usage totals and the
+    /// iteration's linked token, runs at most one compaction pass, and
+    /// returns the totals with any summariser usage folded in. Built by
+    /// Compaction.createHook; None on TurnLoopOptions disables compaction.
+    type CompactionHook = IList<ChatMessage> -> int64 -> int64 -> CancellationToken -> Task<int64 * int64>
+
     /// Internal loop tuning: the tool-result char limit plus the effective
     /// per-turn budget, with the optional last-moment claim fence. The
     /// budget fields always carry resolved values (see
@@ -66,6 +73,9 @@ module internal TurnLoop =
     /// claim at the last moment and loses the lease on a fenced-out claim.
     /// None means no fence; the session path resolves through
     /// <c>resolveBudget</c> instead, which leaves the fence unset.
+    /// Compaction carries issue 45's per-iteration-boundary hook: Some runs
+    /// one compaction pass after the lease and budget checks and before the
+    /// provider call, None compacts nothing.
     type TurnLoopOptions =
         {
             /// Maximum tool-result chars before truncation with <see cref="TruncationMarker" />.
@@ -76,11 +86,14 @@ module internal TurnLoop =
             Timeout: TimeSpan
             /// The last-moment per-tool claim fence, or None for no fence.
             VerifyClaim: (unit -> Task<bool>) option
+            /// The per-iteration-boundary compaction hook, or None for no
+            /// compaction.
+            Compaction: CompactionHook option
         }
 
         /// Default tuning: 4000 chars before truncation with the iteration
         /// and wall-clock budgets mirroring the <c>Turns</c> configuration
-        /// defaults and no claim fence. The session path resolves through
+        /// defaults, no claim fence, and no compaction. The session path resolves through
         /// <c>resolveBudget</c> instead.
         static member Default =
             {
@@ -88,6 +101,7 @@ module internal TurnLoop =
                 MaxIterations = TurnsOptions().DefaultMaxIterations
                 Timeout = TurnsOptions().DefaultTimeout
                 VerifyClaim = None
+                Compaction = None
             }
 
     /// Resolves the effective per-turn budget: the session's explicit knobs
@@ -410,7 +424,9 @@ module internal TurnLoop =
     /// <c>onInjectJournaled</c>, and marked consumed once through
     /// <c>onInjectConsumed</c>. Queue, Interrupt, and Reply entries are
     /// ignored and stay pending. Folding never spends the iteration
-    /// budget. A would-complete turn peeks the drain instead of folding:
+    /// budget. When <c>options</c> carries a Compaction hook (issue 45), the
+    /// boundary then runs one compaction pass and continues with its
+    /// updated usage totals. A would-complete turn peeks the drain instead of folding:
     /// pending Inject user messages stay pending and surface as
     /// HasPendingInjects for the session actor's new turn.
     /// The iteration budget is a pre-call check that settles the turn as
@@ -597,6 +613,17 @@ module internal TurnLoop =
                 else
                     foldInjects ()
 
+                    // Compaction boundary (issue 45): one pass per
+                    // iteration, after the lease and budget checks and
+                    // before the provider call. The hook folds any
+                    // summariser usage into the totals the iteration
+                    // continues with; without a hook the totals pass
+                    // through untouched.
+                    let! compactedInput, compactedOutput =
+                        match options.Compaction with
+                        | Some compact -> compact history inputTokens outputTokens linkedToken
+                        | None -> Task.FromResult((inputTokens, outputTokens))
+
                     try
                         let! response =
                             LlmStreaming.streamResponseAsync
@@ -608,8 +635,8 @@ module internal TurnLoop =
                                 onReasoningDelta
 
                         let nextIterations = iterations + 1
-                        let mutable nextInput = inputTokens
-                        let mutable nextOutput = outputTokens
+                        let mutable nextInput = compactedInput
+                        let mutable nextOutput = compactedOutput
 
                         if isNull response then
                             return completedCompletion nextIterations nextInput nextOutput ""
@@ -1112,13 +1139,21 @@ module internal TurnLoop =
                 else
                     foldInjects ()
 
+                    // Compaction boundary (issue 45): one pass per
+                    // iteration, after the lease and budget checks and
+                    // before the provider call, like the Inject fold above.
+                    let! compactedInput, compactedOutput =
+                        match options.Compaction with
+                        | Some compact -> compact history inputTokens outputTokens linkedToken
+                        | None -> Task.FromResult((inputTokens, outputTokens))
+
                     try
                         let! response =
                             LlmStreaming.streamResponseAsync client history chatOptions linkedToken ignore ignore
 
                         let nextIterations = iterations + 1
-                        let mutable nextInput = inputTokens
-                        let mutable nextOutput = outputTokens
+                        let mutable nextInput = compactedInput
+                        let mutable nextOutput = compactedOutput
 
                         if isNull response then
                             return completedCompletion nextIterations nextInput nextOutput ""

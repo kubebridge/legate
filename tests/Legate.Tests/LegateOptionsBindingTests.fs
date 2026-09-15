@@ -124,6 +124,59 @@ let ``Binds duration forms to TimeSpans`` () =
     options.Workspace.IdleTeardownAfter |> should equal (TimeSpan.FromSeconds 30.0)
 
 [<Fact>]
+let ``Binds the compaction model override and keep count`` () =
+    let section =
+        buildSection
+            [
+                "Legate:Llm:Compaction", "openai/gpt-4o-mini"
+                "Legate:Llm:CompactionKeepMessages", "5"
+            ]
+
+    let options = LegateOptionsBinding.bind section
+
+    options.Llm.Compaction |> should equal "openai/gpt-4o-mini"
+    options.Llm.CompactionKeepMessages |> should equal 5
+    options.Validate() |> should equal null
+
+[<Fact>]
+let ``Unset compaction knobs keep their defaults`` () =
+    let options = LegateOptionsBinding.bind (buildSection [])
+
+    options.Llm.Compaction |> should equal null
+    options.Llm.CompactionKeepMessages |> should equal 10
+    options.Validate() |> should equal null
+
+[<Fact>]
+let ``Invalid compaction knobs fail validation with the section path`` () =
+    let badModel =
+        buildSection
+            [
+                "Legate:Llm:Compaction", "not a reference"
+            ]
+
+    let modelEx =
+        Assert.Throws<InvalidOperationException>(fun () -> LegateOptionsBinding.bind badModel |> ignore)
+
+    modelEx.Message.Contains("Llm") |> should equal true
+
+    modelEx.Message.Contains("Compaction must be a valid model reference")
+    |> should equal true
+
+    let badKeep =
+        buildSection
+            [
+                "Legate:Llm:CompactionKeepMessages", "-1"
+            ]
+
+    let keepEx =
+        Assert.Throws<InvalidOperationException>(fun () -> LegateOptionsBinding.bind badKeep |> ignore)
+
+    keepEx.Message.Contains("Llm") |> should equal true
+
+    keepEx.Message.Contains("CompactionKeepMessages must be at least 0.")
+    |> should equal true
+
+[<Fact>]
 let ``Binds the cluster shutdown grace duration`` () =
     let section =
         buildSection

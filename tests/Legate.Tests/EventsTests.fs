@@ -59,6 +59,8 @@ let sampleEvents: (string * (unit -> SessionEvent)) list =
         fun () -> QuestionAnsweredEvent(sessionId, turnId, noSequence, stamp, "q-1", "blue") :> SessionEvent
         "usage", fun () -> UsageEvent(sessionId, turnId, noSequence, stamp, 1200L, 340L) :> SessionEvent
         "compacted", fun () -> CompactedEvent(sessionId, turnId, noSequence, stamp, 9000L, 1200L) :> SessionEvent
+        "compactionFailed",
+        fun () -> CompactionFailedEvent(sessionId, turnId, noSequence, stamp, "model denied") :> SessionEvent
         "turnCompleted", fun () -> TurnCompletedEvent(sessionId, turnId, noSequence, stamp) :> SessionEvent
         "turnAborted",
         fun () ->
@@ -72,7 +74,7 @@ let sampleEvents: (string * (unit -> SessionEvent)) list =
         fun () -> ContextPrunedEvent(sessionId, turnId, noSequence, stamp, 3, 9000L, 1200L) :> SessionEvent
     ]
 
-// The 18 discriminator strings the base type's XML doc documents as the
+// The 19 discriminator strings the base type's XML doc documents as the
 // wire contract, in the same order as the JsonDerivedType attributes.
 let discriminatorContract =
     [|
@@ -88,6 +90,7 @@ let discriminatorContract =
         "questionAnswered"
         "usage"
         "compacted"
+        "compactionFailed"
         "turnCompleted"
         "turnAborted"
         "turnFailed"
@@ -286,6 +289,15 @@ let ``Compacted round-trips both estimates`` () =
     compacted.AfterEstimate |> should equal 1200L
 
 [<Fact>]
+let ``CompactionFailed round-trips its failure reason`` () =
+    let restored =
+        roundTrip "compactionFailed" (fun () ->
+            CompactionFailedEvent(sessionId, turnId, noSequence, stamp, "model denied") :> SessionEvent)
+
+    let failed = restored :?> CompactionFailedEvent
+    failed.Reason |> should equal "model denied"
+
+[<Fact>]
 let ``TurnAborted round-trips its cause and reason`` () =
     let restored =
         roundTrip "turnAborted" (fun () ->
@@ -383,7 +395,7 @@ let ``Base fields carry the constructor values the constructor set`` () =
 
 [<Fact>]
 let ``An undocumented $type value is rejected instead of guessed`` () =
-    // The 18 documented discriminators are the wire contract: anything
+    // The 19 documented discriminators are the wire contract: anything
     // outside the set must fail the read rather than deserialise to a base
     // instance. The BCL raises NotSupportedException for a discriminator
     // with no registered derived type (surfaced possibly wrapped in a

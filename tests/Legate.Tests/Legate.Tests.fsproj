@@ -53,6 +53,7 @@
     <Compile Include="ClaimHeartbeatTests.fs" />
     <Compile Include="ClaimFenceTests.fs" />
     <Compile Include="JournalWriterTests.fs" />
+    <Compile Include="CompactionTests.fs" />
   </ItemGroup>
 
   <ItemGroup>

@@ -157,6 +157,8 @@ let ``Permissions Validate flags bad rules with indices`` () =
 let ``Llm defaults coordinate locally with no providers`` () =
     let options = LlmOptions()
     options.DefaultModel |> should equal null
+    options.Compaction |> should equal null
+    options.CompactionKeepMessages |> should equal 10
     options.DistributedCoordination |> should equal false
     options.Providers.Count |> should equal 0
     options.Validate() |> should equal null
@@ -195,6 +197,22 @@ let ``Llm Validate flags bad provider map`` () =
     // supply keys through IApiKeyProvider instead.
     valid.Providers.Add("anthropic", LlmProviderOptions()) |> ignore
     valid.Validate() |> should equal null
+
+[<Fact>]
+let ``Llm Validate flags a bad compaction model and keep count`` () =
+    LlmOptions(Compaction = "not a reference").Validate()
+    |> should equal "Compaction must be a valid model reference in provider/model form."
+
+    LlmOptions(CompactionKeepMessages = -1).Validate()
+    |> should equal "CompactionKeepMessages must be at least 0."
+
+    // Blank overrides read as unset, like DefaultModel.
+    LlmOptions(Compaction = "  ").Validate() |> should equal null
+
+    let custom =
+        LlmOptions(Compaction = "openai/gpt-4o-mini", CompactionKeepMessages = 0)
+
+    custom.Validate() |> should equal null
 
 // ──────────────────────────────────────────────────────────────────────────
 // Workspace

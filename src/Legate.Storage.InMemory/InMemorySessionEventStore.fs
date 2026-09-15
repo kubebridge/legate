@@ -264,6 +264,9 @@ type InMemorySessionEventStore(database: InMemoryDatabase) =
                                         source.AfterEstimate
                                     )
                                     :> SessionEvent
+                                | :? CompactionFailedEvent as source ->
+                                    CompactionFailedEvent(sessionId, turnId, sequence, timestamp, source.Reason)
+                                    :> SessionEvent
                                 | :? TurnCompletedEvent ->
                                     TurnCompletedEvent(sessionId, turnId, sequence, timestamp) :> SessionEvent
                                 | :? TurnAbortedEvent as source ->
