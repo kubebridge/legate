@@ -1032,6 +1032,7 @@ let private suspendCursor
         OutputTokens = 5L
         Iterations = 1
         PendingCall = pendingCall
+        Nested = None
     }
 
 /// A Suspended completion parking on the given cursor.

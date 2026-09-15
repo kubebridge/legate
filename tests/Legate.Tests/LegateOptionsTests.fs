@@ -27,6 +27,9 @@ let ``Defaults validate to null and describe a single node`` () =
     options.Sessions.LeaseRenewalInterval
     |> should equal (TimeSpan.FromSeconds 15.0)
 
+    options.Sessions.SubAgents.MaxDepth |> should equal 1
+    options.Sessions.SubAgents.Timeout |> should equal (TimeSpan.FromMinutes 10.0)
+
     options.Turns.DefaultMaxIterations |> should equal 50
     options.Turns.DefaultTimeout |> should equal (TimeSpan.FromMinutes 30.0)
     options.Turns.DefaultDelivery |> should equal DeliveryMode.Queue
@@ -46,6 +49,7 @@ let ``Defaults validate to null and describe a single node`` () =
     options.AskUser.CannedAnswer |> should equal null
 
     options.Sessions.Validate() |> should equal null
+    options.Sessions.SubAgents.Validate() |> should equal null
     options.Turns.Validate() |> should equal null
     options.Permissions.Validate() |> should equal null
     options.Llm.Validate() |> should equal null
@@ -389,3 +393,41 @@ let ``Root Validate prefixes ask-user violations`` () =
     let nullSection = LegateOptions()
     nullSection.AskUser <- nullRef<AskUserOptions>
     nullSection.Validate() |> should equal "AskUser must not be null."
+
+// ──────────────────────────────────────────────────────────────────────────
+// SubAgents
+
+[<Fact>]
+let ``SubAgents Validate flags depth and timeout bounds`` () =
+    SubAgentsOptions(MaxDepth = 0).Validate()
+    |> should equal "MaxDepth must be at least 1."
+
+    SubAgentsOptions(Timeout = TimeSpan.Zero).Validate()
+    |> should equal "Timeout must be positive."
+
+    SubAgentsOptions(MaxDepth = 2, Timeout = TimeSpan.FromMinutes 5.0).Validate()
+    |> should equal null
+
+[<Fact>]
+let ``Sessions Validate flags null sub-agents`` () =
+    let options = SessionsOptions()
+    options.SubAgents <- nullRef<SubAgentsOptions>
+    options.Validate() |> should equal "SubAgents must not be null."
+
+[<Fact>]
+let ``Sessions Validate prefixes sub-agent violations`` () =
+    let options = SessionsOptions()
+    options.SubAgents.MaxDepth <- 0
+    options.Validate() |> should equal "SubAgents: MaxDepth must be at least 1."
+
+    let timeout = SessionsOptions()
+    timeout.SubAgents.Timeout <- TimeSpan.Zero
+    timeout.Validate() |> should equal "SubAgents: Timeout must be positive."
+
+[<Fact>]
+let ``Root Validate prefixes sub-agent violations`` () =
+    let options = LegateOptions()
+    options.Sessions.SubAgents.Timeout <- TimeSpan.Zero
+
+    options.Validate()
+    |> should equal "Sessions: SubAgents: Timeout must be positive."

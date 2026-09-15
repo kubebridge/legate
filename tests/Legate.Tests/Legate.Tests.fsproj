@@ -79,6 +79,7 @@
     <Compile Include="AgentFileParserTests.fs" />
     <Compile Include="FileAgentStoreTests.fs" />
     <Compile Include="SubAgentsTests.fs" />
+    <Compile Include="TaskToolTests.fs" />
   </ItemGroup>
 
   <ItemGroup>

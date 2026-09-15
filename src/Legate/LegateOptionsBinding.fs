@@ -21,6 +21,7 @@ module internal LegateOptionsBinding =
         [
             "Sessions:LeaseDuration"
             "Sessions:LeaseRenewalInterval"
+            "Sessions:SubAgents:Timeout"
             "Turns:DefaultTimeout"
             "Permissions:AskTimeout"
             "Llm:Coordination:MinRetryBackoff"

@@ -52,6 +52,41 @@ type WorkspaceMode =
     /// An isolated container over the Docker CLI.
     | Docker = 2
 
+/// Sub-agent settings: how deep the task tool nests and how long one
+/// nested run may spend. Bound from the <c>Legate:Sessions:SubAgents</c>
+/// configuration section; mutable so hosts can set properties before
+/// registering. Defaults allow one nesting level with a 10 minute
+/// per-run timeout; each nested run is further bounded by the remaining
+/// parent budget, whichever is shorter.
+type SubAgentsOptions() =
+
+    /// How deep task-tool nesting runs. 0 is the top-level turn, 1 is one
+    /// sub-agent level: a task call at this depth or deeper returns a tool
+    /// error instead of running. Default 1.
+    member val MaxDepth: int = 1 with get, set
+
+    /// How long one nested sub-agent run may spend. The effective nested
+    /// deadline is the shorter of this timeout and the parent turn's
+    /// remaining budget. Default 10 minutes.
+    member val Timeout: TimeSpan = TimeSpan.FromMinutes 10.0 with get, set
+
+    /// Returns null when every knob is in range, otherwise a message for the
+    /// first violation.
+    /// <returns>The first violation's message, or null when the settings are valid.</returns>
+    member this.Validate() : string | null =
+        let violations =
+            [|
+                if this.MaxDepth < 1 then
+                    "MaxDepth must be at least 1."
+                if this.Timeout <= TimeSpan.Zero then
+                    "Timeout must be positive."
+            |]
+
+        if violations.Length = 0 then
+            null
+        else
+            Array.head violations
+
 /// Session admission and lease settings: how many sessions the dispatcher
 /// admits and how turn leases renew. Bound from the <c>Legate</c>
 /// configuration section; mutable so hosts can set properties before
@@ -72,32 +107,44 @@ type SessionsOptions() =
     /// half the lease so a missed heartbeat never loses the lease.
     member val LeaseRenewalInterval: TimeSpan = TimeSpan.FromSeconds 15.0 with get, set
 
+    /// Sub-agent settings: the task tool's nesting depth and per-run
+    /// timeout. Never null.
+    member val SubAgents: SubAgentsOptions = SubAgentsOptions() with get, set
+
     /// Returns null when every knob is in range, otherwise a message for the
     /// first violation.
     /// <returns>The first violation's message, or null when the settings are valid.</returns>
     member this.Validate() : string | null =
-        let violations =
-            [|
-                if this.Capacity < 1 then
-                    "Capacity must be at least 1."
-                if this.MaxSessionsPerTenant < 1 then
-                    "MaxSessionsPerTenant must be at least 1."
-                if this.LeaseDuration <= TimeSpan.Zero then
-                    "LeaseDuration must be positive."
-                if this.LeaseRenewalInterval <= TimeSpan.Zero then
-                    "LeaseRenewalInterval must be positive."
-                if
-                    this.LeaseDuration > TimeSpan.Zero
-                    && this.LeaseRenewalInterval > TimeSpan.Zero
-                    && this.LeaseRenewalInterval >= this.LeaseDuration.Divide 2.0
-                then
-                    "LeaseRenewalInterval must be less than half LeaseDuration."
-            |]
-
-        if violations.Length = 0 then
-            null
+        if isNull (box this.SubAgents) then
+            "SubAgents must not be null."
         else
-            Array.head violations
+            let violations =
+                [|
+                    if this.Capacity < 1 then
+                        "Capacity must be at least 1."
+                    if this.MaxSessionsPerTenant < 1 then
+                        "MaxSessionsPerTenant must be at least 1."
+                    if this.LeaseDuration <= TimeSpan.Zero then
+                        "LeaseDuration must be positive."
+                    if this.LeaseRenewalInterval <= TimeSpan.Zero then
+                        "LeaseRenewalInterval must be positive."
+                    if
+                        this.LeaseDuration > TimeSpan.Zero
+                        && this.LeaseRenewalInterval > TimeSpan.Zero
+                        && this.LeaseRenewalInterval >= this.LeaseDuration.Divide 2.0
+                    then
+                        "LeaseRenewalInterval must be less than half LeaseDuration."
+                |]
+
+            if violations.Length <> 0 then
+                Array.head violations
+            else
+                let subAgentsViolation = this.SubAgents.Validate()
+
+                if isNull (box subAgentsViolation) then
+                    null
+                else
+                    $"SubAgents: %s{subAgentsViolation}"
 
 /// Per-turn defaults: the iteration and wall-clock budgets a turn runs
 /// under, how prompts to a busy session deliver, and what a crash does to
