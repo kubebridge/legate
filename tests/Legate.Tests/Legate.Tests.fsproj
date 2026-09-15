@@ -78,6 +78,7 @@
     <Compile Include="PromptCompositionTests.fs" />
     <Compile Include="AgentFileParserTests.fs" />
     <Compile Include="FileAgentStoreTests.fs" />
+    <Compile Include="SubAgentsTests.fs" />
   </ItemGroup>
 
   <ItemGroup>

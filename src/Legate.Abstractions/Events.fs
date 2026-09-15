@@ -52,6 +52,7 @@ open System.Text.Json.Serialization
 /// <item><term>contextPruned</term><description>old tool results were replaced with the prune marker.</description></item>
 /// <item><term>skillInvalid</term><description>a packaged skill was skipped during discovery with its reason.</description></item>
 /// <item><term>skillLoaded</term><description>a skill's content was loaded for the turn with its companion list.</description></item>
+/// <item><term>agentInvalid</term><description>an agent definition was kept despite a problem, with its reason.</description></item>
 /// </list>
 /// Every subtype is named <c>&lt;Kind&gt;Event</c> so no kind name collides
 /// with an existing Legate type (for example <see cref="T:Legate.TurnFailed" />
@@ -79,6 +80,7 @@ open System.Text.Json.Serialization
 [<JsonDerivedType(typeof<ContextPrunedEvent>, "contextPruned")>]
 [<JsonDerivedType(typeof<SkillInvalidEvent>, "skillInvalid")>]
 [<JsonDerivedType(typeof<SkillLoadedEvent>, "skillLoaded")>]
+[<JsonDerivedType(typeof<AgentInvalidEvent>, "agentInvalid")>]
 type SessionEvent(sessionId: SessionId, turnId: TurnId, sequence: Nullable<int64>, timestamp: DateTimeOffset) =
 
     /// The session the event belongs to. Sequence numbers are per-session,
@@ -567,3 +569,33 @@ and [<Sealed>] SkillLoadedEvent
     /// The package-relative companion paths of the loaded skill, in ordinal
     /// order, excluding SKILL.md itself. Never null.
     member _.Companions: IReadOnlyList<string> = companions
+
+/// An agent definition was kept despite a problem: its file parsed but the
+/// definition is missing its description or names unknown tools. Discovery
+/// never drops such an agent silently: the agent stays in the merged view
+/// and one of these events carries the reason the host may render, mirroring
+/// <see cref="T:Legate.SkillInvalidEvent" />. The reason never contains
+/// secrets; it may name the agent and the offending tools.
+/// <param name="sessionId">The session discovery ran for.</param>
+/// <param name="turnId">The turn discovery ran inside.</param>
+/// <param name="sequence">The event's per-session sequence number, or empty while in flight.</param>
+/// <param name="timestamp">When the agent was flagged.</param>
+/// <param name="agentName">The name of the agent that was kept, as parsed from its file.</param>
+/// <param name="reason">Why the agent was flagged: a missing description or unknown tools. Never contains secrets.</param>
+and [<Sealed>] AgentInvalidEvent
+    (
+        sessionId: SessionId,
+        turnId: TurnId,
+        sequence: Nullable<int64>,
+        timestamp: DateTimeOffset,
+        agentName: string,
+        reason: string
+    ) =
+    inherit SessionEvent(sessionId, turnId, sequence, timestamp)
+
+    /// The name of the agent that was kept, as parsed from its file.
+    member _.AgentName = agentName
+
+    /// Why the agent was flagged: a missing description or unknown tools.
+    /// Never contains secrets.
+    member _.Reason = reason

@@ -748,6 +748,7 @@ let expectedRules: (string * int * SessionCellKind) list =
         "contextPruned", 1, SessionCellKind.System // one System audit cell per prune event
         "skillInvalid", 1, SessionCellKind.System // one System failure cell per skipped skill
         "skillLoaded", 0, SessionCellKind.User // progress marker: no cells, hosts read the event stream
+        "agentInvalid", 1, SessionCellKind.System // one System failure cell per flagged agent
     ]
 
 [<Fact>]
@@ -839,6 +840,17 @@ let ``The fold classifies a bare event of every kind per the mapped rule`` () =
                         ResizeArray<string>([| ".agent/skills/deploy/refs/api.md" |]) :> IReadOnlyList<string>
                     )
                     :> SessionEvent
+            | "agentInvalid" ->
+                fun () ->
+                    AgentInvalidEvent(
+                        sessionId,
+                        turnId,
+                        noSequence,
+                        stamp,
+                        "helper",
+                        "the agent 'helper' has no description"
+                    )
+                    :> SessionEvent
             | _ -> failwith (sprintf "unmapped discriminator '%s' in the pin table" discriminator)
 
         let cells = foldEvents [ buildEvent () ]
@@ -888,3 +900,23 @@ let ``A compaction failure derives one System error cell carrying the reason`` (
     match cells[0].Metadata with
     | null -> failwith "compaction failure cell lost its metadata"
     | meta -> meta["event"] |> should equal "compactionFailed"
+
+[<Fact>]
+let ``A flagged agent derives one System error cell carrying the agent name`` () =
+    let event =
+        AgentInvalidEvent(sessionId, turnId, noSequence, stamp, "helper", "the agent 'helper' has no description")
+        :> SessionEvent
+
+    let cells = foldEvents [ event ]
+
+    cells.Count |> should equal 1
+    cells[0].Kind |> should equal SessionCellKind.System
+    cells[0].IsError |> should equal true
+    cells[0].Timestamp |> should equal stamp
+    cells[0].Content |> should equal "the agent 'helper' has no description"
+
+    match cells[0].Metadata with
+    | null -> failwith "flagged-agent cell lost its metadata"
+    | meta ->
+        meta["event"] |> should equal "agentInvalid"
+        meta["agentName"] |> should equal "helper"

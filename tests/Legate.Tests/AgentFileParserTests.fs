@@ -69,7 +69,7 @@ let ``Multi-line and quoted values parse`` () =
 [<Fact>]
 let ``Unknown keys are ignored`` () =
     let definition =
-        parseContent "---\nname: helper\ntools: [read, write]\nallowed-tools: read\n---\nPrompt.\n"
+        parseContent "---\nname: helper\nallowed-tools: read\nfuture-key: 42\n---\nPrompt.\n"
 
     definition.Name |> should equal "helper"
     definition.SystemPrompt |> should equal "Prompt.\n"
@@ -80,6 +80,95 @@ let ``String enabled parses case-insensitively`` () =
         parseContent "---\nname: helper\nenabled: \"False\"\n---\nPrompt.\n"
 
     definition.Enabled |> should equal false
+
+// ──────────────────────────────────────────────────────────────────────────
+// Tools allowlist
+
+[<Fact>]
+let ``Block-sequence tools parse in file order`` () =
+    let definition =
+        parseContent "---\nname: helper\ntools:\n  - read_file\n  - glob\n---\nPrompt.\n"
+
+    definition.Tools |> should equal [ "read_file"; "glob" ]
+
+[<Fact>]
+let ``Flow-sequence tools parse`` () =
+    let definition =
+        parseContent "---\nname: helper\ntools: [read_file, grep]\n---\nPrompt.\n"
+
+    definition.Tools |> should equal [ "read_file"; "grep" ]
+
+[<Fact>]
+let ``Absent tools parse as empty`` () =
+    let definition = parseContent "---\nname: helper\n---\nPrompt.\n"
+
+    definition.Tools |> should be Empty
+
+[<Fact>]
+let ``Empty tools list parses as empty`` () =
+    let definition = parseContent "---\nname: helper\ntools: []\n---\nPrompt.\n"
+
+    definition.Tools |> should be Empty
+
+[<Fact>]
+let ``Scalar tools fail naming the file`` () =
+    let dir = freshDir ()
+
+    try
+        let path =
+            writeFile dir "scalar-tools.md" "---\nname: helper\ntools: read_file\n---\nBody\n"
+
+        let ex =
+            Assert.Throws<InvalidOperationException>(fun () -> AgentFileParser.parseFile path |> ignore)
+
+        ex.Message.Contains("scalar-tools.md") |> should equal true
+    finally
+        Directory.Delete(dir, true)
+
+[<Fact>]
+let ``Mapping tools fail naming the file`` () =
+    let dir = freshDir ()
+
+    try
+        let path =
+            writeFile dir "mapping-tools.md" "---\nname: helper\ntools:\n  read_file: true\n---\nBody\n"
+
+        let ex =
+            Assert.Throws<InvalidOperationException>(fun () -> AgentFileParser.parseFile path |> ignore)
+
+        ex.Message.Contains("mapping-tools.md") |> should equal true
+    finally
+        Directory.Delete(dir, true)
+
+[<Fact>]
+let ``Non-string tools entries fail naming the file`` () =
+    let dir = freshDir ()
+
+    try
+        let path =
+            writeFile dir "mixed-tools.md" "---\nname: helper\ntools:\n  - read_file\n  - {tool: grep}\n---\nBody\n"
+
+        let ex =
+            Assert.Throws<InvalidOperationException>(fun () -> AgentFileParser.parseFile path |> ignore)
+
+        ex.Message.Contains("mixed-tools.md") |> should equal true
+    finally
+        Directory.Delete(dir, true)
+
+[<Fact>]
+let ``Blank tools entries fail naming the file`` () =
+    let dir = freshDir ()
+
+    try
+        let path =
+            writeFile dir "blank-tools.md" "---\nname: helper\ntools:\n  - read_file\n  - \"  \"\n---\nBody\n"
+
+        let ex =
+            Assert.Throws<InvalidOperationException>(fun () -> AgentFileParser.parseFile path |> ignore)
+
+        ex.Message.Contains("blank-tools.md") |> should equal true
+    finally
+        Directory.Delete(dir, true)
 
 // ──────────────────────────────────────────────────────────────────────────
 // Fail-fast

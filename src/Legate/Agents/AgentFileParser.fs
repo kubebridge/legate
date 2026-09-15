@@ -36,6 +36,10 @@ type internal AgentFileDefinition =
         Model: ModelReference
         /// Whether new sessions are accepted, from <c>enabled</c>.
         Enabled: bool
+        /// The built-in tool allowlist, from <c>tools</c> as a YAML
+        /// sequence of tool names, in file order. Empty when the key is
+        /// absent: the store maps that to the runtime default.
+        Tools: string list
         /// The verbatim body after the closing marker.
         SystemPrompt: string
     }
@@ -199,10 +203,35 @@ let parseFile (path: string) : AgentFileDefinition =
                 InvalidOperationException(sprintf "Agent file '%s' has a non-boolean 'enabled' frontmatter value." path)
             )
 
+    let tools =
+        match valueOf values "tools" with
+        | null -> []
+        | :? System.Collections.IList as items ->
+            [
+                for item in items do
+                    match item with
+                    | :? string as raw when not (String.IsNullOrWhiteSpace raw) -> raw.Trim()
+                    | _ ->
+                        raise (
+                            InvalidOperationException(
+                                sprintf "Agent file '%s' has a 'tools' list holding a non-string tool name." path
+                            )
+                        )
+            ]
+        | _ ->
+            raise (
+                InvalidOperationException(
+                    sprintf
+                        "Agent file '%s' has a non-list 'tools' frontmatter value: 'tools' must be a list of tool names."
+                        path
+                )
+            )
+
     {
         Name = name
         Description = description
         Model = model
         Enabled = enabled
+        Tools = tools
         SystemPrompt = body
     }

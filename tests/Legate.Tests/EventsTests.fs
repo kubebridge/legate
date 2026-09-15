@@ -88,9 +88,13 @@ let sampleEvents: (string * (unit -> SessionEvent)) list =
                 ResizeArray<string>([| ".agent/skills/deploy/refs/api.md" |]) :> IReadOnlyList<string>
             )
             :> SessionEvent
+        "agentInvalid",
+        fun () ->
+            AgentInvalidEvent(sessionId, turnId, noSequence, stamp, "helper", "the agent 'helper' has no description")
+            :> SessionEvent
     ]
 
-// The 21 discriminator strings the base type's XML doc documents as the
+// The 22 discriminator strings the base type's XML doc documents as the
 // wire contract, in the same order as the JsonDerivedType attributes.
 let discriminatorContract =
     [|
@@ -115,6 +119,7 @@ let discriminatorContract =
         "contextPruned"
         "skillInvalid"
         "skillLoaded"
+        "agentInvalid"
     |]
 
 /// Reads the TypeDiscriminator values from the JsonDerivedType attributes
@@ -409,6 +414,17 @@ let ``SkillLoaded round-trips its skill name and companions`` () =
             ".agent/skills/deploy/refs/api.md"
             ".agent/skills/deploy/runbook.md"
         ]
+
+[<Fact>]
+let ``AgentInvalid round-trips its agent name and reason`` () =
+    let restored =
+        roundTrip "agentInvalid" (fun () ->
+            AgentInvalidEvent(sessionId, turnId, noSequence, stamp, "helper", "the agent 'helper' has no description")
+            :> SessionEvent)
+
+    let invalid = restored :?> AgentInvalidEvent
+    invalid.AgentName |> should equal "helper"
+    invalid.Reason |> should equal "the agent 'helper' has no description"
 
 // ───────────────────────────────────────────────────────────────────────────
 // Sequence and base-field nullability
