@@ -74,6 +74,8 @@
     <Compile Include="SearchToolsTests.fs" />
     <Compile Include="SessionPermissionsTests.fs" />
     <Compile Include="SkillDiscoveryTests.fs" />
+    <Compile Include="AgentFileParserTests.fs" />
+    <Compile Include="FileAgentStoreTests.fs" />
   </ItemGroup>
 
   <ItemGroup>

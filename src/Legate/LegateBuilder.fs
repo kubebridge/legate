@@ -2,6 +2,7 @@
 namespace Legate
 
 open System
+open System.Collections.Generic
 open Microsoft.Extensions.Configuration
 open Microsoft.Extensions.DependencyInjection
 open Microsoft.Extensions.DependencyInjection.Extensions
@@ -220,9 +221,34 @@ type PoliciesBuilder internal (services: IServiceCollection) as this =
 /// Configures the agent store and the agent audit sink. Neither is required:
 /// sessions can run without a managed agent catalog, and the audit sink
 /// defaults to a builder-scoped no-op.
+///
+/// File layers (<c>AddFromDirectory</c> plus <c>Add</c>) merge with later
+/// definitions winning: the backing store from <c>UseStore</c>, then the
+/// directory files in sorted file order, then code-defined entries in call
+/// order, all keyed by agent name. The directory and code-defined layers
+/// serve <see cref="F:Legate.TenantId.Default" /> only; other tenants see
+/// the backing store alone. A missing directory reads as empty, and every
+/// store read re-reads the directories from disk with no watcher.
 [<Sealed>]
 type AgentsBuilder internal (services: IServiceCollection) as this =
     do ArgumentNullException.ThrowIfNull(services)
+
+    let directories = ResizeArray<string>()
+    let codeDefined = ResizeArray<Agent>()
+
+    /// The container the builder registers into.
+    member internal _.Services: IServiceCollection = services
+
+    /// Whether the host registered at least one file layer.
+    member internal _.HasFileLayers: bool = directories.Count > 0 || codeDefined.Count > 0
+
+    /// The registered agent directories, in call order.
+    member internal _.FileDirectories: IReadOnlyList<string> =
+        directories :> IReadOnlyList<string>
+
+    /// The code-defined agent templates, in call order.
+    member internal _.FileAgents: IReadOnlyList<Agent> =
+        codeDefined :> IReadOnlyList<Agent>
 
     /// Registers the agent store, replacing any previous one.
     /// <param name="store">The store managing host agents.</param>
@@ -239,6 +265,80 @@ type AgentsBuilder internal (services: IServiceCollection) as this =
     member _.UseStore<'T when 'T :> IAgentStore>() : AgentsBuilder =
         services.Replace(ServiceDescriptor(typeof<IAgentStore>, typeof<'T>, ServiceLifetime.Singleton))
         |> ignore
+
+        this
+
+    /// Registers a directory of agent definition files (`.agent/agents`
+    /// for CLI hosts): every top-level `*.md` file contributes one agent
+    /// whose frontmatter (`name`, `description`, `model`, `enabled`) plus
+    /// body-as-system-prompt merge over the backing store with later files
+    /// winning in sorted file order. The directory is re-read on every
+    /// store read, so disk changes apply on the next open with no watcher;
+    /// a missing directory reads as empty. Writes always throw
+    /// <see cref="T:Legate.ReadOnlyAgentStoreException" />.
+    /// <param name="path">The directory holding the `*.md` agent files.</param>
+    /// <returns>This builder, for chaining.</returns>
+    member _.AddFromDirectory(path: string) : AgentsBuilder =
+        if isNull (box path) then
+            raise (ArgumentNullException(nameof path))
+
+        if String.IsNullOrWhiteSpace path then
+            raise (ArgumentException("An agent directory path must be a non-empty string.", nameof path))
+
+        directories.Add(path)
+        this
+
+    /// Registers a code-defined agent on
+    /// <see cref="F:Legate.TenantId.Default" />: the template starts with
+    /// the registered name, a fresh id, the default model, an empty system
+    /// prompt, and enabled, and <paramref name="configure" /> shapes the
+    /// rest. F# hosts copy with <c>{ template with ... }</c>; C# hosts
+    /// mutate the template's properties and return it. Code-defined entries
+    /// merge last, so they win over the same name from the backing store or
+    /// a directory file; the registered name and the default tenant always
+    /// key the entry, even when <paramref name="configure" /> replaces them.
+    /// <param name="name">The agent name keying the entry.</param>
+    /// <param name="configure">The transform shaping the agent from its template. Must not return null.</param>
+    /// <returns>This builder, for chaining.</returns>
+    member _.Add(name: string, configure: Func<Agent, Agent>) : AgentsBuilder =
+        if isNull (box name) then
+            raise (ArgumentNullException(nameof name))
+
+        if String.IsNullOrWhiteSpace name then
+            raise (ArgumentException("An agent name must be a non-empty string.", nameof name))
+
+        ArgumentNullException.ThrowIfNull(configure)
+
+        let template: Agent =
+            {
+                Id = AgentId.New()
+                Tenant = TenantId.Default
+                Name = name.Trim()
+                Description = null
+                Model = Agents.AgentFileParser.defaultModel
+                SystemPrompt = ""
+                EnvironmentVariables = null
+                PermissionDefaults = null
+                ToolSelection = null
+                PackageReference = null
+                Enabled = true
+                Schedule = null
+                RowVersion = 0UL
+                CreatedAt = DateTimeOffset.UtcNow
+                UpdatedAt = DateTimeOffset.UtcNow
+            }
+
+        let customized = configure.Invoke(template)
+
+        if isNull (box customized) then
+            raise (ArgumentException("The agent configure function must return an agent.", nameof configure))
+
+        codeDefined.Add(
+            { customized with
+                Name = name.Trim()
+                Tenant = TenantId.Default
+            }
+        )
 
         this
 

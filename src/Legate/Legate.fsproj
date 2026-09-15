@@ -33,7 +33,9 @@
     <Compile Include="SessionActor.fs" />
     <Compile Include="SessionPermissions.fs" />
     <Compile Include="LocalActorSystem.fs" />
+    <Compile Include="Agents/AgentFileParser.fs" />
     <Compile Include="LegateBuilder.fs" />
+    <Compile Include="Agents/FileAgentStore.fs" />
     <Compile Include="AddLegate.fs" />
   </ItemGroup>
 
