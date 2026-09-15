@@ -9,6 +9,7 @@
   <ItemGroup>
     <Compile Include="AssemblyInfo.fs" />
     <Compile Include="Seams.fs" />
+    <Compile Include="SkillDiscovery.fs" />
     <Compile Include="Tools/FileTools.fs" />
     <Compile Include="BuiltinEditTools.fs" />
     <Compile Include="BuiltinSearchTools.fs" />
@@ -52,6 +53,7 @@
     <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" />
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
     <PackageReference Include="Microsoft.Extensions.Options" />
+    <PackageReference Include="YamlDotNet" />
   </ItemGroup>
 
 </Project>

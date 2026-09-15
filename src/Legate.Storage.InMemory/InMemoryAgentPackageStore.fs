@@ -154,6 +154,30 @@ type InMemoryAgentPackageStore(database: InMemoryDatabase) =
                           | false, _ -> Unchecked.defaultof<Stream>)))
             |> ok
 
+        member _.ListFiles(tenant, agentId, version, prefix, _) =
+            PackageVersions.Validate version |> ignore
+
+            if isNull (box prefix) then
+                raise (ArgumentNullException(nameof prefix))
+
+            let canonicalPrefix = AgentPackagePaths.Normalise prefix
+
+            lock database.Gate (fun () ->
+                match packageRow tenant agentId with
+                | None -> [] :> IReadOnlyList<string>
+                | Some row ->
+                    match row.Versions.TryGetValue version with
+                    | false, _ -> [] :> IReadOnlyList<string>
+                    | true, stored ->
+                        stored.Files.Keys
+                        |> Seq.filter (fun path ->
+                            path = canonicalPrefix
+                            || path.StartsWith(canonicalPrefix + "/", StringComparison.Ordinal))
+                        |> Seq.sortWith (fun left right -> String.CompareOrdinal(left, right))
+                        |> Seq.toList
+                        :> IReadOnlyList<string>)
+            |> ok
+
         member _.UploadPackage(tenant, agentId, version, source, entries, cancellationToken) =
             if isNull (box source) then
                 raise (ArgumentNullException(nameof source))

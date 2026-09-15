@@ -175,6 +175,37 @@ type FakePackageStore() =
                 return read
             }
 
+        member _.ListFiles(t, a, v, prefix, _) =
+            task {
+                let validatedVersion = PackageVersions.Validate v
+
+                if isNull (box prefix) then
+                    raise (ArgumentNullException(nameof prefix))
+
+                let canonicalPrefix = AgentPackagePaths.Normalise prefix
+                let scope = versionKey t a validatedVersion + "|"
+
+                let listed =
+                    files.Keys
+                    |> Seq.choose (fun key ->
+                        if key.StartsWith scope then
+                            let path = key.Substring(scope.Length)
+
+                            if
+                                path = canonicalPrefix
+                                || path.StartsWith(canonicalPrefix + "/", StringComparison.Ordinal)
+                            then
+                                Some path
+                            else
+                                None
+                        else
+                            None)
+                    |> Seq.toArray
+                    |> Array.sortWith (fun x y -> String.CompareOrdinal(x, y))
+
+                return listed :> IReadOnlyList<string>
+            }
+
         member _.UploadPackage(t, a, v, source, entries, _) =
             task {
                 if isNull (box source) then

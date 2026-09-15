@@ -746,6 +746,7 @@ let expectedRules: (string * int * SessionCellKind) list =
         "sessionClosed", 0, SessionCellKind.User // progress marker: no cells
         "userMessage", 1, SessionCellKind.User // one User cell per folded Inject message
         "contextPruned", 1, SessionCellKind.System // one System audit cell per prune event
+        "skillInvalid", 1, SessionCellKind.System // one System failure cell per skipped skill
     ]
 
 [<Fact>]
@@ -815,6 +816,17 @@ let ``The fold classifies a bare event of every kind per the mapped rule`` () =
                 fun () -> UserMessageEvent(sessionId, turnId, noSequence, stamp, userMessage "steer") :> SessionEvent
             | "contextPruned" ->
                 fun () -> ContextPrunedEvent(sessionId, turnId, noSequence, stamp, 2, 10L, 4L) :> SessionEvent
+            | "skillInvalid" ->
+                fun () ->
+                    SkillInvalidEvent(
+                        sessionId,
+                        turnId,
+                        noSequence,
+                        stamp,
+                        "deploy",
+                        "the skill frontmatter has no 'name'"
+                    )
+                    :> SessionEvent
             | _ -> failwith (sprintf "unmapped discriminator '%s' in the pin table" discriminator)
 
         let cells = foldEvents [ buildEvent () ]

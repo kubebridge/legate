@@ -301,6 +301,9 @@ let ``Every text-bearing kind redacts`` () =
             ("FailReason",
              TurnFailedEvent(sessionId, turnId, noSequence, startInstant, "pwd=hunter2") :> SessionEvent,
              fun event -> (event :?> TurnFailedEvent).Reason)
+            ("SkipReason",
+             SkillInvalidEvent(sessionId, turnId, noSequence, startInstant, "deploy", "pwd=hunter2") :> SessionEvent,
+             fun event -> (event :?> SkillInvalidEvent).Reason)
         ]
 
     for _, event, field in kinds do
@@ -342,6 +345,14 @@ let ``Every text-bearing kind redacts`` () =
 
     let keptStarted = JournalWriter.sanitizeEvent started :?> ToolCallStartedEvent
     keptStarted.ToolName |> should equal "exec"
+
+    // The skip reason redacts like any failure reason; the skill name is
+    // an identifier and passes through verbatim.
+    let skipped =
+        SkillInvalidEvent(sessionId, turnId, noSequence, startInstant, "deploy", "pwd=hunter2") :> SessionEvent
+
+    let keptSkipped = JournalWriter.sanitizeEvent skipped :?> SkillInvalidEvent
+    keptSkipped.SkillName |> should equal "deploy"
 
 [<Fact>]
 let ``Null text fields stay null`` () =

@@ -47,7 +47,7 @@ type SessionCellKind =
 /// <item><term>Assistant</term><description>one cell per contiguous run of TextDeltaEvents; content concatenates the deltas; timestamp is the first delta's. Reasoning deltas are transient and produce no cell.</description></item>
 /// <item><term>ToolCall</term><description>one cell per ToolCallStartedEvent, emitted immediately so hosts render the call while it runs; toolName and toolCallId set; content is empty because arguments are journaled, never streamed.</description></item>
 /// <item><term>ToolResult</term><description>one cell per ToolCallCompletedEvent: content is the call's accumulated ToolCallOutputEvent fragments, or the error reason when the call failed with no output; isError mirrors the completion event's error. A call started but never completed yields no result cell (abort case).</description></item>
-/// <item><term>System</term><description>one cell per PermissionRequestedEvent, PermissionResolvedEvent, QuestionAskedEvent, or QuestionAnsweredEvent, one per TurnFailedEvent, one per ContextPrunedEvent, and one per CompactionFailedEvent; content is the tool name, decision, question, answer, failure reason, or prune summary; metadata carries the request or question id (or the pruned count plus the before/after estimates) plus the event discriminator.</description></item>
+/// <item><term>System</term><description>one cell per PermissionRequestedEvent, PermissionResolvedEvent, QuestionAskedEvent, or QuestionAnsweredEvent, one per TurnFailedEvent, one per ContextPrunedEvent, one per CompactionFailedEvent, and one per SkillInvalidEvent; content is the tool name, decision, question, answer, failure reason, prune summary, or skip reason; metadata carries the request or question id (or the pruned count plus the before/after estimates, or the skill name) plus the event discriminator.</description></item>
 /// </list>
 /// Progress markers (turnStarted, usage, compacted, turnCompleted,
 /// turnAborted, sessionClosed) produce no cells; hosts read them from the
@@ -625,6 +625,28 @@ type SessionCellDeriver() =
                         iteration
                         (Some(metadata :> IReadOnlyDictionary<string, string>))
                         failed.Timestamp
+
+                | :? SkillInvalidEvent as invalid ->
+                    // Rule 9: one system cell carrying the discovery skip,
+                    // isError true like the other failure remarks: the turn
+                    // continues without the skill, but hosts surface the
+                    // miss. Metadata carries the discriminator plus the
+                    // skill name, so hosts can filter on either.
+                    flushRun ()
+
+                    let metadata = Dictionary<string, string>()
+                    metadata["event"] <- "skillInvalid"
+                    metadata["skillName"] <- invalid.SkillName
+
+                    addCell
+                        SessionCellKind.System
+                        invalid.Reason
+                        null
+                        null
+                        true
+                        iteration
+                        (Some(metadata :> IReadOnlyDictionary<string, string>))
+                        invalid.Timestamp
 
                 | _ ->
                     // Progress markers (turnStarted, usage, compacted,

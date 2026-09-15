@@ -265,6 +265,16 @@ module internal JournalWriter =
         | :? CompactionFailedEvent as source when not (isNull (box source)) ->
             CompactionFailedEvent(source.SessionId, source.TurnId, source.Sequence, source.Timestamp, map source.Reason)
             :> SessionEvent
+        | :? SkillInvalidEvent as source when not (isNull (box source)) ->
+            SkillInvalidEvent(
+                source.SessionId,
+                source.TurnId,
+                source.Sequence,
+                source.Timestamp,
+                source.SkillName,
+                map source.Reason
+            )
+            :> SessionEvent
         | :? UserMessageEvent as source when not (isNull (box source)) ->
             let mapped = mapParts map source.Message.Parts
 
@@ -328,6 +338,8 @@ module internal JournalWriter =
         | :? TurnAbortedEvent as source when not (isNull (box source)) -> length source.Reason
         | :? TurnFailedEvent as source when not (isNull (box source)) -> length source.Reason
         | :? CompactionFailedEvent as source when not (isNull (box source)) -> length source.Reason
+        | :? SkillInvalidEvent as source when not (isNull (box source)) ->
+            max (length source.SkillName) (length source.Reason)
         | :? UserMessageEvent as source when not (isNull (box source)) ->
             if isNull (box source.Message) || isNull (box source.Message.Parts) then
                 0
