@@ -52,6 +52,7 @@
     <Compile Include="StopArbitrationTests.fs" />
     <Compile Include="ClaimHeartbeatTests.fs" />
     <Compile Include="ClaimFenceTests.fs" />
+    <Compile Include="JournalWriterTests.fs" />
   </ItemGroup>
 
   <ItemGroup>

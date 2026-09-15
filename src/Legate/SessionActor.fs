@@ -387,10 +387,17 @@ module internal SessionActor =
                                         payload.Message
                                     )
 
+                                // Route the fold through the journal writer:
+                                // the observer sees the redacted shape, so a
+                                // downstream journal carries no secrets. The
+                                // writer never drops: kind and ids survive,
+                                // only secret shapes are replaced.
+                                let redacted = JournalWriter.sanitizeEvent event :?> UserMessageEvent
+
                                 match wiring.JournalEvent with
                                 | Some observe ->
                                     try
-                                        observe event
+                                        observe redacted
                                     with _ ->
                                         ()
                                 | None -> ()
@@ -1539,7 +1546,36 @@ module internal SessionActor =
                     ()
             | None -> ()
 
-        let journalSuspend (suspension: TurnLoop.TurnLoopSuspension) : unit =
+        /// Settles a turn whose suspend/resolve journal write never landed
+        /// as Failed with the typed reason: parking or resuming would strand
+        /// the turn on a missing journal event. Consumes the entry and
+        /// returns the session to Idle with the Failed result observed,
+        /// mirroring the AskTimeout settle.
+        /// <param name="entry">The turn's inbox entry to consume.</param>
+        /// <param name="reason">Why the turn failed. Never contains secrets or tool arguments.</param>
+        let settleJournalFailure (entry: InboxEntry) (reason: string) : unit =
+            let result =
+                {
+                    AssistantText = ""
+                    Status = TurnStatus.Failed
+                    Iterations = 0
+                    Usage = { InputTokens = 0L; OutputTokens = 0L }
+                    Outcome = TurnFailed(reason) :> TurnOutcome
+                }
+
+            notifySettled result
+
+            let positions = [| entry.Position |] :> IReadOnlyList<int64>
+
+            awaitTask (props.Store.MarkInboxConsumed(props.Tenant, props.SessionId, positions, CancellationToken.None))
+            |> ignore
+
+            awaitTask (
+                props.Store.UpdateSessionState(props.Tenant, props.SessionId, SessionState.Idle, CancellationToken.None)
+            )
+            |> ignore
+
+        let journalSuspend (suspension: TurnLoop.TurnLoopSuspension) : JournalWriter.JournalWriteResult =
             let turnId = TurnId.New()
             let stamp = DateTimeOffset.UtcNow
 
@@ -1568,21 +1604,21 @@ module internal SessionActor =
 
             let events = ResizeArray<SessionEvent>([| event |]) :> IReadOnlyList<SessionEvent>
 
-            try
-                awaitTask (
-                    suspend.EventStore.Append(
-                        props.Tenant,
-                        props.SessionId,
-                        suspend.JournalToken,
-                        events,
-                        CancellationToken.None
-                    )
-                )
-                |> ignore
-            with _ ->
-                ()
+            // Through the journal writer: sanitized, bounded, fenced on the
+            // journal token with bounded retries. The caller branches the
+            // result: Appended parks the turn, Rejected/Failed settle it
+            // Failed with the typed reason instead.
+            awaitTask (
+                JournalWriter.appendWithTokenAsync
+                    suspend.EventStore
+                    props.Tenant
+                    props.SessionId
+                    suspend.JournalToken
+                    events
+                    CancellationToken.None
+            )
 
-        let journalResolve (reply: Reply) : unit =
+        let journalResolve (reply: Reply) : JournalWriter.JournalWriteResult =
             let turnId = TurnId.New()
             let stamp = DateTimeOffset.UtcNow
 
@@ -1613,23 +1649,26 @@ module internal SessionActor =
                 | _ -> None
 
             match eventOpt with
-            | None -> ()
+            | None ->
+                // No journal shape for this reply kind (Reply carries only
+                // the two known subtypes): nothing to append, so the resume
+                // proceeds on an empty applied result.
+                JournalWriter.JournalAppended(ResizeArray<SessionEvent>() :> IReadOnlyList<SessionEvent>)
             | Some event ->
                 let events = ResizeArray<SessionEvent>([| event |]) :> IReadOnlyList<SessionEvent>
 
-                try
-                    awaitTask (
-                        suspend.EventStore.Append(
-                            props.Tenant,
-                            props.SessionId,
-                            suspend.JournalToken,
-                            events,
-                            CancellationToken.None
-                        )
-                    )
-                    |> ignore
-                with _ ->
-                    ()
+                // Through the journal writer, like the suspend event: the
+                // caller branches the result instead of resuming on a write
+                // that never landed.
+                awaitTask (
+                    JournalWriter.appendWithTokenAsync
+                        suspend.EventStore
+                        props.Tenant
+                        props.SessionId
+                        suspend.JournalToken
+                        events
+                        CancellationToken.None
+                )
 
         let journalTimeout () : unit =
             let turnId = TurnId.New()
@@ -1640,19 +1679,19 @@ module internal SessionActor =
 
             let events = ResizeArray<SessionEvent>([| event |]) :> IReadOnlyList<SessionEvent>
 
-            try
-                awaitTask (
-                    suspend.EventStore.Append(
-                        props.Tenant,
-                        props.SessionId,
-                        suspend.JournalToken,
-                        events,
-                        CancellationToken.None
-                    )
-                )
-                |> ignore
-            with _ ->
-                ()
+            // Through the journal writer, best-effort: the turn already
+            // settles Failed, so a rejected or failed write carries no
+            // further turn to fail.
+            awaitTask (
+                JournalWriter.appendWithTokenAsync
+                    suspend.EventStore
+                    props.Tenant
+                    props.SessionId
+                    suspend.JournalToken
+                    events
+                    CancellationToken.None
+            )
+            |> ignore
 
         let startSuspendable (entry: InboxEntry) (attempt: int) (allowed: HashSet<string>) : unit =
             let runTask =
@@ -1896,24 +1935,34 @@ module internal SessionActor =
                             )
                             |> ignore
 
-                            journalSuspend cursor
+                            match journalSuspend cursor with
+                            | JournalWriter.JournalAppended _ ->
+                                let timeoutCts = new CancellationTokenSource()
 
-                            let timeoutCts = new CancellationTokenSource()
+                                let carried = if isNull (box allowed) then HashSet<string>() else allowed
 
-                            let carried = if isNull (box allowed) then HashSet<string>() else allowed
+                                let parked =
+                                    {
+                                        Entry = entry
+                                        Cursor = Some cursor
+                                        Rebuilt = None
+                                        Allowed = carried
+                                        Attempt = attempt
+                                        TimeoutCts = timeoutCts
+                                    }
 
-                            let parked =
-                                {
-                                    Entry = entry
-                                    Cursor = Some cursor
-                                    Rebuilt = None
-                                    Allowed = carried
-                                    Attempt = attempt
-                                    TimeoutCts = timeoutCts
-                                }
-
-                            armTimeout cursor.RequestId timeoutCts
-                            return! loop SessionState.WaitingForInput (Some parked) resolved
+                                armTimeout cursor.RequestId timeoutCts
+                                return! loop SessionState.WaitingForInput (Some parked) resolved
+                            | JournalWriter.JournalRejected rejection ->
+                                // The suspend event never landed: parking
+                                // would strand the turn on a missing journal
+                                // entry, so the turn fails with the typed
+                                // reason instead.
+                                settleJournalFailure entry (sprintf "The journal append was rejected: %s." rejection)
+                                return! loop SessionState.Idle None resolved
+                            | JournalWriter.JournalFailed failure ->
+                                settleJournalFailure entry failure
+                                return! loop SessionState.Idle None resolved
                     | SessionState.WaitingForInput, Some parked when parked.Cursor.IsNone && parked.Rebuilt.IsSome ->
                         // Crash-retry path should never produce a running
                         // finish while still parked; ignore stale completions.
@@ -2012,55 +2061,80 @@ module internal SessionActor =
                                     )
                                     |> ignore
 
-                                    journalResolve reply
-                                    resolved.Add(requestId) |> ignore
+                                    let writeResult = journalResolve reply
 
-                                    awaitTask (
-                                        props.Store.UpdateSessionState(
-                                            props.Tenant,
-                                            props.SessionId,
-                                            SessionState.Running,
-                                            CancellationToken.None
+                                    match writeResult with
+                                    | JournalWriter.JournalAppended _ ->
+                                        resolved.Add(requestId) |> ignore
+
+                                        awaitTask (
+                                            props.Store.UpdateSessionState(
+                                                props.Tenant,
+                                                props.SessionId,
+                                                SessionState.Running,
+                                                CancellationToken.None
+                                            )
                                         )
-                                    )
-                                    |> ignore
+                                        |> ignore
 
-                                    // AllowForSession memory: remember the tool
-                                    // before resuming so the continued run skips
-                                    // Evaluate for it.
-                                    match reply with
-                                    | :? PermissionDecision as decision when
-                                        not (isNull (box decision))
-                                        && decision.Decision = PermissionDecisionKind.AllowForSession
-                                        ->
-                                        let toolName =
-                                            match parked.Cursor with
-                                            | Some cursor -> cursor.ToolName
-                                            | None ->
-                                                match parked.Rebuilt with
-                                                | Some rebuilt -> rebuilt.ToolName
-                                                | None -> ""
+                                        // AllowForSession memory: remember the tool
+                                        // before resuming so the continued run skips
+                                        // Evaluate for it.
+                                        match reply with
+                                        | :? PermissionDecision as decision when
+                                            not (isNull (box decision))
+                                            && decision.Decision = PermissionDecisionKind.AllowForSession
+                                            ->
+                                            let toolName =
+                                                match parked.Cursor with
+                                                | Some cursor -> cursor.ToolName
+                                                | None ->
+                                                    match parked.Rebuilt with
+                                                    | Some rebuilt -> rebuilt.ToolName
+                                                    | None -> ""
 
-                                        if not (String.IsNullOrEmpty toolName) then
-                                            parked.Allowed.Add(toolName) |> ignore
-                                    | _ -> ()
+                                            if not (String.IsNullOrEmpty toolName) then
+                                                parked.Allowed.Add(toolName) |> ignore
+                                        | _ -> ()
 
-                                    mailbox.Sender() <! ReplyAccepted replyEntry
+                                        mailbox.Sender() <! ReplyAccepted replyEntry
 
-                                    let nextAttempt = parked.Attempt + 1
+                                        let nextAttempt = parked.Attempt + 1
 
-                                    match parked.Cursor with
-                                    | Some _ ->
-                                        resumeSuspendable parked reply nextAttempt
-                                        return! loop SessionState.Running None resolved
-                                    | None ->
-                                        // Crash-retry: no cursor, so retry the
-                                        // parked entry from scratch under the new
-                                        // attempt. The retried run suspends again
-                                        // or settles; either path re-enters this
-                                        // loop.
-                                        startSuspendable parked.Entry nextAttempt parked.Allowed
-                                        return! loop SessionState.Running None resolved
+                                        match parked.Cursor with
+                                        | Some _ ->
+                                            resumeSuspendable parked reply nextAttempt
+                                            return! loop SessionState.Running None resolved
+                                        | None ->
+                                            // Crash-retry: no cursor, so retry the
+                                            // parked entry from scratch under the new
+                                            // attempt. The retried run suspends again
+                                            // or settles; either path re-enters this
+                                            // loop.
+                                            startSuspendable parked.Entry nextAttempt parked.Allowed
+                                            return! loop SessionState.Running None resolved
+                                    | JournalWriter.JournalRejected rejection ->
+                                        // The resolve event never landed: resuming
+                                        // would strand the turn on a missing
+                                        // journal entry, so the turn fails with
+                                        // the typed reason instead. The reply
+                                        // matched and is consumed, so it still
+                                        // acks Accepted, and the request id is
+                                        // recorded so a redelivery replays
+                                        // Accepted instead of ReplyMismatch.
+                                        resolved.Add(requestId) |> ignore
+
+                                        settleJournalFailure
+                                            parked.Entry
+                                            (sprintf "The journal append was rejected: %s." rejection)
+
+                                        mailbox.Sender() <! ReplyAccepted replyEntry
+                                        return! loop SessionState.Idle None resolved
+                                    | JournalWriter.JournalFailed failure ->
+                                        resolved.Add(requestId) |> ignore
+                                        settleJournalFailure parked.Entry failure
+                                        mailbox.Sender() <! ReplyAccepted replyEntry
+                                        return! loop SessionState.Idle None resolved
                             | Some requestId, _ ->
                                 let error =
                                     ReplyMismatchException(
