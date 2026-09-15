@@ -2119,7 +2119,11 @@ module internal SessionActor =
                                         // journal entry, so the turn fails with
                                         // the typed reason instead. The reply
                                         // matched and is consumed, so it still
-                                        // acks Accepted.
+                                        // acks Accepted, and the request id is
+                                        // recorded so a redelivery replays
+                                        // Accepted instead of ReplyMismatch.
+                                        resolved.Add(requestId) |> ignore
+
                                         settleJournalFailure
                                             parked.Entry
                                             (sprintf "The journal append was rejected: %s." rejection)
@@ -2127,6 +2131,7 @@ module internal SessionActor =
                                         mailbox.Sender() <! ReplyAccepted replyEntry
                                         return! loop SessionState.Idle None resolved
                                     | JournalWriter.JournalFailed failure ->
+                                        resolved.Add(requestId) |> ignore
                                         settleJournalFailure parked.Entry failure
                                         mailbox.Sender() <! ReplyAccepted replyEntry
                                         return! loop SessionState.Idle None resolved

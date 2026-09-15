@@ -189,6 +189,39 @@ let ``Bearer tokens redact`` () =
     (bearer.Contains "eyJhbGciOiJIUzI1NiJ9") |> should equal false
 
 [<Fact>]
+let ``Quoted-label JSON secrets redact`` () =
+    // Round-1 review: the labelled rule required [:=] immediately after the
+    // label, so JSON shapes ("label": "value") passed through verbatim.
+    let doubleSpaced = JournalWriter.redactText "{\"password\": \"hunter2\"}"
+    (doubleSpaced.Contains "[REDACTED]") |> should equal true
+    (doubleSpaced.Contains "hunter2") |> should equal false
+
+    let doubleTight = JournalWriter.redactText "{\"secret\":\"hunter2\"}"
+    (doubleTight.Contains "[REDACTED]") |> should equal true
+    (doubleTight.Contains "hunter2") |> should equal false
+
+    let singleQuoted = JournalWriter.redactText "{ 'token': 'abc123xyz' }"
+    (singleQuoted.Contains "[REDACTED]") |> should equal true
+    (singleQuoted.Contains "abc123xyz") |> should equal false
+
+    let tokenSpaced = JournalWriter.redactText "{ \"token\": \"abc123xyz\" }"
+    (tokenSpaced.Contains "[REDACTED]") |> should equal true
+    (tokenSpaced.Contains "abc123xyz") |> should equal false
+
+[<Fact>]
+let ``Basic auth headers and URI credentials redact`` () =
+    let basic = JournalWriter.redactText "Authorization: Basic dXNlcjpwYXNz"
+    (basic.Contains "[REDACTED]") |> should equal true
+    (basic.Contains "dXNlcjpwYXNz") |> should equal false
+
+    let uri = JournalWriter.redactText "connect mongodb://user:p%40ssword@host/db now"
+    (uri.Contains "[REDACTED]") |> should equal true
+    (uri.Contains "p%40ssword") |> should equal false
+
+    let bareHost = JournalWriter.redactText "connect mongodb://host/db now"
+    bareHost |> should equal "connect mongodb://host/db now"
+
+[<Fact>]
 let ``Labelled secrets redact with mixed case and quotes`` () =
     JournalWriter.redactText "api_key=hunter2" |> should equal "[REDACTED]"
     JournalWriter.redactText "API_KEY: \"hunter2\"" |> should equal "[REDACTED]"
@@ -421,6 +454,34 @@ let ``Metadata trims to 64 entries deterministically`` () =
         metadata["m63"] |> should equal "v63"
         (metadata.ContainsKey "m64") |> should equal false
     | _ -> failwith "Expected trimmed metadata to survive bounding."
+
+[<Fact>]
+let ``UserMessage text parts bound below 64 KiB`` () =
+    // Round-1 review: boundEvent never reduced UserMessageEvent text parts,
+    // so a 100K-char part exited at ~100270 bytes. Parts now truncate and
+    // shrink symmetric with every other text-bearing kind.
+    let parts =
+        ResizeArray<AIContent>(
+            [|
+                TextContent(String('c', 100000)) :> AIContent
+            |]
+        )
+        :> IReadOnlyList<AIContent>
+
+    let event =
+        UserMessageEvent(SessionId.New(), TurnId.New(), noSequence, startInstant, UserMessage(parts, null))
+
+    let bounded = JournalWriter.boundEvent event :?> UserMessageEvent
+
+    JournalWriter.estimateEventBytes bounded <= JournalWriter.MaxEventBytes
+    |> should equal true
+
+    let part = bounded.Message.Parts[0] :?> TextContent
+
+    (part.Text.EndsWith(JournalWriter.TruncationMarker, StringComparison.Ordinal))
+    |> should equal true
+
+    (part.Text.Length < 100000) |> should equal true
 
 [<Fact>]
 let ``Escape-heavy text shrinks below 64 KiB without dropping`` () =

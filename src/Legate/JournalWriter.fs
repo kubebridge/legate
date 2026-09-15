@@ -105,7 +105,9 @@ module internal JournalWriter =
             ("google-api-key", Regex(@"\bAIza[0-9A-Za-z\-_]{35}\b", options))
             ("slack-token", Regex(@"\bxox[bpas]-[A-Za-z0-9\-]+\b", options))
             ("bearer-token", Regex(@"(?i)\bbearer\s+[A-Za-z0-9\-._~+/=]{8,}", options))
+            ("basic-auth", Regex(@"(?i)\bbasic\s+[A-Za-z0-9\-._~+/=]{8,}", options))
             ("connection-password", Regex(@"(?i)\b(password|pwd)=[^;\s""']+", options))
+            ("uri-credential", Regex(@"(?<=://)[^/\s@]+:[^@\s/]*@", options))
             ("env-assignment",
              Regex(
                  @"(?im)^\s*[A-Z][A-Z0-9_]*?(?:KEY|SECRET|TOKEN|PASSWORD|PASSWD|_PWD|CREDENTIAL|PRIVATE)[A-Z0-9_]*\s*=\s*[^\r\n]+",
@@ -113,7 +115,7 @@ module internal JournalWriter =
              ))
             ("labelled-secret",
              Regex(
-                 @"(?i)\b(api[_-]?key|api[_-]?secret|secret[_-]?key|client[_-]?secret|private[_-]?key|auth[_-]?token|access[_-]?token|refresh[_-]?token|claim[\s_-]?token|session[\s_-]?token|id[\s_-]?token|password|passwd|pwd|secret|token)\b\s*[:=]\s*\S+",
+                 @"(?i)\b(api[_-]?key|api[_-]?secret|secret[_-]?key|client[_-]?secret|private[_-]?key|auth[_-]?token|access[_-]?token|refresh[_-]?token|claim[\s_-]?token|session[\s_-]?token|id[\s_-]?token|password|passwd|pwd|secret|token)\b[""']?\s*[:=]\s*[""']?\S+",
                  options
              ))
         ]
@@ -159,6 +161,34 @@ module internal JournalWriter =
                     | _ -> redacted.Add(part)
 
             redacted :> IReadOnlyList<AIContent>
+
+    /// Maps the text parts of a user message through the given function,
+    /// preserving every non-text part by reference and every null entry as
+    /// null. Null text stays null. The generic transform behind the
+    /// UserMessage branch of mapTexts, so truncation and shrinking reduce
+    /// message parts symmetric with every other text-bearing kind.
+    /// <param name="map">The null-safe function applied to each text part.</param>
+    /// <param name="parts">The message parts, or null.</param>
+    /// <returns>The mapped parts, or null when the input was null.</returns>
+    let private mapParts (map: string -> string) (parts: IReadOnlyList<AIContent>) : IReadOnlyList<AIContent> =
+        if isNull (box parts) then
+            null
+        else
+            let mapped = ResizeArray<AIContent>(parts.Count)
+
+            for part in parts do
+                if isNull (box part) then
+                    mapped.Add(null)
+                else
+                    match part with
+                    | :? TextContent as text when not (isNull (box text)) ->
+                        if isNull (box text.Text) then
+                            mapped.Add(part)
+                        else
+                            mapped.Add(TextContent(map text.Text) :> AIContent)
+                    | _ -> mapped.Add(part)
+
+            mapped :> IReadOnlyList<AIContent>
 
     /// Maps every text-bearing field of an event through the given function,
     /// rebuilding the event with the same ids, sequence, and timestamp.
@@ -233,9 +263,9 @@ module internal JournalWriter =
             TurnFailedEvent(source.SessionId, source.TurnId, source.Sequence, source.Timestamp, map source.Reason)
             :> SessionEvent
         | :? UserMessageEvent as source when not (isNull (box source)) ->
-            let redacted = redactParts source.Message.Parts
+            let mapped = mapParts map source.Message.Parts
 
-            let message = UserMessage(redacted, source.Message.Metadata)
+            let message = UserMessage(mapped, source.Message.Metadata)
 
             UserMessageEvent(source.SessionId, source.TurnId, source.Sequence, source.Timestamp, message)
             :> SessionEvent
