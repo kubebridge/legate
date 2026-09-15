@@ -173,6 +173,7 @@ let private productionRunner
         TurnLoop.TurnLoopOptions.Default
         (NeverDelay() :> ILlmDelay)
         policy
+        None
 
 // ──────────────────────────────────────────────────────────────────────────
 // Production spawn wiring: Ask suspends the live actor (Tasks 1+3)

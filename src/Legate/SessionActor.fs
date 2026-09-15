@@ -405,6 +405,7 @@ module internal SessionActor =
     /// <param name="delay">The delay seam the hard deadline fires off. Must not be null.</param>
     /// <param name="isLeaseValid">The lease hook the loop checks. Must not be null.</param>
     /// <param name="inject">The store-backed Inject fold wiring, or None for a Queue-only turn with no fold.</param>
+    /// <param name="getSystemPrompt">The composed system prompt hook (issue 66), or None to run with no system message.</param>
     /// <returns>A runner executing one inbox entry per turn.</returns>
     let private runnerFor
         (client: IChatClient)
@@ -413,6 +414,7 @@ module internal SessionActor =
         (delay: ILlmDelay)
         (isLeaseValid: unit -> bool)
         (inject: InjectFoldWiring option)
+        (getSystemPrompt: PromptComposition.GetTurnSystemPrompt option)
         : (InboxEntry -> CancellationToken -> Task<TurnResult>) =
         ArgumentNullException.ThrowIfNull(client)
         ArgumentNullException.ThrowIfNull(tools)
@@ -422,6 +424,15 @@ module internal SessionActor =
         fun entry cancellationToken ->
             task {
                 let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+
+                // Package-load step (issue 66): resolve the composed
+                // system prompt and lead the history with it. A
+                // null/empty resolution keeps today's user-only shape.
+                match getSystemPrompt with
+                | Some resolve ->
+                    let! systemPrompt = resolve entry cancellationToken
+                    PromptComposition.prependSystemPrompt history systemPrompt
+                | None -> ()
 
                 match entry.Payload with
                 | :? UserMessagePayload as userMessage when
@@ -523,7 +534,32 @@ module internal SessionActor =
         (options: TurnLoop.TurnLoopOptions)
         (delay: ILlmDelay)
         : (InboxEntry -> CancellationToken -> Task<TurnResult>) =
-        runnerFor client tools options delay (fun () -> true) None
+        runnerFor client tools options delay (fun () -> true) None None
+
+    /// Builds the composed turn runner over TurnLoop.runAsync for Queue
+    /// delivery (issue 66): the same history shape as
+    /// <see cref="M:Legate.SessionActor.createTurnRunner" />, but the
+    /// turn's composed system prompt leads the history as a
+    /// ChatRole.System message. A null or empty resolution runs the
+    /// user-only shape, so an uncomposed turn behaves exactly like the
+    /// default runner.
+    /// <param name="client">The chat client the turn runs against.</param>
+    /// <param name="tools">The tools the turn may call.</param>
+    /// <param name="options">The turn loop tuning and per-turn budget.</param>
+    /// <param name="delay">The delay seam the hard deadline fires off. Must not be null.</param>
+    /// <param name="getSystemPrompt">Resolves the turn's composed system prompt. Must not be null.</param>
+    /// <returns>A runner executing one Queue inbox entry per turn with the composed system message first.</returns>
+    let createComposedTurnRunner
+        (client: IChatClient)
+        (tools: IReadOnlyDictionary<string, AITool>)
+        (options: TurnLoop.TurnLoopOptions)
+        (delay: ILlmDelay)
+        (getSystemPrompt: PromptComposition.GetTurnSystemPrompt)
+        : (InboxEntry -> CancellationToken -> Task<TurnResult>) =
+        if isNull (box getSystemPrompt) then
+            raise (ArgumentNullException(nameof getSystemPrompt))
+
+        runnerFor client tools options delay (fun () -> true) None (Some getSystemPrompt)
 
     /// Builds the Inject-aware turn runner over
     /// TurnLoop.runAsyncWithInjects (issue 34): the same history shape as
@@ -549,7 +585,7 @@ module internal SessionActor =
         if isNull (box wiring) then
             raise (ArgumentNullException(nameof wiring))
 
-        runnerFor client tools options delay (fun () -> true) (Some wiring)
+        runnerFor client tools options delay (fun () -> true) (Some wiring) None
 
     /// Builds the claimed turn runner over TurnLoop.runAsync for Queue
     /// delivery (issue 33): the same history shape as
@@ -580,6 +616,7 @@ module internal SessionActor =
             }
             delay
             isLeaseValid
+            None
             None
 
     // ────────────────── Compaction wiring (issue 45) ──────────────────

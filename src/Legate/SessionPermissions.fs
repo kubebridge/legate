@@ -27,10 +27,12 @@ open Microsoft.Extensions.DependencyInjection
 module internal SessionPermissions =
 
     /// Builds the user history for a fresh run from the entry's parts,
-    /// mirroring the actor's Queue runner shape.
+    /// mirroring the actor's Queue runner shape, with the composed system
+    /// prompt (issue 66) leading when present.
     /// <param name="entry">The inbox entry the run executes.</param>
-    /// <returns>The history carrying the entry's user message.</returns>
-    let private historyOf (entry: InboxEntry) : IList<ChatMessage> =
+    /// <param name="systemPrompt">The composed system prompt, or null for the user-only shape.</param>
+    /// <returns>The history carrying the system message (when present) and the entry's user message.</returns>
+    let private historyOf (entry: InboxEntry) (systemPrompt: string | null) : IList<ChatMessage> =
         let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
 
         match entry.Payload with
@@ -48,6 +50,7 @@ module internal SessionPermissions =
             history.Add(ChatMessage(ChatRole.User, parts :> IList<AIContent>))
         | _ -> history.Add(ChatMessage(ChatRole.User, ""))
 
+        PromptComposition.prependSystemPrompt history systemPrompt
         history
 
     /// Builds the production suspendable runner over
@@ -61,6 +64,7 @@ module internal SessionPermissions =
     /// <param name="options">The turn loop tuning and per-turn budget.</param>
     /// <param name="loopDelay">The delay seam the turn's hard deadline fires off. Must not be null.</param>
     /// <param name="policy">The permission policy, or null for no gate (every call executes).</param>
+    /// <param name="getSystemPrompt">The composed system prompt hook (issue 66), or None to run with no system message.</param>
     /// <returns>The suspendable runner executing one attempt per call.</returns>
     let createRunner
         (client: IChatClient)
@@ -68,6 +72,7 @@ module internal SessionPermissions =
         (options: TurnLoop.TurnLoopOptions)
         (loopDelay: ILlmDelay)
         (policy: IPermissionPolicy | null)
+        (getSystemPrompt: PromptComposition.GetTurnSystemPrompt option)
         : SessionActor.SuspendableRunner =
         ArgumentNullException.ThrowIfNull(client)
         ArgumentNullException.ThrowIfNull(tools)
@@ -85,9 +90,20 @@ module internal SessionPermissions =
 
         fun entry _attempt allowed cursor reply runnerToken ->
             task {
+                // Package-load step (issue 66): fresh runs resolve the
+                // composed system prompt and lead with it. Resumes replay
+                // the suspended history verbatim, never recomposing.
+                let resolveSystem () : Task<string | null> =
+                    task {
+                        match getSystemPrompt with
+                        | Some resolve -> return! resolve entry runnerToken
+                        | None -> return null
+                    }
+
                 match cursor, reply with
                 | None, None ->
-                    let history = historyOf entry
+                    let! systemPrompt = resolveSystem ()
+                    let history = historyOf entry systemPrompt
 
                     return!
                         TurnLoop.runSuspendableAsync
@@ -137,7 +153,8 @@ module internal SessionPermissions =
                 | None, Some _ ->
                     // Crash-rebuild shape: no live cursor, so retry the
                     // turn from its inbox entry with the persisted grants.
-                    let history = historyOf entry
+                    let! rebuildPrompt = resolveSystem ()
+                    let history = historyOf entry rebuildPrompt
 
                     return!
                         TurnLoop.runSuspendableAsync
