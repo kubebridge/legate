@@ -47,7 +47,7 @@ type SessionCellKind =
 /// <item><term>Assistant</term><description>one cell per contiguous run of TextDeltaEvents; content concatenates the deltas; timestamp is the first delta's. Reasoning deltas are transient and produce no cell.</description></item>
 /// <item><term>ToolCall</term><description>one cell per ToolCallStartedEvent, emitted immediately so hosts render the call while it runs; toolName and toolCallId set; content is empty because arguments are journaled, never streamed.</description></item>
 /// <item><term>ToolResult</term><description>one cell per ToolCallCompletedEvent: content is the call's accumulated ToolCallOutputEvent fragments, or the error reason when the call failed with no output; isError mirrors the completion event's error. A call started but never completed yields no result cell (abort case).</description></item>
-/// <item><term>System</term><description>one cell per PermissionRequestedEvent, PermissionResolvedEvent, QuestionAskedEvent, or QuestionAnsweredEvent, one per TurnFailedEvent, and one per ContextPrunedEvent; content is the tool name, decision, question, answer, failure reason, or prune summary; metadata carries the request or question id (or the pruned count plus the before/after estimates) plus the event discriminator.</description></item>
+/// <item><term>System</term><description>one cell per PermissionRequestedEvent, PermissionResolvedEvent, QuestionAskedEvent, or QuestionAnsweredEvent, one per TurnFailedEvent, one per ContextPrunedEvent, and one per CompactionFailedEvent; content is the tool name, decision, question, answer, failure reason, or prune summary; metadata carries the request or question id (or the pruned count plus the before/after estimates) plus the event discriminator.</description></item>
 /// </list>
 /// Progress markers (turnStarted, usage, compacted, turnCompleted,
 /// turnAborted, sessionClosed) produce no cells; hosts read them from the
@@ -606,6 +606,25 @@ type SessionCellDeriver() =
                         iteration
                         (Some(metadata :> IReadOnlyDictionary<string, string>))
                         pruned.Timestamp
+
+                | :? CompactionFailedEvent as failed ->
+                    // Rule 8: one system cell carrying the compaction failure
+                    // reason, isError true like the turn-failure remark: the
+                    // turn continues uncompacted, but hosts surface the miss.
+                    flushRun ()
+
+                    let metadata = Dictionary<string, string>()
+                    metadata["event"] <- "compactionFailed"
+
+                    addCell
+                        SessionCellKind.System
+                        failed.Reason
+                        null
+                        null
+                        true
+                        iteration
+                        (Some(metadata :> IReadOnlyDictionary<string, string>))
+                        failed.Timestamp
 
                 | _ ->
                     // Progress markers (turnStarted, usage, compacted,

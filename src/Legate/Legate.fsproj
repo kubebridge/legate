@@ -16,6 +16,7 @@
     <Compile Include="LlmStreaming.fs" />
     <Compile Include="StopArbitration.fs" />
     <Compile Include="TurnLoop.fs" />
+    <Compile Include="Compaction.fs" />
     <Compile Include="LegateOptionsBinding.fs" />
     <Compile Include="LegateDefaults.fs" />
     <Compile Include="LegateStartupValidation.fs" />

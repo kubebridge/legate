@@ -225,16 +225,26 @@ type PermissionsOptions() =
 
             violation
 
-/// LLM settings: the default model, the coordinator knobs, the per-provider
-/// settings keyed by provider id, and whether the coordinator uses
-/// distributed admission. Bound from the <c>Legate</c> configuration
-/// section; mutable so hosts can set properties before registering.
-/// Defaults name no model, coordinate locally, and register no providers.
+/// LLM settings: the default model, the compaction model, the coordinator
+/// knobs, the per-provider settings keyed by provider id, and whether the
+/// coordinator uses distributed admission. Bound from the <c>Legate</c>
+/// configuration section; mutable so hosts can set properties before
+/// registering. Defaults name no model, coordinate locally, and register no
+/// providers.
 type LlmOptions() =
 
     /// The default model in <c>provider/model</c> form, or null when the
     /// host always names the model per agent.
     member val DefaultModel: string | null = null with get, set
+
+    /// The compaction model in <c>provider/model</c> form, or null when
+    /// compaction summarises through the session's model. Bound from
+    /// <c>Legate:Llm:Compaction</c>.
+    member val Compaction: string | null = null with get, set
+
+    /// How many of the most recent history messages compaction keeps after
+    /// the summary when it rewrites the transcript. Default 10.
+    member val CompactionKeepMessages: int = 10 with get, set
 
     /// The coordinator's rate, concurrency, and retry knobs. Never null.
     member val Coordination: LlmCoordinationOptions = LlmCoordinationOptions() with get, set
@@ -252,21 +262,28 @@ type LlmOptions() =
     /// first violation.
     /// <returns>The first violation's message, or null when the settings are valid.</returns>
     member this.Validate() : string | null =
-        match Option.ofObj this.DefaultModel with
-        | Some model when not (String.IsNullOrWhiteSpace model) ->
-            let mutable parsed = Unchecked.defaultof<ModelReference>
+        let mutable parsed = Unchecked.defaultof<ModelReference>
 
-            if not (ModelReference.TryParse(model, &parsed)) then
-                "DefaultModel must be a valid model reference in provider/model form."
-            elif isNull (box this.Coordination) then
-                "Coordination must not be null."
-            else
-                this.ValidateMaps()
-        | _ ->
-            if isNull (box this.Coordination) then
-                "Coordination must not be null."
-            else
-                this.ValidateMaps()
+        let defaultInvalid =
+            match Option.ofObj this.DefaultModel with
+            | Some model when not (String.IsNullOrWhiteSpace model) -> not (ModelReference.TryParse(model, &parsed))
+            | _ -> false
+
+        let compactionInvalid =
+            match Option.ofObj this.Compaction with
+            | Some model when not (String.IsNullOrWhiteSpace model) -> not (ModelReference.TryParse(model, &parsed))
+            | _ -> false
+
+        if defaultInvalid then
+            "DefaultModel must be a valid model reference in provider/model form."
+        elif compactionInvalid then
+            "Compaction must be a valid model reference in provider/model form."
+        elif this.CompactionKeepMessages < 0 then
+            "CompactionKeepMessages must be at least 0."
+        elif isNull (box this.Coordination) then
+            "Coordination must not be null."
+        else
+            this.ValidateMaps()
 
     /// Validates the coordination knobs and the provider map after the
     /// default-model check passed.

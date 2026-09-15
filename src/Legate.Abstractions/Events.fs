@@ -42,6 +42,7 @@ open System.Text.Json.Serialization
 /// <item><term>questionAnswered</term><description>the host's answer was applied.</description></item>
 /// <item><term>usage</term><description>token usage was checkpointed.</description></item>
 /// <item><term>compacted</term><description>the conversation was summarised.</description></item>
+/// <item><term>compactionFailed</term><description>compaction failed and the turn continued uncompacted.</description></item>
 /// <item><term>turnCompleted</term><description>the turn settled normally.</description></item>
 /// <item><term>turnAborted</term><description>the turn stopped with its stop cause (abort or host shutdown).</description></item>
 /// <item><term>turnFailed</term><description>the turn failed inside the loop.</description></item>
@@ -66,6 +67,7 @@ open System.Text.Json.Serialization
 [<JsonDerivedType(typeof<QuestionAnsweredEvent>, "questionAnswered")>]
 [<JsonDerivedType(typeof<UsageEvent>, "usage")>]
 [<JsonDerivedType(typeof<CompactedEvent>, "compacted")>]
+[<JsonDerivedType(typeof<CompactionFailedEvent>, "compactionFailed")>]
 [<JsonDerivedType(typeof<TurnCompletedEvent>, "turnCompleted")>]
 [<JsonDerivedType(typeof<TurnAbortedEvent>, "turnAborted")>]
 [<JsonDerivedType(typeof<TurnFailedEvent>, "turnFailed")>]
@@ -359,6 +361,23 @@ and [<Sealed>] CompactedEvent
 
     /// The estimated token count after compaction, summary included.
     member _.AfterEstimate = afterEstimate
+
+/// Compaction failed but the turn continues without compaction: the model
+/// denied the summariser call, the provider errored, or the summary came
+/// back empty. Carries the client-safe reason the host may render; never
+/// secrets or tool arguments.
+/// <param name="sessionId">The session the event belongs to.</param>
+/// <param name="turnId">The turn that attempted the compaction.</param>
+/// <param name="sequence">The event's per-session sequence number, or empty while in flight.</param>
+/// <param name="timestamp">When the compaction failed.</param>
+/// <param name="reason">Why compaction failed. Client-safe: never contains secrets or tool arguments.</param>
+and [<Sealed>] CompactionFailedEvent
+    (sessionId: SessionId, turnId: TurnId, sequence: Nullable<int64>, timestamp: DateTimeOffset, reason: string) =
+    inherit SessionEvent(sessionId, turnId, sequence, timestamp)
+
+    /// Why compaction failed. Client-safe: never contains secrets or tool
+    /// arguments.
+    member _.Reason = reason
 
 /// The turn settled normally: the model stopped calling tools. Mirrors the
 /// terminal status on <see cref="T:Legate.Turn" />; the structured outcome,

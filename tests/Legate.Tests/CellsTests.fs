@@ -739,6 +739,7 @@ let expectedRules: (string * int * SessionCellKind) list =
         "questionAnswered", 1, SessionCellKind.System
         "usage", 0, SessionCellKind.User // progress marker: no cells
         "compacted", 0, SessionCellKind.User // progress marker: no cells
+        "compactionFailed", 1, SessionCellKind.System // one System failure cell per failed compaction
         "turnCompleted", 0, SessionCellKind.User // progress marker: no cells
         "turnAborted", 0, SessionCellKind.User // progress marker: no cells
         "turnFailed", 1, SessionCellKind.System
@@ -801,6 +802,8 @@ let ``The fold classifies a bare event of every kind per the mapped rule`` () =
                 fun () -> QuestionAnsweredEvent(sessionId, turnId, noSequence, stamp, "q", "because") :> SessionEvent
             | "usage" -> fun () -> UsageEvent(sessionId, turnId, noSequence, stamp, 1L, 2L) :> SessionEvent
             | "compacted" -> fun () -> CompactedEvent(sessionId, turnId, noSequence, stamp, 10L, 2L) :> SessionEvent
+            | "compactionFailed" ->
+                fun () -> CompactionFailedEvent(sessionId, turnId, noSequence, stamp, "model denied") :> SessionEvent
             | "turnCompleted" -> fun () -> TurnCompletedEvent(sessionId, turnId, noSequence, stamp) :> SessionEvent
             | "turnAborted" ->
                 fun () ->
@@ -844,3 +847,20 @@ let ``A prune event derives one System cell carrying the audit metadata`` () =
     match cells[0].Content with
     | null -> failwith "prune cell lost its summary content"
     | content -> content.Contains("2") |> should equal true
+
+[<Fact>]
+let ``A compaction failure derives one System error cell carrying the reason`` () =
+    let event =
+        CompactionFailedEvent(sessionId, turnId, noSequence, stamp, "model denied") :> SessionEvent
+
+    let cells = foldEvents [ event ]
+
+    cells.Count |> should equal 1
+    cells[0].Kind |> should equal SessionCellKind.System
+    cells[0].IsError |> should equal true
+    cells[0].Timestamp |> should equal stamp
+    cells[0].Content |> should equal "model denied"
+
+    match cells[0].Metadata with
+    | null -> failwith "compaction failure cell lost its metadata"
+    | meta -> meta["event"] |> should equal "compactionFailed"

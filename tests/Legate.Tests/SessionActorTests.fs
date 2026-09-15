@@ -11,6 +11,7 @@ open Akka.FSharp
 open FsUnit.Xunit
 open Legate
 open Legate.Storage.InMemory
+open Legate.Testing
 open Microsoft.Extensions.AI
 open Microsoft.Extensions.Options
 open Microsoft.Extensions.Hosting
@@ -2239,3 +2240,173 @@ let ``Fold orders the initial user cell before the injected one`` () =
     cells[1].Content |> should equal "steer"
     cells[1].Kind |> should equal SessionCellKind.User
     cells[1].Iteration |> should equal 0
+
+// ──────────────────────────────────────────────────────────────────────────
+// Compaction wiring (issue 45)
+
+/// Fresh session + event stores over one database so appends fence on the
+/// session store's live claim token.
+let private createJournalStores () =
+    let database = InMemoryDatabase()
+    (InMemorySessionStore(database) :> ISessionStore, InMemorySessionEventStore(database) :> ISessionEventStore)
+
+/// Claims the next turn, failing the test unless the store grants it.
+let private claimTurn (store: ISessionStore) (sessionId: SessionId) (owner: string) : TurnClaim =
+    match
+        store.ClaimNextTurn(tenant, sessionId, owner, TimeSpan.FromSeconds 120.0, CancellationToken.None)
+        |> fun task -> task.GetAwaiter().GetResult()
+    with
+    | :? TurnLeaseRenewed as renewed -> renewed.Claim
+    | state -> failwith $"Expected a granted claim, observed %s{state.GetType().Name}."
+
+let private compactionEntry () : ModelCatalogEntry =
+    {
+        Model = ModelReference.Parse "test/session-model"
+        ContextWindowTokens = 1500
+        ReservedOutputTokens = 200
+        MaxOutputTokens = 200
+        Capabilities =
+            {
+                Streaming = true
+                Reasoning = false
+                ToolCalling = true
+            }
+    }
+
+type private FakeCompactionCatalog(entry: ModelCatalogEntry | null) =
+    interface ILlmModelCatalog with
+        member _.GetEntry(_) = entry
+        member _.HasEntry(_) = not (isNull (box entry))
+
+type private DenyCompactionPolicy(message: string) =
+    interface IModelPolicy with
+        member _.Authorize(_, _, _) =
+            ModelDenied(message) :> ModelPolicyDecision
+
+/// Six 1000-char turns after a system message: over the wiring's 1200
+/// threshold, compacted to four messages with keep two.
+let private compactionHistory () : IList<ChatMessage> =
+    ResizeArray<ChatMessage>(
+        [|
+            ChatMessage(ChatRole.System, "sys")
+            ChatMessage(ChatRole.User, String('x', 1000))
+            ChatMessage(ChatRole.Assistant, String('x', 1000))
+            ChatMessage(ChatRole.User, String('x', 1000))
+            ChatMessage(ChatRole.Assistant, String('x', 1000))
+            ChatMessage(ChatRole.User, String('x', 1000))
+            ChatMessage(ChatRole.Assistant, String('x', 1000))
+        |]
+    )
+    :> IList<ChatMessage>
+
+let private buildWiring
+    (sessionId: SessionId)
+    (client: IChatClient)
+    (policy: IModelPolicy | null)
+    (journal: ISessionEventStore)
+    (token: string)
+    : SessionActor.CompactionWiring =
+    let llm = LlmOptions()
+    llm.CompactionKeepMessages <- 2
+
+    {
+        Llm = llm
+        ReservedBufferTokens = 100
+        SessionModel = ModelReference.Parse "test/session-model"
+        Catalog = FakeCompactionCatalog(compactionEntry ()) :> ILlmModelCatalog
+        Client = client
+        Observer = Unchecked.defaultof<IUsageObserver>
+        Policy = policy
+        Tenant = tenant
+        SessionId = sessionId
+        TurnId = TurnId.New()
+        Attempt = 1
+        EventStore = journal
+        JournalToken = token
+        IsLeaseValid = (fun () -> true)
+    }
+
+let private replayEvents (journal: ISessionEventStore) (sessionId: SessionId) : IReadOnlyList<SessionEvent> =
+    match journal.Replay(tenant, sessionId, 0L, 10, CancellationToken.None).GetAwaiter().GetResult() with
+    | :? EventReplayPage as page -> page.Events
+    | _ -> failwith "Expected the compacted journal page."
+
+[<Fact>]
+let ``Compaction wiring compacts and journals CompactedEvent under the token`` () =
+    let store, journal = createJournalStores ()
+    let session = createSession store
+    appendStored store session.Id "run" |> ignore
+    let claim = claimTurn store session.Id "owner-a"
+
+    let client =
+        new ScriptedChatClient(
+            ResizeArray<ScriptStep>(
+                [|
+                    ScriptStep.Text("wiring gist", 4L, 6L)
+                |]
+            )
+        )
+
+    let history = compactionHistory ()
+
+    let hook =
+        SessionActor.buildCompactionHook (
+            buildWiring session.Id (client :> IChatClient) Unchecked.defaultof<IModelPolicy> journal claim.Token
+        )
+
+    let inputTokens, outputTokens =
+        hook history 0L 0L CancellationToken.None
+        |> fun task -> task.GetAwaiter().GetResult()
+
+    inputTokens |> should equal 4L
+    outputTokens |> should equal 6L
+
+    // The rewrite landed: system, marked summary, last two.
+    history.Count |> should equal 4
+    history[0].Text |> should equal "sys"
+
+    (history[1].Text.StartsWith(Compaction.SummaryMarker, StringComparison.Ordinal))
+    |> should equal true
+
+    (history[1].Text.Contains("wiring gist")) |> should equal true
+
+    let events = replayEvents journal session.Id
+    events.Count |> should equal 1
+
+    let compacted = events[0] :?> CompactedEvent
+    (compacted.BeforeEstimate > compacted.AfterEstimate) |> should equal true
+
+[<Fact>]
+let ``Compaction wiring continues on denial with CompactionFailedEvent`` () =
+    let store, journal = createJournalStores ()
+    let session = createSession store
+    appendStored store session.Id "run" |> ignore
+    let claim = claimTurn store session.Id "owner-a"
+
+    let client = new ScriptedChatClient(ResizeArray<ScriptStep>([||]))
+    let history = compactionHistory ()
+
+    let hook =
+        SessionActor.buildCompactionHook (
+            buildWiring
+                session.Id
+                (client :> IChatClient)
+                (DenyCompactionPolicy("quota spent") :> IModelPolicy)
+                journal
+                claim.Token
+        )
+
+    let inputTokens, outputTokens =
+        hook history 0L 0L CancellationToken.None
+        |> fun task -> task.GetAwaiter().GetResult()
+
+    inputTokens |> should equal 0L
+    outputTokens |> should equal 0L
+    client.Calls |> should equal 0
+    history.Count |> should equal 7
+
+    let events = replayEvents journal session.Id
+    events.Count |> should equal 1
+
+    let failed = events[0] :?> CompactionFailedEvent
+    failed.Reason |> should equal "quota spent"
