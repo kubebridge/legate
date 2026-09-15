@@ -47,6 +47,7 @@ open System.Text.Json.Serialization
 /// <item><term>turnFailed</term><description>the turn failed inside the loop.</description></item>
 /// <item><term>sessionClosed</term><description>the session closed.</description></item>
 /// <item><term>userMessage</term><description>an injected user message was folded into the running turn.</description></item>
+/// <item><term>contextPruned</term><description>old tool results were replaced with the prune marker.</description></item>
 /// </list>
 /// Every subtype is named <c>&lt;Kind&gt;Event</c> so no kind name collides
 /// with an existing Legate type (for example <see cref="T:Legate.TurnFailed" />
@@ -70,6 +71,7 @@ open System.Text.Json.Serialization
 [<JsonDerivedType(typeof<TurnFailedEvent>, "turnFailed")>]
 [<JsonDerivedType(typeof<SessionClosedEvent>, "sessionClosed")>]
 [<JsonDerivedType(typeof<UserMessageEvent>, "userMessage")>]
+[<JsonDerivedType(typeof<ContextPrunedEvent>, "contextPruned")>]
 type SessionEvent(sessionId: SessionId, turnId: TurnId, sequence: Nullable<int64>, timestamp: DateTimeOffset) =
 
     /// The session the event belongs to. Sequence numbers are per-session,
@@ -441,3 +443,37 @@ and [<Sealed>] UserMessageEvent
 
     /// The injected user message, verbatim.
     member _.Message = message
+
+/// Old tool results were replaced with the prune marker (issue 44): the
+/// audit remark pruning journals after rewriting eligible
+/// <see cref="F:Legate.SessionCellKind.ToolResult" /> cells. The transcript
+/// fold derives one <see cref="F:Legate.SessionCellKind.System" /> cell per
+/// matching-turn event. The estimates bound the size the pruning changed,
+/// not exact token counts, mirroring <see cref="T:Legate.CompactedEvent" />.
+/// <param name="sessionId">The session the event belongs to.</param>
+/// <param name="turnId">The turn that performed the pruning.</param>
+/// <param name="sequence">The event's per-session sequence number, or empty while in flight.</param>
+/// <param name="timestamp">When the pruning ran.</param>
+/// <param name="prunedCount">How many tool-result cells pruning replaced with the marker.</param>
+/// <param name="beforeEstimate">The estimated token count of the transcript before pruning.</param>
+/// <param name="afterEstimate">The estimated token count after pruning, markers included.</param>
+and [<Sealed>] ContextPrunedEvent
+    (
+        sessionId: SessionId,
+        turnId: TurnId,
+        sequence: Nullable<int64>,
+        timestamp: DateTimeOffset,
+        prunedCount: int,
+        beforeEstimate: int64,
+        afterEstimate: int64
+    ) =
+    inherit SessionEvent(sessionId, turnId, sequence, timestamp)
+
+    /// How many tool-result cells pruning replaced with the marker.
+    member _.PrunedCount = prunedCount
+
+    /// The estimated token count of the transcript before pruning.
+    member _.BeforeEstimate = beforeEstimate
+
+    /// The estimated token count after pruning, markers included.
+    member _.AfterEstimate = afterEstimate

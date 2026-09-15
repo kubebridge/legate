@@ -744,6 +744,7 @@ let expectedRules: (string * int * SessionCellKind) list =
         "turnFailed", 1, SessionCellKind.System
         "sessionClosed", 0, SessionCellKind.User // progress marker: no cells
         "userMessage", 1, SessionCellKind.User // one User cell per folded Inject message
+        "contextPruned", 1, SessionCellKind.System // one System audit cell per prune event
     ]
 
 [<Fact>]
@@ -809,6 +810,8 @@ let ``The fold classifies a bare event of every kind per the mapped rule`` () =
             | "sessionClosed" -> fun () -> SessionClosedEvent(sessionId, turnId, noSequence, stamp) :> SessionEvent
             | "userMessage" ->
                 fun () -> UserMessageEvent(sessionId, turnId, noSequence, stamp, userMessage "steer") :> SessionEvent
+            | "contextPruned" ->
+                fun () -> ContextPrunedEvent(sessionId, turnId, noSequence, stamp, 2, 10L, 4L) :> SessionEvent
             | _ -> failwith (sprintf "unmapped discriminator '%s' in the pin table" discriminator)
 
         let cells = foldEvents [ buildEvent () ]
@@ -817,3 +820,27 @@ let ``The fold classifies a bare event of every kind per the mapped rule`` () =
 
         if expectedCount > 0 then
             cells[0].Kind |> should equal expectedKind
+
+[<Fact>]
+let ``A prune event derives one System cell carrying the audit metadata`` () =
+    let event =
+        ContextPrunedEvent(sessionId, turnId, noSequence, stamp, 2, 10L, 4L) :> SessionEvent
+
+    let cells = foldEvents [ event ]
+
+    cells.Count |> should equal 1
+    cells[0].Kind |> should equal SessionCellKind.System
+    cells[0].IsError |> should equal false
+    cells[0].Timestamp |> should equal stamp
+
+    match cells[0].Metadata with
+    | null -> failwith "prune cell lost its audit metadata"
+    | meta ->
+        meta["event"] |> should equal "contextPruned"
+        meta["prunedCount"] |> should equal "2"
+        meta["beforeEstimate"] |> should equal "10"
+        meta["afterEstimate"] |> should equal "4"
+
+    match cells[0].Content with
+    | null -> failwith "prune cell lost its summary content"
+    | content -> content.Contains("2") |> should equal true

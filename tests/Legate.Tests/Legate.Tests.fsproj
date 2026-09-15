@@ -39,6 +39,7 @@
     <Compile Include="ToolSourcesTests.fs" />
     <Compile Include="EventsTests.fs" />
     <Compile Include="CellsTests.fs" />
+    <Compile Include="ContextPruningTests.fs" />
     <Compile Include="SessionsStoreTests.fs" />
     <Compile Include="SessionEventStoreTests.fs" />
     <Compile Include="AgentStoreTests.fs" />

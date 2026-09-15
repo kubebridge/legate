@@ -36,6 +36,12 @@ let ``Defaults validate to null and describe a single node`` () =
     options.Workspace.Mode |> should equal WorkspaceMode.Process
     options.Completion.MaxDeliveryAttempts |> should equal 3
 
+    options.Pruning.ReservedBufferTokens |> should equal 10_000
+    options.Pruning.KeepLastAssistantTurns |> should equal 2
+
+    options.Pruning.PrunedMarker
+    |> should equal ContextPruningOptions.DefaultPrunedMarker
+
     options.Sessions.Validate() |> should equal null
     options.Turns.Validate() |> should equal null
     options.Permissions.Validate() |> should equal null
@@ -43,6 +49,7 @@ let ``Defaults validate to null and describe a single node`` () =
     options.Workspace.Validate() |> should equal null
     options.Completion.Validate() |> should equal null
     options.Cluster.Validate() |> should equal null
+    options.Pruning.Validate() |> should equal null
 
 [<Fact>]
 let ``Options are mutable`` () =
@@ -260,6 +267,34 @@ let ``Cluster Validate flags unknown mode and bad seeds`` () =
     seeded.Validate() |> should equal null
 
 // ──────────────────────────────────────────────────────────────────────────
+// Pruning
+
+[<Fact>]
+let ``Pruning defaults reserve buffer and protect two turns`` () =
+    let options = ContextPruningOptions()
+    options.ReservedBufferTokens |> should equal 10_000
+    options.KeepLastAssistantTurns |> should equal 2
+    options.PrunedMarker |> should equal ContextPruningOptions.DefaultPrunedMarker
+    options.Validate() |> should equal null
+
+[<Fact>]
+let ``Pruning Validate flags negative knobs and empty marker`` () =
+    ContextPruningOptions(ReservedBufferTokens = -1).Validate()
+    |> should equal "ReservedBufferTokens must be at least 0."
+
+    ContextPruningOptions(KeepLastAssistantTurns = -1).Validate()
+    |> should equal "KeepLastAssistantTurns must be at least 0."
+
+    ContextPruningOptions(PrunedMarker = "").Validate()
+    |> should equal "PrunedMarker must be a non-empty string."
+
+    let nullMarker = ContextPruningOptions()
+    nullMarker.PrunedMarker <- nullRef<string>
+    nullMarker.Validate() |> should equal "PrunedMarker must be a non-empty string."
+
+    ContextPruningOptions().Validate() |> should equal null
+
+// ──────────────────────────────────────────────────────────────────────────
 // Root composition
 
 [<Fact>]
@@ -283,3 +318,15 @@ let ``Root Validate flags null sections`` () =
     let turns = LegateOptions()
     turns.Cluster <- nullRef<ClusterOptions>
     turns.Validate() |> should equal "Cluster must not be null."
+
+    let pruning = LegateOptions()
+    pruning.Pruning <- nullRef<ContextPruningOptions>
+    pruning.Validate() |> should equal "Pruning must not be null."
+
+[<Fact>]
+let ``Root Validate prefixes pruning violations`` () =
+    let options = LegateOptions()
+    options.Pruning.ReservedBufferTokens <- -1
+
+    options.Validate()
+    |> should equal "Pruning: ReservedBufferTokens must be at least 0."

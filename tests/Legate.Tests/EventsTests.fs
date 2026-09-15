@@ -68,9 +68,11 @@ let sampleEvents: (string * (unit -> SessionEvent)) list =
         "sessionClosed", fun () -> SessionClosedEvent(sessionId, turnId, noSequence, stamp) :> SessionEvent
         "userMessage",
         fun () -> UserMessageEvent(sessionId, turnId, noSequence, stamp, UserMessage.Text "steer") :> SessionEvent
+        "contextPruned",
+        fun () -> ContextPrunedEvent(sessionId, turnId, noSequence, stamp, 3, 9000L, 1200L) :> SessionEvent
     ]
 
-// The 17 discriminator strings the base type's XML doc documents as the
+// The 18 discriminator strings the base type's XML doc documents as the
 // wire contract, in the same order as the JsonDerivedType attributes.
 let discriminatorContract =
     [|
@@ -91,6 +93,7 @@ let discriminatorContract =
         "turnFailed"
         "sessionClosed"
         "userMessage"
+        "contextPruned"
     |]
 
 /// Reads the TypeDiscriminator values from the JsonDerivedType attributes
@@ -323,6 +326,17 @@ let ``UserMessage round-trips its message verbatim`` () =
 
     texts |> should equal [ "steer" ]
 
+[<Fact>]
+let ``ContextPruned round-trips its counts and estimates`` () =
+    let restored =
+        roundTrip "contextPruned" (fun () ->
+            ContextPrunedEvent(sessionId, turnId, noSequence, stamp, 3, 9000L, 1200L) :> SessionEvent)
+
+    let pruned = restored :?> ContextPrunedEvent
+    pruned.PrunedCount |> should equal 3
+    pruned.BeforeEstimate |> should equal 9000L
+    pruned.AfterEstimate |> should equal 1200L
+
 // ───────────────────────────────────────────────────────────────────────────
 // Sequence and base-field nullability
 
@@ -369,7 +383,7 @@ let ``Base fields carry the constructor values the constructor set`` () =
 
 [<Fact>]
 let ``An undocumented $type value is rejected instead of guessed`` () =
-    // The 17 documented discriminators are the wire contract: anything
+    // The 18 documented discriminators are the wire contract: anything
     // outside the set must fail the read rather than deserialise to a base
     // instance. The BCL raises NotSupportedException for a discriminator
     // with no registered derived type (surfaced possibly wrapped in a

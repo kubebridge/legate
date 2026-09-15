@@ -241,6 +241,39 @@ let ``Empty section binds to valid single-node defaults`` () =
     options.Turns.DefaultDelivery |> should equal DeliveryMode.Queue
     options.Llm.DistributedCoordination |> should equal false
 
+[<Fact>]
+let ``Binds the pruning section with scalar knobs`` () =
+    let section =
+        buildSection
+            [
+                "Legate:Pruning:ReservedBufferTokens", "5000"
+                "Legate:Pruning:KeepLastAssistantTurns", "1"
+                "Legate:Pruning:PrunedMarker", "[pruned]"
+            ]
+
+    let options = LegateOptionsBinding.bind section
+
+    options.Pruning.ReservedBufferTokens |> should equal 5000
+    options.Pruning.KeepLastAssistantTurns |> should equal 1
+    options.Pruning.PrunedMarker |> should equal "[pruned]"
+    options.Validate() |> should equal null
+
+[<Fact>]
+let ``Binding then validating rejects a negative pruning buffer`` () =
+    let section =
+        buildSection
+            [
+                "Legate:Pruning:ReservedBufferTokens", "-1"
+            ]
+
+    let ex =
+        Assert.Throws<InvalidOperationException>(fun () -> LegateOptionsBinding.bind section |> ignore)
+
+    ex.Message.Contains("Pruning") |> should equal true
+
+    ex.Message.Contains("ReservedBufferTokens must be at least 0.")
+    |> should equal true
+
 // ──────────────────────────────────────────────────────────────────────────
 // Env vars (dedicated collection: mutates process environment)
 
