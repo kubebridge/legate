@@ -29,6 +29,7 @@
     <Compile Include="LegateDefaults.fs" />
     <Compile Include="LegateStartupValidation.fs" />
     <Compile Include="SessionActor.fs" />
+    <Compile Include="SessionPermissions.fs" />
     <Compile Include="LocalActorSystem.fs" />
     <Compile Include="LegateBuilder.fs" />
     <Compile Include="AddLegate.fs" />

@@ -217,6 +217,7 @@ let claimSession (sessionStore: ISessionStore) =
                 ClosedAt = Nullable()
                 WorkspaceBinding = null
                 Options = SessionOptions()
+                PermissionGrants = ResizeArray<string>() :> IReadOnlyList<string>
             }
 
         let! created = sessionStore.CreateSession(tenant, session, CancellationToken.None)

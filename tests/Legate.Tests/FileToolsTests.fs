@@ -37,6 +37,7 @@ module FileToolsTests =
                 ClosedAt = Nullable()
                 WorkspaceBinding = null
                 Options = SessionOptions()
+                PermissionGrants = ResizeArray<string>() :> IReadOnlyList<string>
             }
 
         runtime.Bind(session, null, CancellationToken.None).GetAwaiter().GetResult()

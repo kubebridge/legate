@@ -1717,6 +1717,11 @@ module internal SessionActor =
         /// One-way from the delay seam.
         | SuspendTimedOut of requestId: string
 
+        /// Closes the suspendable session: the store row closes (evicting
+        /// the grant memory) and the actor drops to Closed. Answered with
+        /// the stored session.
+        | SuspendableCloseSession of cancellationToken: CancellationToken
+
     /// Reason carried by TurnFailed when AskTimeout fires while suspended.
     /// Never contains secrets or tool arguments.
     [<Literal>]
@@ -1856,6 +1861,21 @@ module internal SessionActor =
 
         let suspendSelf = mailbox.Self
 
+        /// Reads the session's persisted AllowForSession memory: the grant
+        /// tool names the store row carries. A missing row or a null grant
+        /// list reads as empty, so a stored row from before grants existed
+        /// resumes with no memory and the persisted set always wins over the
+        /// actor's in-memory copy on rebuild.
+        /// <returns>The granted tool names.</returns>
+        let readGrantsNow () : HashSet<string> =
+            try
+                match awaitTask (props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None)) with
+                | null -> HashSet<string>()
+                | session when isNull (box session.PermissionGrants) -> HashSet<string>()
+                | session -> HashSet<string>(session.PermissionGrants :> seq<string>)
+            with :? SessionNotFoundException ->
+                HashSet<string>()
+
         let initialRecovered: SessionState * RebuiltPending option =
             let found =
                 awaitTask (props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
@@ -1919,7 +1939,7 @@ module internal SessionActor =
                             Entry = entry
                             Cursor = None
                             Rebuilt = Some rebuilt
-                            Allowed = HashSet<string>()
+                            Allowed = readGrantsNow ()
                             Attempt = 1
                             TimeoutCts = new CancellationTokenSource()
                         }
@@ -2261,7 +2281,7 @@ module internal SessionActor =
                             |> Seq.tryHead
                             |> Option.defaultValue appended
 
-                        startSuspendable first 1 (HashSet<string>())
+                        startSuspendable first 1 (readGrantsNow ())
                         mailbox.Sender() <! PromptAccepted appended
                         return! loop SessionState.Running None resolved
                     | SessionState.Running
@@ -2328,7 +2348,7 @@ module internal SessionActor =
 
                             match next with
                             | Some following ->
-                                startSuspendable following 1 (HashSet<string>())
+                                startSuspendable following 1 (readGrantsNow ())
                                 return! loop SessionState.Running None resolved
                             | None ->
                                 awaitTask (
@@ -2496,8 +2516,10 @@ module internal SessionActor =
                                         |> ignore
 
                                         // AllowForSession memory: remember the tool
-                                        // before resuming so the continued run skips
-                                        // Evaluate for it.
+                                        // in memory before resuming so the continued
+                                        // run skips Evaluate for it, and persist the
+                                        // grant on the session row so it survives a
+                                        // restart; the close evicts it.
                                         match reply with
                                         | :? PermissionDecision as decision when
                                             not (isNull (box decision))
@@ -2513,6 +2535,16 @@ module internal SessionActor =
 
                                             if not (String.IsNullOrEmpty toolName) then
                                                 parked.Allowed.Add(toolName) |> ignore
+
+                                                awaitTask (
+                                                    props.Store.GrantSessionTool(
+                                                        props.Tenant,
+                                                        props.SessionId,
+                                                        toolName,
+                                                        CancellationToken.None
+                                                    )
+                                                )
+                                                |> ignore
                                         | _ -> ()
 
                                         mailbox.Sender() <! ReplyAccepted replyEntry
@@ -2639,6 +2671,20 @@ module internal SessionActor =
                             return! loop SessionState.Idle None resolved
                         | _ -> return! loop state suspended resolved
                     | _ -> return! loop state suspended resolved
+                | SuspendableCloseSession cancellationToken ->
+                    match suspended with
+                    | Some parked ->
+                        try
+                            parked.TimeoutCts.Cancel()
+                        with _ ->
+                            ()
+                    | None -> ()
+
+                    let closed =
+                        awaitTask (props.Store.CloseSession(props.Tenant, props.SessionId, cancellationToken))
+
+                    mailbox.Sender() <! closed
+                    return! loop SessionState.Closed None resolved
                 | SuspendableGetSnapshot ->
                     mailbox.Sender() <! takeSuspendSnapshot state suspended
                     return! loop state suspended resolved
@@ -2775,6 +2821,37 @@ module internal SessionActor =
             | ReplyRejected error -> return raise error
         }
 
+    /// Closes a suspendable session: the client boundary. Valid in every
+    /// state and idempotent; the store close evicts the session's grant
+    /// memory. Unknown sessions throw SessionNotFoundException before
+    /// touching the actor. A turn running while the session closes keeps
+    /// its detached task, but its journal writes fence on the claim and its
+    /// finish is ignored once the actor is Closed.
+    /// <param name="store">The durable store.</param>
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="sessionId">The session to close.</param>
+    /// <param name="session">The suspendable session actor.</param>
+    /// <param name="cancellationToken">Cancels the close.</param>
+    /// <returns>The stored session after the close.</returns>
+    let closeSuspendableAsync
+        (store: ISessionStore)
+        (tenant: TenantId)
+        (sessionId: SessionId)
+        (session: IActorRef)
+        (cancellationToken: CancellationToken)
+        : Task<Session> =
+        ArgumentNullException.ThrowIfNull(store)
+        ArgumentNullException.ThrowIfNull(session)
+
+        task {
+            let! _ = requireSessionAsync store tenant sessionId cancellationToken
+
+            let! closed =
+                askSuspendableAsync<Session> session (SuspendableCloseSession cancellationToken) cancellationToken
+
+            return closed
+        }
+
     /// Reads a suspendable actor's snapshot: its lifecycle state, the
     /// store's pending inbox count, and the pending suspend request id.
     /// <param name="session">The suspendable session actor.</param>
@@ -2783,3 +2860,125 @@ module internal SessionActor =
     let getSuspendSnapshotAsync (session: IActorRef) (cancellationToken: CancellationToken) : Task<SessionSnapshot> =
         ArgumentNullException.ThrowIfNull(session)
         askSuspendableAsync<SessionSnapshot> session SuspendableGetSnapshot cancellationToken
+
+    /// Builds the production child-spawn factory the session router uses:
+    /// like <see cref="M:Legate.SessionActor.spawnFactory" /> but spawning
+    /// the suspendable behavior (<see cref="M:Legate.SessionActor.behaviorWithSuspend" />),
+    /// so live sessions suspend on Ask instead of running the base loop.
+    /// The suspendable runner carries the DI-resolved
+    /// <see cref="T:Legate.IPermissionPolicy" />: the caller builds it (see
+    /// SessionPermissions.createRunner) with the policy the container
+    /// resolved, and this factory threads it into every child it spawns.
+    /// The journal token is primed per session at spawn: when the session
+    /// row exists the factory appends a bootstrap inbox entry and claims it,
+    /// so the suspend and resolve journal writes fence on a live claim
+    /// (mirroring the harness prime); the bootstrap entry is consumed by the
+    /// claim, so real prompts still drain first. When the row is missing the
+    /// child starts as an empty Idle shell over a fallback token and the
+    /// client boundary rejects its mutations, exactly like the base shell.
+    /// Claim renewal while suspended belongs to the dispatcher and heartbeat
+    /// cycle: the primed lease covers the configured AskTimeout window, and
+    /// a lapsed lease settles the turn Failed with the typed reason instead
+    /// of journaling half a suspension.
+    /// <param name="store">The durable store session actors persist through.</param>
+    /// <param name="tenant">The tenant router-spawned sessions belong to.</param>
+    /// <param name="eventStore">The journal suspend and resolve events append to.</param>
+    /// <param name="delay">The seam the AskTimeout deadline fires off.</param>
+    /// <param name="askTimeout">How long a suspension waits for its Reply before settling Failed. Must be positive.</param>
+    /// <param name="claimOwner">The claim owner identity the journal prime claims under. Must not be null.</param>
+    /// <param name="leaseDuration">How long the primed journal claim lasts. Must be positive.</param>
+    /// <param name="runSuspendable">Runs one suspendable attempt, bound to the DI-resolved policy. Never null.</param>
+    /// <returns>A factory mapping a session id string to a suspendable child spawn.</returns>
+    let spawnSuspendFactory
+        (store: ISessionStore)
+        (tenant: TenantId)
+        (eventStore: ISessionEventStore)
+        (delay: ILlmDelay)
+        (askTimeout: TimeSpan)
+        (claimOwner: string)
+        (leaseDuration: TimeSpan)
+        (runSuspendable: SuspendableRunner)
+        : (string -> IActorContext -> string -> IActorRef) =
+        ArgumentNullException.ThrowIfNull(store)
+        ArgumentNullException.ThrowIfNull(eventStore)
+        ArgumentNullException.ThrowIfNull(delay)
+
+        if String.IsNullOrWhiteSpace claimOwner then
+            raise (ArgumentException("The claim owner must be a non-empty string.", nameof claimOwner))
+
+        if askTimeout <= TimeSpan.Zero then
+            raise (ArgumentOutOfRangeException(nameof askTimeout, "AskTimeout must be positive."))
+
+        if leaseDuration <= TimeSpan.Zero then
+            raise (ArgumentOutOfRangeException(nameof leaseDuration, "The lease duration must be positive."))
+
+        if isNull (box runSuspendable) then
+            raise (ArgumentNullException(nameof runSuspendable))
+
+        /// The base turn runner never runs on a suspendable child: the
+        /// suspend behavior drives RunSuspendable only. It stays non-null
+        /// because the props contract requires it.
+        let unusedRunTurn (_: InboxEntry) (_: CancellationToken) : Task<TurnResult> =
+            Task.FromException<TurnResult>(
+                InvalidOperationException("A suspendable session actor never runs its base turn runner.")
+            )
+
+        /// Primes the journal token for one session: appends a bootstrap
+        /// entry and claims it, returning the live claim token. A missing
+        /// session row (or any prime failure) falls back to a fresh token:
+        /// the child starts as an Idle shell whose mutations the boundary
+        /// rejects, so the token never fences a real write.
+        let primeToken (sessionId: SessionId) : string =
+            try
+                match store.GetSession(tenant, sessionId, CancellationToken.None).GetAwaiter().GetResult() with
+                | null -> Guid.NewGuid().ToString("N")
+                | _ ->
+                    let bootstrap =
+                        UserMessagePayload(UserMessage.Text "legate journal prime") :> InboxPayload
+
+                    store
+                        .AppendInboxMessage(tenant, sessionId, bootstrap, DeliveryMode.Queue, CancellationToken.None)
+                        .GetAwaiter()
+                        .GetResult()
+                    |> ignore
+
+                    match
+                        store
+                            .ClaimNextTurn(tenant, sessionId, claimOwner, leaseDuration, CancellationToken.None)
+                            .GetAwaiter()
+                            .GetResult()
+                    with
+                    | :? TurnLeaseRenewed as renewed when not (isNull (box renewed)) -> renewed.Claim.Token
+                    | :? TurnLeaseHeld as held when not (isNull (box held)) -> held.Claim.Token
+                    | :? TurnLeaseExpiring as expiring when not (isNull (box expiring)) -> expiring.Claim.Token
+                    | _ -> Guid.NewGuid().ToString("N")
+            with _ ->
+                Guid.NewGuid().ToString("N")
+
+        fun sessionId context name ->
+            let mutable parsed = Unchecked.defaultof<SessionId>
+
+            if SessionId.TryParse(sessionId, &parsed) then
+                let props: SessionActorProps =
+                    {
+                        Store = store
+                        Tenant = tenant
+                        SessionId = parsed
+                        RunTurn = unusedRunTurn
+                        OnTurnSettled = None
+                        OnInjectJournaled = None
+                        Compact = None
+                    }
+
+                let suspend: SuspendDeps =
+                    {
+                        EventStore = eventStore
+                        Delay = delay
+                        AskTimeout = askTimeout
+                        JournalToken = primeToken parsed
+                        RunSuspendable = runSuspendable
+                    }
+
+                spawn context name (behaviorWithSuspend props suspend)
+            else
+                spawn context name (actorOf (fun (_: obj) -> ()))

@@ -62,6 +62,7 @@ let sampleSession () =
                 Dictionary<string, string>(dict [ ("source", "cli") ]) :> IReadOnlyDictionary<string, string>
 
             options
+        PermissionGrants = ResizeArray<string>([| "read_file" |]) :> IReadOnlyList<string>
     }
 
 /// Builds a session whose marker-interface options are null: the shape
@@ -251,6 +252,7 @@ let ``Session JSON round-trip preserves every field with default options`` () =
     roundTripped.UpdatedAt |> should equal session.UpdatedAt
     roundTripped.ClosedAt.HasValue |> should equal false
     roundTripped.WorkspaceBinding |> should equal session.WorkspaceBinding
+    roundTripped.PermissionGrants |> List.ofSeq |> should equal [ "read_file" ]
 
     roundTripped.Options.Title |> should equal session.Options.Title
     roundTripped.Options.AutoClose |> should equal true

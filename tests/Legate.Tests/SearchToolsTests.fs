@@ -2,6 +2,7 @@
 module Legate.Tests.SearchToolsTests
 
 open System
+open System.Collections.Generic
 open System.IO
 open System.Text
 open System.Threading
@@ -33,6 +34,7 @@ let private bindWorkspace () : IWorkspace =
             ClosedAt = Nullable()
             WorkspaceBinding = null
             Options = SessionOptions()
+            PermissionGrants = ResizeArray<string>() :> IReadOnlyList<string>
         }
 
     runtime.Bind(session, null, CancellationToken.None).GetAwaiter().GetResult()

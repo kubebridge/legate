@@ -50,6 +50,7 @@ let private sampleSession () =
         ClosedAt = Unchecked.defaultof<Nullable<DateTimeOffset>>
         WorkspaceBinding = null
         Options = SessionOptions()
+        PermissionGrants = ResizeArray<string>() :> IReadOnlyList<string>
     }
 
 let private createSession (store: ISessionStore) : Session =

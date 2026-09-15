@@ -60,6 +60,7 @@ type SessionStoreConformance(store: ISessionStore, clock: TestClock, tenant: Ten
             ClosedAt = Nullable()
             WorkspaceBinding = null
             Options = SessionOptions()
+            PermissionGrants = ResizeArray<string>() :> IReadOnlyList<string>
         }
 
     // ── Tenancy ──
@@ -355,4 +356,82 @@ type SessionStoreConformance(store: ISessionStore, clock: TestClock, tenant: Ten
 
             let! otherCount = store.CountSessionsByTenant(this.OtherTenant, CancellationToken.None)
             Assert.Equal(0, otherCount)
+        }
+
+    // ── Permission grants: the AllowForSession memory ──
+
+    [<Fact>]
+    member this.``GrantSessionTool persists the grant on the session row``() =
+        task {
+            let! created = store.CreateSession(tenant, this.SampleSession(), CancellationToken.None)
+
+            let! granted = store.GrantSessionTool(tenant, created.Id, "exec", CancellationToken.None)
+
+            Assert.Contains("exec", granted.PermissionGrants)
+
+            // The grant survives a store round-trip: a restarted host
+            // reloads it instead of re-asking the policy.
+            let! reloaded = store.GetSession(tenant, created.Id, CancellationToken.None)
+
+            match reloaded with
+            | null -> failwith "expected the session"
+            | session -> Assert.Contains("exec", session.PermissionGrants)
+        }
+
+    [<Fact>]
+    member this.``GrantSessionTool is idempotent: granting twice stores once``() =
+        task {
+            let! created = store.CreateSession(tenant, this.SampleSession(), CancellationToken.None)
+
+            let! _ = store.GrantSessionTool(tenant, created.Id, "exec", CancellationToken.None)
+            let! twice = store.GrantSessionTool(tenant, created.Id, "exec", CancellationToken.None)
+
+            let count =
+                twice.PermissionGrants |> Seq.filter (fun grant -> grant = "exec") |> Seq.length
+
+            Assert.Equal(1, count)
+        }
+
+    [<Fact>]
+    member this.``GrantSessionTool rejects blank names, wrong tenants, and closed sessions``() =
+        task {
+            let! created = store.CreateSession(tenant, this.SampleSession(), CancellationToken.None)
+
+            Assert.Throws<ArgumentException>(fun () ->
+                store.GrantSessionTool(tenant, created.Id, "  ", CancellationToken.None).GetAwaiter().GetResult()
+                |> ignore)
+            |> ignore
+
+            Assert.Throws<SessionNotFoundException>(fun () ->
+                store
+                    .GrantSessionTool(this.OtherTenant, created.Id, "exec", CancellationToken.None)
+                    .GetAwaiter()
+                    .GetResult()
+                |> ignore)
+            |> ignore
+
+            let! _ = store.CloseSession(tenant, created.Id, CancellationToken.None)
+
+            Assert.Throws<InvalidSessionStateException>(fun () ->
+                store.GrantSessionTool(tenant, created.Id, "exec", CancellationToken.None).GetAwaiter().GetResult()
+                |> ignore)
+            |> ignore
+        }
+
+    [<Fact>]
+    member this.``CloseSession evicts the grant memory``() =
+        task {
+            let! created = store.CreateSession(tenant, this.SampleSession(), CancellationToken.None)
+
+            let! _ = store.GrantSessionTool(tenant, created.Id, "exec", CancellationToken.None)
+
+            let! closed = store.CloseSession(tenant, created.Id, CancellationToken.None)
+
+            Assert.Empty(closed.PermissionGrants)
+
+            let! reloaded = store.GetSession(tenant, created.Id, CancellationToken.None)
+
+            match reloaded with
+            | null -> failwith "expected the session"
+            | session -> Assert.Empty(session.PermissionGrants)
         }

@@ -46,6 +46,7 @@ let private sampleSession () =
         ClosedAt = Unchecked.defaultof<Nullable<DateTimeOffset>>
         WorkspaceBinding = null
         Options = SessionOptions()
+        PermissionGrants = ResizeArray<string>() :> IReadOnlyList<string>
     }
 
 /// Creates the session row and returns it.

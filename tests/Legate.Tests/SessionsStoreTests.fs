@@ -41,6 +41,7 @@ let sampleSession () =
         ClosedAt = Unchecked.defaultof<Nullable<DateTimeOffset>>
         WorkspaceBinding = "ws://acme/checkout"
         Options = SessionOptions()
+        PermissionGrants = ResizeArray<string>() :> IReadOnlyList<string>
     }
 
 /// Builds a claim over a turn, the shape ClaimNextTurn hands out and every
@@ -142,10 +143,35 @@ type FakeSessionStore() =
                     { session with
                         State = SessionState.Closed
                         ClosedAt = Nullable sessionStamp
+                        PermissionGrants = ResizeArray<string>() :> IReadOnlyList<string>
                     }
 
                 sessions[key t sessionId] <- closed
                 Task.FromResult closed
+
+        member _.GrantSessionTool(t, sessionId, toolName, _) =
+            if String.IsNullOrWhiteSpace toolName then
+                raise (ArgumentException("The tool name must be a non-empty string.", nameof toolName))
+
+            match sessions.TryGetValue(key t sessionId) with
+            | false, _ -> raise (SessionNotFoundException(sessionId, "Session not found."))
+            | true, session ->
+                if session.State = SessionState.Closed then
+                    raise (InvalidSessionStateException(sessionId, "Closed", "A closed session carries no grants."))
+                else
+                    let grants = ResizeArray<string>(session.PermissionGrants)
+
+                    if not (grants.Contains toolName) then
+                        grants.Add toolName
+
+                    let updated =
+                        { session with
+                            PermissionGrants = grants :> IReadOnlyList<string>
+                            UpdatedAt = sessionStamp
+                        }
+
+                    sessions[key t sessionId] <- updated
+                    Task.FromResult updated
 
         member _.SetSessionAgent(t, sessionId, agentId, _) =
             match sessions.TryGetValue(key t sessionId) with

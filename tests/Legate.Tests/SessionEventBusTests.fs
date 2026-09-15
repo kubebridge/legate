@@ -36,6 +36,7 @@ let makeSession (sessions: ISessionStore) (tenant: TenantId) (sessionId: Session
                 ClosedAt = Nullable()
                 WorkspaceBinding = null
                 Options = SessionOptions()
+                PermissionGrants = ResizeArray<string>() :> IReadOnlyList<string>
             }
 
         let! created = sessions.CreateSession(tenant, session, CancellationToken.None)
