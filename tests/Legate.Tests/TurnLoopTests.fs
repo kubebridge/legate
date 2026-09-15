@@ -8,6 +8,7 @@ open System.Threading
 open System.Threading.Tasks
 open FsUnit.Xunit
 open Legate
+open Legate.Testing
 open Legate.Tests.LlmStreamingTests
 open Microsoft.Extensions.AI
 open Microsoft.Extensions.Time.Testing
@@ -37,23 +38,30 @@ type RecordingClockDelay(clock: TimeProvider, recorded: ResizeArray<TimeSpan>) =
             recorded.Add(delay)
             Task.Delay(delay, clock, cancellationToken)
 
-/// Scripted IChatClient: returns queued responses in order and records how
-/// many provider calls ran. No Akka, no network.
-type ScriptedChatClient(responses: ChatResponse list) =
-    let mutable calls = 0
+/// Wraps script steps in the shared scripted client.
+let scripted (steps: ScriptStep list) : ScriptedChatClient =
+    new ScriptedChatClient(ResizeArray<ScriptStep>(steps) :> IReadOnlyList<ScriptStep>)
 
-    interface IChatClient with
-        member _.GetResponseAsync(_, _, _) =
-            calls <- calls + 1
-            let index = min (calls - 1) (responses.Length - 1)
-            Task.FromResult(responses[index])
+/// One scripted assistant text step.
+let textStep (text: string) : ScriptStep = ScriptStep.Text text
 
-        member _.GetStreamingResponseAsync(_, _, _) = raise (NotImplementedException())
+/// One scripted single tool-call step with empty arguments.
+let callStep (callId: string) (name: string) : ScriptStep = ScriptStep.ToolCall(callId, name)
 
-        member _.GetService(_, _) = null
-        member _.Dispose() = ()
+/// One scripted multi-call step from call-id/tool-name pairs.
+let callSteps (calls: (string * string) list) : ScriptStep =
+    ScriptStep.ToolCalls(
+        ResizeArray<ScriptToolCall>(
+            calls
+            |> List.map (fun (callId, name) -> ScriptToolCall(callId, name))
+            |> Array.ofList
+        )
+        :> IReadOnlyList<ScriptToolCall>
+    )
 
-    member _.Calls = calls
+/// One scripted streaming step from content chunks.
+let streamStep (contents: AIContent list) : ScriptStep =
+    ScriptStep.Stream(ResizeArray<AIContent>(contents) :> IReadOnlyList<AIContent>)
 
 let emptyArgs () : IDictionary<string, obj> =
     Dictionary<string, obj>() :> IDictionary<string, obj>
@@ -188,7 +196,7 @@ let private runLoop
 
 [<Fact>]
 let ``No tool calls completes with the assistant text`` () =
-    let client = new ScriptedChatClient([ textResponse "done" ])
+    let client = scripted [ textStep "done" ]
 
     let history =
         ResizeArray<ChatMessage>(
@@ -214,10 +222,9 @@ let ``Stop after tool round completes with the final text`` () =
     let invocations = ref []
     let fn = stubTool "lookup" "row-1" invocations
 
-    let first =
-        new ChatResponse(ResizeArray<ChatMessage>([| callMessage [ "c1", "lookup" ] |]))
+    let first = callStep "c1" "lookup"
 
-    let client = new ScriptedChatClient([ first; textResponse "finished" ])
+    let client = scripted [ first; textStep "finished" ]
     let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
 
     let result =
@@ -243,16 +250,13 @@ let ``Multiple calls execute sequentially in order with results appended in orde
     let a = stubTool "tool_a" "a-out" order
     let b = stubTool "tool_b" "b-out" order
 
-    let first =
-        new ChatResponse(
-            ResizeArray<ChatMessage>(
-                [|
-                    callMessage [ "c1", "tool_a"; "c2", "tool_b" ]
-                |]
-            )
-        )
+    let client =
+        scripted
+            [
+                callSteps [ "c1", "tool_a"; "c2", "tool_b" ]
+                textStep "ok"
+            ]
 
-    let client = new ScriptedChatClient([ first; textResponse "ok" ])
     let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
 
     let result =
@@ -275,10 +279,9 @@ let ``Multiple calls execute sequentially in order with results appended in orde
 
 [<Fact>]
 let ``Unknown tool continues with Error Unknown tool`` () =
-    let first =
-        new ChatResponse(ResizeArray<ChatMessage>([| callMessage [ "c1", "missing" ] |]))
+    let first = callStep "c1" "missing"
 
-    let client = new ScriptedChatClient([ first; textResponse "recovered" ])
+    let client = scripted [ first; textStep "recovered" ]
     let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
 
     let result =
@@ -293,10 +296,9 @@ let ``Unknown tool continues with Error Unknown tool`` () =
 let ``Tool exception continues with Error message only`` () =
     let fn = failingTool "boom_tool" "kaboom"
 
-    let first =
-        new ChatResponse(ResizeArray<ChatMessage>([| callMessage [ "c1", "boom_tool" ] |]))
+    let first = callStep "c1" "boom_tool"
 
-    let client = new ScriptedChatClient([ first; textResponse "recovered" ])
+    let client = scripted [ first; textStep "recovered" ]
     let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
 
     let result =
@@ -326,10 +328,9 @@ let ``Overlong tool result is truncated with the marker`` () =
     let invocations = ref []
     let fn = stubTool "big" "abcdef" invocations
 
-    let first =
-        new ChatResponse(ResizeArray<ChatMessage>([| callMessage [ "c1", "big" ] |]))
+    let first = callStep "c1" "big"
 
-    let client = new ScriptedChatClient([ first; textResponse "ok" ])
+    let client = scripted [ first; textStep "ok" ]
     let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
 
     let result =
@@ -350,10 +351,9 @@ let ``Result exactly at the limit passes through without the marker`` () =
     let invocations = ref []
     let fn = stubTool "exact" "abcd" invocations
 
-    let first =
-        new ChatResponse(ResizeArray<ChatMessage>([| callMessage [ "c1", "exact" ] |]))
+    let first = callStep "c1" "exact"
 
-    let client = new ScriptedChatClient([ first; textResponse "ok" ])
+    let client = scripted [ first; textStep "ok" ]
     let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
 
     runLoop client history (makeTools [ "exact", fn ]) options CancellationToken.None alwaysLeased
@@ -369,7 +369,7 @@ let ``Result exactly at the limit passes through without the marker`` () =
 let ``Cancelled token propagates OperationCanceledException`` () =
     use cts = new CancellationTokenSource()
     cts.Cancel()
-    let client = new ScriptedChatClient([ textResponse "never" ])
+    let client = scripted [ textStep "never" ]
     let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
 
     (fun () ->
@@ -384,13 +384,11 @@ let ``Lease loss stops the loop with zero further effects`` () =
     let invocations = ref []
     let fn = stubTool "lookup" "row-1" invocations
 
-    let first =
-        new ChatResponse(ResizeArray<ChatMessage>([| callMessage [ "c1", "lookup" ] |]))
+    let first = callStep "c1" "lookup"
 
-    let second =
-        new ChatResponse(ResizeArray<ChatMessage>([| callMessage [ "c2", "lookup" ] |]))
+    let second = callStep "c2" "lookup"
 
-    let client = new ScriptedChatClient([ first; second; textResponse "never" ])
+    let client = scripted [ first; second; textStep "never" ]
     let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
     let mutable calls = 0
 
@@ -438,26 +436,6 @@ type DeadlineUpdates(cancellationToken: CancellationToken) =
                 member _.DisposeAsync() = ValueTask()
             }
 
-/// Scripted streaming IChatClient: yields the queued updates for each call
-/// in order. The streaming entry point works here; the non-streaming one
-/// raises, mirroring a streaming-only provider.
-type ScriptedStreamingLoopClient(updatesPerCall: ChatResponseUpdate list list) =
-    let mutable calls = 0
-
-    interface IChatClient with
-        member _.GetResponseAsync(_, _, _) =
-            raise (NotImplementedException("streaming only"))
-
-        member _.GetStreamingResponseAsync(_, _, _) =
-            calls <- calls + 1
-            let index = min (calls - 1) (updatesPerCall.Length - 1)
-            EnumerableUpdates(updatesPerCall[index]) :> IAsyncEnumerable<ChatResponseUpdate>
-
-        member _.GetService(_, _) = null
-        member _.Dispose() = ()
-
-    member _.Calls = calls
-
 /// Streaming IChatClient that treats the passed token as the work: it waits
 /// for the token to fire (no sleeps) and then observes it, so a linked
 /// deadline surfaces as OperationCanceledException from in-flight streaming
@@ -478,19 +456,11 @@ type StreamingDeadlineClient() =
 
     member _.Calls = calls
 
-let streamUpdate (text: string) : ChatResponseUpdate =
-    ChatResponseUpdate(Nullable ChatRole.Assistant, text)
+/// One scripted text chunk.
+let textChunk (text: string) : AIContent = TextContent(text) :> AIContent
 
-let reasoningStreamUpdate (text: string) : ChatResponseUpdate =
-    ChatResponseUpdate(
-        Nullable ChatRole.Assistant,
-        ResizeArray<AIContent>(
-            [|
-                TextReasoningContent(text) :> AIContent
-            |]
-        )
-        :> IList<AIContent>
-    )
+/// One scripted reasoning chunk.
+let reasoningChunk (text: string) : AIContent = TextReasoningContent(text) :> AIContent
 
 let private runLoopWithDeltas
     (client: IChatClient)
@@ -535,15 +505,15 @@ let assistantTextOf (history: IList<ChatMessage>) : string =
 [<Fact>]
 let ``Streaming chunks emit ordered deltas and coalesce into one history message`` () =
     let client =
-        new ScriptedStreamingLoopClient(
+        scripted
             [
-                [
-                    streamUpdate "Hel"
-                    streamUpdate "lo"
-                    streamUpdate " world"
-                ]
+                streamStep
+                    [
+                        textChunk "Hel"
+                        textChunk "lo"
+                        textChunk " world"
+                    ]
             ]
-        )
 
     let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
 
@@ -569,15 +539,15 @@ let ``Streaming chunks emit ordered deltas and coalesce into one history message
 [<Fact>]
 let ``Streaming deltas fold into a single Assistant cell with reasoning excluded`` () =
     let client =
-        new ScriptedStreamingLoopClient(
+        scripted
             [
-                [
-                    reasoningStreamUpdate "hmm"
-                    streamUpdate "done"
-                    reasoningStreamUpdate " more"
-                ]
+                streamStep
+                    [
+                        reasoningChunk "hmm"
+                        textChunk "done"
+                        reasoningChunk " more"
+                    ]
             ]
-        )
 
     let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
 
@@ -614,16 +584,25 @@ let ``Streaming deltas fold into a single Assistant cell with reasoning excluded
 [<Fact>]
 let ``Streaming preserves raw thought signatures into the history`` () =
     let signature = obj ()
+    let payload = obj ()
     let reasoning = TextReasoningContent("thinking")
     reasoning.RawRepresentation <- signature
 
-    let update =
-        ChatResponseUpdate(
-            Nullable ChatRole.Assistant,
-            ResizeArray<AIContent>([| reasoning :> AIContent |]) :> IList<AIContent>
-        )
+    let client =
+        scripted
+            [
+                ScriptStep.Stream(
+                    ResizeArray<AIContent>(
+                        [|
+                            reasoning :> AIContent
+                            textChunk "done"
+                        |]
+                    )
+                    :> IReadOnlyList<AIContent>,
+                    payload
+                )
+            ]
 
-    let client = new ScriptedStreamingLoopClient([ [ update; streamUpdate "done" ] ])
     let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
 
     let result, _, reasonings =
@@ -652,9 +631,12 @@ let ``Streaming preserves raw thought signatures into the history`` () =
     Object.ReferenceEquals(stored[0].RawRepresentation, signature)
     |> should equal true
 
+    Object.ReferenceEquals(history[0].RawRepresentation, payload)
+    |> should equal true
+
 [<Fact>]
 let ``Non-streaming clients fall back to a single delta`` () =
-    let client = new ScriptedChatClient([ textResponse "done" ])
+    let client = scripted [ textStep "done" ]
     let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
 
     let result, texts, reasonings =
@@ -773,13 +755,11 @@ let ``Iteration cap settles Failed with TurnFailed and makes no further provider
     let invocations = ref []
     let fn = stubTool "lookup" "row-1" invocations
 
-    let first =
-        new ChatResponse(ResizeArray<ChatMessage>([| callMessage [ "c1", "lookup" ] |]))
+    let first = callStep "c1" "lookup"
 
-    let second =
-        new ChatResponse(ResizeArray<ChatMessage>([| callMessage [ "c2", "lookup" ] |]))
+    let second = callStep "c2" "lookup"
 
-    let client = new ScriptedChatClient([ first; second; textResponse "never" ])
+    let client = scripted [ first; second; textStep "never" ]
     let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
 
     let options: TurnLoop.TurnLoopOptions =
@@ -802,7 +782,7 @@ let ``Iteration cap settles Failed with TurnFailed and makes no further provider
 
 [<Fact>]
 let ``Zero MaxIterations on the loop options is rejected`` () =
-    let client = new ScriptedChatClient([ textResponse "never" ])
+    let client = scripted [ textStep "never" ]
     let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
 
     let options: TurnLoop.TurnLoopOptions =
@@ -820,10 +800,9 @@ let ``Lease loss wins over an exhausted iteration budget`` () =
     let invocations = ref []
     let fn = stubTool "lookup" "row-1" invocations
 
-    let first =
-        new ChatResponse(ResizeArray<ChatMessage>([| callMessage [ "c1", "lookup" ] |]))
+    let first = callStep "c1" "lookup"
 
-    let client = new ScriptedChatClient([ first; textResponse "never" ])
+    let client = scripted [ first; textStep "never" ]
     let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
     let mutable checks = 0
 
@@ -970,7 +949,7 @@ let ``External cancellation wins over a pending seam deadline`` () =
 
 [<Fact>]
 let ``A null delay seam is rejected`` () =
-    let client = new ScriptedChatClient([ textResponse "never" ])
+    let client = scripted [ textStep "never" ]
     let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
     let nullDelay = Unchecked.defaultof<ILlmDelay>
 
@@ -990,7 +969,7 @@ let ``A null delay seam is rejected`` () =
 let ``External cancellation still propagates when a short deadline is configured`` () =
     use cts = new CancellationTokenSource()
     cts.Cancel()
-    let client = new ScriptedChatClient([ textResponse "never" ])
+    let client = scripted [ textStep "never" ]
     let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
 
     let options: TurnLoop.TurnLoopOptions =
@@ -1005,7 +984,7 @@ let ``External cancellation still propagates when a short deadline is configured
 
 [<Fact>]
 let ``Zero Timeout on the loop options is rejected`` () =
-    let client = new ScriptedChatClient([ textResponse "never" ])
+    let client = scripted [ textStep "never" ]
     let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
 
     let options: TurnLoop.TurnLoopOptions =
@@ -1030,10 +1009,9 @@ let ``Resolved session budget flows into the loop`` () =
     let invocations = ref []
     let fn = stubTool "lookup" "row-1" invocations
 
-    let first =
-        new ChatResponse(ResizeArray<ChatMessage>([| callMessage [ "c1", "lookup" ] |]))
+    let first = callStep "c1" "lookup"
 
-    let client = new ScriptedChatClient([ first; textResponse "never" ])
+    let client = scripted [ first; textStep "never" ]
     let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
 
     let result =
@@ -1115,10 +1093,9 @@ let ``Injects fold after tool results before the next provider call in arrival o
     let invocations = ref []
     let fn = stubTool "lookup" "row-1" invocations
 
-    let first =
-        new ChatResponse(ResizeArray<ChatMessage>([| callMessage [ "c1", "lookup" ] |]))
+    let first = callStep "c1" "lookup"
 
-    let client = new ScriptedChatClient([ first; textResponse "finished" ])
+    let client = scripted [ first; textStep "finished" ]
     let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
 
     let firstInject = textInject 2L "steer-one"
@@ -1178,7 +1155,7 @@ let ``Injects fold after tool results before the next provider call in arrival o
 
 [<Fact>]
 let ``Empty drain is a no-op`` () =
-    let client = new ScriptedChatClient([ textResponse "done" ])
+    let client = scripted [ textStep "done" ]
     let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
     let journaled = ResizeArray<InboxEntry>()
     let consumed = ResizeArray<InboxEntry>()
@@ -1207,7 +1184,7 @@ let ``Empty drain is a no-op`` () =
 
 [<Fact>]
 let ``Queue Interrupt and Reply entries are ignored and stay pending`` () =
-    let client = new ScriptedChatClient([ textResponse "done" ])
+    let client = scripted [ textStep "done" ]
     let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
 
     let queued =
@@ -1265,7 +1242,7 @@ let ``Queue Interrupt and Reply entries are ignored and stay pending`` () =
 
 [<Fact>]
 let ``Inject arriving during the final iteration stays pending with the new-turn signal`` () =
-    let client = new ScriptedChatClient([ textResponse "done" ])
+    let client = scripted [ textStep "done" ]
     let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
     let late = textInject 7L "late-steer"
     let journaled = ResizeArray<InboxEntry>()
@@ -1305,7 +1282,7 @@ let ``Inject arriving during the final iteration stays pending with the new-turn
 
 [<Fact>]
 let ``Inject appends raw parts verbatim and ignores metadata`` () =
-    let client = new ScriptedChatClient([ textResponse "done" ])
+    let client = scripted [ textStep "done" ]
     let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
 
     let parts =
@@ -1403,29 +1380,22 @@ let private runSuspendable
         allowed
     |> fun task -> task.GetAwaiter().GetResult()
 
-let private questionCallMessage (callId: string) (question: string) : ChatMessage =
+/// One scripted ask_user question step: the question argument flows into
+/// the suspension's question text.
+let private questionStep (callId: string) (question: string) : ScriptStep =
     let args = Dictionary<string, obj>()
     args["question"] <- question :> obj
 
-    let contents =
-        ResizeArray<AIContent>(
-            [|
-                new FunctionCallContent(callId, TurnLoop.AskUserToolName, args) :> AIContent
-            |]
-        )
-        :> IList<AIContent>
-
-    new ChatMessage(ChatRole.Assistant, contents)
+    ScriptStep.ToolCall(callId, TurnLoop.AskUserToolName, args)
 
 [<Fact>]
 let ``Ask suspends with the unified carrier and invokes nothing`` () =
     let invocations = ref []
     let fn = stubTool "exec" "out" invocations
 
-    let first =
-        new ChatResponse(ResizeArray<ChatMessage>([| callMessage [ "c1", "exec" ] |]))
+    let first = callStep "c1" "exec"
 
-    let client = new ScriptedChatClient([ first; textResponse "never" ])
+    let client = scripted [ first; textStep "never" ]
     let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
 
     let policy =
@@ -1452,10 +1422,9 @@ let ``Deny continues without the tool effect`` () =
     let invocations = ref []
     let fn = stubTool "exec" "out" invocations
 
-    let first =
-        new ChatResponse(ResizeArray<ChatMessage>([| callMessage [ "c1", "exec" ] |]))
+    let first = callStep "c1" "exec"
 
-    let client = new ScriptedChatClient([ first; textResponse "done" ])
+    let client = scripted [ first; textStep "done" ]
     let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
 
     let policy =
@@ -1488,10 +1457,9 @@ let ``AllowForSession memory skips Evaluate`` () =
     let invocations = ref []
     let fn = stubTool "exec" "out" invocations
 
-    let first =
-        new ChatResponse(ResizeArray<ChatMessage>([| callMessage [ "c1", "exec" ] |]))
+    let first = callStep "c1" "exec"
 
-    let client = new ScriptedChatClient([ first; textResponse "done" ])
+    let client = scripted [ first; textStep "done" ]
     let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
     let scripted = ScriptPolicy(Map.ofList [ "exec", PermissionVerdict.Ask ])
     let allowed = HashSet<string>()
@@ -1506,16 +1474,13 @@ let ``AllowForSession memory skips Evaluate`` () =
 
 [<Fact>]
 let ``ask_user suspends as a question through the same carrier`` () =
-    let first =
-        new ChatResponse(
-            ResizeArray<ChatMessage>(
-                [|
-                    questionCallMessage "q1" "Which region?"
-                |]
-            )
-        )
+    let client =
+        scripted
+            [
+                questionStep "q1" "Which region?"
+                textStep "never"
+            ]
 
-    let client = new ScriptedChatClient([ first; textResponse "never" ])
     let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
     let policy = ScriptPolicy(Map.empty) :> IPermissionPolicy
 
@@ -1536,10 +1501,9 @@ let ``Resume with AllowOnce executes the same parked call`` () =
     let invocations = ref []
     let fn = stubTool "exec" "out" invocations
 
-    let first =
-        new ChatResponse(ResizeArray<ChatMessage>([| callMessage [ "c1", "exec" ] |]))
+    let first = callStep "c1" "exec"
 
-    let client = new ScriptedChatClient([ first; textResponse "finished" ])
+    let client = scripted [ first; textStep "finished" ]
     let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
 
     let policy =
@@ -1578,10 +1542,9 @@ let ``Resume with Deny skips the parked call`` () =
     let invocations = ref []
     let fn = stubTool "exec" "out" invocations
 
-    let first =
-        new ChatResponse(ResizeArray<ChatMessage>([| callMessage [ "c1", "exec" ] |]))
+    let first = callStep "c1" "exec"
 
-    let client = new ScriptedChatClient([ first; textResponse "finished" ])
+    let client = scripted [ first; textStep "finished" ]
     let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
 
     let policy =

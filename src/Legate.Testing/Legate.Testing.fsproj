@@ -16,16 +16,28 @@
     <Compile Include="AgentStoreConformance.fs" />
     <Compile Include="BlobStoreConformance.fs" />
     <Compile Include="AgentPackageStoreConformance.fs" />
+    <Compile Include="ScriptedChatClient.fs" />
+    <Compile Include="StaticToolSource.fs" />
+    <Compile Include="SessionHarness.fs" />
+    <Compile Include="ScriptedChatClientTests.fs" />
+    <Compile Include="StaticToolSourceTests.fs" />
+    <Compile Include="SessionHarnessTests.fs" />
   </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="../Legate.Abstractions/Legate.Abstractions.fsproj" />
+    <ProjectReference Include="../Legate/Legate.fsproj" />
+    <ProjectReference Include="../Legate.Storage.InMemory/Legate.Storage.InMemory.fsproj" />
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="Akka" />
+    <PackageReference Include="Akka.FSharp" />
     <PackageReference Include="FSharp.Core" />
+    <PackageReference Include="Microsoft.Extensions.AI.Abstractions" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" />
     <PackageReference Include="xunit" />
+    <PackageReference Include="xunit.runner.visualstudio" />
   </ItemGroup>
 
 </Project>

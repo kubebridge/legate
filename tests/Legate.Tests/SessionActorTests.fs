@@ -1724,8 +1724,8 @@ let private callUserTexts (messages: IEnumerable<ChatMessage>) : string list =
 
 /// Scripted IChatClient that returns queued responses in order and records
 /// the user texts of every provider call, so Inject tests prove the folded
-/// message reached the model context. Streaming is unimplemented like
-/// TurnLoopTests.ScriptedChatClient: the loop falls back to a single delta.
+/// message reached the model context. Streaming is unimplemented like the
+/// shared scripted client: the loop falls back to a single delta.
 type RecordingChatClient(responses: ChatResponse list) =
     let gate = obj ()
     let mutable calls = 0

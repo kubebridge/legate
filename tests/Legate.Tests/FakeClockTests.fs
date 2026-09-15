@@ -109,6 +109,30 @@ module FakeClockTests =
         Assert.Equal(0, clock.PendingTimerCount)
 
     [<Fact>]
+    let ``An infinite period is a one-shot per the TimeProvider contract`` () =
+        let clock = FakeClock()
+        let provider = clock :> TimeProvider
+        let fired = ResizeArray<int>()
+
+        // Task.Delay over a custom clock passes InfiniteTimeSpan as the
+        // period: CreateTimer must accept it as a one-shot, firing once
+        // and leaving nothing queued.
+        use timer =
+            provider.CreateTimer(
+                TimerCallback(fun _ -> fired.Add 1),
+                null,
+                TimeSpan.FromSeconds 5.,
+                Timeout.InfiniteTimeSpan
+            )
+
+        clock.Advance(TimeSpan.FromSeconds 5.)
+        Assert.Equal(1, fired.Count)
+
+        clock.Advance(TimeSpan.FromHours 1.)
+        Assert.Equal(1, fired.Count)
+        Assert.Equal(0, clock.PendingTimerCount)
+
+    [<Fact>]
     let ``The clock rejects moving backwards`` () =
         let clock = FakeClock(DateTimeOffset(2026, 1, 1, 12, 0, 0, TimeSpan.Zero))
 
