@@ -85,6 +85,19 @@ let ``Suffix truncates back to 128 and re-validates`` () =
         assigned |> List.forall ToolNameRules.TryValidate |> should equal true
 
 [<Fact>]
+let ``Suffix fails when the suffix space is exhausted`` () =
+    let taken =
+        [
+            for suffix in 2..9999 -> $"x_{suffix}"
+        ]
+
+    let names = "x" :: taken @ [ "x" ]
+
+    match McpNaming.resolve McpNameCollisionPolicy.Suffix names with
+    | Ok _ -> Assert.Fail("Exhausted suffix space must fail.") |> ignore
+    | Error message -> message.Contains("suffix space exhausted") |> should equal true
+
+[<Fact>]
 let ``Unknown policy fails closed`` () =
     match McpNaming.resolve (enum<McpNameCollisionPolicy> 99) [ "a" ] with
     | Ok _ -> Assert.Fail("Unknown policies must fail.") |> ignore

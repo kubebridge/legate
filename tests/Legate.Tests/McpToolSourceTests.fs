@@ -20,7 +20,7 @@ open Xunit
 
 /// One scripted server session: scripted tools, counted lists and calls,
 /// and an optional list failure.
-type ScriptedSession(serverName: string, tools: McpDiscovery.McpDiscoveredTool list, failList: bool) =
+type internal ScriptedSession(serverName: string, tools: McpDiscovery.McpDiscoveredTool list, failList: bool) =
 
     let mutable lists = 0
     let mutable calls: string list = []
@@ -70,7 +70,7 @@ type ScriptedSession(serverName: string, tools: McpDiscovery.McpDiscoveredTool l
 
 /// A scripted connector: connects from the scripted sessions, records
 /// connects per server, and fails connects for the named servers.
-type ScriptedConnector(sessions: Map<string, ScriptedSession>, failConnect: Set<string>) =
+type internal ScriptedConnector(sessions: Map<string, ScriptedSession>, failConnect: Set<string>) =
 
     let connects = Dictionary<string, int>(StringComparer.Ordinal)
 

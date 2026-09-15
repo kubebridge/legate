@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-module Legate.Mcp.McpDiscovery
+module internal Legate.Mcp.McpDiscovery
 
 open System
 open System.Text.Json

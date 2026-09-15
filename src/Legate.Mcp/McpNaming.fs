@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-module Legate.Mcp.McpNaming
+module internal Legate.Mcp.McpNaming
 
 open System
 
