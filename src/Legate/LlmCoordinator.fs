@@ -1094,6 +1094,20 @@ module internal LlmCoordination =
 
                 logCall "The coordinator admitted the call."
 
+                let providerStart = Telemetry.timestamp ()
+
+                use _providerScope =
+                    Telemetry.startProviderScope
+                        providerId
+                        reference.Model
+                        (Telemetry.idTagsFor
+                            (sessionId.ToString())
+                            (turnId.ToString())
+                            null
+                            (tenant.ToString())
+                            (string attempt)
+                            null)
+
                 try
                     let! terminal = attemptLoop context 0
 
@@ -1111,8 +1125,22 @@ module internal LlmCoordination =
 
                     reportSuccessCheckpoint observer tenant sessionId turnId attempt reference inputTokens outputTokens
 
+                    Telemetry.recordProviderCall providerId reference.Model Telemetry.StatusOk
+
+                    Telemetry.recordProviderLatency
+                        (Telemetry.elapsedMilliseconds providerStart)
+                        providerId
+                        reference.Model
+
                     return terminal.Value
                 with ex ->
+                    Telemetry.recordProviderCall providerId reference.Model Telemetry.StatusError
+
+                    Telemetry.recordProviderLatency
+                        (Telemetry.elapsedMilliseconds providerStart)
+                        providerId
+                        reference.Model
+
                     reportAbandonedSettlement observer tenant sessionId turnId attempt reference
                     return! Task.FromException<'T>(ex)
             }

@@ -259,6 +259,15 @@ module internal ClaimHeartbeat =
 
                 let! decision = stepAsync renew current isCancellationRequested cancellationToken
 
+                let outcome =
+                    match decision with
+                    | Continue _ -> Telemetry.LeaseContinued
+                    | RenewNow _ -> Telemetry.LeaseRenewNow
+                    | StopLeaseLost -> Telemetry.LeaseLost
+                    | StopCancelled -> Telemetry.LeaseCancelled
+
+                Telemetry.recordLeaseRenewal outcome
+
                 match view with
                 | Some live -> live.Observe(decision)
                 | None -> ()

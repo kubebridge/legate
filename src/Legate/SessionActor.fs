@@ -1060,6 +1060,8 @@ module internal SessionActor =
             awaitTask (props.Store.MarkInboxConsumed(props.Tenant, props.SessionId, positions, cancellationToken))
             |> ignore
 
+            Telemetry.addQueueDepth -1
+
             let pending =
                 awaitTask (props.Store.ReadPendingInbox(props.Tenant, props.SessionId, cancellationToken))
 
@@ -1160,9 +1162,13 @@ module internal SessionActor =
             (delivery: DeliveryMode)
             (cancellationToken: CancellationToken)
             : InboxEntry =
-            awaitTask (
-                props.Store.AppendInboxMessage(props.Tenant, props.SessionId, payload, delivery, cancellationToken)
-            )
+            let appended =
+                awaitTask (
+                    props.Store.AppendInboxMessage(props.Tenant, props.SessionId, payload, delivery, cancellationToken)
+                )
+
+            Telemetry.addQueueDepth 1
+            appended
 
         /// Appends a prompt entry while Idle and starts its turn: persists
         /// Running store-first, then drains tier-first (Interrupt first,

@@ -865,6 +865,17 @@ module internal TurnLoop =
         (cancellationToken: CancellationToken)
         : Task<string> =
         task {
+            let name =
+                if isNull (box call) || isNull call.Name then
+                    ""
+                else
+                    call.Name
+
+            let idTags = Telemetry.idTagsFromScope options.LogScope
+            let started = Telemetry.timestamp ()
+
+            use _toolScope = Telemetry.startToolScope name idTags
+
             let! text, error = invokeOneWithErrorAsync tools call cancellationToken
 
             let log = LoggingScopes.resolveLogger options.Logger
@@ -875,12 +886,6 @@ module internal TurnLoop =
                 else
                     options.LogScope
 
-            let name =
-                if isNull (box call) || isNull call.Name then
-                    ""
-                else
-                    call.Name
-
             use _scope = LoggingScopes.beginScope log scope
 
             log.LogInformation(
@@ -890,6 +895,15 @@ module internal TurnLoop =
             )
 
             do! observeToolCallAsync options call text error
+
+            let status =
+                if error.IsSome then
+                    Telemetry.StatusError
+                else
+                    Telemetry.StatusOk
+
+            Telemetry.recordToolCall name status
+            Telemetry.recordToolLatency (Telemetry.elapsedMilliseconds started) name
             return text
         }
 
@@ -1315,8 +1329,15 @@ module internal TurnLoop =
             }
 
         task {
+            Telemetry.recordTurnStarted ()
+
+            use _turnScope =
+                Telemetry.startTurnScope (Telemetry.idTagsFromScope options.LogScope)
+
             try
-                return! loop 0 0L 0L
+                let! completion = loop 0 0L 0L
+                Telemetry.recordTurnSettled (completion.Result.Status.ToString())
+                return completion
             finally
                 timeoutCts.Dispose()
                 linkedCts.Dispose()
@@ -1913,10 +1934,25 @@ module internal TurnLoop =
                         }
 
                     try
+                        let taskName =
+                            if isNull (box call) || isNull call.Name then
+                                ""
+                            else
+                                call.Name
+
+                        let taskStarted = Telemetry.timestamp ()
+
+                        use _taskScope =
+                            Telemetry.startToolScope taskName (Telemetry.idTagsFromScope options.LogScope)
+
                         let! nested = runNested request
                         let shaped = truncateToolResult options nested.Text
                         appendToolResult history call.CallId shaped
                         do! observeToolCallAsync options call shaped None
+
+                        Telemetry.recordToolCall taskName Telemetry.StatusOk
+
+                        Telemetry.recordToolLatency (Telemetry.elapsedMilliseconds taskStarted) taskName
 
                         return
                             roundIterations + nested.Iterations,
@@ -2218,8 +2254,15 @@ module internal TurnLoop =
             }
 
         task {
+            Telemetry.recordTurnStarted ()
+
+            use _turnScope =
+                Telemetry.startTurnScope (Telemetry.idTagsFromScope options.LogScope)
+
             try
-                return! loop 0 0L 0L
+                let! completion = loop 0 0L 0L
+                Telemetry.recordTurnSettled (completion.Result.Status.ToString())
+                return completion
             finally
                 timeoutCts.Dispose()
                 linkedCts.Dispose()
