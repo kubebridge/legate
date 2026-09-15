@@ -3,6 +3,7 @@ namespace Legate
 
 open System
 open System.Runtime.CompilerServices
+open Legate.Agents
 open Microsoft.Extensions.DependencyInjection
 open Microsoft.Extensions.DependencyInjection.Extensions
 
@@ -77,6 +78,7 @@ type LegateServiceCollectionExtensions =
         | Some configureHost ->
             let builder = LegateBuilder(services)
             configureHost builder
+            FileAgentStoreRegistration.compose builder.Agents
         | _ -> ()
 
         LegateDefaultRegistration.register services
