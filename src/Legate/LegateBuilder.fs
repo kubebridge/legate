@@ -128,6 +128,9 @@ type WorkspaceBuilder internal (services: IServiceCollection) as this =
 type ToolsBuilder internal (services: IServiceCollection) as this =
     do ArgumentNullException.ThrowIfNull(services)
 
+    /// The container the builder registers into.
+    member _.Services: IServiceCollection = services
+
     /// Registers one tool source instance.
     /// <param name="source">The source contributing tools to sessions.</param>
     /// <returns>This builder, for chaining.</returns>
