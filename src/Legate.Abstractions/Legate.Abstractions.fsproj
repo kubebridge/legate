@@ -27,6 +27,7 @@
     <Compile Include="ToolSources.fs" />
     <Compile Include="Events.fs" />
     <Compile Include="Cells.fs" />
+    <Compile Include="Transcripts.fs" />
     <Compile Include="ContextPruning.fs" />
     <Compile Include="SessionsStore.fs" />
     <Compile Include="SessionEventStore.fs" />
