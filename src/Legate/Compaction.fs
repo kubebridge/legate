@@ -287,6 +287,78 @@ module internal Compaction =
     let estimateHistory (history: IList<ChatMessage>) (sessionId: SessionId) (turnId: TurnId) : int64 =
         ContextPruning.Estimate(toEstimateCells history sessionId turnId)
 
+    /// Builds the estimate-preserving call leg for a cell carrying a tool
+    /// name: a FunctionCallContent with the cell's call id (or empty when
+    /// the journal never observed the start) and name, so callNameOf
+    /// recovers the name while textOf stays empty.
+    /// <param name="cell">The cell carrying the tool name. Must not be null.</param>
+    /// <returns>The call content preserving the name leg.</returns>
+    let private callContentOf (cell: SessionCell) : FunctionCallContent =
+        let callId = if isNull cell.ToolCallId then "" else cell.ToolCallId
+        let name = if isNull cell.ToolName then "" else cell.ToolName
+        FunctionCallContent(callId, name)
+
+    /// Rebuilds an on-demand compaction history from transcript cells: the
+    /// inverse of <see cref="M:Legate.Compaction.toEstimateCells" /> over
+    /// role and text (issue 46). User, Assistant, and System cells become
+    /// same-role text messages; ToolResult cells become Tool-role text
+    /// messages; ToolCall cells become Assistant messages carrying the call
+    /// name (their content is empty because arguments journal, never
+    /// stream). A cell ToolName survives on a FunctionCallContent leg, so
+    /// the estimate mapping sees the same name. Null contents become empty
+    /// text. Estimate-preserving: Estimate over toEstimateCells of the
+    /// result equals Estimate over the input cells, and cells that came
+    /// from toEstimateCells round-trip to identical kinds, contents, and
+    /// tool names (ToolCall cells normalize to Assistant, which estimates
+    /// the same). Pure: reads the cells, returns fresh messages, performs
+    /// no I/O.
+    /// <param name="cells">The transcript cells, in order. Must not be null and must not contain null.</param>
+    /// <returns>The rebuilt history, in cell order.</returns>
+    let messagesFromCells (cells: IReadOnlyList<SessionCell>) : IList<ChatMessage> =
+        if isNull (box cells) then
+            raise (ArgumentNullException(nameof cells))
+
+        let history = ResizeArray<ChatMessage>(cells.Count)
+
+        for cell in cells do
+            if isNull (box cell) then
+                raise (ArgumentNullException(nameof cells))
+
+            let text = if isNull cell.Content then "" else cell.Content
+
+            match cell.Kind with
+            | SessionCellKind.User -> history.Add(ChatMessage(ChatRole.User, text))
+            | SessionCellKind.Assistant ->
+                if isNull (box cell.ToolName) then
+                    history.Add(ChatMessage(ChatRole.Assistant, text))
+                else
+                    let contents = ResizeArray<AIContent>()
+
+                    if text <> "" then
+                        contents.Add(TextContent(text) :> AIContent)
+
+                    contents.Add(callContentOf cell :> AIContent)
+                    history.Add(ChatMessage(ChatRole.Assistant, contents :> IList<AIContent>))
+            | SessionCellKind.System -> history.Add(ChatMessage(ChatRole.System, text))
+            | SessionCellKind.ToolResult ->
+                let contents = ResizeArray<AIContent>()
+                contents.Add(TextContent(text) :> AIContent)
+
+                if not (isNull (box cell.ToolName)) then
+                    contents.Add(callContentOf cell :> AIContent)
+
+                history.Add(ChatMessage(ChatRole.Tool, contents :> IList<AIContent>))
+            | SessionCellKind.ToolCall ->
+                if isNull (box cell.ToolName) then
+                    history.Add(ChatMessage(ChatRole.Assistant, ""))
+                else
+                    let contents = ResizeArray<AIContent>()
+                    contents.Add(callContentOf cell :> AIContent)
+                    history.Add(ChatMessage(ChatRole.Assistant, contents :> IList<AIContent>))
+            | _ -> history.Add(ChatMessage(ChatRole.System, text))
+
+        history :> IList<ChatMessage>
+
     /// Reports whether a history crosses the compaction threshold: its
     /// estimate strictly exceeds ContextPruning.PruneThreshold for the
     /// session model's catalog entry. Pure; the threshold is never
@@ -536,13 +608,35 @@ module internal Compaction =
             return FailedContinue(safe, request.InputTokens, request.OutputTokens)
         }
 
+    /// A one-shot on-demand compaction request shared between a session
+    /// actor and its turn hooks (issue 46): the actor arms it when a
+    /// Compact lands while Running, and the running turn's force-aware
+    /// boundary hook takes it at the next iteration boundary. Thread-safe:
+    /// Request arms while Take clears atomically, so the compaction fires
+    /// exactly once no matter how many boundaries race it. A request left
+    /// armed when its turn ends without another boundary stays armed for
+    /// the next turn's hook, so the client request is never dropped
+    /// silently.
+    type CompactForce() =
+        let mutable requested = 0
+
+        /// Arms the one-shot request. Idempotent: arming twice still fires once.
+        member _.Request() : unit =
+            Interlocked.Exchange(&requested, 1) |> ignore
+
+        /// Takes the armed request, clearing it: true exactly once per Request.
+        member _.Take() : bool = Interlocked.Exchange(&requested, 0) = 1
+
     /// Attempts one compaction pass: at most one summariser call and one
-    /// rewrite per call (the single-pass-per-boundary guard). Cancellation
-    /// and lease loss propagate; every other failure journals a
+    /// rewrite per call (the single-pass-per-boundary guard). A forced pass
+    /// bypasses the threshold check but keeps the guard: with nothing
+    /// replaceable it still compacts nothing and runs no summariser call.
+    /// Cancellation and lease loss propagate; every other failure journals a
     /// CompactionFailedEvent and continues uncompacted.
+    /// <param name="forced">True bypasses the threshold check for an on-demand compact.</param>
     /// <param name="request">What the attempt needs. Its client, history, journal sink, and lease hook must not be null.</param>
     /// <returns>What the attempt decided.</returns>
-    let tryCompactAsync (request: CompactionRequest) : Task<CompactionOutcome> =
+    let tryCompactCoreAsync (forced: bool) (request: CompactionRequest) : Task<CompactionOutcome> =
         if isNull (box request.Client) then
             raise (ArgumentNullException(nameof request))
 
@@ -563,7 +657,7 @@ module internal Compaction =
                 ContextPruning.PruneThreshold(request.CatalogEntry, request.ReservedBufferTokens)
 
             if
-                beforeEstimate <= int64 threshold
+                (not forced && beforeEstimate <= int64 threshold)
                 || not (wouldReplace request.History request.KeepMessages)
             then
                 return NotNeeded
@@ -660,14 +754,26 @@ module internal Compaction =
                             return Compacted(beforeEstimate, afterEstimate, totalInput, totalOutput)
         }
 
+    /// Attempts one threshold-gated compaction pass: the TurnLoop boundary
+    /// shape over <see cref="M:Legate.Compaction.tryCompactCoreAsync" />.
+    /// Under threshold (or with nothing replaceable) no provider call runs,
+    /// nothing journals, and history stays untouched.
+    /// <param name="request">What the attempt needs. Its client, history, journal sink, and lease hook must not be null.</param>
+    /// <returns>What the attempt decided.</returns>
+    let tryCompactAsync (request: CompactionRequest) : Task<CompactionOutcome> = tryCompactCoreAsync false request
+
     /// Adapts one attempt's fixed dependencies to the TurnLoop boundary
-    /// shape: the boundary supplies the history, usage totals, and
-    /// cancellation token per iteration and continues with the updated
-    /// totals. Internal-callable so issue 46 reuses it for
-    /// ILegateClient.Compact.
+    /// shape over a force seam: the boundary takes the one-shot and runs
+    /// the forced core when armed, otherwise the threshold-gated core, then
+    /// continues with the updated totals. Internal-callable so issue 46
+    /// reuses it for ILegateClient.Compact.
+    /// <param name="takeForce">Takes the armed one-shot request. Must not be null.</param>
     /// <param name="deps">What the turn's attempts need. Its client, journal sink, and lease hook must not be null.</param>
     /// <returns>The boundary hook.</returns>
-    let createHook (deps: CompactionHookDeps) : TurnLoop.CompactionHook =
+    let private hookOf (takeForce: unit -> bool) (deps: CompactionHookDeps) : TurnLoop.CompactionHook =
+        if isNull (box takeForce) then
+            raise (ArgumentNullException(nameof takeForce))
+
         if isNull (box deps.Client) then
             raise (ArgumentNullException(nameof deps))
 
@@ -679,6 +785,8 @@ module internal Compaction =
 
         fun history inputTokens outputTokens cancellationToken ->
             task {
+                let forced = takeForce ()
+
                 let request: CompactionRequest =
                     {
                         Client = deps.Client
@@ -701,10 +809,31 @@ module internal Compaction =
                         CancellationToken = cancellationToken
                     }
 
-                let! outcome = tryCompactAsync request
+                let! outcome = tryCompactCoreAsync forced request
 
                 match outcome with
                 | NotNeeded -> return (inputTokens, outputTokens)
                 | Compacted(_, _, totalInput, totalOutput) -> return (totalInput, totalOutput)
                 | FailedContinue(_, totalInput, totalOutput) -> return (totalInput, totalOutput)
             }
+
+    /// Adapts one attempt's fixed dependencies to the TurnLoop boundary
+    /// shape: the boundary supplies the history, usage totals, and
+    /// cancellation token per iteration and continues with the updated
+    /// totals. Internal-callable so issue 46 reuses it for
+    /// ILegateClient.Compact.
+    /// <param name="deps">What the turn's attempts need. Its client, journal sink, and lease hook must not be null.</param>
+    /// <returns>The boundary hook.</returns>
+    let createHook (deps: CompactionHookDeps) : TurnLoop.CompactionHook = hookOf (fun () -> false) deps
+
+    /// Adapts one attempt's fixed dependencies to the force-aware TurnLoop
+    /// boundary shape (issue 46): each boundary takes the shared one-shot
+    /// force cell, so an armed Compact fires one threshold-bypassed pass at
+    /// the next boundary exactly once while unforced boundaries behave like
+    /// <see cref="M:Legate.Compaction.createHook" />.
+    /// <param name="force">The one-shot cell the session actor arms. Must not be null.</param>
+    /// <param name="deps">What the turn's attempts need. Its client, journal sink, and lease hook must not be null.</param>
+    /// <returns>The force-aware boundary hook.</returns>
+    let createForceHook (force: CompactForce) (deps: CompactionHookDeps) : TurnLoop.CompactionHook =
+        ArgumentNullException.ThrowIfNull(force)
+        hookOf force.Take deps

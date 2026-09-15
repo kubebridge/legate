@@ -85,6 +85,7 @@ let private spawnSession
             RunTurn = runTurn
             OnTurnSettled = None
             OnInjectJournaled = None
+            Compact = None
         }
 
     spawn system $"test-{Guid.NewGuid():N}" (SessionActor.behavior props)
@@ -106,6 +107,7 @@ let private spawnSessionWithProbe
             RunTurn = runTurn
             OnTurnSettled = Some probe
             OnInjectJournaled = None
+            Compact = None
         }
 
     spawn system $"test-{Guid.NewGuid():N}" (SessionActor.behavior props)
@@ -1111,6 +1113,7 @@ let private spawnSuspendable
             RunTurn = (fun _ _ -> Task.FromResult(completed "unused"))
             OnTurnSettled = Some(fun result -> lock settled (fun () -> settled.Add(result)))
             OnInjectJournaled = None
+            Compact = None
         }
 
     let deps: SessionActor.SuspendDeps =
@@ -1679,6 +1682,7 @@ let private spawnSessionFull
             RunTurn = runTurn
             OnTurnSettled = Some settled.Add
             OnInjectJournaled = Some(fun event -> lock journaled (fun () -> journaled.Add(event)))
+            Compact = None
         }
 
     spawn system $"test-{Guid.NewGuid():N}" (SessionActor.behavior props)
@@ -2410,3 +2414,410 @@ let ``Compaction wiring continues on denial with CompactionFailedEvent`` () =
 
     let failed = events[0] :?> CompactionFailedEvent
     failed.Reason |> should equal "quota spent"
+
+// ──────────────────────────────────────────────────────────────────────────
+// On-demand Compact (issue 46)
+
+/// Compacts through the client boundary and blocks for the reply.
+let private compact (store: ISessionStore) (sessionId: SessionId) (session: IActorRef) : SessionCompactReply =
+    SessionActor.compactAsync store tenant sessionId session CancellationToken.None
+    |> fun task -> task.GetAwaiter().GetResult()
+
+/// Builds on-demand compaction dependencies sharing the force cell with
+/// the turn's force-aware hook.
+let private compactDeps
+    (client: IChatClient)
+    (policy: IModelPolicy | null)
+    (journal: ISessionEventStore)
+    (token: string)
+    (force: Compaction.CompactForce)
+    : CompactDeps =
+    let llm = LlmOptions()
+    llm.CompactionKeepMessages <- 2
+
+    {
+        Llm = llm
+        ReservedBufferTokens = 100
+        SessionModel = ModelReference.Parse "test/session-model"
+        Catalog = FakeCompactionCatalog(compactionEntry ()) :> ILlmModelCatalog
+        Client = client
+        Observer = Unchecked.defaultof<IUsageObserver>
+        Policy = policy
+        EventStore = journal
+        JournalToken = token
+        Force = force
+    }
+
+/// Spawns a session actor carrying on-demand compaction dependencies.
+let private spawnSessionWithCompact
+    (system: ActorSystem)
+    (store: ISessionStore)
+    (sessionId: SessionId)
+    (runTurn: InboxEntry -> CancellationToken -> Task<TurnResult>)
+    (compact: CompactDeps)
+    : IActorRef =
+    let props: SessionActorProps =
+        {
+            Store = store
+            Tenant = tenant
+            SessionId = sessionId
+            RunTurn = runTurn
+            OnTurnSettled = None
+            OnInjectJournaled = None
+            Compact = Some compact
+        }
+
+    spawn system $"test-{Guid.NewGuid():N}" (SessionActor.behavior props)
+
+/// Seeds the journal with one user message per text under the token.
+let private seedJournal
+    (journal: ISessionEventStore)
+    (sessionId: SessionId)
+    (token: string)
+    (texts: string list)
+    : unit =
+    let events =
+        ResizeArray<SessionEvent>(
+            [|
+                for text in texts ->
+                    UserMessageEvent(
+                        sessionId,
+                        TurnId.New(),
+                        Nullable<int64>(),
+                        DateTimeOffset.UtcNow,
+                        UserMessage.Text(text)
+                    )
+                    :> SessionEvent
+            |]
+        )
+        :> IReadOnlyList<SessionEvent>
+
+    match
+        JournalWriter.appendWithTokenAsync journal tenant sessionId token events CancellationToken.None
+        |> fun task -> task.GetAwaiter().GetResult()
+    with
+    | JournalWriter.JournalAppended _ -> ()
+    | JournalWriter.JournalRejected rejection ->
+        failwith $"Expected the seed append to land, observed rejection: %s{rejection}."
+    | JournalWriter.JournalFailed failure ->
+        failwith $"Expected the seed append to land, observed failure: %s{failure}."
+
+/// Six 1000-char user messages: over the 1200 wiring threshold, so an
+/// Idle compact summarises.
+let private overThresholdTexts () : string list = [ for _ in 1..6 -> String('x', 1000) ]
+
+[<Fact>]
+let ``Compact on Idle replays the journal and compacts without starting a turn`` () =
+    use system = createSystem ()
+    let store, journal = createJournalStores ()
+    let created = createSession store
+    appendStored store created.Id "run" |> ignore
+    let claim = claimTurn store created.Id "owner-a"
+    seedJournal journal created.Id claim.Token (overThresholdTexts ())
+
+    let client =
+        new ScriptedChatClient(
+            ResizeArray<ScriptStep>(
+                [|
+                    ScriptStep.Text("idle gist", 4L, 6L)
+                |]
+            )
+        )
+
+    let deps =
+        compactDeps
+            (client :> IChatClient)
+            Unchecked.defaultof<IModelPolicy>
+            journal
+            claim.Token
+            (Compaction.CompactForce())
+
+    let session =
+        spawnSessionWithCompact system store created.Id (fun _ _ -> Task.FromResult(completed "unused")) deps
+
+    try
+        match compact store created.Id session with
+        | CompactCompleted(beforeEstimate, afterEstimate) -> (beforeEstimate > afterEstimate) |> should equal true
+        | reply -> failwith $"Expected CompactCompleted, observed %A{reply}."
+
+        // No turn started: the actor and the store stayed Idle with no
+        // running entry.
+        let snapshot = snapshotOf session
+        snapshot.State |> should equal SessionState.Idle
+        snapshot.RunningPosition.IsNone |> should equal true
+        (storedOf store created.Id).State |> should equal SessionState.Idle
+
+        // Six seeded messages plus the one CompactedEvent, and exactly one
+        // summariser call.
+        let events = replayEvents journal created.Id
+        events.Count |> should equal 7
+        (events[6] :? CompactedEvent) |> should equal true
+        client.Calls |> should equal 1
+    finally
+        stopSystem system
+
+[<Fact>]
+let ``Compact on Idle under threshold makes no summariser call`` () =
+    use system = createSystem ()
+    let store, journal = createJournalStores ()
+    let created = createSession store
+    appendStored store created.Id "run" |> ignore
+    let claim = claimTurn store created.Id "owner-a"
+    seedJournal journal created.Id claim.Token [ "hello" ]
+
+    let client = new ScriptedChatClient(ResizeArray<ScriptStep>([||]))
+
+    let deps =
+        compactDeps
+            (client :> IChatClient)
+            Unchecked.defaultof<IModelPolicy>
+            journal
+            claim.Token
+            (Compaction.CompactForce())
+
+    let session =
+        spawnSessionWithCompact system store created.Id (fun _ _ -> Task.FromResult(completed "unused")) deps
+
+    try
+        match compact store created.Id session with
+        | CompactNotNeeded -> ()
+        | reply -> failwith $"Expected CompactNotNeeded, observed %A{reply}."
+
+        client.Calls |> should equal 0
+        (replayEvents journal created.Id).Count |> should equal 1
+        (snapshotOf session).State |> should equal SessionState.Idle
+    finally
+        stopSystem system
+
+[<Fact>]
+let ``Compact on Idle with a denied model journals CompactionFailedEvent and continues`` () =
+    use system = createSystem ()
+    let store, journal = createJournalStores ()
+    let created = createSession store
+    appendStored store created.Id "run" |> ignore
+    let claim = claimTurn store created.Id "owner-a"
+    seedJournal journal created.Id claim.Token (overThresholdTexts ())
+
+    let client = new ScriptedChatClient(ResizeArray<ScriptStep>([||]))
+
+    let deps =
+        compactDeps
+            (client :> IChatClient)
+            (DenyCompactionPolicy("quota spent") :> IModelPolicy)
+            journal
+            claim.Token
+            (Compaction.CompactForce())
+
+    let session =
+        spawnSessionWithCompact system store created.Id (fun _ _ -> Task.FromResult(completed "unused")) deps
+
+    try
+        match compact store created.Id session with
+        | CompactNotNeeded -> ()
+        | reply -> failwith $"Expected CompactNotNeeded, observed %A{reply}."
+
+        client.Calls |> should equal 0
+
+        let events = replayEvents journal created.Id
+        events.Count |> should equal 7
+
+        let failed = events[6] :?> CompactionFailedEvent
+        failed.Reason |> should equal "quota spent"
+        (snapshotOf session).State |> should equal SessionState.Idle
+    finally
+        stopSystem system
+
+[<Fact>]
+let ``Compact on Idle with a stale claim journals nothing`` () =
+    use system = createSystem ()
+    let store, journal = createJournalStores ()
+    let created = createSession store
+    appendStored store created.Id "run" |> ignore
+    let claim = claimTurn store created.Id "owner-a"
+    seedJournal journal created.Id claim.Token (overThresholdTexts ())
+
+    let client =
+        new ScriptedChatClient(ResizeArray<ScriptStep>([| ScriptStep.Text("loser gist") |]))
+
+    // The takeover winner re-claimed elsewhere: these dependencies carry a
+    // token the store no longer honors.
+    let deps =
+        compactDeps
+            (client :> IChatClient)
+            Unchecked.defaultof<IModelPolicy>
+            journal
+            "bogus-token"
+            (Compaction.CompactForce())
+
+    let session =
+        spawnSessionWithCompact system store created.Id (fun _ _ -> Task.FromResult(completed "unused")) deps
+
+    try
+        match compact store created.Id session with
+        | CompactFenced -> ()
+        | reply -> failwith $"Expected CompactFenced, observed %A{reply}."
+
+        // The summariser ran (the fence checks at the last moment before
+        // the journal write), but the loser journaled nothing.
+        client.Calls |> should equal 1
+        (replayEvents journal created.Id).Count |> should equal 6
+        (snapshotOf session).State |> should equal SessionState.Idle
+    finally
+        stopSystem system
+
+[<Fact>]
+let ``Compact on Running defers to the next boundary exactly once`` () =
+    use system = createSystem ()
+    let store, journal = createJournalStores ()
+    let created = createSession store
+    appendStored store created.Id "run" |> ignore
+    let claim = claimTurn store created.Id "owner-a"
+
+    let client =
+        new ScriptedChatClient(ResizeArray<ScriptStep>([| ScriptStep.Text("running gist") |]))
+
+    let force = Compaction.CompactForce()
+
+    let deps =
+        compactDeps (client :> IChatClient) Unchecked.defaultof<IModelPolicy> journal claim.Token force
+
+    // The scripted turn honors the shared force cell at two scripted
+    // boundaries, then settles: the armed request fires once.
+    let gate = new TaskCompletionSource<unit>()
+
+    let runTurn _ _ =
+        task {
+            do! gate.Task
+
+            let hook =
+                SessionActor.buildForcedCompactionHook
+                    force
+                    (buildWiring
+                        created.Id
+                        (client :> IChatClient)
+                        Unchecked.defaultof<IModelPolicy>
+                        journal
+                        claim.Token)
+
+            let history =
+                ResizeArray<ChatMessage>(
+                    [|
+                        ChatMessage(ChatRole.User, "alpha")
+                        ChatMessage(ChatRole.Assistant, "beta")
+                        ChatMessage(ChatRole.User, "gamma")
+                    |]
+                )
+                :> IList<ChatMessage>
+
+            let! _ = hook history 0L 0L CancellationToken.None
+            let! _ = hook history 0L 0L CancellationToken.None
+            return completed "done"
+        }
+
+    let session = spawnSessionWithCompact system store created.Id runTurn deps
+
+    try
+        prompt store created.Id session "go" |> ignore
+
+        let running =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () -> (snapshotOf session).State = SessionState.Running)
+
+        running |> should equal true
+
+        match compact store created.Id session with
+        | CompactDeferred -> ()
+        | reply -> failwith $"Expected CompactDeferred, observed %A{reply}."
+
+        gate.TrySetResult() |> ignore
+
+        let drained =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () -> (snapshotOf session).State = SessionState.Idle)
+
+        drained |> should equal true
+
+        // One summariser call across both boundaries: the first consumed
+        // the armed flag, the second found it spent.
+        client.Calls |> should equal 1
+
+        let events = replayEvents journal created.Id
+        events.Count |> should equal 1
+        (events[0] :? CompactedEvent) |> should equal true
+    finally
+        stopSystem system
+
+[<Fact>]
+let ``Compact on WaitingForInput no-ops without touching the journal`` () =
+    use system = createSystem ()
+    let store, journal = createJournalStores ()
+    let created = createSession store
+    appendStored store created.Id "run" |> ignore
+    let claim = claimTurn store created.Id "owner-a"
+    seedJournal journal created.Id claim.Token [ "parked" ]
+
+    store
+        .UpdateSessionState(tenant, created.Id, SessionState.WaitingForInput, CancellationToken.None)
+        .GetAwaiter()
+        .GetResult()
+    |> ignore
+
+    let client = new ScriptedChatClient(ResizeArray<ScriptStep>([||]))
+
+    let deps =
+        compactDeps
+            (client :> IChatClient)
+            Unchecked.defaultof<IModelPolicy>
+            journal
+            claim.Token
+            (Compaction.CompactForce())
+
+    let session =
+        spawnSessionWithCompact system store created.Id (fun _ _ -> Task.FromResult(completed "unused")) deps
+
+    try
+        match compact store created.Id session with
+        | CompactNotNeeded -> ()
+        | reply -> failwith $"Expected CompactNotNeeded, observed %A{reply}."
+
+        client.Calls |> should equal 0
+        (replayEvents journal created.Id).Count |> should equal 1
+        (snapshotOf session).State |> should equal SessionState.WaitingForInput
+    finally
+        stopSystem system
+
+[<Fact>]
+let ``Compact without configured wiring no-ops`` () =
+    use system = createSystem ()
+    let store = createStore ()
+    let created = createSession store
+
+    let session =
+        spawnSession system store created.Id (fun _ _ -> Task.FromResult(completed "unused"))
+
+    try
+        match compact store created.Id session with
+        | CompactNotNeeded -> ()
+        | reply -> failwith $"Expected CompactNotNeeded, observed %A{reply}."
+
+        (snapshotOf session).State |> should equal SessionState.Idle
+    finally
+        stopSystem system
+
+[<Fact>]
+let ``Compact on Closed throws InvalidSessionStateException at the boundary`` () =
+    use system = createSystem ()
+    let store = createStore ()
+    let created = createSession store
+
+    let session =
+        spawnSession system store created.Id (fun _ _ -> Task.FromResult(completed "unused"))
+
+    try
+        close store created.Id session |> ignore
+
+        let ex =
+            Assert.Throws<InvalidSessionStateException>(fun () -> compact store created.Id session |> ignore)
+
+        ex.SessionId |> should equal created.Id
+        ex.CurrentState |> should equal (SessionState.Closed.ToString())
+    finally
+        stopSystem system

@@ -495,6 +495,7 @@ type SessionHarness
                         RunTurn = (fun _ _ -> Task.FromResult(unusedResult))
                         OnTurnSettled = Some signals.ObserveSettled
                         OnInjectJournaled = None
+                        Compact = None
                     }
 
                 let deps: SessionActor.SuspendDeps =

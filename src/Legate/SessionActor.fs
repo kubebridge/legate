@@ -56,6 +56,35 @@ type internal SessionPromptReply =
     /// appended. Carries the state the session was in.
     | PromptRejected of state: SessionState
 
+/// How the session actor answers an on-demand compaction. The actor never
+/// throws InvalidSessionStateException: a Closed-state compact is rejected
+/// with the current state and the client boundary maps it to the exception.
+type internal SessionCompactReply =
+
+    /// The Idle session compacted now without starting a turn: the
+    /// before/after estimates from the CompactionOutcome.
+    | CompactCompleted of beforeEstimate: int64 * afterEstimate: int64
+
+    /// Nothing compacted and no summariser call ran: the session was Idle
+    /// but under threshold (or had nothing replaceable), WaitingForInput (a
+    /// suspended turn owns the history), in an out-of-range state,
+    /// unconfigured, cancelled, or the summariser failed and the session
+    /// continues uncompacted (the CompactionFailedEvent carries the reason).
+    | CompactNotNeeded
+
+    /// The session was Running: the one-shot force flag is armed and the
+    /// running turn's force-aware boundary hook compacts at the next
+    /// iteration boundary, bypassing the threshold once.
+    | CompactDeferred
+
+    /// The actor lost its claim before the journal write landed, so it
+    /// journaled nothing: the takeover winner owns the session.
+    | CompactFenced
+
+    /// The compact arrived while the session was Closed; nothing ran.
+    /// Carries the state the session was in.
+    | CompactRejected of state: SessionState
+
 /// The session actor protocol. QueuePrompt, InjectPrompt,
 /// InterruptPrompt, CloseSession, and GetSnapshot
 /// are answered to the sender; the SessionTurnSettled and SessionTurnFaulted completions
@@ -101,6 +130,15 @@ type internal SessionActorMessage =
     /// (ExplicitAbort, HostShutdown) act; anything else is a no-op. Answered
     /// with <see cref="T:Legate.SessionSnapshot" />.
     | AbortSession of cause: StopCause * reason: string * cancellationToken: CancellationToken
+
+    /// Compact the session on demand: Idle replays the journal into a
+    /// history and compacts now without starting a turn, Running arms the
+    /// one-shot force flag the turn's force-aware boundary hook honors at
+    /// the next iteration (threshold bypassed, single-pass guard kept),
+    /// WaitingForInput is a no-op (suspended turns belong to issue 36:
+    /// nothing runs to compact), and Closed rejects. Answered with
+    /// <see cref="T:Legate.SessionCompactReply" />.
+    | CompactSession of cancellationToken: CancellationToken
 
     /// Reads the actor's current state plus the store's pending inbox count.
     /// Answered with <see cref="T:Legate.SessionSnapshot" />.
@@ -149,6 +187,43 @@ type private RunningTurn =
         Cts: CancellationTokenSource
     }
 
+/// What an on-demand compact needs outside a turn (issue 46): the same
+/// summariser wiring a per-turn CompactionWiring carries, plus the journal
+/// to replay and the one-shot force cell the turn's force-aware boundary
+/// hooks share. The Idle path replays the journal into a history through
+/// Transcripts.readTranscript and Compaction.messagesFromCells, then runs
+/// the merged runner; the Running path only arms Force.
+type internal CompactDeps =
+    {
+        /// LLM settings carrying the Compaction model override and the
+        /// CompactionKeepMessages tail. Never null.
+        Llm: LlmOptions
+        /// The tokens held back beyond the reserved output when deriving
+        /// the threshold.
+        ReservedBufferTokens: int
+        /// The session's model: the threshold lookup and default
+        /// summariser model.
+        SessionModel: ModelReference
+        /// Resolves the session model to its catalog entry, or null
+        /// when the host keeps no catalog (the threshold falls back to
+        /// the catalog defaults).
+        Catalog: ILlmModelCatalog | null
+        /// The chat client the summariser call runs against. Never null.
+        Client: IChatClient
+        /// Receives the summariser usage checkpoint, or null.
+        Observer: IUsageObserver | null
+        /// Authorises the summariser model call, or null.
+        Policy: IModelPolicy | null
+        /// The journal the Idle path replays and appends to. Never null.
+        EventStore: ISessionEventStore
+        /// The claim token fencing the journal appends. Never null.
+        JournalToken: string
+        /// The one-shot force cell the turn's force-aware boundary hooks
+        /// share: arming fires compaction at the next boundary exactly
+        /// once. Never null.
+        Force: Compaction.CompactForce
+    }
+
 /// What a session actor is built from: the durable store, the tenant and
 /// session it owns, and the turn runner it drives per Queue entry. The
 /// default runner (<see cref="M:Legate.SessionActor.createTurnRunner" />)
@@ -174,6 +249,12 @@ type internal SessionActorProps =
         /// entry, after the message is appended to history and before the
         /// consume hook. Guarded: a throwing observer never kills the turn.
         OnInjectJournaled: (UserMessageEvent -> unit) option
+        /// Carries the on-demand compaction wiring (summariser client,
+        /// model, catalog, journal, and the one-shot force cell the turn's
+        /// force-aware boundary hooks share), or None when the host did not
+        /// configure compaction: CompactSession then answers without
+        /// compacting and never starts a turn.
+        Compact: CompactDeps option
     }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -550,12 +631,43 @@ module internal SessionActor =
             IsLeaseValid: unit -> bool
         }
 
-    /// Builds the per-turn compaction hook from the store-backed wiring:
-    /// one summarise-and-rewrite pass per iteration boundary, journaled
-    /// under the wiring's token and fenced by its lease hook.
-    /// <param name="wiring">The store-backed compaction wiring for the turn.</param>
-    /// <returns>The boundary hook for TurnLoopOptions.</returns>
-    let buildCompactionHook (wiring: CompactionWiring) : TurnLoop.CompactionHook =
+    /// Resolves the session model's catalog entry: the wiring's catalog, or
+    /// null when the host keeps no catalog (the threshold falls back to the
+    /// catalog defaults).
+    /// <param name="catalog">The model catalog, or null for the fallback threshold.</param>
+    /// <param name="sessionModel">The session's model.</param>
+    /// <returns>The catalog entry, or null when the model is unknown.</returns>
+    let private catalogEntryOf
+        (catalog: ILlmModelCatalog | null)
+        (sessionModel: ModelReference)
+        : ModelCatalogEntry | null =
+        match box catalog with
+        | null -> Unchecked.defaultof<ModelCatalogEntry>
+        | :? ILlmModelCatalog as live -> live.GetEntry(sessionModel)
+        | _ -> Unchecked.defaultof<ModelCatalogEntry>
+
+    /// Journals one event under a claim token: the sink every compaction
+    /// path shares, fenced store-side so a takeover loser journals nothing.
+    /// <param name="eventStore">The journal the event appends to. Must not be null.</param>
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="sessionId">The session compacting.</param>
+    /// <param name="token">The claim token fencing the append. Must not be null.</param>
+    /// <returns>The single-event journal sink.</returns>
+    let private journalSink
+        (eventStore: ISessionEventStore)
+        (tenant: TenantId)
+        (sessionId: SessionId)
+        (token: string)
+        : SessionEvent -> Task<JournalWriter.JournalWriteResult> =
+        fun event ->
+            let events = ResizeArray<SessionEvent>([| event |]) :> IReadOnlyList<SessionEvent>
+
+            JournalWriter.appendWithTokenAsync eventStore tenant sessionId token events CancellationToken.None
+
+    /// Validates the store-backed compaction wiring shared by the hook
+    /// builders: every reference the boundary dereferences must be set.
+    /// <param name="wiring">The wiring to validate. Must not be null.</param>
+    let private requireWiring (wiring: CompactionWiring) : unit =
         if isNull (box wiring) then
             raise (ArgumentNullException(nameof wiring))
 
@@ -565,40 +677,154 @@ module internal SessionActor =
         ArgumentNullException.ThrowIfNull(wiring.JournalToken)
         ArgumentNullException.ThrowIfNull(wiring.IsLeaseValid)
 
-        let entry: ModelCatalogEntry | null =
-            match box wiring.Catalog with
-            | null -> Unchecked.defaultof<ModelCatalogEntry>
-            | :? ILlmModelCatalog as catalog -> catalog.GetEntry(wiring.SessionModel)
-            | _ -> Unchecked.defaultof<ModelCatalogEntry>
+    /// Builds the per-turn hook dependencies from the store-backed wiring.
+    /// <param name="wiring">The store-backed compaction wiring for the turn. Must be validated.</param>
+    /// <param name="turnId">The turn compacting.</param>
+    /// <param name="attempt">The 1-based attempt the turn runs under.</param>
+    /// <param name="journalAsync">The fenced single-event journal sink. Must not be null.</param>
+    /// <param name="isLeaseValid">The last-moment claim fence. Must not be null.</param>
+    /// <returns>The boundary dependencies.</returns>
+    let private hookDepsOf
+        (wiring: CompactionWiring)
+        (turnId: TurnId)
+        (attempt: int)
+        (journalAsync: SessionEvent -> Task<JournalWriter.JournalWriteResult>)
+        (isLeaseValid: unit -> bool)
+        : Compaction.CompactionHookDeps =
+        {
+            Client = wiring.Client
+            SessionModel = wiring.SessionModel
+            CompactionModel = wiring.Llm.Compaction
+            KeepMessages = wiring.Llm.CompactionKeepMessages
+            CatalogEntry = catalogEntryOf wiring.Catalog wiring.SessionModel
+            ReservedBufferTokens = wiring.ReservedBufferTokens
+            Observer = wiring.Observer
+            ModelPolicy = wiring.Policy
+            Tenant = wiring.Tenant
+            SessionId = wiring.SessionId
+            TurnId = turnId
+            Attempt = attempt
+            JournalAsync = journalAsync
+            IsLeaseValid = isLeaseValid
+        }
 
-        let journalAsync (event: SessionEvent) : Task<JournalWriter.JournalWriteResult> =
-            let events = ResizeArray<SessionEvent>([| event |]) :> IReadOnlyList<SessionEvent>
+    /// Builds the per-turn compaction hook from the store-backed wiring:
+    /// one summarise-and-rewrite pass per iteration boundary, journaled
+    /// under the wiring's token and fenced by its lease hook.
+    /// <param name="wiring">The store-backed compaction wiring for the turn.</param>
+    /// <returns>The boundary hook for TurnLoopOptions.</returns>
+    let buildCompactionHook (wiring: CompactionWiring) : TurnLoop.CompactionHook =
+        requireWiring wiring
 
-            JournalWriter.appendWithTokenAsync
-                wiring.EventStore
-                wiring.Tenant
-                wiring.SessionId
-                wiring.JournalToken
-                events
-                CancellationToken.None
+        let journalAsync =
+            journalSink wiring.EventStore wiring.Tenant wiring.SessionId wiring.JournalToken
 
-        Compaction.createHook
-            {
-                Client = wiring.Client
-                SessionModel = wiring.SessionModel
-                CompactionModel = wiring.Llm.Compaction
-                KeepMessages = wiring.Llm.CompactionKeepMessages
-                CatalogEntry = entry
-                ReservedBufferTokens = wiring.ReservedBufferTokens
-                Observer = wiring.Observer
-                ModelPolicy = wiring.Policy
-                Tenant = wiring.Tenant
-                SessionId = wiring.SessionId
-                TurnId = wiring.TurnId
-                Attempt = wiring.Attempt
-                JournalAsync = journalAsync
-                IsLeaseValid = wiring.IsLeaseValid
-            }
+        Compaction.createHook (hookDepsOf wiring wiring.TurnId wiring.Attempt journalAsync wiring.IsLeaseValid)
+
+    /// Builds the force-aware per-turn compaction hook from the store-backed
+    /// wiring (issue 46): each boundary takes the shared one-shot force
+    /// cell, so an armed Compact fires one threshold-bypassed pass at the
+    /// next boundary exactly once while unforced boundaries behave like
+    /// <see cref="M:Legate.SessionActor.buildCompactionHook" />. The host
+    /// shares the cell instance with the CompactDeps it passes in props.
+    /// <param name="force">The one-shot cell the session actor arms. Must not be null.</param>
+    /// <param name="wiring">The store-backed compaction wiring for the turn.</param>
+    /// <returns>The force-aware boundary hook for TurnLoopOptions.</returns>
+    let buildForcedCompactionHook
+        (force: Compaction.CompactForce)
+        (wiring: CompactionWiring)
+        : TurnLoop.CompactionHook =
+        ArgumentNullException.ThrowIfNull(force)
+        requireWiring wiring
+
+        let journalAsync =
+            journalSink wiring.EventStore wiring.Tenant wiring.SessionId wiring.JournalToken
+
+        Compaction.createForceHook
+            force
+            (hookDepsOf wiring wiring.TurnId wiring.Attempt journalAsync wiring.IsLeaseValid)
+
+    /// Validates the on-demand compaction dependencies: every reference the
+    /// Idle path dereferences must be set.
+    /// <param name="compact">The dependencies to validate. Must not be null.</param>
+    let private requireCompactDeps (compact: CompactDeps) : unit =
+        if isNull (box compact) then
+            raise (ArgumentNullException(nameof compact))
+
+        ArgumentNullException.ThrowIfNull(compact.Llm)
+        ArgumentNullException.ThrowIfNull(compact.Client)
+        ArgumentNullException.ThrowIfNull(compact.EventStore)
+        ArgumentNullException.ThrowIfNull(compact.JournalToken)
+        ArgumentNullException.ThrowIfNull(compact.Force)
+
+    /// Compacts an Idle session now without starting a turn: replays the
+    /// journal into a history through the shared estimate mapping, then
+    /// runs the merged runner. Under threshold (or with nothing
+    /// replaceable) no summariser call runs and a summariser failure
+    /// journals CompactionFailedEvent while the session continues
+    /// uncompacted. The mailbox serializes Idle work, so the lease hook is
+    /// actor-owned constant-true; the store-side token still fences a
+    /// takeover loser into TurnLeaseLostException before anything journals.
+    /// Runs synchronously on the actor thread like the other fast
+    /// store-first paths; the summariser call bounds the block.
+    /// <param name="props">The session actor dependencies.</param>
+    /// <param name="compact">The on-demand compaction wiring. Must be validated.</param>
+    /// <param name="cancellationToken">Abandons the replay and the summariser call.</param>
+    /// <returns>How the on-demand compact answered.</returns>
+    let private compactIdleNow
+        (props: SessionActorProps)
+        (compact: CompactDeps)
+        (cancellationToken: CancellationToken)
+        : SessionCompactReply =
+        try
+            let options = ReadTranscriptOptions()
+
+            let cells =
+                awaitTask (
+                    Transcripts.readTranscript
+                        compact.EventStore
+                        props.Tenant
+                        props.SessionId
+                        options
+                        100
+                        cancellationToken
+                )
+
+            let history = Compaction.messagesFromCells cells
+
+            let journalAsync =
+                journalSink compact.EventStore props.Tenant props.SessionId compact.JournalToken
+
+            let request: Compaction.CompactionRequest =
+                {
+                    Client = compact.Client
+                    History = history
+                    SessionModel = compact.SessionModel
+                    CompactionModel = compact.Llm.Compaction
+                    KeepMessages = compact.Llm.CompactionKeepMessages
+                    CatalogEntry = catalogEntryOf compact.Catalog compact.SessionModel
+                    ReservedBufferTokens = compact.ReservedBufferTokens
+                    Observer = compact.Observer
+                    ModelPolicy = compact.Policy
+                    Tenant = props.Tenant
+                    SessionId = props.SessionId
+                    TurnId = TurnId.New()
+                    Attempt = 1
+                    InputTokens = 0L
+                    OutputTokens = 0L
+                    JournalAsync = journalAsync
+                    IsLeaseValid = (fun () -> true)
+                    CancellationToken = cancellationToken
+                }
+
+            match awaitTask (Compaction.tryCompactAsync request) with
+            | Compaction.NotNeeded -> CompactNotNeeded
+            | Compaction.Compacted(beforeEstimate, afterEstimate, _, _) ->
+                CompactCompleted(beforeEstimate, afterEstimate)
+            | Compaction.FailedContinue _ -> CompactNotNeeded
+        with
+        | :? TurnLoop.TurnLeaseLostException -> CompactFenced
+        | :? OperationCanceledException -> CompactNotNeeded
 
     /// The session actor: recovers from the store, then owns the state
     /// machine. The mailbox parameter is injected by the spawn functions;
@@ -613,6 +839,10 @@ module internal SessionActor =
 
         if isNull (box props.RunTurn) then
             raise (ArgumentNullException(nameof props))
+
+        match props.Compact with
+        | Some compact -> requireCompactDeps compact
+        | None -> ()
 
         let initialState = recover props
         let self = mailbox.Self
@@ -940,6 +1170,41 @@ module internal SessionActor =
                         // returning the current state.
                         mailbox.Sender() <! takeSnapshot state running
                         return! loop state running arbitration pendingStop
+                | CompactSession cancellationToken ->
+                    match state with
+                    | SessionState.Closed ->
+                        mailbox.Sender() <! CompactRejected SessionState.Closed
+                        return! loop state running arbitration pendingStop
+                    | SessionState.Idle ->
+                        match props.Compact with
+                        | None ->
+                            mailbox.Sender() <! CompactNotNeeded
+                            return! loop state running arbitration pendingStop
+                        | Some compact ->
+                            let reply = compactIdleNow props compact cancellationToken
+                            mailbox.Sender() <! reply
+                            return! loop state running arbitration pendingStop
+                    | SessionState.Running ->
+                        match props.Compact with
+                        | Some compact when not (isNull (box compact.Force)) ->
+                            compact.Force.Request()
+                            mailbox.Sender() <! CompactDeferred
+                            return! loop state running arbitration pendingStop
+                        | _ ->
+                            // Unconfigured: no boundary hook shares the
+                            // one-shot cell, so nothing can fire later.
+                            mailbox.Sender() <! CompactNotNeeded
+                            return! loop state running arbitration pendingStop
+                    | SessionState.WaitingForInput ->
+                        // Suspended turns belong to issue 36: their history
+                        // is parked, so an on-demand compact no-ops.
+                        mailbox.Sender() <! CompactNotNeeded
+                        return! loop state running arbitration pendingStop
+                    | _ ->
+                        // Out-of-range stored state: stay durable but
+                        // compact nothing.
+                        mailbox.Sender() <! CompactNotNeeded
+                        return! loop state running arbitration pendingStop
                 | GetSnapshot ->
                     mailbox.Sender() <! takeSnapshot state running
                     return! loop state running arbitration pendingStop
@@ -1026,6 +1291,7 @@ module internal SessionActor =
                         RunTurn = runTurn
                         OnTurnSettled = None
                         OnInjectJournaled = None
+                        Compact = None
                     }
 
                 spawn context name (behavior props)
@@ -1275,6 +1541,59 @@ module internal SessionActor =
                     )
             else
                 return snapshot
+        }
+
+    /// Compacts a session on demand: the client boundary. Idle replays the
+    /// journal and compacts now without starting a turn, answering the
+    /// before/after estimates; Running arms the one-shot force flag the
+    /// turn's force-aware hook honors at the next boundary;
+    /// WaitingForInput no-ops (suspended turns belong to issue 36).
+    /// Unknown sessions throw SessionNotFoundException and Closed sessions
+    /// throw InvalidSessionStateException before touching the actor; a
+    /// Close racing the compact maps to the same exception. The future
+    /// public ILegateClient wrapper stays a follow-up: this boundary is
+    /// internal.
+    /// <param name="store">The durable store.</param>
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="sessionId">The session to compact.</param>
+    /// <param name="session">The session actor.</param>
+    /// <param name="cancellationToken">Cancels the compact.</param>
+    /// <returns>The actor's compact reply.</returns>
+    let compactAsync
+        (store: ISessionStore)
+        (tenant: TenantId)
+        (sessionId: SessionId)
+        (session: IActorRef)
+        (cancellationToken: CancellationToken)
+        : Task<SessionCompactReply> =
+        ArgumentNullException.ThrowIfNull(store)
+        ArgumentNullException.ThrowIfNull(session)
+
+        task {
+            let! current = requireSessionAsync store tenant sessionId cancellationToken
+
+            if current.State = SessionState.Closed then
+                raise (
+                    InvalidSessionStateException(
+                        sessionId,
+                        current.State.ToString(),
+                        "The session is closed and accepts no compact."
+                    )
+                )
+
+            let! reply = askAsync<SessionCompactReply> session (CompactSession cancellationToken) cancellationToken
+
+            match reply with
+            | CompactRejected rejectedState ->
+                return
+                    raise (
+                        InvalidSessionStateException(
+                            sessionId,
+                            rejectedState.ToString(),
+                            "The session closed before the compact was accepted."
+                        )
+                    )
+            | _ -> return reply
         }
 
     // ────────────────── Suspend and resume (issue 36) ──────────────────
