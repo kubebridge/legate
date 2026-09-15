@@ -3,12 +3,14 @@ module Legate.Tests.McpToolSourceTests
 
 open System
 open System.Collections.Generic
+open System.IO
 open System.Threading
 open System.Threading.Tasks
 open FsUnit.Xunit
 open Legate
 open Legate.Mcp
 open Microsoft.Extensions.AI
+open ModelContextProtocol.Protocol
 open Xunit
 
 // Scripted transports only: no subprocess, no socket. The scripted
@@ -56,6 +58,7 @@ type internal ScriptedSession(serverName: string, tools: McpDiscovery.McpDiscove
                     {
                         Text = $"called:{toolName}"
                         IsError = false
+                        Binaries = ResizeArray<McpBinaryPart>() :> IReadOnlyList<McpBinaryPart>
                     }
             }
 
@@ -493,3 +496,199 @@ let ``Invoking a projected tool stamps a call observation`` () =
     observations[0].Text |> should equal "called:read"
     observations[0].IsError |> should equal false
     (observations[0].Duration >= TimeSpan.Zero) |> should equal true
+
+// ──────────────────────────
+// Artifact sink plumbing: scripted binary answers and scoped sinks only.
+
+// A minimal 1x1 PNG payload.
+let private png1x1 () : byte[] =
+    [|
+        0x89uy
+        0x50uy
+        0x4Euy
+        0x47uy
+        0x0Duy
+        0x0Auy
+        0x1Auy
+        0x0Auy
+        0x00uy
+        0x00uy
+        0x00uy
+        0x0Duy
+        0x49uy
+        0x48uy
+        0x44uy
+        0x52uy
+        0x00uy
+        0x00uy
+        0x00uy
+        0x01uy
+        0x00uy
+        0x00uy
+        0x00uy
+        0x01uy
+        0x08uy
+        0x02uy
+        0x00uy
+        0x00uy
+        0x00uy
+        0x90uy
+        0x77uy
+        0x53uy
+        0xDEuy
+    |]
+
+/// One SDK image answer split exactly as the connector splits it.
+let private binaryAnswer () : McpCallResult =
+    let blocks = ResizeArray<ContentBlock>()
+    blocks.Add(TextContentBlock(Text = "snapshot") :> ContentBlock)
+    blocks.Add(ImageContentBlock.FromBytes(ReadOnlyMemory(png1x1 ()), "image/png") :> ContentBlock)
+
+    let result = CallToolResult(Content = blocks)
+
+    let rendered, binaries = McpProtocolMapping.splitCallResult result
+
+    {
+        Text = rendered
+        IsError = false
+        Binaries = binaries
+    }
+
+/// One session answering every call with the fixed binary result.
+type internal BinaryAnswerSession(answer: McpCallResult) =
+
+    interface IMcpServerSession with
+        member _.ServerName: string = "alpha"
+
+        member _.ListToolsAsync
+            (_cancellationToken: CancellationToken)
+            : Task<IReadOnlyList<McpDiscovery.McpDiscoveredTool>> =
+            task {
+                let listed = ResizeArray<McpDiscovery.McpDiscoveredTool>()
+                listed.Add(discovered "alpha" "shot" false)
+                return listed :> IReadOnlyList<McpDiscovery.McpDiscoveredTool>
+            }
+
+        member _.CallToolAsync
+            (_toolName: string, _arguments: IReadOnlyDictionary<string, obj>, _cancellationToken: CancellationToken)
+            : Task<McpCallResult> =
+            Task.FromResult answer
+
+    interface IAsyncDisposable with
+        member _.DisposeAsync() : ValueTask = ValueTask.CompletedTask
+
+/// A connector returning the one scripted session.
+let private binaryConnector (session: IMcpServerSession) : IMcpServerConnector =
+    { new IMcpServerConnector with
+        member _.ConnectAsync(_, _) = Task.FromResult session
+    }
+
+/// A recording in-memory artifact sink: names land under the fixed
+/// prefix.
+type internal RecordingArtifactStore(prefix: string) =
+    let backing = Dictionary<string, byte[] * string>(StringComparer.Ordinal)
+
+    interface IArtifactBlobStore with
+        member _.Get(name, _) =
+            let missing: byte[] | null = null
+
+            match backing.TryGetValue(prefix + name) with
+            | true, (bytes, _) -> Task.FromResult(bytes)
+            | false, _ -> Task.FromResult(missing)
+
+        member _.Put(name, content, _) =
+            backing[prefix + name] <- content.Bytes, content.ContentType
+
+            Task.FromResult(BlobMetadata(content.ContentType, int64 content.Bytes.Length, Guid.NewGuid().ToString("N")))
+
+        member _.CompareExchange(_, _, _, _) : Task<BlobMetadata | null> =
+            raise (NotSupportedException("test sink only stores"))
+
+        member _.OpenRead(_, _) : Task<Stream> =
+            raise (NotSupportedException("test sink only stores"))
+
+        member _.OpenWrite(_, _, _) : Task<Stream> =
+            raise (NotSupportedException("test sink only stores"))
+
+        member _.List(_, _) : IAsyncEnumerable<string> =
+            raise (NotSupportedException("test sink only stores"))
+
+        member _.DeletePrefix(_, _) : Task<int> =
+            raise (NotSupportedException("test sink only stores"))
+
+        member _.GetMetadata(_, _) : Task<BlobMetadata | null> =
+            raise (NotSupportedException("test sink only stores"))
+
+        member _.TryGetPresignedUrl(_, _, _) : Task<Uri | null> =
+            raise (NotSupportedException("test sink only stores"))
+
+    /// How many artifacts were stored.
+    member _.StoredCount: int = backing.Count
+
+/// No call observations.
+let private noObserve () : Action<McpInvocation.McpCallObservation> | null = null
+
+/// Builds a source over the binary session with the given factory.
+let private artifactSource
+    (messages: ResizeArray<string>)
+    (factory: Func<ToolSourceContext, IArtifactBlobStore> | null)
+    : McpToolSource =
+    let session = BinaryAnswerSession(binaryAnswer ())
+
+    McpToolSource(
+        optionsFor [ stdioServer "alpha" ],
+        degradeSink messages,
+        binaryConnector (session :> IMcpServerSession),
+        noObserve (),
+        factory,
+        McpArtifacts.McpArtifactCaps.Default
+    )
+
+/// Invokes the first resolved tool and returns its text.
+let private invokeFirst (source: McpToolSource) : string =
+    let tools =
+        (source :> IToolSource).GetTools(sampleContext ()).GetAwaiter().GetResult()
+
+    tools.Count |> should equal 1
+
+    let outcome =
+        (tools[0] :?> AIFunction).InvokeAsync(AIFunctionArguments(), CancellationToken.None).GetAwaiter().GetResult()
+
+    unbox<string> (box outcome)
+
+[<Fact>]
+let ``Artifact factory stores binaries and substitutes references`` () =
+    let messages = ResizeArray<string>()
+    let store = RecordingArtifactStore("artifacts/acme/session-1/")
+
+    let factory =
+        Func<ToolSourceContext, IArtifactBlobStore>(fun _ -> store :> IArtifactBlobStore)
+
+    let text = invokeFirst (artifactSource messages factory)
+
+    text.Contains("[artifact:") |> should equal true
+    text.Contains("mime=\"image/png\"") |> should equal true
+    text.Contains("dimensions=\"1x1\"") |> should equal true
+    store.StoredCount |> should equal 1
+    messages.Count |> should equal 0
+
+[<Fact>]
+let ``Null artifact factory keeps placeholder output`` () =
+    let messages = ResizeArray<string>()
+
+    let text = invokeFirst (artifactSource messages null)
+
+    text |> should equal (binaryAnswer ()).Text
+    messages.Count |> should equal 0
+
+[<Fact>]
+let ``Throwing artifact factory degrades to placeholders`` () =
+    let messages = ResizeArray<string>()
+
+    let factory =
+        Func<ToolSourceContext, IArtifactBlobStore>(fun _ -> raise (InvalidOperationException("no sink")))
+
+    let text = invokeFirst (artifactSource messages factory)
+
+    text |> should equal (binaryAnswer ()).Text
+    messages.Count |> should equal 0

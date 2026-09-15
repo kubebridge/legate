@@ -94,6 +94,119 @@ let ``HTTP options reject stdio servers and bad urls`` () =
         |> ignore)
     |> should throw typeof<InvalidOperationException>
 
+// ──────────────────────────
+// Binary extraction: scripted blocks only, no live servers.
+
+// A minimal 1x1 PNG payload.
+let private png1x1 () : byte[] =
+    [|
+        0x89uy
+        0x50uy
+        0x4Euy
+        0x47uy
+        0x0Duy
+        0x0Auy
+        0x1Auy
+        0x0Auy
+        0x00uy
+        0x00uy
+        0x00uy
+        0x0Duy
+        0x49uy
+        0x48uy
+        0x44uy
+        0x52uy
+        0x00uy
+        0x00uy
+        0x00uy
+        0x01uy
+        0x00uy
+        0x00uy
+        0x00uy
+        0x01uy
+        0x08uy
+        0x02uy
+        0x00uy
+        0x00uy
+        0x00uy
+        0x90uy
+        0x77uy
+        0x53uy
+        0xDEuy
+    |]
+
+/// Builds a call result over the given blocks.
+let private callResult (blocks: ContentBlock list) : CallToolResult =
+    CallToolResult(Content = ResizeArray<ContentBlock>(blocks))
+
+/// One text block.
+let private textBlock (text: string) : ContentBlock =
+    TextContentBlock(Text = text) :> ContentBlock
+
+/// One image block over the given bytes.
+let private imageBlock (bytes: byte[]) (mime: string) : ContentBlock =
+    ImageContentBlock.FromBytes(ReadOnlyMemory bytes, mime) :> ContentBlock
+
+/// One embedded blob resource block.
+let private blobResourceBlock (bytes: byte[]) (uri: string) (mime: string) : ContentBlock =
+    let contents = BlobResourceContents.FromBytes(ReadOnlyMemory bytes, uri, mime)
+    EmbeddedResourceBlock(Resource = contents) :> ContentBlock
+
+[<Fact>]
+let ``Split keeps text byte-identical and extracts image binaries`` () =
+    let result =
+        callResult
+            [
+                textBlock "hello"
+                imageBlock (png1x1 ()) "image/png"
+            ]
+
+    let text, binaries = McpProtocolMapping.splitCallResult result
+
+    text |> should equal (McpProtocolMapping.renderCallResult result)
+    text |> should equal "hello\n[non-text content: image]"
+    binaries.Count |> should equal 1
+    binaries.[0].MimeType |> should equal "image/png"
+    binaries.[0].Bytes |> should equal (png1x1 ())
+    binaries.[0].Name |> should equal null
+
+[<Fact>]
+let ``Embedded blob resources yield mime bytes and URI names`` () =
+    let pdf = [| 0x25uy; 0x50uy; 0x44uy; 0x46uy |]
+
+    let result =
+        callResult
+            [
+                blobResourceBlock pdf "files/report.pdf" "application/pdf"
+            ]
+
+    let text, binaries = McpProtocolMapping.splitCallResult result
+
+    text |> should equal (McpProtocolMapping.renderCallResult result)
+
+    text.StartsWith("[non-text content:", StringComparison.Ordinal)
+    |> should equal true
+
+    binaries.Count |> should equal 1
+    binaries.[0].MimeType |> should equal "application/pdf"
+    binaries.[0].Bytes |> should equal pdf
+    binaries.[0].Name |> should equal "report.pdf"
+
+[<Fact>]
+let ``Text-only results carry no binaries`` () =
+    let result = callResult [ textBlock "hello" ]
+    let text, binaries = McpProtocolMapping.splitCallResult result
+
+    text |> should equal "hello"
+    binaries.Count |> should equal 0
+
+[<Fact>]
+let ``Null results split to empty text with no binaries`` () =
+    let text, binaries = McpProtocolMapping.splitCallResult null
+
+    text |> should equal ""
+    binaries.Count |> should equal 0
+
 [<Fact>]
 let ``Client options decline every elicitation request`` () =
     let options = McpElicitation.buildClientOptions ()

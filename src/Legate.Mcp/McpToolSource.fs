@@ -20,7 +20,11 @@ open Microsoft.Extensions.Options
 // resolved across servers per the configured collision policy, and every
 // projected function carries the title, schemas, and annotation hints,
 // with a real destructiveHint == true as boolean true so the merged
-// permission policy asks before running it.
+// permission policy asks before running it. Binary result blocks are
+// stored through the optional per-session artifact factory: GetTools
+// resolves the asking session's pre-scoped sink and each projected tool
+// closes over it, so the Mcp layer never derives tenant keys; a null
+// factory keeps today's placeholder text.
 
 /// Connects the configured MCP servers and exposes their tools as
 /// <see cref="T:Microsoft.Extensions.AI.AIFunction" />s. Servers start
@@ -37,7 +41,9 @@ type McpToolSource
         logDegrade: Action<string | null>,
         connector: IMcpServerConnector,
         httpClient: HttpClient | null,
-        observeCall: Action<McpInvocation.McpCallObservation> | null
+        observeCall: Action<McpInvocation.McpCallObservation> | null,
+        artifactStores: Func<ToolSourceContext, IArtifactBlobStore> | null,
+        artifactCaps: McpArtifacts.McpArtifactCaps
     ) =
 
     do
@@ -70,7 +76,9 @@ type McpToolSource
             logDegrade,
             SdkMcpServerConnector(logger :> ILogger, owned) :> IMcpServerConnector,
             owned,
-            null
+            null,
+            null,
+            McpArtifacts.McpArtifactCaps.Default
         )
 
     /// Creates the source over an explicit degrade sink and connector.
@@ -78,7 +86,15 @@ type McpToolSource
     /// test spawns a subprocess or opens a socket. Call observations go
     /// nowhere.
     internal new(options: McpOptions, logDegrade: Action<string | null>, connector: IMcpServerConnector) =
-        McpToolSource(options, logDegrade, connector, Unchecked.defaultof<HttpClient>, null)
+        McpToolSource(
+            options,
+            logDegrade,
+            connector,
+            Unchecked.defaultof<HttpClient>,
+            null,
+            null,
+            McpArtifacts.McpArtifactCaps.Default
+        )
 
     /// Creates the source over an explicit degrade sink, connector, and
     /// call-observation sink. Internal: tests capture the observation sink
@@ -94,7 +110,46 @@ type McpToolSource
             connector: IMcpServerConnector,
             observeCall: Action<McpInvocation.McpCallObservation> | null
         ) =
-        McpToolSource(options, logDegrade, connector, Unchecked.defaultof<HttpClient>, observeCall)
+        McpToolSource(
+            options,
+            logDegrade,
+            connector,
+            Unchecked.defaultof<HttpClient>,
+            observeCall,
+            null,
+            McpArtifacts.McpArtifactCaps.Default
+        )
+
+    /// Creates the source over an explicit degrade sink, connector,
+    /// call-observation sink, and per-session artifact sink factory.
+    /// Internal: tests resolve the factory per asking session against a
+    /// scoped in-memory sink; a null factory keeps today's placeholder
+    /// output. A factory that throws or returns null degrades one
+    /// session's tools to placeholders, never to an error.
+    /// <param name="options">The bound MCP options. Must not be null.</param>
+    /// <param name="logDegrade">The degrade sink. Must not be null.</param>
+    /// <param name="connector">The scripted or SDK connector. Must not be null.</param>
+    /// <param name="observeCall">The call-observation sink, or null to observe nothing.</param>
+    /// <param name="artifactStores">Resolves the asking session's pre-scoped artifact sink, or null for placeholders.</param>
+    /// <param name="artifactCaps">The header-only validation bounds.</param>
+    internal new
+        (
+            options: McpOptions,
+            logDegrade: Action<string | null>,
+            connector: IMcpServerConnector,
+            observeCall: Action<McpInvocation.McpCallObservation> | null,
+            artifactStores: Func<ToolSourceContext, IArtifactBlobStore> | null,
+            artifactCaps: McpArtifacts.McpArtifactCaps
+        ) =
+        McpToolSource(
+            options,
+            logDegrade,
+            connector,
+            Unchecked.defaultof<HttpClient>,
+            observeCall,
+            artifactStores,
+            artifactCaps
+        )
 
     /// The degrade reason, or null while healthy. Internal: tests assert
     /// the logged reason through the capturing logger instead.
@@ -188,15 +243,39 @@ type McpToolSource
                 discovered
         | _ -> discovered
 
+    /// Resolves the asking session's artifact sink: the factory's
+    /// pre-scoped store, or null when no factory is wired, the factory
+    /// throws, or it returns null. Sink wiring never fails tool listing.
+    /// <param name="context">The tenant, agent, and session asking for its tools.</param>
+    /// <returns>The session's sink, or null for placeholders.</returns>
+    member private _.ArtifactStoreFor(context: ToolSourceContext) : IArtifactBlobStore | null =
+        if isNull (box artifactStores) then
+            null
+        else
+            try
+                artifactStores.Invoke(context)
+            with _ ->
+                null
+
     /// Lists one session's tools, projecting each onto its assigned name.
     /// Any failure degrades the whole source to zero tools.
     /// <param name="pairs">The session/discovered pairs.</param>
     /// <param name="assigned">The assigned names in discovery order.</param>
+    /// <param name="artifactStore">The asking session's pre-scoped sink, or null for placeholders.</param>
     /// <returns>The projected tools.</returns>
     member private _.ProjectTools
-        (pairs: (IMcpServerSession * McpDiscovery.McpDiscoveredTool) list, assigned: string list)
-        : IReadOnlyList<AITool> =
+        (
+            pairs: (IMcpServerSession * McpDiscovery.McpDiscoveredTool) list,
+            assigned: string list,
+            artifactStore: IArtifactBlobStore | null
+        ) : IReadOnlyList<AITool> =
         let tools = ResizeArray<AITool>()
+
+        let effectiveCaps =
+            if isNull (box artifactCaps) then
+                McpArtifacts.McpArtifactCaps.Default
+            else
+                artifactCaps
 
         List.iter2
             (fun (session: IMcpServerSession, discovered: McpDiscovery.McpDiscoveredTool) (name: string) ->
@@ -214,13 +293,15 @@ type McpToolSource
                                     unbox<IReadOnlyDictionary<string, obj>> (box arguments)
 
                             return!
-                                McpInvocation.invokeAsync
+                                McpInvocation.invokeWithArtifactsAsync
                                     session
                                     name
                                     discovered.ToolName
                                     args
                                     cancellationToken
                                     observeCall
+                                    artifactStore
+                                    effectiveCaps
                         })
 
                 tools.Add(McpProjectionFactory.create name discovered invoke :> AITool))
@@ -230,7 +311,7 @@ type McpToolSource
         tools :> IReadOnlyList<AITool>
 
     interface IToolSource with
-        member this.GetTools(_context: ToolSourceContext) : Task<IReadOnlyList<AITool>> =
+        member this.GetTools(context: ToolSourceContext) : Task<IReadOnlyList<AITool>> =
             task {
                 try
                     do! this.EnsureStartedAsync(CancellationToken.None)
@@ -271,7 +352,8 @@ type McpToolSource
                                     McpNaming.buildServerToolName discovered.ServerName discovered.ToolName)
 
                             match McpNaming.resolve options.CollisionPolicy sanitized with
-                            | Ok assigned -> return this.ProjectTools(effective, assigned)
+                            | Ok assigned ->
+                                return this.ProjectTools(effective, assigned, this.ArtifactStoreFor(context))
                             | Error message ->
                                 logDegrade.Invoke(message)
                                 return ResizeArray<AITool>() :> IReadOnlyList<AITool>
