@@ -56,6 +56,7 @@
     <Compile Include="JournalWriterTests.fs" />
     <Compile Include="CompactionTests.fs" />
     <Compile Include="SessionEventBusTests.fs" />
+    <Compile Include="LlmCoordinatorTests.fs" />
   </ItemGroup>
 
   <ItemGroup>
