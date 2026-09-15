@@ -60,12 +60,17 @@
     <Compile Include="GoogleLlmOptionsTests.fs" />
     <Compile Include="GoogleProviderTests.fs" />
     <Compile Include="RegistrationTests.fs" />
+    <Compile Include="OpenAIProviderOptionsTests.fs" />
+    <Compile Include="ProviderErrorsTests.fs" />
+    <Compile Include="OpenAICompatibleProviderTests.fs" />
+    <Compile Include="OpenAIRegistrationTests.fs" />
   </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="../../src/Legate.Abstractions/Legate.Abstractions.fsproj" />
     <ProjectReference Include="../../src/Legate/Legate.fsproj" />
     <ProjectReference Include="../../src/Legate.Llm.Google/Legate.Llm.Google.fsproj" />
+    <ProjectReference Include="../../src/Legate.Llm.OpenAI/Legate.Llm.OpenAI.fsproj" />
     <ProjectReference Include="../../src/Legate.Storage.InMemory/Legate.Storage.InMemory.fsproj" />
     <ProjectReference Include="../../src/Legate.Testing/Legate.Testing.fsproj" />
     <ProjectReference Include="../../src/Legate.Workspace.Process/Legate.Workspace.Process.fsproj" />

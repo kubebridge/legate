@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>Legate.Llm.OpenAI</RootNamespace>
+    <Description>OpenAI, Anthropic (OpenAI-compatible), Ollama Cloud, and generic OpenAI-compatible LLM providers for Legate, over the official OpenAI SDK surfaced as IChatClient through the Microsoft.Extensions.AI.OpenAI adapter.</Description>
+  </PropertyGroup>
+
+  <!-- Compile order is explicit: register every new file here, in dependency order. -->
+  <ItemGroup>
+    <Compile Include="AssemblyInfo.fs" />
+    <Compile Include="ProviderOptions.fs" />
+    <Compile Include="ProviderErrors.fs" />
+    <Compile Include="OpenAICompatibleProvider.fs" />
+    <Compile Include="LlmBuilderExtensions.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../Legate.Abstractions/Legate.Abstractions.fsproj" />
+    <ProjectReference Include="../Legate/Legate.fsproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="FSharp.Core" />
+    <PackageReference Include="Microsoft.Extensions.AI.Abstractions" />
+    <PackageReference Include="Microsoft.Extensions.AI.OpenAI" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Abstractions" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Binder" />
+    <PackageReference Include="OpenAI" />
+  </ItemGroup>
+
+</Project>
