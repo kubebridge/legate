@@ -443,3 +443,121 @@ let ``Tenants stay isolated on the bus and the store`` () =
         receivedB.Count |> should equal 1
         (receivedB[0] :? SessionClosedEvent) |> should equal true
     }
+
+// ──────────────────────────────────────────────────────────────────────────
+// Logging scopes (issue 93)
+
+/// One captured log line with the scopes active when it logged.
+type private LoggedLine =
+    {
+        Level: string
+        Text: string
+        Scopes: (string * obj) list
+    }
+
+/// An ILogger capturing every entry with the scopes active at log time.
+type private ScopeCapturingLogger() =
+    let gate = obj ()
+    let entries = ResizeArray<LoggedLine>()
+    let stack = ResizeArray<(string * obj) list>()
+
+    let toPairs (state: obj | null) : (string * obj) list =
+        if isNull (box state) then
+            []
+        else
+            match state with
+            | :? IReadOnlyList<KeyValuePair<string, obj>> as kvs ->
+                kvs |> Seq.map (fun kv -> kv.Key, kv.Value) |> List.ofSeq
+            | :? IEnumerable<KeyValuePair<string, obj>> as kvs ->
+                kvs |> Seq.map (fun kv -> kv.Key, kv.Value) |> List.ofSeq
+            | _ -> []
+
+    interface Microsoft.Extensions.Logging.ILogger with
+        member _.BeginScope<'TState when 'TState: not null>(state: 'TState) : IDisposable =
+            let pairs = toPairs (box state)
+            lock gate (fun () -> stack.Add(pairs))
+
+            { new IDisposable with
+                member _.Dispose() =
+                    lock gate (fun () ->
+                        if stack.Count > 0 then
+                            stack.RemoveAt(stack.Count - 1))
+            }
+
+        member _.IsEnabled(_) = true
+
+        member _.Log<'TState>
+            (
+                logLevel: Microsoft.Extensions.Logging.LogLevel,
+                _eventId: Microsoft.Extensions.Logging.EventId,
+                state: 'TState,
+                ex: exn,
+                formatter: Func<'TState, exn, string>
+            ) : unit =
+            let text = formatter.Invoke(state, ex)
+            let scopes = lock gate (fun () -> stack |> Seq.concat |> List.ofSeq)
+
+            lock gate (fun () ->
+                entries.Add(
+                    {
+                        Level = logLevel.ToString()
+                        Text = text
+                        Scopes = scopes
+                    }
+                ))
+
+    /// Every captured line, oldest first.
+    member _.Entries: LoggedLine list = lock gate (fun () -> entries |> List.ofSeq)
+
+[<Fact>]
+let ``Bus subscribe and publish carry all six scopes`` () =
+    task {
+        let _, sessions, events = makeStores ()
+        let tenant = tenantOf "acme"
+        let sessionId = SessionId.New()
+        let! _, claim = makeSession sessions tenant sessionId
+        let logger = ScopeCapturingLogger()
+
+        use bus =
+            new SessionEventBus(events, SessionSubscriptionOptions(), logger :> Microsoft.Extensions.Logging.ILogger)
+
+        let! received =
+            task {
+                let! enumerator =
+                    task {
+                        let enumerable = bus.Subscribe(tenant, sessionId, 0L, CancellationToken.None)
+                        return enumerable.GetAsyncEnumerator(CancellationToken.None)
+                    }
+
+                let! _ =
+                    appendViaWriter
+                        events
+                        tenant
+                        sessionId
+                        claim.Token
+                        ([ delta sessionId claim.TurnId "hello" ] :> IReadOnlyList<_>)
+
+                let! has = enumerator.MoveNextAsync().AsTask()
+                has |> should equal true
+                let first = enumerator.Current
+                do! enumerator.DisposeAsync().AsTask()
+                return first
+            }
+
+        received |> should not' (equal null)
+
+        let entries = logger.Entries
+        entries |> should not' (equal [])
+
+        for entry in entries do
+            for key in
+                [
+                    LoggingScopes.SessionIdKey
+                    LoggingScopes.TurnIdKey
+                    LoggingScopes.AgentIdKey
+                    LoggingScopes.TenantIdKey
+                    LoggingScopes.AttemptKey
+                    LoggingScopes.ClaimOwnerKey
+                ] do
+                entry.Scopes |> List.exists (fun (name, _) -> name = key) |> should equal true
+    }

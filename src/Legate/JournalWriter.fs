@@ -17,6 +17,8 @@ open System.Text.RegularExpressions
 open System.Threading
 open System.Threading.Tasks
 open Microsoft.Extensions.AI
+open Microsoft.Extensions.Logging
+open Microsoft.Extensions.Logging.Abstractions
 
 // Journal writer (issue 48): the sole append path into ISessionEventStore.
 // Every event is sanitized (table-driven secret-shape redaction to
@@ -723,5 +725,102 @@ module internal JournalWriter =
             | JournalRejected _ -> ()
             | JournalFailed _ -> ()
 
+            return result
+        }
+
+    // ────────────────── Scoped outcome logging (issue 93) ──────────────────
+
+    /// Resolves a nullable logger to a live one: the given logger, or the
+    /// NullLogger when it is null. Local (not via LoggingScopes) because
+    /// this module compiles before LoggingScopes and must not reference it.
+    /// <param name="logger">The logger, or null for no logging.</param>
+    /// <returns>The live logger, never null.</returns>
+    let private resolveOutcomeLogger (logger: ILogger | null) : ILogger =
+        match Option.ofObj logger with
+        | Some live -> live
+        | None -> NullLogger.Instance :> ILogger
+
+    /// Reports one append outcome under the caller's pre-built six-key
+    /// logging scope (built with LoggingScopes.createScope by modules
+    /// compiled after LoggingScopes). Reasons are already secret-free
+    /// (fixed vocabularies, never secrets or tool arguments) and still
+    /// travel through redactText. Appended outcomes log at Information,
+    /// rejections and failures at Warning.
+    /// <param name="logger">The logger, or null for no logging.</param>
+    /// <param name="scope">The pre-built scope entries, or null for no scope entries.</param>
+    /// <param name="result">The append outcome to report.</param>
+    let reportOutcome
+        (logger: ILogger | null)
+        (scope: IReadOnlyList<KeyValuePair<string, obj>> | null)
+        (result: JournalWriteResult)
+        : unit =
+        let log = resolveOutcomeLogger logger
+
+        use _scope =
+            if isNull (box scope) then
+                log.BeginScope(Dictionary<string, obj>())
+            else
+                log.BeginScope(scope)
+
+        match result with
+        | JournalAppended stamped ->
+            let count = if isNull (box stamped) then 0 else stamped.Count
+            log.LogInformation("The journal appended {Count} events.", count)
+        | JournalRejected reason -> log.LogWarning("The journal rejected the append: {Reason}", redactText reason)
+        | JournalFailed reason -> log.LogWarning("The journal failed the append: {Reason}", redactText reason)
+
+    /// Appends under the claim fence and reports the outcome under the
+    /// caller's scope.
+    /// <param name="sessionStore">The session store verifying the claim. Must not be null.</param>
+    /// <param name="eventStore">The journal the events append to. Must not be null.</param>
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="sessionId">The session whose journal appends.</param>
+    /// <param name="claim">The claim fencing the append. Must not be null.</param>
+    /// <param name="events">The events to append, in order. Must not be null or empty and must carry no nulls.</param>
+    /// <param name="cancellationToken">Abandons the append.</param>
+    /// <param name="logger">The logger, or null for no logging.</param>
+    /// <param name="scope">The pre-built scope entries, or null for no scope entries.</param>
+    /// <returns>The write result.</returns>
+    let appendAsyncWithLogger
+        (sessionStore: ISessionStore)
+        (eventStore: ISessionEventStore)
+        (tenant: TenantId)
+        (sessionId: SessionId)
+        (claim: TurnClaim)
+        (events: IReadOnlyList<SessionEvent>)
+        (cancellationToken: CancellationToken)
+        (logger: ILogger | null)
+        (scope: IReadOnlyList<KeyValuePair<string, obj>> | null)
+        : Task<JournalWriteResult> =
+        task {
+            let! result = appendAsync sessionStore eventStore tenant sessionId claim events cancellationToken
+            reportOutcome logger scope result
+            return result
+        }
+
+    /// Appends under the journal token fence and reports the outcome under
+    /// the caller's scope.
+    /// <param name="eventStore">The journal the events append to. Must not be null.</param>
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="sessionId">The session whose journal appends.</param>
+    /// <param name="claimToken">The opaque turn claim token fencing the journal write. Must not be null.</param>
+    /// <param name="events">The events to append, in order. Must not be null or empty and must carry no nulls.</param>
+    /// <param name="cancellationToken">Abandons the append.</param>
+    /// <param name="logger">The logger, or null for no logging.</param>
+    /// <param name="scope">The pre-built scope entries, or null for no scope entries.</param>
+    /// <returns>The write result.</returns>
+    let appendWithTokenAsyncWithLogger
+        (eventStore: ISessionEventStore)
+        (tenant: TenantId)
+        (sessionId: SessionId)
+        (claimToken: string)
+        (events: IReadOnlyList<SessionEvent>)
+        (cancellationToken: CancellationToken)
+        (logger: ILogger | null)
+        (scope: IReadOnlyList<KeyValuePair<string, obj>> | null)
+        : Task<JournalWriteResult> =
+        task {
+            let! result = appendWithTokenAsync eventStore tenant sessionId claimToken events cancellationToken
+            reportOutcome logger scope result
             return result
         }

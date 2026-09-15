@@ -7,6 +7,7 @@ open System.Collections.Generic
 open System.Threading
 open System.Threading.Channels
 open System.Threading.Tasks
+open Microsoft.Extensions.Logging
 
 // Session event bus (issue 49): the replay-then-live hub the merged
 // JournalWriter (#48) publishes its stamped events to. The writer stays the
@@ -270,7 +271,8 @@ type private SubscribeEnumerable
 /// by the store calls carrying the tenant; fenced-out writes publish
 /// nothing because the writer only notifies on landed batches.
 [<Sealed>]
-type SessionEventBus(eventStore: ISessionEventStore, options: SessionSubscriptionOptions) =
+type SessionEventBus
+    internal (eventStore: ISessionEventStore, options: SessionSubscriptionOptions, logger: ILogger | null) =
     do ArgumentNullException.ThrowIfNull(eventStore)
     do ArgumentNullException.ThrowIfNull(options)
 
@@ -284,6 +286,19 @@ type SessionEventBus(eventStore: ISessionEventStore, options: SessionSubscriptio
     let maxSubscribers = options.MaxSubscribersPerSession
     let bufferSize = options.PerSubscriberBufferSize
     let mutable disposed = 0
+    let log = LoggingScopes.resolveLogger logger
+
+    /// Logs one bus point under the six canonical scopes. Event payloads
+    /// never travel: only counts and the fixed vocabulary do.
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="sessionId">The session the point belongs to.</param>
+    /// <param name="message">The fixed message.</param>
+    let logBus (tenant: TenantId) (sessionId: SessionId) (message: string) : unit =
+        let scope =
+            LoggingScopes.createScope (tenant.ToString()) (sessionId.ToString()) null null 0 null
+
+        use _scope = LoggingScopes.beginScope log scope
+        log.LogInformation("{Message}", LoggingScopes.redactForLog message)
 
     let isDisposed () = Volatile.Read(&disposed) = 1
 
@@ -320,16 +335,26 @@ type SessionEventBus(eventStore: ISessionEventStore, options: SessionSubscriptio
                     with _ ->
                         ()
 
+                    logBus tenant sessionId "The bus disconnected a slow subscriber."
+
                 if hub.Subscribers.Count = 0 then
                     let mutable removed = Unchecked.defaultof<Hub>
                     hubs.TryRemove((tenant, sessionId), &removed) |> ignore)
+
+            logBus tenant sessionId "The bus published events to live subscribers."
 
     do JournalWriter.Published.Add(fun (tenant, sessionId, stamped) -> publishToHub tenant sessionId stamped)
 
     /// Constructs the hub over the given journal with default subscription
     /// options (512 subscribers per session, 128 buffered events each).
     /// <param name="eventStore">The journal Subscribe replays from. Must not be null.</param>
-    new(eventStore: ISessionEventStore) = new SessionEventBus(eventStore, SessionSubscriptionOptions())
+    new(eventStore: ISessionEventStore) = new SessionEventBus(eventStore, SessionSubscriptionOptions(), null)
+
+    /// Constructs the hub over the given journal and options with no logger.
+    /// <param name="eventStore">The journal Subscribe replays from. Must not be null.</param>
+    /// <param name="options">The subscription bounds. Must not be null.</param>
+    new(eventStore: ISessionEventStore, options: SessionSubscriptionOptions) =
+        new SessionEventBus(eventStore, options, null)
 
     /// The journal Subscribe replays from.
     /// <returns>The event store.</returns>
@@ -461,6 +486,8 @@ type SessionEventBus(eventStore: ISessionEventStore, options: SessionSubscriptio
                     let attached = Subscriber(channel)
                     hub.Subscribers.Add(attached)
                     attached)
+
+            logBus tenant sessionId "The session subscribed to its events."
 
             upcast
                 SubscribeEnumerable(

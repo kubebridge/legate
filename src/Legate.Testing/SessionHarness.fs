@@ -518,6 +518,7 @@ type SessionHarness
                                 signals.ObserveSettled result
                                 PromptWaitHubs.ObserveSettled created.Id result)
                         OnInjectJournaled = None
+                        Logger = null
                         Compact = None
                     }
 

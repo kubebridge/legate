@@ -86,6 +86,7 @@ let private spawnSession
             RunTurn = runTurn
             OnTurnSettled = None
             OnInjectJournaled = None
+            Logger = null
             Compact = None
         }
 
@@ -108,6 +109,7 @@ let private spawnSessionWithProbe
             RunTurn = runTurn
             OnTurnSettled = Some probe
             OnInjectJournaled = None
+            Logger = null
             Compact = None
         }
 
@@ -1116,6 +1118,7 @@ let private spawnSuspendable
             RunTurn = (fun _ _ -> Task.FromResult(completed "unused"))
             OnTurnSettled = Some(fun result -> lock settled (fun () -> settled.Add(result)))
             OnInjectJournaled = None
+            Logger = null
             Compact = None
         }
 
@@ -1685,6 +1688,7 @@ let private spawnSessionFull
             RunTurn = runTurn
             OnTurnSettled = Some settled.Add
             OnInjectJournaled = Some(fun event -> lock journaled (fun () -> journaled.Add(event)))
+            Logger = null
             Compact = None
         }
 
@@ -2467,6 +2471,7 @@ let private spawnSessionWithCompact
             RunTurn = runTurn
             OnTurnSettled = None
             OnInjectJournaled = None
+            Logger = null
             Compact = Some compact
         }
 
@@ -3087,5 +3092,120 @@ let ``Settlement without a sink stores no outbox row`` () =
                 .GetResult()
 
         rows.Count |> should equal 0
+    finally
+        stopSystem system
+
+// ──────────────────────────────────────────────────────────────────────────
+// Logging scopes (issue 93)
+
+/// One captured log line with the scopes active when it logged.
+type private LoggedLine =
+    {
+        Level: string
+        Text: string
+        Scopes: (string * obj) list
+    }
+
+/// An ILogger capturing every entry with the scopes active at log time.
+type private ScopeCapturingLogger() =
+    let gate = obj ()
+    let entries = ResizeArray<LoggedLine>()
+    let stack = ResizeArray<(string * obj) list>()
+
+    let toPairs (state: obj | null) : (string * obj) list =
+        if isNull (box state) then
+            []
+        else
+            match state with
+            | :? IReadOnlyList<KeyValuePair<string, obj>> as kvs ->
+                kvs |> Seq.map (fun kv -> kv.Key, kv.Value) |> List.ofSeq
+            | :? IEnumerable<KeyValuePair<string, obj>> as kvs ->
+                kvs |> Seq.map (fun kv -> kv.Key, kv.Value) |> List.ofSeq
+            | _ -> []
+
+    interface Microsoft.Extensions.Logging.ILogger with
+        member _.BeginScope<'TState when 'TState: not null>(state: 'TState) : IDisposable =
+            let pairs = toPairs (box state)
+            lock gate (fun () -> stack.Add(pairs))
+
+            { new IDisposable with
+                member _.Dispose() =
+                    lock gate (fun () ->
+                        if stack.Count > 0 then
+                            stack.RemoveAt(stack.Count - 1))
+            }
+
+        member _.IsEnabled(_) = true
+
+        member _.Log<'TState>
+            (
+                logLevel: Microsoft.Extensions.Logging.LogLevel,
+                _eventId: Microsoft.Extensions.Logging.EventId,
+                state: 'TState,
+                ex: exn,
+                formatter: Func<'TState, exn, string>
+            ) : unit =
+            let text = formatter.Invoke(state, ex)
+            let scopes = lock gate (fun () -> stack |> Seq.concat |> List.ofSeq)
+
+            lock gate (fun () ->
+                entries.Add(
+                    {
+                        Level = logLevel.ToString()
+                        Text = text
+                        Scopes = scopes
+                    }
+                ))
+
+    /// Every captured line, oldest first.
+    member _.Entries: LoggedLine list = lock gate (fun () -> entries |> List.ofSeq)
+
+[<Fact>]
+let ``Session actor prompt and settle carry all six scopes and leak no secret`` () =
+    use system = createSystem ()
+    let store = createStore ()
+    let created = createSession store
+    let logger = ScopeCapturingLogger()
+    let runner = ScriptedRunner([ "done" ])
+
+    let props: SessionActorProps =
+        {
+            Store = store
+            Tenant = tenant
+            SessionId = created.Id
+            RunTurn = runner.Func
+            OnTurnSettled = None
+            OnInjectJournaled = None
+            Logger = logger :> Microsoft.Extensions.Logging.ILogger
+            Compact = None
+        }
+
+    let session = spawn system $"test-{Guid.NewGuid():N}" (SessionActor.behavior props)
+    let secret = "sk-ant-session-secret-11111111"
+
+    try
+        prompt store created.Id session $"hello {secret}" |> ignore
+
+        let idle =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () -> (snapshotOf session).State = SessionState.Idle)
+
+        idle |> should equal true
+
+        let entries = logger.Entries
+        entries |> should not' (equal [])
+
+        for entry in entries do
+            for key in
+                [
+                    LoggingScopes.SessionIdKey
+                    LoggingScopes.TurnIdKey
+                    LoggingScopes.AgentIdKey
+                    LoggingScopes.TenantIdKey
+                    LoggingScopes.AttemptKey
+                    LoggingScopes.ClaimOwnerKey
+                ] do
+                entry.Scopes |> List.exists (fun (name, _) -> name = key) |> should equal true
+
+            entry.Text.Contains(secret) |> should equal false
     finally
         stopSystem system

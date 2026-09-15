@@ -1881,3 +1881,131 @@ let ``Deliveries carry fresh distinct idempotency keys`` () =
     |> should equal true
 
     keys[0] |> should not' (equal keys[1])
+
+// ──────────────────────────────────────────────────────────────────────────
+// Logging scopes (issue 93)
+
+/// One captured log line with the scopes active when it logged.
+type private LoggedLine =
+    {
+        Level: string
+        Text: string
+        Scopes: (string * obj) list
+    }
+
+/// An ILogger capturing every entry with the scopes active at log time.
+type private ScopeCapturingLogger() =
+    let gate = obj ()
+    let entries = ResizeArray<LoggedLine>()
+    let stack = ResizeArray<(string * obj) list>()
+
+    let toPairs (state: obj | null) : (string * obj) list =
+        if isNull (box state) then
+            []
+        else
+            match state with
+            | :? IReadOnlyList<KeyValuePair<string, obj>> as kvs ->
+                kvs |> Seq.map (fun kv -> kv.Key, kv.Value) |> List.ofSeq
+            | :? IEnumerable<KeyValuePair<string, obj>> as kvs ->
+                kvs |> Seq.map (fun kv -> kv.Key, kv.Value) |> List.ofSeq
+            | _ -> []
+
+    interface Microsoft.Extensions.Logging.ILogger with
+        member _.BeginScope<'TState when 'TState: not null>(state: 'TState) : IDisposable =
+            let pairs = toPairs (box state)
+            lock gate (fun () -> stack.Add(pairs))
+
+            { new IDisposable with
+                member _.Dispose() =
+                    lock gate (fun () ->
+                        if stack.Count > 0 then
+                            stack.RemoveAt(stack.Count - 1))
+            }
+
+        member _.IsEnabled(_) = true
+
+        member _.Log<'TState>
+            (
+                logLevel: Microsoft.Extensions.Logging.LogLevel,
+                _eventId: Microsoft.Extensions.Logging.EventId,
+                state: 'TState,
+                ex: exn,
+                formatter: Func<'TState, exn, string>
+            ) : unit =
+            let text = formatter.Invoke(state, ex)
+            let scopes = lock gate (fun () -> stack |> Seq.concat |> List.ofSeq)
+
+            lock gate (fun () ->
+                entries.Add(
+                    {
+                        Level = logLevel.ToString()
+                        Text = text
+                        Scopes = scopes
+                    }
+                ))
+
+    /// Every captured line, oldest first.
+    member _.Entries: LoggedLine list = lock gate (fun () -> entries |> List.ofSeq)
+
+[<Fact>]
+let ``Coordinator admit logs carry all six scopes and never carry keys`` () =
+    let logger = ScopeCapturingLogger()
+
+    let options =
+        makeOptions (fun _ -> ()) [ "acme", "sk-static-coordinator-key" ] false
+
+    let registry =
+        makeRegistry
+            [
+                StubProvider("acme", "fast") :> ILlmProvider
+            ]
+
+    let clock = FakeTimeProvider()
+    let tracker = ParallelTracker()
+
+    let coordinator =
+        LlmCoordination.LlmCoordinator(
+            options,
+            registry,
+            TableKeyProvider(Map.empty) :> IApiKeyProvider,
+            clock,
+            (NeverDelay() :> ILlmDelay),
+            (SeededRandom(1) :> ILlmRandom),
+            (logger :> Microsoft.Extensions.Logging.ILogger)
+        )
+
+    let invoke = instantInvoke tracker (usageOf 1L 1L) "ok"
+
+    let value =
+        coordinator.ExecuteAsync(
+            ModelReference.Parse("acme/fast"),
+            tenantA,
+            10L,
+            invoke,
+            CancellationToken.None,
+            null,
+            null,
+            SessionId.New(),
+            TurnId.New(),
+            1
+        )
+        |> fun task -> task.GetAwaiter().GetResult()
+
+    value |> should equal "ok"
+
+    let entries = logger.Entries
+    entries |> should not' (equal [])
+
+    for entry in entries do
+        for key in
+            [
+                LoggingScopes.SessionIdKey
+                LoggingScopes.TurnIdKey
+                LoggingScopes.AgentIdKey
+                LoggingScopes.TenantIdKey
+                LoggingScopes.AttemptKey
+                LoggingScopes.ClaimOwnerKey
+            ] do
+            entry.Scopes |> List.exists (fun (name, _) -> name = key) |> should equal true
+
+        entry.Text.Contains("sk-static-coordinator-key") |> should equal false
