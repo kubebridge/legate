@@ -122,6 +122,14 @@ module internal SessionPermissions =
                             (TurnId.New())
                             None
                             allowed
+                | Some live, Some answer when live.Nested.IsSome ->
+                    // Nested sub-agent suspension (issue 72): the reply
+                    // re-enters the nested loop through the suspension's
+                    // resume, which continues the parent turn once the
+                    // nested run settles. Crash rebuilds lose the resume
+                    // and retry from the inbox entry instead.
+                    let nested = live.Nested.Value
+                    return! nested.ResumeAsync answer runnerToken
                 | Some live, Some(:? PermissionDecision as decision) ->
                     return!
                         TurnLoop.resumePermissionAsync

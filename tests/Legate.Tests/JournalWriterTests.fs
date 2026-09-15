@@ -888,6 +888,7 @@ let private testCursor (requestId: string) (question: string) : TurnLoop.TurnLoo
         OutputTokens = 5L
         Iterations = 1
         PendingCall = FunctionCallContent("c1", TurnLoop.AskUserToolName, args)
+        Nested = None
     }
 
 /// A Suspended completion parking on the given cursor.

@@ -65,6 +65,27 @@ module internal TurnLoop =
     /// Compaction.createHook; None on TurnLoopOptions disables compaction.
     type CompactionHook = IList<ChatMessage> -> int64 -> int64 -> CancellationToken -> Task<int64 * int64>
 
+    /// What one settled tool invocation looked like: the name the model
+    /// called it by, the call id the result answers, the appended result
+    /// text, and the failure when the invocation raised instead of
+    /// returning. Error is Some only when the invocation raised (an
+    /// unknown or non-invokable tool counts as raised); denials carry
+    /// their denial text with no error, and suspensions never observe:
+    /// a suspended call has not settled. The nested task-tool runner
+    /// journals these observations as the sub-agent execution markers the
+    /// transcript read links back to the parent call.
+    type ToolCallObservation =
+        {
+            /// The name the model called the tool by.
+            ToolName: string
+            /// The tool-call id the result answers.
+            ToolCallId: string
+            /// The appended result text, already bounded by truncation.
+            Text: string
+            /// Why the invocation raised, or None when it returned.
+            Error: string option
+        }
+
     /// Internal loop tuning: the tool-result char limit plus the effective
     /// per-turn budget, with the optional last-moment claim fence. The
     /// budget fields always carry resolved values (see
@@ -80,6 +101,14 @@ module internal TurnLoop =
     /// AskUser carries the ask_user headless policy (issue 64): None
     /// suspends for a host answer (interactive), Some Fail fails the turn
     /// fast, Some AnswerWith continues with the canned answer.
+    /// OnToolCall carries the settled-invocation observer (issue 72): Some
+    /// observes every settled tool invocation after its result appends
+    /// (denials included, suspensions excluded), None observes nothing.
+    /// The nested task-tool runner sets it to journal the sub-agent
+    /// execution markers; parent turns leave it unset.
+    /// TaskNested carries the task-tool nested runner (issue 72): Some
+    /// runs the requested sub-agent through the nested loop, None reads a
+    /// task call as an unknown tool.
     type TurnLoopOptions =
         {
             /// Maximum tool-result chars before truncation with <see cref="TruncationMarker" />.
@@ -96,6 +125,11 @@ module internal TurnLoop =
             /// The ask_user headless policy, or None to suspend for a host
             /// answer.
             AskUser: AskUserOptions option
+            /// The settled-invocation observer, or None to observe nothing.
+            OnToolCall: (ToolCallObservation -> Task<unit>) option
+            /// The task-tool nested runner, or None when the turn offers no
+            /// task tool.
+            TaskNested: TaskNestedRun option
         }
 
         /// Default tuning: 4000 chars before truncation with the iteration
@@ -110,7 +144,87 @@ module internal TurnLoop =
                 VerifyClaim = None
                 Compaction = None
                 AskUser = None
+                OnToolCall = None
+                TaskNested = None
             }
+
+    /// One task-tool nested run: the parent call plus everything the
+    /// nested loop reuses from the parent scope. The hook implementation
+    /// (the task tool) filters the parent tool map into the nested pool,
+    /// resolves the agent definition and model override, and runs the
+    /// nested loop under the nested deadline with the parent claim fence
+    /// still applied, so a takeover loser performs zero nested effects.
+    and TaskNestedRequest =
+        {
+            /// The parent task call spawning the nested run.
+            Call: FunctionCallContent
+            /// The parent tool map the nested pool filters from.
+            Tools: IReadOnlyDictionary<string, AITool>
+            /// The parent tuning and budget: the nested run inherits the
+            /// char limit, iteration budget, claim fence, compaction hook,
+            /// headless policy, and observation hook, with only the
+            /// timeout narrowed to the nested deadline.
+            Options: TurnLoopOptions
+            /// The chat client the parent turn runs against: the nested
+            /// run reuses it unless the call carries a model override.
+            Client: IChatClient
+            /// The delay seam the nested deadline fires off.
+            Delay: ILlmDelay
+            /// The parent deadline scope: the nested run abandons when the
+            /// parent budget or the nested deadline fires.
+            CancellationToken: CancellationToken
+            /// The lease hook the nested loop checks.
+            IsLeaseValid: unit -> bool
+            /// The permission policy the nested calls evaluate against, or
+            /// null for no gate.
+            Policy: IPermissionPolicy
+            /// The session the nested run belongs to.
+            SessionId: SessionId
+            /// The parent turn spawning the nested run.
+            ParentTurnId: TurnId
+            /// Mints stable request ids, or None for GUIDs.
+            NewRequestId: (unit -> string) option
+            /// Tool names the host already allowed for the session, shared
+            /// with the parent so AllowForSession memory stays session-wide.
+            AllowedForSession: HashSet<string>
+        }
+
+    /// What one task-tool nested run settled with: the shaped tool result
+    /// text with the nested totals the parent folds into its budget. A
+    /// nested suspension never returns: the hook raises
+    /// <see cref="T:Legate.TurnLoop.TaskNestedSuspended" /> carrying the
+    /// nested cursor with the resume that continues it, and the parent
+    /// task branch parks the parent turn on it.
+    and TaskNestedResult =
+        {
+            /// The shaped result text: success wrapped for the model,
+            /// failures as <c>Sub-agent failed: ...</c>.
+            Text: string
+            /// Model iterations the nested run spent.
+            Iterations: int
+            /// Input tokens the nested run spent.
+            InputTokens: int64
+            /// Output tokens the nested run spent.
+            OutputTokens: int64
+        }
+
+    /// Continues a suspended nested run with the host's reply: resumes the
+    /// nested loop to its next suspension or its settled result. A nested
+    /// re-suspension raises
+    /// <see cref="T:Legate.TurnLoop.TaskNestedSuspended" /> again, so the
+    /// loop re-parks the parent carrying the fresh cursor; every reply
+    /// re-enters the nested loop before the parent continues. Runners never
+    /// call it directly: they invoke the suspension's ResumeAsync with the
+    /// reply instead.
+    and TaskNestedResume = Reply -> CancellationToken -> Task<TaskNestedResult>
+
+    /// Runs one task-tool nested run over the parent scope. Returns the
+    /// settled result; a nested suspension raises
+    /// <see cref="T:Legate.TurnLoop.TaskNestedSuspended" /> instead of
+    /// returning. Lease loss and cancellation propagate as their own
+    /// exceptions instead of shaping, so the takeover loser never reports
+    /// success.
+    and TaskNestedRun = TaskNestedRequest -> Task<TaskNestedResult>
 
     /// Resolves the effective per-turn budget: the session's explicit knobs
     /// win, unset knobs (0 iterations, empty timeout) fall back to the
@@ -207,6 +321,10 @@ module internal TurnLoop =
     /// suspend time, so later mutation of the running history never moves
     /// the resume point. PendingCall carries the FunctionCallContent that
     /// raised the request, so the resume executes or skips that same call.
+    /// Nested carries the sub-agent resume when a nested task-tool run
+    /// suspended the parent: Some wraps the nested cursor with the resume
+    /// that continues the nested loop before the parent continues, None
+    /// resumes through the standard permission/question continuations.
     type TurnLoopSuspension =
         {
             /// The stable id the host answers: a PermissionDecision answers
@@ -234,6 +352,23 @@ module internal TurnLoop =
             Iterations: int
             /// The tool call that raised the request.
             PendingCall: FunctionCallContent
+            /// The sub-agent resume, or None for a directly suspended turn.
+            Nested: NestedResume option
+        }
+
+    /// Resumes a suspended nested run with the host's reply and continues
+    /// the parent turn: the nested cursor to resume plus the parent
+    /// continuation that maps the nested outcome back onto the parent
+    /// loop. Runners invoke ResumeAsync with the reply instead of the
+    /// standard continuations when Nested is Some; a crash rebuild loses
+    /// it and retries the parent turn from its inbox entry instead.
+    and NestedResume =
+        {
+            /// The nested suspend cursor the resume continues from.
+            Cursor: TurnLoopSuspension
+            /// Continues the nested run with the reply, then continues the
+            /// parent turn with the nested outcome applied.
+            ResumeAsync: Reply -> CancellationToken -> Task<TurnLoopCompletion>
         }
 
     /// Completion of a loop run with the inject fold applied: the settled
@@ -246,7 +381,7 @@ module internal TurnLoop =
     /// TurnStatus.Suspended then), None when the turn settled normally.
     /// Reply-never-starts-a-turn: a suspension never starts work, it only
     /// parks the cursor the matching Reply resumes from.
-    type TurnLoopCompletion =
+    and TurnLoopCompletion =
         {
             /// The settled turn result.
             Result: TurnResult
@@ -256,6 +391,15 @@ module internal TurnLoop =
             /// The suspend cursor, or None when the turn settled.
             Suspension: TurnLoopSuspension option
         }
+
+    /// Raised by the task-tool nested runner when the nested loop suspends
+    /// (a nested permission Ask or question): carries the nested cursor
+    /// with the resume that continues it. The parent task branch catches it
+    /// and parks the parent turn carrying the cursor for the matching
+    /// reply, mirroring how TurnLeaseLostException carries control flow.
+    /// Lease loss and cancellation propagate as their own exceptions
+    /// instead, so a fenced-out loser never parks a turn it lost.
+    exception TaskNestedSuspended of cursor: TurnLoopSuspension * resume: TaskNestedResume
 
     /// No-op drain: no pending Inject entries.
     let private noInjects () : IReadOnlyList<InboxEntry> =
@@ -357,20 +501,22 @@ module internal TurnLoop =
             if usage.OutputTokenCount.HasValue then
                 outputTokens <- outputTokens + usage.OutputTokenCount.Value
 
-    /// Invokes one resolved tool and returns its result text. Unknown names
-    /// and non-invokable tools map to UnknownToolMessage; tool exceptions
-    /// map to Error: texts. Cancellation propagates.
-    let private invokeOneAsync
+    /// Invokes one resolved tool and returns its result text with the
+    /// failure. Unknown names and non-invokable tools map to
+    /// UnknownToolMessage with that message as the failure; tool
+    /// exceptions map to Error: texts with the mapped text as the
+    /// failure. Cancellation propagates.
+    let private invokeOneWithErrorAsync
         (tools: IReadOnlyDictionary<string, AITool>)
         (call: FunctionCallContent)
         (cancellationToken: CancellationToken)
-        : Task<string> =
+        : Task<string * string option> =
         task {
             let mutable tool = Unchecked.defaultof<AITool>
             let found = tools.TryGetValue(call.Name, &tool)
 
             if not found || isNull tool then
-                return UnknownToolMessage
+                return UnknownToolMessage, Some UnknownToolMessage
             else
                 match tool with
                 | :? AIFunction as fn ->
@@ -382,11 +528,71 @@ module internal TurnLoop =
                                 AIFunctionArguments(call.Arguments)
 
                         let! result = fn.InvokeAsync(args, cancellationToken)
-                        return toolValueToString result
+                        return toolValueToString result, None
                     with
-                    | :? OperationCanceledException as canceled -> return! Task.FromException<string>(canceled)
-                    | ex -> return toolExceptionToString ex
-                | _ -> return UnknownToolMessage
+                    | :? OperationCanceledException as canceled ->
+                        return! Task.FromException<string * string option>(canceled)
+                    | ex ->
+                        let message = toolExceptionToString ex
+                        return message, Some message
+                | _ -> return UnknownToolMessage, Some UnknownToolMessage
+        }
+
+    /// Observes one settled tool invocation through the options hook: the
+    /// text is the appended result text, the error marks a raised
+    /// invocation. Suspensions never observe: a suspended call has not
+    /// settled. An observing failure propagates, so a fenced-out loser
+    /// never reports success past the fence.
+    /// <param name="options">The turn loop tuning carrying the observer.</param>
+    /// <param name="call">The settled call.</param>
+    /// <param name="text">The appended result text.</param>
+    /// <param name="error">Why the invocation raised, or None when it returned.</param>
+    let private observeToolCallAsync
+        (options: TurnLoopOptions)
+        (call: FunctionCallContent)
+        (text: string)
+        (error: string option)
+        : Task<unit> =
+        match options.OnToolCall with
+        | Some observe ->
+            let name =
+                if isNull (box call) || isNull call.Name then
+                    ""
+                else
+                    call.Name
+
+            let callId =
+                if isNull (box call) || isNull call.CallId then
+                    ""
+                else
+                    call.CallId
+
+            observe
+                {
+                    ToolName = name
+                    ToolCallId = callId
+                    Text = if isNull text then "" else text
+                    Error = error
+                }
+        | None -> Task.FromResult(())
+
+    /// Invokes one resolved tool, observes the settlement, and returns its
+    /// result text: the single path every tool round uses, so the nested
+    /// task-tool observer sees every settled invocation in turn order.
+    /// <param name="options">The turn loop tuning carrying the observer.</param>
+    /// <param name="tools">The resolved tool map.</param>
+    /// <param name="call">The call to invoke.</param>
+    /// <param name="cancellationToken">Abandons the invocation.</param>
+    let private invokeAndObserveAsync
+        (options: TurnLoopOptions)
+        (tools: IReadOnlyDictionary<string, AITool>)
+        (call: FunctionCallContent)
+        (cancellationToken: CancellationToken)
+        : Task<string> =
+        task {
+            let! text, error = invokeOneWithErrorAsync tools call cancellationToken
+            do! observeToolCallAsync options call text error
+            return text
         }
 
     /// Builds the Failed TurnResult for an exhausted budget: the spent
@@ -594,7 +800,7 @@ module internal TurnLoop =
                                 raise (TurnLeaseLostException())
                         | None -> ()
 
-                        let! rawText = invokeOneAsync tools call linkedToken
+                        let! rawText = invokeAndObserveAsync options tools call linkedToken
                         let text = truncateToolResult options rawText
                         let resultContent = FunctionResultContent(call.CallId, text)
 
@@ -787,6 +993,16 @@ module internal TurnLoop =
     [<Literal>]
     let SkillToolName = "skill"
 
+    /// The built-in tool name that runs a sub-agent as a nested turn loop:
+    /// a call to this tool runs the requested agent definition through
+    /// runSuspendableAsync sharing the session workspace and journal, with
+    /// its own filtered tool pool, model override, and depth limit. The
+    /// loop intercepts the call into the TurnLoopOptions.TaskNested runner
+    /// before any invocation, exactly like ask_user and skill; the
+    /// AIFunction itself only carries the schema and never executes.
+    [<Literal>]
+    let TaskToolName = "task"
+
     /// Reason carried by <see cref="T:Legate.TurnFailed" /> when the turn
     /// calls ask_user under a Fail headless policy: the question has no
     /// host to answer it. Never contains the question or the options hint.
@@ -965,7 +1181,7 @@ module internal TurnLoop =
     /// <param name="newRequestId">Mints stable request ids, or None for GUIDs.</param>
     /// <param name="allowedForSession">Tool names the host already allowed for the session, or null for none.</param>
     /// <returns>The settled result or the Suspended carrier.</returns>
-    let runSuspendableAsync
+    let rec runSuspendableAsync
         (client: IChatClient)
         (history: IList<ChatMessage>)
         (tools: IReadOnlyDictionary<string, AITool>)
@@ -1101,9 +1317,175 @@ module internal TurnLoop =
                     OutputTokens = outputTokens
                     Iterations = iterations
                     PendingCall = call
+                    Nested = None
                 }
 
             suspendedCompletion suspension
+
+        /// Wraps one nested resume into the parent continuation: runs the
+        /// nested resume with the reply, then maps the nested outcome back
+        /// onto the parent turn. A settled nested run appends its shaped
+        /// text as the task call's tool result and continues the parent
+        /// loop from a fresh budget scope with the spent totals folded
+        /// back, mirroring the standard resume continuations. A
+        /// re-suspended nested run parks the parent again carrying the
+        /// fresh cursor with this same wrapper, so every reply re-enters
+        /// the nested loop before the parent continues.
+        let rec wrapNestedResume
+            (taskCall: FunctionCallContent)
+            (prefixIterations: int)
+            (prefixInput: int64)
+            (prefixOutput: int64)
+            (resumeNested: TaskNestedResume)
+            : Reply -> CancellationToken -> Task<TurnLoopCompletion> =
+            fun reply resumeToken ->
+                task {
+                    try
+                        let! nested = resumeNested reply resumeToken
+
+                        let shaped = truncateToolResult options nested.Text
+                        appendToolResult history taskCall.CallId shaped
+                        do! observeToolCallAsync options taskCall shaped None
+
+                        let! continued =
+                            runSuspendableAsync
+                                client
+                                history
+                                tools
+                                options
+                                delay
+                                resumeToken
+                                isLeaseValid
+                                drainInjected
+                                onInjectJournaled
+                                onInjectConsumed
+                                policy
+                                sessionId
+                                turnId
+                                newRequestId
+                                allowed
+
+                        let totalIterations =
+                            prefixIterations + nested.Iterations + continued.Result.Iterations
+
+                        let totalInput =
+                            prefixInput + nested.InputTokens + continued.Result.Usage.InputTokens
+
+                        let totalOutput =
+                            prefixOutput + nested.OutputTokens + continued.Result.Usage.OutputTokens
+
+                        let totalResult =
+                            { continued.Result with
+                                Iterations = totalIterations
+                                Usage =
+                                    {
+                                        InputTokens = totalInput
+                                        OutputTokens = totalOutput
+                                    }
+                            }
+
+                        return { continued with Result = totalResult }
+                    with TaskNestedSuspended(cursor, resume) ->
+                        return
+                            suspendedCompletion (
+                                parentSuspensionOf taskCall prefixIterations prefixInput prefixOutput cursor resume
+                            )
+                }
+
+        /// Parks the parent turn on one nested suspension: a fresh
+        /// parent-level request id the host answers, the nested tool name
+        /// and question for display, the parent task call parked, and the
+        /// nested cursor with the wrapped resume for the matching reply.
+        /// Totals fold the nested spend into the parent prefix, like the
+        /// standard suspend points.
+        and parentSuspensionOf
+            (taskCall: FunctionCallContent)
+            (prefixIterations: int)
+            (prefixInput: int64)
+            (prefixOutput: int64)
+            (cursor: TurnLoopSuspension)
+            (resumeNested: TaskNestedResume)
+            : TurnLoopSuspension =
+            {
+                RequestId = mintId ()
+                ToolName = cursor.ToolName
+                ToolCallId = taskCall.CallId
+                Kind = cursor.Kind
+                QuestionText = cursor.QuestionText
+                QuestionOptions = cursor.QuestionOptions
+                HistorySnapshot = snapshotHistory history
+                InputTokens = prefixInput + cursor.InputTokens
+                OutputTokens = prefixOutput + cursor.OutputTokens
+                Iterations = prefixIterations + cursor.Iterations
+                PendingCall = taskCall
+                Nested =
+                    Some
+                        {
+                            Cursor = cursor
+                            ResumeAsync =
+                                wrapNestedResume taskCall prefixIterations prefixInput prefixOutput resumeNested
+                        }
+            }
+
+        /// Runs one task-tool call through the options hook and maps the
+        /// nested outcome onto the parent round: a settled nested run
+        /// appends its shaped text as the tool result with the nested
+        /// totals folded into the parent budget; a suspended nested run
+        /// parks the parent carrying the nested cursor. A missing hook
+        /// reads the call as an unknown tool. Lease loss and cancellation
+        /// propagate instead of shaping, so a fenced-out loser never
+        /// reports success past the fence.
+        /// <param name="call">The parent task call.</param>
+        /// <param name="roundIterations">The parent iterations spent this round.</param>
+        /// <param name="roundInput">The parent input tokens spent this round.</param>
+        /// <param name="roundOutput">The parent output tokens spent this round.</param>
+        /// <returns>The next parent totals with the suspension, or the totals with no suspension.</returns>
+        let runTaskCallAsync
+            (call: FunctionCallContent)
+            (roundIterations: int)
+            (roundInput: int64)
+            (roundOutput: int64)
+            : Task<int * int64 * int64 * TurnLoopCompletion option> =
+            task {
+                match options.TaskNested with
+                | None ->
+                    appendToolResult history call.CallId UnknownToolMessage
+                    do! observeToolCallAsync options call UnknownToolMessage (Some UnknownToolMessage)
+                    return roundIterations, roundInput, roundOutput, None
+                | Some runNested ->
+                    let request: TaskNestedRequest =
+                        {
+                            Call = call
+                            Tools = tools
+                            Options = options
+                            Client = client
+                            Delay = delay
+                            CancellationToken = linkedToken
+                            IsLeaseValid = isLeaseValid
+                            Policy = policy
+                            SessionId = sessionId
+                            ParentTurnId = turnId
+                            NewRequestId = newRequestId
+                            AllowedForSession = allowed
+                        }
+
+                    try
+                        let! nested = runNested request
+                        let shaped = truncateToolResult options nested.Text
+                        appendToolResult history call.CallId shaped
+                        do! observeToolCallAsync options call shaped None
+
+                        return
+                            roundIterations + nested.Iterations,
+                            roundInput + nested.InputTokens,
+                            roundOutput + nested.OutputTokens,
+                            None
+                    with TaskNestedSuspended(cursor, resume) ->
+                        let suspension =
+                            parentSuspensionOf call roundIterations roundInput roundOutput cursor resume
+
+                        return roundIterations, roundInput, roundOutput, Some(suspendedCompletion suspension)
+            }
 
         let rec runTools
             (roundIterations: int)
@@ -1161,6 +1543,7 @@ module internal TurnLoop =
                                 match Option.ofObj ask.CannedAnswer with
                                 | Some canned when not (String.IsNullOrWhiteSpace canned) ->
                                     appendToolResult history call.CallId canned
+                                    do! observeToolCallAsync options call canned None
                                     return! runTools roundIterations roundInput roundOutput rest
                                 | _ ->
                                     return
@@ -1187,15 +1570,32 @@ module internal TurnLoop =
                             // The last-moment VerifyClaim fence above still
                             // applies, so a takeover loser never reaches the
                             // invocation.
-                            let! rawText = invokeOneAsync tools call linkedToken
+                            let! rawText = invokeAndObserveAsync options tools call linkedToken
                             let text = truncateToolResult options rawText
                             appendToolResult history call.CallId text
                             return! runTools roundIterations roundInput roundOutput rest
+                        elif String.Equals(toolName, TaskToolName, StringComparison.Ordinal) then
+                            // Task tool (issue 72): the call runs the
+                            // requested sub-agent through the nested loop
+                            // under the options hook instead of invoking.
+                            // The fence above still applies, so a takeover
+                            // loser never starts the nested run; the policy
+                            // is not consulted for the task call itself
+                            // (like the skill bypass), the nested loop gates
+                            // every nested call instead. A nested suspension
+                            // parks the parent carrying the nested cursor
+                            // for the matching reply.
+                            let! nextIterations, nextInput, nextOutput, suspended =
+                                runTaskCallAsync call roundIterations roundInput roundOutput
+
+                            match suspended with
+                            | Some completion -> return Some completion
+                            | None -> return! runTools nextIterations nextInput nextOutput rest
                         else
                             let remembered = allowed.Contains(toolName)
 
                             if remembered || isNull (box policy) then
-                                let! rawText = invokeOneAsync tools call linkedToken
+                                let! rawText = invokeAndObserveAsync options tools call linkedToken
                                 let text = truncateToolResult options rawText
                                 appendToolResult history call.CallId text
                                 return! runTools roundIterations roundInput roundOutput rest
@@ -1212,7 +1612,7 @@ module internal TurnLoop =
                                             )
                                         )
                                 elif verdict :? AllowVerdict then
-                                    let! rawText = invokeOneAsync tools call linkedToken
+                                    let! rawText = invokeAndObserveAsync options tools call linkedToken
                                     let text = truncateToolResult options rawText
                                     appendToolResult history call.CallId text
                                     return! runTools roundIterations roundInput roundOutput rest
@@ -1220,6 +1620,7 @@ module internal TurnLoop =
                                     let deny = verdict :?> DenyVerdict
                                     let reason = if isNull deny.Reason then "" else deny.Reason
                                     appendToolResult history call.CallId (DenyResultPrefix + reason)
+                                    do! observeToolCallAsync options call (DenyResultPrefix + reason) None
                                     return! runTools roundIterations roundInput roundOutput rest
                                 elif verdict :? AskVerdict then
                                     let suspension =
@@ -1235,6 +1636,7 @@ module internal TurnLoop =
                                             OutputTokens = roundOutput
                                             Iterations = roundIterations
                                             PendingCall = call
+                                            Nested = None
                                         }
 
                                     return Some(suspendedCompletion suspension)
@@ -1374,6 +1776,13 @@ module internal TurnLoop =
             | PermissionDecisionKind.AllowForSession -> allowed.Add(suspension.ToolName) |> ignore
             | PermissionDecisionKind.Deny ->
                 appendToolResult history suspension.ToolCallId (DenyResultPrefix + "the host denied the call")
+
+                do!
+                    observeToolCallAsync
+                        options
+                        suspension.PendingCall
+                        (DenyResultPrefix + "the host denied the call")
+                        None
             | _ -> raise (ArgumentOutOfRangeException(nameof decision, "Unknown permission decision."))
 
             match decision with
@@ -1390,7 +1799,7 @@ module internal TurnLoop =
                         raise (TurnLeaseLostException())
                 | None -> ()
 
-                let! rawText = invokeOneAsync tools suspension.PendingCall cancellationToken
+                let! rawText = invokeAndObserveAsync options tools suspension.PendingCall cancellationToken
                 let text = truncateToolResult options rawText
                 appendToolResult history suspension.ToolCallId text
 

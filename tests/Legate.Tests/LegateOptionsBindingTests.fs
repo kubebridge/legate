@@ -105,6 +105,7 @@ let ``Binds duration forms to TimeSpans`` () =
             [
                 "Legate:Sessions:LeaseDuration", "30s"
                 "Legate:Sessions:LeaseRenewalInterval", "500ms"
+                "Legate:Sessions:SubAgents:Timeout", "5m"
                 "Legate:Turns:DefaultTimeout", "1h"
                 "Legate:Permissions:AskTimeout", "15m"
                 "Legate:Completion:RetryDelay", "30d"
@@ -114,6 +115,8 @@ let ``Binds duration forms to TimeSpans`` () =
     let options = LegateOptionsBinding.bind section
 
     options.Sessions.LeaseDuration |> should equal (TimeSpan.FromSeconds 30.0)
+
+    options.Sessions.SubAgents.Timeout |> should equal (TimeSpan.FromMinutes 5.0)
 
     options.Sessions.LeaseRenewalInterval
     |> should equal (TimeSpan.FromMilliseconds 500.0)
@@ -218,6 +221,33 @@ let ``Invalid duration fails with the section path`` () =
         Assert.Throws<InvalidOperationException>(fun () -> LegateOptionsBinding.bind section |> ignore)
 
     ex.Message.Contains("Legate:Sessions:LeaseDuration") |> should equal true
+    ex.Message.Contains("unknown duration") |> should equal true
+
+[<Fact>]
+let ``Binds the sub-agent depth and timeout`` () =
+    let section =
+        buildSection
+            [
+                "Legate:Sessions:SubAgents:MaxDepth", "2"
+                "Legate:Sessions:SubAgents:Timeout", "5m"
+            ]
+
+    let options = LegateOptionsBinding.bind section
+    options.Sessions.SubAgents.MaxDepth |> should equal 2
+    options.Sessions.SubAgents.Timeout |> should equal (TimeSpan.FromMinutes 5.0)
+
+[<Fact>]
+let ``Invalid sub-agent timeout fails with the section path`` () =
+    let section =
+        buildSection
+            [
+                "Legate:Sessions:SubAgents:Timeout", "not-a-duration"
+            ]
+
+    let ex =
+        Assert.Throws<InvalidOperationException>(fun () -> LegateOptionsBinding.bind section |> ignore)
+
+    ex.Message.Contains("Legate:Sessions:SubAgents:Timeout") |> should equal true
     ex.Message.Contains("unknown duration") |> should equal true
 
 [<Fact>]
