@@ -239,3 +239,52 @@ type PackageLeaseException(agentId: AgentId, owner: string, operation: string, m
     /// "hold" when the lease was lost during the work. Never contains
     /// secrets or tool arguments.
     member _.Operation = operation
+
+/// Raised when a session exists but its event journal no longer does: it
+/// was archived or deleted by cleanup before the read. Distinct from end of
+/// stream: there are events the caller will never see. The session id
+/// travels on a property so hosts can report it without parsing messages.
+/// <param name="sessionId">The id of the session whose journal is gone.</param>
+/// <param name="message">The exception message, without secrets or tool arguments.</param>
+[<Sealed>]
+type SessionJournalExpiredException(sessionId: SessionId, message: string) =
+    inherit LegateException(message)
+
+    /// The id of the session whose journal is gone.
+    member _.SessionId = sessionId
+
+/// Raised when a live event subscriber falls behind its bounded channel:
+/// the publisher never stalls the turn, so the slow subscriber is
+/// disconnected instead. The reason is a stable string, never parsed from
+/// messages.
+/// <param name="sessionId">The id of the session the subscriber lagged on.</param>
+/// <param name="reason">Why the subscriber was disconnected: "slowSubscriber" when its bounded channel overflowed.</param>
+/// <param name="message">The exception message, without secrets or tool arguments.</param>
+[<Sealed>]
+type SessionSubscriptionLaggedException(sessionId: SessionId, reason: string, message: string) =
+    inherit LegateException(message)
+
+    /// The id of the session the subscriber lagged on.
+    member _.SessionId = sessionId
+
+    /// Why the subscriber was disconnected: "slowSubscriber" when its
+    /// bounded channel overflowed. Never contains secrets or tool
+    /// arguments.
+    member _.Reason = reason
+
+/// Raised when a session already holds the maximum live event subscribers:
+/// the new subscription is rejected instead of evicting an existing one.
+/// The limit travels on a property so hosts can report it without parsing
+/// messages.
+/// <param name="sessionId">The id of the session that is fully subscribed.</param>
+/// <param name="limit">The maximum live subscribers the session holds.</param>
+/// <param name="message">The exception message, without secrets or tool arguments.</param>
+[<Sealed>]
+type SessionSubscriptionLimitExceededException(sessionId: SessionId, limit: int, message: string) =
+    inherit LegateException(message)
+
+    /// The id of the session that is fully subscribed.
+    member _.SessionId = sessionId
+
+    /// The maximum live subscribers the session holds.
+    member _.Limit = limit
