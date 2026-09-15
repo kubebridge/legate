@@ -73,6 +73,7 @@
     <Compile Include="EditToolsTests.fs" />
     <Compile Include="SearchToolsTests.fs" />
     <Compile Include="SessionPermissionsTests.fs" />
+    <Compile Include="SkillDiscoveryTests.fs" />
   </ItemGroup>
 
   <ItemGroup>
@@ -89,6 +90,7 @@
     <PackageReference Include="Akka" />
     <PackageReference Include="Akka.FSharp" />
     <PackageReference Include="FSharp.Core" />
+    <PackageReference Include="FsCheck.Xunit" />
     <PackageReference Include="FsUnit.xUnit" />
     <PackageReference Include="Google.GenAI" />
     <PackageReference Include="Microsoft.Extensions.Configuration" />

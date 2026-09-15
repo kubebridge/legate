@@ -237,3 +237,129 @@ type AgentPackageStoreConformance(store: IAgentPackageStore, tenant: TenantId) =
 
             Assert.Equal(0, wrongVersions.Count)
         }
+
+    /// One entry stream per pair: the multi-file uploads prefix scans need.
+    static member EntriesTexts(entries: (string * string) list) =
+        let prepared =
+            entries
+            |> List.map (fun (path, text) ->
+                AgentPackageEntry(path, new MemoryStream(System.Text.Encoding.UTF8.GetBytes text)))
+            |> List.toArray
+
+        { new IAsyncEnumerable<AgentPackageEntry> with
+            member _.GetAsyncEnumerator(_: CancellationToken) =
+                let mutable index = -1
+
+                { new IAsyncEnumerator<AgentPackageEntry> with
+                    member _.MoveNextAsync() =
+                        index <- index + 1
+                        ValueTask<bool>(index < prepared.Length)
+
+                    member _.Current: AgentPackageEntry = prepared[index]
+
+                    member _.DisposeAsync() : ValueTask = ValueTask()
+                }
+        }
+
+    [<Fact>]
+    member this.``ListFiles scans one version by prefix in lexicographic order``() =
+        task {
+            let agentId = this.AgentId
+
+            let! _ =
+                store.UploadPackage(
+                    tenant,
+                    agentId,
+                    "1.0.0",
+                    "prefix",
+                    AgentPackageStoreConformance.EntriesTexts(
+                        [
+                            "AGENTS.md", "Be helpful."
+                            ".agent/skills/deploy/SKILL.md", "name: deploy"
+                            ".agent/skills/deploy/refs/api.md", "api notes"
+                            ".agent/skills/other/SKILL.md", "name: other"
+                            ".agent/agents/helper/AGENT.md", "name: helper"
+                        ]
+                    ),
+                    CancellationToken.None
+                )
+
+            // A skill directory scans with or without the trailing
+            // separator, ordinally ordered and scoped to the directory.
+            for prefix in
+                [
+                    ".agent/skills/deploy"
+                    ".agent/skills/deploy/"
+                ] do
+                let! listed = store.ListFiles(tenant, agentId, "1.0.0", prefix, CancellationToken.None)
+
+                Assert.Equal<string list>(
+                    [
+                        ".agent/skills/deploy/SKILL.md"
+                        ".agent/skills/deploy/refs/api.md"
+                    ],
+                    listed |> Seq.toList
+                )
+
+            // A wider prefix sees every skill file but not AGENTS.md: the
+            // top-level instructions file is not under the .agent prefix.
+            let! skills = store.ListFiles(tenant, agentId, "1.0.0", ".agent/skills", CancellationToken.None)
+
+            Assert.Equal<string list>(
+                [
+                    ".agent/skills/deploy/SKILL.md"
+                    ".agent/skills/deploy/refs/api.md"
+                    ".agent/skills/other/SKILL.md"
+                ],
+                skills |> Seq.toList
+            )
+        }
+
+    [<Fact>]
+    member this.``ListFiles is empty on absent data and validates its inputs``() =
+        task {
+            let agentId = this.AgentId
+
+            let! _ =
+                store.UploadPackage(
+                    tenant,
+                    agentId,
+                    "1.0.0",
+                    "prefix",
+                    AgentPackageStoreConformance.EntriesText("AGENTS.md", "Be helpful."),
+                    CancellationToken.None
+                )
+
+            // An unknown version and a foreign tenant scan empty: absent
+            // data is an expected branch, never an exception.
+            let! unknown = store.ListFiles(tenant, agentId, "2.0.0", ".agent/skills", CancellationToken.None)
+
+            Assert.Equal(0, unknown.Count)
+
+            let! foreign = store.ListFiles(this.OtherTenant, agentId, "1.0.0", ".agent/skills", CancellationToken.None)
+
+            Assert.Equal(0, foreign.Count)
+
+            // Control-plane preconditions still throw: the version rule,
+            // the null prefix, and the path rule.
+            Assert.Throws<ArgumentException>(fun () ->
+                store
+                    .ListFiles(tenant, agentId, "no spaces", ".agent/skills", CancellationToken.None)
+                    .GetAwaiter()
+                    .GetResult()
+                |> ignore)
+            |> ignore
+
+            Assert.Throws<ArgumentNullException>(fun () ->
+                store
+                    .ListFiles(tenant, agentId, "1.0.0", Unchecked.defaultof<string>, CancellationToken.None)
+                    .GetAwaiter()
+                    .GetResult()
+                |> ignore)
+            |> ignore
+
+            Assert.Throws<InvalidPackagePathException>(fun () ->
+                store.ListFiles(tenant, agentId, "1.0.0", "../escape", CancellationToken.None).GetAwaiter().GetResult()
+                |> ignore)
+            |> ignore
+        }

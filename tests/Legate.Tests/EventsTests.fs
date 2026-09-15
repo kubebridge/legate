@@ -72,9 +72,13 @@ let sampleEvents: (string * (unit -> SessionEvent)) list =
         fun () -> UserMessageEvent(sessionId, turnId, noSequence, stamp, UserMessage.Text "steer") :> SessionEvent
         "contextPruned",
         fun () -> ContextPrunedEvent(sessionId, turnId, noSequence, stamp, 3, 9000L, 1200L) :> SessionEvent
+        "skillInvalid",
+        fun () ->
+            SkillInvalidEvent(sessionId, turnId, noSequence, stamp, "deploy", "the skill frontmatter has no 'name'")
+            :> SessionEvent
     ]
 
-// The 19 discriminator strings the base type's XML doc documents as the
+// The 20 discriminator strings the base type's XML doc documents as the
 // wire contract, in the same order as the JsonDerivedType attributes.
 let discriminatorContract =
     [|
@@ -97,6 +101,7 @@ let discriminatorContract =
         "sessionClosed"
         "userMessage"
         "contextPruned"
+        "skillInvalid"
     |]
 
 /// Reads the TypeDiscriminator values from the JsonDerivedType attributes
@@ -349,6 +354,17 @@ let ``ContextPruned round-trips its counts and estimates`` () =
     pruned.BeforeEstimate |> should equal 9000L
     pruned.AfterEstimate |> should equal 1200L
 
+[<Fact>]
+let ``SkillInvalid round-trips its skill name and reason`` () =
+    let restored =
+        roundTrip "skillInvalid" (fun () ->
+            SkillInvalidEvent(sessionId, turnId, noSequence, stamp, "deploy", "the skill frontmatter has no 'name'")
+            :> SessionEvent)
+
+    let invalid = restored :?> SkillInvalidEvent
+    invalid.SkillName |> should equal "deploy"
+    invalid.Reason |> should equal "the skill frontmatter has no 'name'"
+
 // ───────────────────────────────────────────────────────────────────────────
 // Sequence and base-field nullability
 
@@ -395,7 +411,7 @@ let ``Base fields carry the constructor values the constructor set`` () =
 
 [<Fact>]
 let ``An undocumented $type value is rejected instead of guessed`` () =
-    // The 19 documented discriminators are the wire contract: anything
+    // The 20 documented discriminators are the wire contract: anything
     // outside the set must fail the read rather than deserialise to a base
     // instance. The BCL raises NotSupportedException for a discriminator
     // with no registered derived type (surfaced possibly wrapped in a

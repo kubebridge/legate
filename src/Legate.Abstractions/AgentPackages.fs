@@ -386,6 +386,31 @@ type IAgentPackageStore =
         tenant: TenantId * agentId: AgentId * version: string * path: string * cancellationToken: CancellationToken ->
             Task<Stream | null>
 
+    /// Lists the entry paths stored under one version's prefix, in
+    /// lexicographic (ordinal) order: the prefix scan skill discovery stages
+    /// companions with. The prefix is a package-relative directory path,
+    /// normalised through <see cref="M:Legate.AgentPackagePaths.Normalise*" />
+    /// (a trailing separator is collapsed, so a skill directory scans as
+    /// either <c>.agent/skills/deploy</c> or
+    /// <c>.agent/skills/deploy/</c>); a stored path matches when it equals
+    /// the normalised prefix or starts with the prefix plus a separator.
+    /// Empty when the version has no entries under the prefix, including
+    /// when the version itself is absent: absent data is an expected branch
+    /// and never an exception, mirroring
+    /// <see cref="M:Legate.IAgentPackageStore.ReadFile*" />.
+    /// <param name="tenant">The tenant the agent belongs to.</param>
+    /// <param name="agentId">The agent whose package to scan.</param>
+    /// <param name="version">The version to scan, validated against <see cref="P:Legate.PackageVersions.Pattern" />.</param>
+    /// <param name="prefix">The package-relative directory prefix to scan, normalised through <see cref="M:Legate.AgentPackagePaths.Normalise*" />.</param>
+    /// <param name="cancellationToken">Token that abandons the scan.</param>
+    /// <returns>The matching canonical paths, lexicographically ordered; empty when none match.</returns>
+    /// <exception cref="T:System.ArgumentNullException">The prefix is null.</exception>
+    /// <exception cref="T:System.ArgumentException">The version fails <see cref="P:Legate.PackageVersions.Pattern" />.</exception>
+    /// <exception cref="T:Legate.InvalidPackagePathException">The prefix fails normalisation.</exception>
+    abstract ListFiles:
+        tenant: TenantId * agentId: AgentId * version: string * prefix: string * cancellationToken: CancellationToken ->
+            Task<IReadOnlyList<string>>
+
     /// Publishes a package version from a stream of entries and makes it
     /// the active version: deploy semantics, folding activation into the
     /// one write that semantically publishes. Atomic: a failed upload

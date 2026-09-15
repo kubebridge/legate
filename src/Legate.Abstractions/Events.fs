@@ -49,6 +49,7 @@ open System.Text.Json.Serialization
 /// <item><term>sessionClosed</term><description>the session closed.</description></item>
 /// <item><term>userMessage</term><description>an injected user message was folded into the running turn.</description></item>
 /// <item><term>contextPruned</term><description>old tool results were replaced with the prune marker.</description></item>
+/// <item><term>skillInvalid</term><description>a packaged skill was skipped during discovery with its reason.</description></item>
 /// </list>
 /// Every subtype is named <c>&lt;Kind&gt;Event</c> so no kind name collides
 /// with an existing Legate type (for example <see cref="T:Legate.TurnFailed" />
@@ -74,6 +75,7 @@ open System.Text.Json.Serialization
 [<JsonDerivedType(typeof<SessionClosedEvent>, "sessionClosed")>]
 [<JsonDerivedType(typeof<UserMessageEvent>, "userMessage")>]
 [<JsonDerivedType(typeof<ContextPrunedEvent>, "contextPruned")>]
+[<JsonDerivedType(typeof<SkillInvalidEvent>, "skillInvalid")>]
 type SessionEvent(sessionId: SessionId, turnId: TurnId, sequence: Nullable<int64>, timestamp: DateTimeOffset) =
 
     /// The session the event belongs to. Sequence numbers are per-session,
@@ -496,3 +498,33 @@ and [<Sealed>] ContextPrunedEvent
 
     /// The estimated token count after pruning, markers included.
     member _.AfterEstimate = afterEstimate
+
+/// A packaged skill was skipped during skill discovery: its SKILL.md was
+/// missing, its frontmatter was absent or invalid, or its staging failed.
+/// Discovery never drops a skill silently: the skill is excluded from the
+/// available-skills block and one of these events carries the reason the
+/// host may render. The reason never contains secrets; it may name the
+/// skill and the offending path.
+/// <param name="sessionId">The session discovery ran for.</param>
+/// <param name="turnId">The turn discovery ran inside.</param>
+/// <param name="sequence">The event's per-session sequence number, or empty while in flight.</param>
+/// <param name="timestamp">When the skill was skipped.</param>
+/// <param name="skillName">The name of the skill that was skipped, as listed by package info.</param>
+/// <param name="reason">Why the skill was skipped: a missing SKILL.md, a frontmatter failure, or a staging failure. Never contains secrets.</param>
+and [<Sealed>] SkillInvalidEvent
+    (
+        sessionId: SessionId,
+        turnId: TurnId,
+        sequence: Nullable<int64>,
+        timestamp: DateTimeOffset,
+        skillName: string,
+        reason: string
+    ) =
+    inherit SessionEvent(sessionId, turnId, sequence, timestamp)
+
+    /// The name of the skill that was skipped, as listed by package info.
+    member _.SkillName = skillName
+
+    /// Why the skill was skipped: a missing SKILL.md, a frontmatter
+    /// failure, or a staging failure. Never contains secrets.
+    member _.Reason = reason
