@@ -28,6 +28,7 @@ let ``Every subtype derives from LegateException`` () =
     assertDerived typeof<InvalidPackagePathException>
     assertDerived typeof<PackageLeaseException>
     assertDerived typeof<ReplyMismatchException>
+    assertDerived typeof<ModelDeniedException>
 
 [<Fact>]
 let ``SessionNotFoundException carries the session id and message`` () =
@@ -160,6 +161,15 @@ let ``ReplyMismatchException carries the session id and request id`` () =
     ex.Message |> should equal "The reply answered no pending request."
 
 [<Fact>]
+let ``ModelDeniedException carries the provider id, model, and client-safe message`` () =
+    let ex =
+        ModelDeniedException("anthropic", "claude-sonnet", "Model is not on your plan.")
+
+    ex.ProviderId |> should equal "anthropic"
+    ex.Model |> should equal "claude-sonnet"
+    ex.Message |> should equal "Model is not on your plan."
+
+[<Fact>]
 let ``Messages are returned exactly as given without appended data`` () =
     let exs: exn list =
         [
@@ -181,6 +191,7 @@ let ``Messages are returned exactly as given without appended data`` () =
             InvalidPackagePathException("../escape", "msg-l")
             PackageLeaseException(AgentId.New(), "sync-worker-1", "acquire", "msg-m")
             ReplyMismatchException(session, "req-1", "msg-n")
+            ModelDeniedException("anthropic", "claude-sonnet", "msg-o")
         ]
 
     exs
@@ -202,6 +213,7 @@ let ``Messages are returned exactly as given without appended data`` () =
             "msg-l"
             "msg-m"
             "msg-n"
+            "msg-o"
         ]
 
 [<Fact>]
