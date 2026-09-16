@@ -117,6 +117,56 @@ type SessionEventStoreConformance
         }
 
     [<Fact>]
+    member this.``Appends across batches continue the per-session sequence``() =
+        task {
+            let! sessionId, claim = this.ClaimedSession()
+
+            let first =
+                ([
+                    this.Delta(sessionId, claim.TurnId)
+                    this.Delta(sessionId, claim.TurnId)
+                ]
+                :> IReadOnlyList<_>)
+
+            let! firstOutcome = eventStore.Append(tenant, sessionId, claim.Token, first, CancellationToken.None)
+
+            match firstOutcome with
+            | :? EventAppended as appended ->
+                let sequences =
+                    appended.Events |> Seq.map (fun event -> event.Sequence.Value) |> Seq.toList
+
+                Assert.Equal<int64 list>([ 1L; 2L ], sequences)
+            | _ -> failwith "expected the first batch appended"
+
+            let second =
+                ([
+                    this.Delta(sessionId, claim.TurnId)
+                    this.Delta(sessionId, claim.TurnId)
+                ]
+                :> IReadOnlyList<_>)
+
+            let! secondOutcome = eventStore.Append(tenant, sessionId, claim.Token, second, CancellationToken.None)
+
+            match secondOutcome with
+            | :? EventAppended as appended ->
+                let sequences =
+                    appended.Events |> Seq.map (fun event -> event.Sequence.Value) |> Seq.toList
+
+                Assert.Equal<int64 list>([ 3L; 4L ], sequences)
+            | _ -> failwith "expected the second batch appended"
+
+            let! replayed = eventStore.Replay(tenant, sessionId, 0L, 10, CancellationToken.None)
+
+            match replayed with
+            | :? EventReplayPage as page ->
+                let sequences =
+                    page.Events |> Seq.map (fun event -> event.Sequence.Value) |> Seq.toList
+
+                Assert.Equal<int64 list>([ 1L; 2L; 3L; 4L ], sequences)
+            | _ -> failwith "expected the ordered replay"
+        }
+
+    [<Fact>]
     member this.``A stale claim token writes nothing``() =
         task {
             let! sessionId, claim = this.ClaimedSession()
@@ -177,6 +227,30 @@ type SessionEventStoreConformance
         }
 
     [<Fact>]
+    member this.``Replay at the end cursor yields EndOfStream``() =
+        task {
+            let! sessionId, claim = this.ClaimedSession()
+
+            let batch = ([ this.Delta(sessionId, claim.TurnId) ] :> IReadOnlyList<_>)
+
+            let! appended = eventStore.Append(tenant, sessionId, claim.Token, batch, CancellationToken.None)
+
+            Assert.True(appended :? EventAppended)
+
+            // The cursor at the last sequence is exhausted: there is
+            // nothing strictly greater left to page.
+            let! drained = eventStore.Replay(tenant, sessionId, 1L, 10, CancellationToken.None)
+
+            Assert.True(drained :? EventReplayEndOfStream)
+
+            // A cursor past the end resolves the same way: no
+            // malformed-cursor branch exists.
+            let! beyond = eventStore.Replay(tenant, sessionId, 99L, 10, CancellationToken.None)
+
+            Assert.True(beyond :? EventReplayEndOfStream)
+        }
+
+    [<Fact>]
     member this.``Cleanup lease is single-winner and fenced``() =
         task {
             let! sessionId, claim = this.ClaimedSession()
@@ -233,6 +307,122 @@ type SessionEventStoreConformance
             let lease = (replanted :?> EventCleanupClaimed).Claim
 
             let! completed = eventStore.CompleteCleanup(tenant, sessionId, lease.Token, CancellationToken.None)
+
+            Assert.True(
+                (completed :? EventCleanupApplied)
+                && (completed :?> EventCleanupApplied).Completed
+            )
+
+            let! expired = eventStore.Replay(tenant, sessionId, 0L, 10, CancellationToken.None)
+
+            Assert.True(expired :? EventReplayJournalExpired)
+        }
+
+    [<Fact>]
+    member this.``DeferCleanup and CompleteCleanup reject a stale token``() =
+        task {
+            let! sessionId, claim = this.ClaimedSession()
+
+            let! appended =
+                eventStore.Append(
+                    tenant,
+                    sessionId,
+                    claim.Token,
+                    ([ this.Delta(sessionId, claim.TurnId) ] :> IReadOnlyList<_>),
+                    CancellationToken.None
+                )
+
+            Assert.True(appended :? EventAppended)
+
+            let! granted =
+                eventStore.TryClaimCleanup(
+                    tenant,
+                    sessionId,
+                    "cleanup-worker",
+                    TimeSpan.FromMinutes 5.,
+                    CancellationToken.None
+                )
+
+            Assert.True(granted :? EventCleanupClaimed)
+
+            let! deferRejected = eventStore.DeferCleanup(tenant, sessionId, "stale-token", CancellationToken.None)
+
+            Assert.True(deferRejected :? EventCleanupRejected)
+
+            let! completeRejected = eventStore.CompleteCleanup(tenant, sessionId, "stale-token", CancellationToken.None)
+
+            Assert.True(completeRejected :? EventCleanupRejected)
+
+            // The rejected settlements changed nothing: the journal still
+            // replays its event.
+            let! replayed = eventStore.Replay(tenant, sessionId, 0L, 10, CancellationToken.None)
+
+            match replayed with
+            | :? EventReplayPage as page -> Assert.Equal(1, page.Events.Count)
+            | _ -> failwith "expected the journal intact after rejected settlements"
+        }
+
+    [<Fact>]
+    member this.``A lapsed cleanup lease re-opens to a second winner``() =
+        task {
+            let! sessionId, claim = this.ClaimedSession()
+
+            let! appended =
+                eventStore.Append(
+                    tenant,
+                    sessionId,
+                    claim.Token,
+                    ([ this.Delta(sessionId, claim.TurnId) ] :> IReadOnlyList<_>),
+                    CancellationToken.None
+                )
+
+            Assert.True(appended :? EventAppended)
+
+            // Another tenant sees no journal to lease.
+            let! foreign =
+                eventStore.TryClaimCleanup(
+                    this.OtherTenant,
+                    sessionId,
+                    "cleanup-worker",
+                    TimeSpan.FromMinutes 5.,
+                    CancellationToken.None
+                )
+
+            Assert.True(foreign :? EventCleanupNotClaimable)
+
+            let! granted =
+                eventStore.TryClaimCleanup(
+                    tenant,
+                    sessionId,
+                    "cleanup-worker",
+                    TimeSpan.FromMinutes 5.,
+                    CancellationToken.None
+                )
+
+            let lease = (granted :?> EventCleanupClaimed).Claim
+
+            // Past the lease with no settlement: a second worker wins.
+            this.Clock.Advance(TimeSpan.FromMinutes 6.)
+
+            let! reclaimed =
+                eventStore.TryClaimCleanup(
+                    tenant,
+                    sessionId,
+                    "cleanup-worker-2",
+                    TimeSpan.FromMinutes 5.,
+                    CancellationToken.None
+                )
+
+            Assert.True(reclaimed :? EventCleanupClaimed)
+
+            let winner = (reclaimed :?> EventCleanupClaimed).Claim
+
+            // The lapsed token settles nothing.
+            let! loserComplete = eventStore.CompleteCleanup(tenant, sessionId, lease.Token, CancellationToken.None)
+
+            Assert.True(loserComplete :? EventCleanupRejected)
+
+            let! completed = eventStore.CompleteCleanup(tenant, sessionId, winner.Token, CancellationToken.None)
 
             Assert.True(
                 (completed :? EventCleanupApplied)
