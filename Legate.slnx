@@ -5,6 +5,7 @@
     <Project Path="src/Legate.Llm.Google/Legate.Llm.Google.fsproj" />
     <Project Path="src/Legate.Llm.OpenAI/Legate.Llm.OpenAI.fsproj" />
     <Project Path="src/Legate.Storage.InMemory/Legate.Storage.InMemory.fsproj" />
+    <Project Path="src/Legate.Storage.Postgres/Legate.Storage.Postgres.fsproj" />
     <Project Path="src/Legate.Storage.Migrations/Legate.Storage.Migrations.fsproj" />
     <Project Path="src/Legate.Storage.Sqlite/Legate.Storage.Sqlite.fsproj" />
     <Project Path="src/Legate.Testing/Legate.Testing.fsproj" />
@@ -13,6 +14,7 @@
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/Legate.Tests/Legate.Tests.fsproj" />
+    <Project Path="tests/Legate.Storage.Postgres.Tests/Legate.Storage.Postgres.Tests.fsproj" />
   </Folder>
   <Folder Name="/samples/">
     <Project Path="samples/LegateCli/LegateCli.fsproj" />

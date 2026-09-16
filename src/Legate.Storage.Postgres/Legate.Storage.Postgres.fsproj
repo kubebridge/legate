@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>Legate.Storage.Postgres</RootNamespace>
+    <Description>PostgreSQL implementations of the Legate store contracts: sessions, events, and agents over the shared relational baseline, with row-locked claims and tenant-scoped queries. For hosted multi-tenant services.</Description>
+  </PropertyGroup>
+
+  <!-- Compile order is explicit: register every new file here, in dependency order. -->
+  <ItemGroup>
+    <Compile Include="PostgresOptions.fs" />
+    <Compile Include="PostgresSql.fs" />
+    <Compile Include="PostgresSessionStore.fs" />
+    <Compile Include="PostgresSessionEventStore.fs" />
+    <Compile Include="PostgresAgentStore.fs" />
+    <Compile Include="PostgresRegistration.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../Legate.Abstractions/Legate.Abstractions.fsproj" />
+    <ProjectReference Include="../Legate/Legate.fsproj" />
+    <ProjectReference Include="../Legate.Storage.Migrations/Legate.Storage.Migrations.fsproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="FluentMigrator.Runner" />
+    <PackageReference Include="FluentMigrator.Runner.Postgres" />
+    <PackageReference Include="FSharp.Core" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Abstractions" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Binder" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" />
+    <PackageReference Include="Microsoft.Extensions.Options" />
+    <PackageReference Include="Npgsql" />
+    <PackageReference Include="Ulid" />
+  </ItemGroup>
+
+</Project>

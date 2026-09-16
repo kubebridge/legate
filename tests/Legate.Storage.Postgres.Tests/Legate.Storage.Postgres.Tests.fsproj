@@ -1,0 +1,54 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <IsPackable>false</IsPackable>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <IsTestProject>true</IsTestProject>
+    <RootNamespace>Legate.Storage.Postgres.Tests</RootNamespace>
+  </PropertyGroup>
+
+  <!-- Compile order is explicit: register every new file here, in dependency order.
+       The Docker-backed suites compile on non-Windows only: xUnit 2.9 has no
+       dynamic-skip mechanism (verified against the 2.9.3 runner assemblies),
+       so the Windows CI leg excludes them at compile time and never attempts
+       a container. A Windows host with Linux-container Docker opts back in
+       explicitly (-p:LegatePostgresDocker=true). The gate
+       (PostgresTestDatabase) and the Docker-free registration tests compile
+       everywhere. -->
+  <ItemGroup>
+    <Compile Include="TestAssembly.fs" />
+    <Compile Include="PostgresTestDatabase.fs" />
+    <Compile Include="PostgresSessionStoreTests.fs" Condition="'$(OS)' != 'Windows_NT' or '$(LegatePostgresDocker)' == 'true'" />
+    <Compile Include="PostgresSessionEventStoreTests.fs" Condition="'$(OS)' != 'Windows_NT' or '$(LegatePostgresDocker)' == 'true'" />
+    <Compile Include="PostgresAgentStoreTests.fs" Condition="'$(OS)' != 'Windows_NT' or '$(LegatePostgresDocker)' == 'true'" />
+    <Compile Include="PostgresMigrationTests.fs" Condition="'$(OS)' != 'Windows_NT' or '$(LegatePostgresDocker)' == 'true'" />
+    <Compile Include="PostgresTenantIsolationTests.fs" Condition="'$(OS)' != 'Windows_NT' or '$(LegatePostgresDocker)' == 'true'" />
+    <Compile Include="PostgresClaimFencingTests.fs" Condition="'$(OS)' != 'Windows_NT' or '$(LegatePostgresDocker)' == 'true'" />
+    <Compile Include="PostgresLimitTests.fs" Condition="'$(OS)' != 'Windows_NT' or '$(LegatePostgresDocker)' == 'true'" />
+    <Compile Include="PostgresRegistrationTests.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../src/Legate.Abstractions/Legate.Abstractions.fsproj" />
+    <ProjectReference Include="../../src/Legate/Legate.fsproj" />
+    <ProjectReference Include="../../src/Legate.Storage.Migrations/Legate.Storage.Migrations.fsproj" />
+    <ProjectReference Include="../../src/Legate.Storage.Postgres/Legate.Storage.Postgres.fsproj" />
+    <ProjectReference Include="../../src/Legate.Testing/Legate.Testing.fsproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="FluentMigrator.Runner" />
+    <PackageReference Include="FluentMigrator.Runner.Postgres" />
+    <PackageReference Include="FSharp.Core" />
+    <PackageReference Include="Microsoft.Extensions.Configuration" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Binder" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection" />
+    <PackageReference Include="Microsoft.Extensions.Options" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="Npgsql" />
+    <PackageReference Include="Testcontainers.PostgreSql" />
+    <PackageReference Include="xunit" />
+    <PackageReference Include="xunit.runner.visualstudio" />
+  </ItemGroup>
+
+</Project>
