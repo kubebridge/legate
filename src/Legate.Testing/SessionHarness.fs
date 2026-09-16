@@ -197,20 +197,20 @@ type internal HarnessSignals() =
             | :? QuestionAskedEvent as asked when not (isNull (box asked)) -> this.SignalSuspend asked.QuestionId
             | _ -> ()
 
-    /// Takes a parked suspension id, if the journal wrote one before the
-    /// waiter attached.
-    member _.TakeSticky() : string option =
+    /// Takes a parked suspension id, or parks a waiter for the next
+    /// signal, atomically under one lock: a signal landing between a
+    /// separate take and park would leave sticky set while the parked
+    /// waiter hangs to its bound.
+    member _.TakeOrWaitSuspend() : Task<string> =
         lock suspendGate (fun () ->
-            let sticky = stickySuspend
-            stickySuspend <- None
-            sticky)
-
-    /// Parks a waiter for the next suspension signal.
-    member _.WaitSuspend() : TaskCompletionSource<string> =
-        lock suspendGate (fun () ->
-            let waiter = TaskCompletionSource<string>()
-            suspendWaiter <- Some waiter
-            waiter)
+            match stickySuspend with
+            | Some value ->
+                stickySuspend <- None
+                Task.FromResult(value)
+            | None ->
+                let waiter = TaskCompletionSource<string>()
+                suspendWaiter <- Some waiter
+                waiter.Task)
 
 /// A scripted session under test: an in-memory store pair, a local actor
 /// system, and one suspendable session actor driven by the scripted client
@@ -673,32 +673,31 @@ type SessionHarness
 
             match snapshot.PendingRequestId with
             | null ->
-                match signals.TakeSticky() with
-                | Some requestId -> return requestId
-                | None ->
-                    let waiter = signals.WaitSuspend()
-                    let mutable outcome: string option = None
+                // Take-or-park under one lock: a signal landing between a
+                // separate take and park would leave sticky set while the
+                // parked waiter hangs to its bound.
+                let mutable outcome: string option = None
 
-                    try
-                        let! signaled = waiter.Task.WaitAsync(waitBound, cancellationToken)
-                        outcome <- Some signaled
-                    with :? TimeoutException ->
-                        ()
+                try
+                    let! signaled = signals.TakeOrWaitSuspend().WaitAsync(waitBound, cancellationToken)
+                    outcome <- Some signaled
+                with :? TimeoutException ->
+                    ()
 
-                    match outcome with
-                    | None -> return raise (TimeoutException("The harness timed out waiting for the turn to suspend."))
-                    | Some _ ->
-                        let! parked = SessionActor.getSuspendSnapshotAsync actor cancellationToken
+                match outcome with
+                | None -> return raise (TimeoutException("The harness timed out waiting for the turn to suspend."))
+                | Some _ ->
+                    let! parked = SessionActor.getSuspendSnapshotAsync actor cancellationToken
 
-                        match parked.PendingRequestId with
-                        | null ->
-                            return
-                                raise (
-                                    InvalidOperationException(
-                                        "The suspension resolved before the harness observed its request id."
-                                    )
+                    match parked.PendingRequestId with
+                    | null ->
+                        return
+                            raise (
+                                InvalidOperationException(
+                                    "The suspension resolved before the harness observed its request id."
                                 )
-                        | requestId -> return requestId
+                            )
+                    | requestId -> return requestId
             | requestId -> return requestId
         }
 

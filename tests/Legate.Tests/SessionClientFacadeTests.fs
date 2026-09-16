@@ -386,6 +386,11 @@ let ``Prompt with Interrupt pre-empts and drains first`` () : Task =
 
                         interrupted.Delivery |> should equal DeliveryMode.Interrupt
 
+                        // Queue the second waiter before releasing the blocker:
+                        // the hub is FIFO with no replay, so a waiter enqueued
+                        // after the interrupt turn settles would hang to its
+                        // bound (see WaitForSettleAsync docs).
+                        let secondWaiter = settleWaiter created.Id
                         release.TrySetResult("unblocked") |> ignore
                         let! first = awaitWhat waiter.Task "the pre-empted turn to settle"
                         first.Status |> should equal TurnStatus.Aborted
@@ -396,7 +401,6 @@ let ``Prompt with Interrupt pre-empts and drains first`` () : Task =
                             aborted.Reason |> should equal SessionActor.InterruptReason
                         | _ -> failwith "Expected the pre-empted turn to settle Aborted."
 
-                        let secondWaiter = settleWaiter created.Id
                         let! second = awaitWhat secondWaiter.Task "the interrupt turn to settle"
                         second.Status |> should equal TurnStatus.Completed
                         second.AssistantText |> should equal "second"
