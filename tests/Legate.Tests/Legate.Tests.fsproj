@@ -104,6 +104,14 @@
     <Compile Include="SessionClientFacadeTests.fs" />
     <Compile Include="LegateCliSmokeTests.fs" />
     <Compile Include="MigrationTests.fs" />
+    <Compile Include="SqliteTestFixture.fs" />
+    <Compile Include="SqliteSessionStoreTests.fs" />
+    <Compile Include="SqliteSessionEventStoreTests.fs" />
+    <Compile Include="SqliteAgentStoreTests.fs" />
+    <Compile Include="SqliteBlobStoreTests.fs" />
+    <Compile Include="SqliteAgentPackageStoreTests.fs" />
+    <Compile Include="SqliteOpenTests.fs" />
+    <Compile Include="SqliteSecondProcessTests.fs" />
   </ItemGroup>
 
   <ItemGroup>
@@ -113,6 +121,7 @@
     <ProjectReference Include="../../src/Legate.Llm.Google/Legate.Llm.Google.fsproj" />
     <ProjectReference Include="../../src/Legate.Llm.OpenAI/Legate.Llm.OpenAI.fsproj" />
     <ProjectReference Include="../../src/Legate.Storage.InMemory/Legate.Storage.InMemory.fsproj" />
+    <ProjectReference Include="../../src/Legate.Storage.Sqlite/Legate.Storage.Sqlite.fsproj" />
     <ProjectReference Include="../../src/Legate.Testing/Legate.Testing.fsproj" />
     <ProjectReference Include="../../src/Legate.Workspace.Process/Legate.Workspace.Process.fsproj" />
     <ProjectReference Include="../../src/Legate.Mcp/Legate.Mcp.fsproj" />
