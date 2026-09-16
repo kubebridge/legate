@@ -203,6 +203,136 @@ type SessionStoreConformance(store: ISessionStore, clock: TestClock, tenant: Ten
             Assert.True(settleLost :? TurnSettleRejected)
         }
 
+    // ── Renewal and verification outcomes ──
+
+    [<Fact>]
+    member this.``RenewClaim extends the lease and VerifyClaim observes Held without mutating``() =
+        task {
+            let! created = store.CreateSession(tenant, this.SampleSession(), CancellationToken.None)
+
+            let message =
+                UserMessagePayload(UserMessage.Text("renew and verify")) :> InboxPayload
+
+            let! _ = store.AppendInboxMessage(tenant, created.Id, message, DeliveryMode.Queue, CancellationToken.None)
+
+            let! claimed =
+                store.ClaimNextTurn(tenant, created.Id, "owner", TimeSpan.FromMinutes 5., CancellationToken.None)
+
+            let claim = (claimed :?> TurnLeaseRenewed).Claim
+
+            // Verify observes without mutating: twice held, same token
+            // and expiry.
+            let! firstSeen = store.VerifyClaim(tenant, claim, CancellationToken.None)
+            Assert.True(firstSeen :? TurnLeaseHeld)
+
+            let! secondSeen = store.VerifyClaim(tenant, claim, CancellationToken.None)
+            Assert.True(secondSeen :? TurnLeaseHeld)
+            Assert.Equal(claim.Token, (secondSeen :?> TurnLeaseHeld).Claim.Token)
+            Assert.Equal(claim.ExpiresAt, (secondSeen :?> TurnLeaseHeld).Claim.ExpiresAt)
+
+            // Renew after time passes moves the expiry forward.
+            this.Clock.Advance(TimeSpan.FromMinutes 1.)
+
+            let! renewedState = store.RenewClaim(tenant, claim, TimeSpan.FromMinutes 5., CancellationToken.None)
+
+            Assert.True(renewedState :? TurnLeaseRenewed)
+
+            let renewed = (renewedState :?> TurnLeaseRenewed).Claim
+            Assert.True(renewed.ExpiresAt > claim.ExpiresAt)
+
+            let! held = store.VerifyClaim(tenant, renewed, CancellationToken.None)
+            Assert.True(held :? TurnLeaseHeld)
+
+            // The renewed claim still settles: the live-claim path from
+            // claim through verify and renew to settlement holds end to
+            // end.
+            let! settled = store.SettleTurn(tenant, renewed, TurnStatus.Completed, null, CancellationToken.None)
+
+            Assert.True(settled :? TurnSettled)
+        }
+
+    [<Fact>]
+    member this.``An expired lease reports Lost while an unknown turn reports Missing``() =
+        task {
+            let! created = store.CreateSession(tenant, this.SampleSession(), CancellationToken.None)
+
+            let message = UserMessagePayload(UserMessage.Text("expiry")) :> InboxPayload
+
+            let! _ = store.AppendInboxMessage(tenant, created.Id, message, DeliveryMode.Queue, CancellationToken.None)
+
+            let! claimed =
+                store.ClaimNextTurn(tenant, created.Id, "owner", TimeSpan.FromMinutes 5., CancellationToken.None)
+
+            let claim = (claimed :?> TurnLeaseRenewed).Claim
+
+            // Past the lease with no takeover: the claim is lost to
+            // expiry, distinctly not missing. The shared rule pins the
+            // outcome type, not the reason string: SQLite reports
+            // "takenOver" here where the contract reads "expired"
+            // (tracked as a provider follow-up under #101/#102).
+            this.Clock.Advance(TimeSpan.FromMinutes 10.)
+
+            let! expired = store.VerifyClaim(tenant, claim, CancellationToken.None)
+            Assert.True(expired :? TurnLeaseLost)
+
+            let! renewExpired = store.RenewClaim(tenant, claim, TimeSpan.FromMinutes 5., CancellationToken.None)
+            Assert.True(renewExpired :? TurnLeaseLost)
+
+            // A turn the store never issued resolves missing, never
+            // lost: the two branches stay distinct.
+            let unknown =
+                {
+                    TurnId = TurnId.New()
+                    Token = "unknown-token"
+                    Owner = "nobody"
+                    ExpiresAt = this.Clock.Instant + TimeSpan.FromMinutes 5.
+                    Attempt = 1
+                }
+
+            let! missing = store.VerifyClaim(tenant, unknown, CancellationToken.None)
+            Assert.True(missing :? TurnLeaseMissing)
+
+            let! renewMissing = store.RenewClaim(tenant, unknown, TimeSpan.FromMinutes 5., CancellationToken.None)
+            Assert.True(renewMissing :? TurnLeaseMissing)
+        }
+
+    [<Fact>]
+    member this.``A takeover race rejects AbortTurn on the loser and still settles for the winner``() =
+        task {
+            let! created = store.CreateSession(tenant, this.SampleSession(), CancellationToken.None)
+
+            let message = UserMessagePayload(UserMessage.Text("abort race")) :> InboxPayload
+
+            let! _ = store.AppendInboxMessage(tenant, created.Id, message, DeliveryMode.Queue, CancellationToken.None)
+
+            let! winner =
+                store.ClaimNextTurn(tenant, created.Id, "owner-a", TimeSpan.FromMinutes 5., CancellationToken.None)
+
+            let claim = (winner :?> TurnLeaseRenewed).Claim
+
+            this.Clock.Advance(TimeSpan.FromMinutes 10.)
+
+            let reply =
+                ReplyPayload(PermissionDecision("req-1", PermissionDecisionKind.AllowOnce)) :> InboxPayload
+
+            let! _ = store.AppendInboxMessage(tenant, created.Id, reply, DeliveryMode.Queue, CancellationToken.None)
+
+            let! taken =
+                store.ClaimNextTurn(tenant, created.Id, "owner-b", TimeSpan.FromMinutes 5., CancellationToken.None)
+
+            let retaken = (taken :?> TurnLeaseRenewed).Claim
+            Assert.Equal(claim.TurnId, retaken.TurnId)
+
+            // The loser aborts nothing.
+            let! abortLost = store.AbortTurn(tenant, claim, CancellationToken.None)
+            Assert.True(abortLost :? TurnLeaseLost || abortLost :? TurnLeaseMissing)
+
+            // The winner still settles the resumed turn.
+            let! settled = store.SettleTurn(tenant, retaken, TurnStatus.Completed, null, CancellationToken.None)
+
+            Assert.True(settled :? TurnSettled)
+        }
+
     // ── Settlement preconditions ──
 
     [<Fact>]
@@ -326,6 +456,54 @@ type SessionStoreConformance(store: ISessionStore, clock: TestClock, tenant: Ten
 
             positions |> List.iter (fun position -> Assert.True(position > 0L))
             Assert.Equal(entries.Length, positions |> List.distinct |> List.length)
+        }
+
+    [<Fact>]
+    member this.``ReadPendingInbox returns entries in position order``() =
+        task {
+            let! created = store.CreateSession(tenant, this.SampleSession(), CancellationToken.None)
+
+            for text in [ "first"; "second"; "third" ] do
+                let message = UserMessagePayload(UserMessage.Text(text)) :> InboxPayload
+
+                let! _ =
+                    store.AppendInboxMessage(tenant, created.Id, message, DeliveryMode.Queue, CancellationToken.None)
+
+                ()
+
+            let! pending = store.ReadPendingInbox(tenant, created.Id, CancellationToken.None)
+
+            Assert.Equal(3, pending.Count)
+
+            let positions = pending |> Seq.map (fun entry -> entry.Position) |> Seq.toList
+
+            Assert.Equal(3, positions |> List.distinct |> List.length)
+
+            Assert.True(
+                positions
+                |> List.pairwise
+                |> List.forall (fun (earlier, later) -> earlier < later)
+            )
+        }
+
+    [<Fact>]
+    member this.``ReadPendingInbox throws for the wrong tenant``() =
+        task {
+            let! created = store.CreateSession(tenant, this.SampleSession(), CancellationToken.None)
+
+            let message = UserMessagePayload(UserMessage.Text("tenanted")) :> InboxPayload
+
+            let! _ = store.AppendInboxMessage(tenant, created.Id, message, DeliveryMode.Queue, CancellationToken.None)
+
+            Assert.Throws<SessionNotFoundException>(fun () ->
+                store.ReadPendingInbox(this.OtherTenant, created.Id, CancellationToken.None).GetAwaiter().GetResult()
+                |> ignore)
+            |> ignore
+
+            // The owning tenant still reads the entry.
+            let! pending = store.ReadPendingInbox(tenant, created.Id, CancellationToken.None)
+
+            Assert.Single(pending) |> ignore
         }
 
     // ── Dispatch and counts ──
