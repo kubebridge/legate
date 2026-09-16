@@ -101,6 +101,7 @@ let private startService
                 "production"
                 leaseDuration
                 runner
+                (fun _ _ -> None)
         )
 
     (service :> IHostedService).StartAsync(CancellationToken.None).GetAwaiter().GetResult()
@@ -163,14 +164,16 @@ let private collectJournal (journal: ISessionEventStore) (sessionId: SessionId) 
 
 /// Builds the production runner over a scripted client and stub tools.
 let private productionRunner
+    (store: ISessionStore)
     (client: ScriptedChatClient)
     (tools: IReadOnlyDictionary<string, AITool>)
     (policy: IPermissionPolicy | null)
     : SessionActor.SuspendableRunner =
     SessionPermissions.createRunner
         (client :> IChatClient)
-        tools
-        TurnLoop.TurnLoopOptions.Default
+        store
+        tenant
+        (fun _ -> (tools, TurnLoop.TurnLoopOptions.Default))
         (NeverDelay() :> ILlmDelay)
         policy
         None
@@ -201,7 +204,7 @@ let ``Ask suspends the live factory-spawned actor with the request journaled sto
         ScriptPolicy(Map.ofList [ "exec", PermissionVerdict.Ask ]) :> IPermissionPolicy
 
     let service =
-        startService store journal (productionRunner client tools policy) (TimeSpan.FromHours 1.0)
+        startService store journal (productionRunner store client tools policy) (TimeSpan.FromHours 1.0)
 
     try
         let child = resolveChild service created.Id
@@ -269,7 +272,7 @@ let ``Deny on the live path skips the tool effect and continues the turn`` () =
         :> IPermissionPolicy
 
     let service =
-        startService store journal (productionRunner client tools policy) (TimeSpan.FromHours 1.0)
+        startService store journal (productionRunner store client tools policy) (TimeSpan.FromHours 1.0)
 
     try
         let child = resolveChild service created.Id
@@ -311,7 +314,7 @@ let ``AllowOnce reply resumes the live turn and journals the resolve`` () =
         ScriptPolicy(Map.ofList [ "exec", PermissionVerdict.Ask ]) :> IPermissionPolicy
 
     let service =
-        startService store journal (productionRunner client tools policy) (TimeSpan.FromHours 1.0)
+        startService store journal (productionRunner store client tools policy) (TimeSpan.FromHours 1.0)
 
     try
         let child = resolveChild service created.Id
@@ -377,6 +380,7 @@ let ``AllowForSession grants survive restart through the session store`` () =
             store
             journal
             (productionRunner
+                store
                 client1
                 (makeTools
                     [
@@ -433,6 +437,7 @@ let ``AllowForSession grants survive restart through the session store`` () =
             store
             journal
             (productionRunner
+                store
                 client2
                 (makeTools
                     [
@@ -480,7 +485,7 @@ let ``Closing the live session evicts the grant memory`` () =
         ScriptPolicy(Map.ofList [ "exec", PermissionVerdict.Ask ]) :> IPermissionPolicy
 
     let service =
-        startService store journal (productionRunner client tools policy) (TimeSpan.FromHours 1.0)
+        startService store journal (productionRunner store client tools policy) (TimeSpan.FromHours 1.0)
 
     try
         let child = resolveChild service created.Id
@@ -546,7 +551,7 @@ let ``Permission events from the live path derive system cells`` () =
         ScriptPolicy(Map.ofList [ "exec", PermissionVerdict.Ask ]) :> IPermissionPolicy
 
     let service =
-        startService store journal (productionRunner client tools policy) (TimeSpan.FromHours 1.0)
+        startService store journal (productionRunner store client tools policy) (TimeSpan.FromHours 1.0)
 
     try
         let child = resolveChild service created.Id
@@ -659,7 +664,7 @@ let ``Null policy runs the live turn with no gate`` () =
         startService
             store
             journal
-            (productionRunner client tools Unchecked.defaultof<IPermissionPolicy>)
+            (productionRunner store client tools Unchecked.defaultof<IPermissionPolicy>)
             (TimeSpan.FromHours 1.0)
 
     try
@@ -709,6 +714,7 @@ let ``spawnSuspendFactory rejects invalid wiring`` () =
             "production"
             (TimeSpan.FromHours 1.0)
             runner
+            (fun _ _ -> None)
         |> ignore)
     |> should throw typeof<ArgumentNullException>
 
@@ -722,6 +728,7 @@ let ``spawnSuspendFactory rejects invalid wiring`` () =
             "  "
             (TimeSpan.FromHours 1.0)
             runner
+            (fun _ _ -> None)
         |> ignore)
     |> should throw typeof<ArgumentException>
 
@@ -735,5 +742,20 @@ let ``spawnSuspendFactory rejects invalid wiring`` () =
             "production"
             (TimeSpan.FromHours 1.0)
             runner
+            (fun _ _ -> None)
         |> ignore)
     |> should throw typeof<ArgumentOutOfRangeException>
+
+    (fun () ->
+        SessionActor.spawnSuspendFactory
+            store
+            tenant
+            journal
+            (NeverDelay() :> ILlmDelay)
+            (TimeSpan.FromMinutes 5.0)
+            "production"
+            (TimeSpan.FromHours 1.0)
+            runner
+            Unchecked.defaultof<SessionId -> string -> CompactDeps option>
+        |> ignore)
+    |> should throw typeof<ArgumentNullException>

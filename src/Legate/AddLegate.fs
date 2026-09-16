@@ -28,8 +28,9 @@ open Microsoft.Extensions.DependencyInjection.Extensions
 /// registrations always win. Missing required registrations (no provider, no
 /// session store, no workspace runtime) fail at host start with one message
 /// listing everything missing. Registers the local actor system hosted
-/// service (Local cluster mode only; Clustered mode is untouched) and
-/// never a session client facade (later cycles own it).
+/// service (Local cluster mode only; Clustered mode is untouched) and the
+/// session client facade (SessionClient over the suspendable router wiring
+/// for hosts that registered an IChatClient, identity children otherwise).
 [<Sealed; AbstractClass; Extension>]
 type LegateServiceCollectionExtensions =
 
@@ -84,6 +85,7 @@ type LegateServiceCollectionExtensions =
         LegateDefaultRegistration.register services
         LegateStartupChecks.register services
         LocalActorSystemRegistration.register services
+        SessionClientRegistration.register services
         CompletionRedriverRegistration.register services
         services
 

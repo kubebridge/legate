@@ -453,8 +453,9 @@ type PermissionsBuilder internal (services: IServiceCollection) as this =
 /// The Microsoft-style builder hosts configure inside
 /// <c>services.AddLegate(configure)</c>: seven sub-builders plus
 /// <see cref="M:Legate.LegateBuilder.UseConfiguration(Microsoft.Extensions.Configuration.IConfigurationSection)" />.
-/// The local actor system registers through AddLegate (Local mode only);
-/// no session client facade yet (later cycles own it): registration,
+/// The local actor system registers through AddLegate (Local mode only)
+/// with the session client facade (SessionClient over the suspendable
+/// router wiring for hosts that registered an IChatClient): registration,
 /// options, and startup validation only.
 [<Sealed>]
 type LegateBuilder internal (services: IServiceCollection) as this =

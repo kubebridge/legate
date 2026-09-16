@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "fixture": {
+      "command": "dotnet",
+      "args": ["${LEGATE_MCP_FIXTURE_DLL}"]
+    }
+  }
+}
