@@ -141,8 +141,9 @@ Legate                      runtime: actors, sharding, dispatcher, ReAct loop, b
                             local LLM coordinator, hosted services, AddLegate()
 Legate.Llm.OpenAI           OpenAI, Anthropic (OpenAI-compatible), Ollama Cloud, any compatible base URL
 Legate.Llm.Google           Gemini via Google.GenAI
-Legate.Storage.Postgres     ISessionStore, ISessionEventStore, IAgentStore + migrations
+Legate.Storage.Postgres     ISessionStore, ISessionEventStore, IAgentStore (migrations shared, see below)
 Legate.Storage.Sqlite       same stores on one SQLite file (CLI harness)
+Legate.Storage.Migrations   shared FluentMigrator baseline both relational providers apply
 Legate.Storage.S3           IBlobStore, IAgentPackageStore
 Legate.Storage.FileSystem   IBlobStore, IAgentPackageStore on local disk
 Legate.Storage.InMemory     all stores in memory (tests, samples)
@@ -160,6 +161,61 @@ packages are added under `src/<PackageName>/` with a matching test module in
 `tests/Legate.Tests` (or their own `tests/<PackageName>.Tests` when they need
 external services), registered in `Legate.slnx`, and versioned through
 `Directory.Packages.props`.
+
+## Relational schema
+
+One shared FluentMigrator baseline (`Legate.Storage.Migrations`, version
+`202609161200`) creates every table both relational providers (Postgres,
+SQLite) store into. Providers call `AddLegateMigrations` when their
+`RunMigrations` option is true and add their own processor and connection
+string; hosts with their own runner reference the package directly.
+`MigrationOptions` carries the schema (default `legate`) and the table
+prefix (default empty). An empty schema means unqualified DDL: that is how
+SQLite applies the migration (one file is one database). Later changes are
+additive-only migrations, never baseline edits; versions are UTC
+`yyyymmddHHMM` (see `AGENTS.md`).
+
+Conventions: enums as text; ids as text; timestamps as ISO-8601 text on
+both engines (stores write UTC, which sorts chronologically, and the full
+offset round-trips); payloads as unlimited text carrying System.Text.Json;
+signing secrets as opaque bytes inside the JSON, never logged. Single-column
+keys are inline `PRIMARY KEY`s; composite keys are unique indexes over
+`NOT NULL` columns (SQLite cannot add a PK constraint after creation, so one
+DDL path uses unique indexes on both engines). No foreign keys in v1:
+retention janitors delete selectively per store contract.
+
+Tables: `sessions`, `inbox`, `turns` (claim token, owner, expiry, and attempt
+on the row), `events`, `cleanup_claims`, `agents` (definition JSON plus
+extracted `schedule_enabled`/`schedule_cron`/`schedule_timezone`),
+`custom_tools` (definition JSON plus row version), plus the three
+provisional tables `schedule_occurrences`, `outbox`, and `session_grants`,
+which have no consumer yet and may be reshaped additively by their owning
+issues.
+
+Every index traces to a store query:
+
+| Index | Query |
+|---|---|
+| `sessions(tenant, updated_at)` | `ListSessions` newest-first paging |
+| `sessions(tenant, agent_id)` | `CountSessionsByAgent` capacity |
+| `inbox(session_id, consumed, position)` | `ReadPendingInbox` pending entries in position order |
+| `inbox(tenant, consumed)` | `GetDispatchCandidates` sessions-with-pending-work join |
+| `turns(session_id)` | per-session turn lookups (claim, checkpoint, settle, abort) |
+| `turns(tenant, status)` | `CountRunningSessions` capacity |
+| `events(session_id, sequence)` unique | `Replay` pages by exclusive cursor; `Subscribe` resume (no secondary index: the key order serves the cursor) |
+| `agents(tenant, agent_id)` unique | `GetAgent` point lookups; optimistic-concurrency reads |
+| `agents(tenant, schedule_enabled)` | `ListAgentsWithEnabledSchedules` dispatcher poll |
+| `custom_tools(tenant, agent_id, name)` unique | `GetCustomTool` point lookups |
+| `custom_tools(tenant, agent_id, enabled)` | `ListCustomTools` enabled-per-agent load |
+| `outbox(idempotency_key)` PK | enqueue idempotency; `VerifyCompletionClaim` / `MarkCompletionDelivered` fences |
+| `outbox(delivered, created_at)` | `ClaimCompletionOutbox` oldest-first pending batch (anticipated: no consumer yet) |
+| `outbox(delivered, delivered_at)` | `PurgeDeliveredCompletions` retention (anticipated: no consumer yet) |
+| `inbox(session_id, position)` unique | append-position assignment; consume-by-position (key integrity) |
+| `schedule_occurrences(tenant, agent_id, occurrence_utc)` unique | consumed-once schedule firing dedupe (anticipated: provisional) |
+| `session_grants(tenant, session_id, tool_name)` unique | grant idempotency; session grant-list load (anticipated: provisional) |
+
+`cleanup_claims(session_id)` needs no secondary index: claim, complete, and
+defer are all point lookups by session.
 
 ## Boundaries
 

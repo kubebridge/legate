@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>Legate.Storage.Migrations</RootNamespace>
+    <Description>Shared FluentMigrator migrations for the Legate relational stores: one versioned baseline both providers apply, with a configurable schema and table prefix.</Description>
+  </PropertyGroup>
+
+  <!-- Compile order is explicit: register every new file here, in dependency order. -->
+  <ItemGroup>
+    <Compile Include="AssemblyInfo.fs" />
+    <Compile Include="MigrationOptions.fs" />
+    <Compile Include="MigrationNaming.fs" />
+    <Compile Include="BaselineV1.fs" />
+    <Compile Include="MigrationServiceExtensions.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="FSharp.Core" />
+    <PackageReference Include="FluentMigrator" />
+    <PackageReference Include="FluentMigrator.Runner" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" />
+    <PackageReference Include="Microsoft.Extensions.Options" />
+  </ItemGroup>
+
+</Project>

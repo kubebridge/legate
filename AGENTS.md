@@ -65,9 +65,12 @@ published to NuGet yet. `Docs/ARCHITECTURE.md` is the normative target.
 - **Build script**: `build.fsx` (FAKE 5) with helpers in `.build/Helpers.fs`.
   The Fantomas scope list (`fantomasPaths`) lives there once; CI calls the
   targets rather than restating paths.
-- **Migrations**: none yet. When `Legate.Storage.Postgres` lands, its
-  FluentMigrator migrations own the `legate` schema with a configurable
-  table prefix; list existing migrations before numbering a new one.
+- **Migrations**: live in the shared `Legate.Storage.Migrations` assembly
+  (never in a provider package), own the `legate` schema with a
+  configurable table prefix, and are versioned `yyyymmddHHMM` in UTC
+  (baseline v1 is `202609161200`); list existing migrations before
+  numbering a new one, and grow only additively, never by editing a
+  landed migration.
 
 ## Build & Validation
 

@@ -5,6 +5,7 @@
     <Project Path="src/Legate.Llm.Google/Legate.Llm.Google.fsproj" />
     <Project Path="src/Legate.Llm.OpenAI/Legate.Llm.OpenAI.fsproj" />
     <Project Path="src/Legate.Storage.InMemory/Legate.Storage.InMemory.fsproj" />
+    <Project Path="src/Legate.Storage.Migrations/Legate.Storage.Migrations.fsproj" />
     <Project Path="src/Legate.Testing/Legate.Testing.fsproj" />
     <Project Path="src/Legate.Workspace.Process/Legate.Workspace.Process.fsproj" />
     <Project Path="src/Legate.Mcp/Legate.Mcp.fsproj" />
