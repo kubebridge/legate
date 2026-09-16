@@ -6,6 +6,7 @@
     <PackageVersion Include="Akka" Version="1.5.71" />
     <PackageVersion Include="Akka.FSharp" Version="1.5.71" />
     <PackageVersion Include="FSharp.Core" Version="10.0.111" />
+    <PackageVersion Include="Giraffe" Version="8.3.0" />
     <PackageVersion Include="Google.GenAI" Version="1.21.0" />
     <PackageVersion Include="Microsoft.Extensions.AI.Abstractions" Version="10.8.3" />
     <PackageVersion Include="Microsoft.Extensions.AI.OpenAI" Version="10.6.0" />

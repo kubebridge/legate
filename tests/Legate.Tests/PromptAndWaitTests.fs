@@ -84,6 +84,13 @@ let ``A settled turn returns its TurnResult`` () : Task =
         Assert.Equal(1, harness.SettledResults.Count)
         Assert.Equal("done", harness.SettledResults[0].AssistantText)
 
+        // Settle barrier: OnTurnSettled fires before the actor writes Idle,
+        // so round-trip the mailbox first (as PromptAndSettleAsync does).
+        // The snapshot only answers after the finish handling (Idle write
+        // included) completed, making the following store read exact
+        // without sleeping.
+        let! _ = SessionActor.getSuspendSnapshotAsync harness.Actor CancellationToken.None
+
         let! session = harness.GetSessionAsync(CancellationToken.None)
         Assert.Equal(SessionState.Idle, session.State)
     }
