@@ -5,9 +5,13 @@
   <ItemGroup>
     <PackageVersion Include="Akka" Version="1.5.71" />
     <PackageVersion Include="Akka.FSharp" Version="1.5.71" />
+    <PackageVersion Include="FluentMigrator" Version="8.0.1" />
+    <PackageVersion Include="FluentMigrator.Runner" Version="8.0.1" />
+    <PackageVersion Include="FluentMigrator.Runner.SQLite" Version="8.0.1" />
     <PackageVersion Include="FSharp.Core" Version="10.0.111" />
     <PackageVersion Include="Giraffe" Version="8.3.0" />
     <PackageVersion Include="Google.GenAI" Version="1.21.0" />
+    <PackageVersion Include="Microsoft.Data.Sqlite" Version="10.0.12" />
     <PackageVersion Include="Microsoft.Extensions.AI.Abstractions" Version="10.8.3" />
     <PackageVersion Include="Microsoft.Extensions.AI.OpenAI" Version="10.6.0" />
     <PackageVersion Include="ModelContextProtocol.Core" Version="2.2.0" />
