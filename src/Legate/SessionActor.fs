@@ -1891,6 +1891,23 @@ module internal SessionActor =
         /// Running or WaitingForInput. Answered with SessionPromptReply.
         | SuspendableQueuePrompt of payload: InboxPayload * cancellationToken: CancellationToken
 
+        /// Inject a user message into the running suspendable turn: appends
+        /// to the durable inbox with Inject delivery, starts a suspendable
+        /// turn when Idle, folds at the next iteration boundary when Running
+        /// through the runner's drain hooks, waits when WaitingForInput,
+        /// rejects when Closed. Never aborts the running turn. Answered with
+        /// <see cref="T:Legate.SessionPromptReply" />.
+        | SuspendableInjectPrompt of payload: InboxPayload * cancellationToken: CancellationToken
+
+        /// Interrupt the running suspendable turn with a user message:
+        /// appends to the durable inbox with Interrupt delivery, starts a
+        /// suspendable turn when Idle, records the ExplicitAbort pending stop
+        /// and drains the Interrupt entry first when Running, waits when
+        /// WaitingForInput, rejects when Closed. The detached suspendable
+        /// turn runs un-cancellable, so a recorded stop wins at its next
+        /// report. Answered with <see cref="T:Legate.SessionPromptReply" />.
+        | SuspendableInterruptPrompt of payload: InboxPayload * cancellationToken: CancellationToken
+
         /// The suspendable turn finished: settled (Suspension None) or
         /// suspended (Suspension Some). One-way from the turn task.
         | SuspendableFinished of
@@ -1917,6 +1934,25 @@ module internal SessionActor =
         /// the grant memory) and the actor drops to Closed. Answered with
         /// the stored session.
         | SuspendableCloseSession of cancellationToken: CancellationToken
+
+        /// Abort the turn running in a suspendable session under a typed
+        /// stop cause: Idle and WaitingForInput (a suspended turn owns
+        /// nothing running to abort) no-op returning the current snapshot;
+        /// Running records the pending stop with first-cause-wins and answers
+        /// the snapshot. The detached suspendable turn runs un-cancellable,
+        /// so the recorded stop wins at its next report, mapping even a
+        /// success to Aborted. Only abort-family causes
+        /// (ExplicitAbort, HostShutdown) act; anything else is a no-op.
+        /// Answered with <see cref="T:Legate.SessionSnapshot" />.
+        | SuspendableAbortSession of cause: StopCause * reason: string * cancellationToken: CancellationToken
+
+        /// Compact the suspendable session on demand: Idle replays the
+        /// journal and compacts now without starting a turn, Running arms
+        /// the one-shot force flag the turn's force-aware boundary hook
+        /// honors at the next iteration, WaitingForInput no-ops (a suspended
+        /// turn owns the history), and Closed rejects. Answered with
+        /// <see cref="T:Legate.SessionCompactReply" />.
+        | SuspendableCompactSession of cancellationToken: CancellationToken
 
     /// Reason carried by TurnFailed when AskTimeout fires while suspended.
     /// Never contains secrets or tool arguments.
@@ -2022,9 +2058,12 @@ module internal SessionActor =
     /// claim heartbeat is never cancelled on suspend: renewal continues
     /// while suspended under the same claim (proven by test; no new
     /// background work, bounded by lease expiry and AskTimeout). Reply
-    /// never starts a turn: it only resumes the suspended one, and
-    /// Inject/Interrupt routing stays with #34. Abort on WaitingForInput
-    /// stays a no-op per #35.
+    /// never starts a turn: it only resumes the suspended one. Inject folds
+    /// at the next iteration boundary through the runner's drain hooks and
+    /// Interrupt pre-empts through the ExplicitAbort pending stop; the
+    /// detached suspendable turn runs un-cancellable, so a recorded stop
+    /// wins at its next report. Abort on WaitingForInput stays a no-op per
+    /// #35, as does Compact there.
     /// <param name="props">The base session actor dependencies.</param>
     /// <param name="suspend">The suspend dependencies.</param>
     /// <param name="mailbox">The actor mailbox, injected by spawn.</param>
@@ -2054,6 +2093,10 @@ module internal SessionActor =
 
         if suspend.AskTimeout <= TimeSpan.Zero then
             raise (ArgumentOutOfRangeException(nameof suspend, "SuspendDeps.AskTimeout must be positive."))
+
+        match props.Compact with
+        | Some compact -> requireCompactDeps compact
+        | None -> ()
 
         let suspendSelf = mailbox.Self
 
@@ -2107,7 +2150,7 @@ module internal SessionActor =
             match initialState, initialRebuilt with
             | SessionState.WaitingForInput, Some rebuilt ->
                 // Crash rebuild: no cursor and no running task; the matching
-                // Reply retries from the oldest pending Queue entry. The
+                // Reply retries from the oldest drainable entry. The
                 // timeout is not restarted here: the AskTimeout bound restarts
                 // when the retried turn suspends again, so a restarted host
                 // never inherits a fired deadline.
@@ -2118,13 +2161,7 @@ module internal SessionActor =
                                 props.Store.ReadPendingInbox(props.Tenant, props.SessionId, CancellationToken.None)
                             )
 
-                        pending
-                        |> Seq.filter (fun entry ->
-                            not (isNull (box entry))
-                            && entry.Delivery = DeliveryMode.Queue
-                            && (entry.Payload :? UserMessagePayload))
-                        |> Seq.sortBy (fun entry -> entry.Position)
-                        |> Seq.tryHead
+                        selectDrainableEntries pending |> List.tryHead
                     with _ ->
                         None
 
@@ -2170,6 +2207,52 @@ module internal SessionActor =
                 RunningPosition = None
                 PendingRequestId = pendingId
             }
+
+        /// Maps a reported result to the Aborted result a won stop settles:
+        /// the stop cause wins over whatever the detached turn reported,
+        /// even a success, so settlement and stop stay mutually exclusive.
+        /// Falls back to the carried result when the cause maps to no
+        /// settlement (only abort-family causes reach the pending stop, so
+        /// this never fires).
+        /// <param name="cause">The stop cause that won.</param>
+        /// <param name="reason">Why the turn stopped.</param>
+        /// <param name="result">The result the turn reported.</param>
+        /// <returns>The result the actor settles.</returns>
+        let mapSuspendAborted (cause: StopCause) (reason: string) (result: TurnResult) : TurnResult =
+            match StopArbitration.settlementFor cause reason with
+            | Some(status, outcome) ->
+                { result with
+                    Status = status
+                    Outcome = outcome
+                }
+            | None -> result
+
+        /// Builds the Aborted result a won stop settles when the turn left
+        /// no result behind (a faulted attempt): zero iterations and usage,
+        /// the abort-family outcome carrying who and why. Falls back to a
+        /// Failed result when the cause maps to no settlement (only
+        /// abort-family causes reach the pending stop, so this never fires).
+        /// <param name="cause">The stop cause that won.</param>
+        /// <param name="reason">Why the turn stopped.</param>
+        /// <returns>The result the actor settles.</returns>
+        let abortedSuspendResult (cause: StopCause) (reason: string) : TurnResult =
+            match StopArbitration.settlementFor cause reason with
+            | Some(status, outcome) ->
+                {
+                    AssistantText = ""
+                    Status = status
+                    Iterations = 0
+                    Usage = { InputTokens = 0L; OutputTokens = 0L }
+                    Outcome = outcome
+                }
+            | None ->
+                {
+                    AssistantText = ""
+                    Status = TurnStatus.Failed
+                    Iterations = 0
+                    Usage = { InputTokens = 0L; OutputTokens = 0L }
+                    Outcome = TurnFailed(reason) :> TurnOutcome
+                }
 
         let notifySettled (result: TurnResult) : unit =
             match props.OnTurnSettled with
@@ -2433,6 +2516,13 @@ module internal SessionActor =
                 Outcome = TurnFailed(AskTimeoutReason) :> TurnOutcome
             }
 
+        // The pending stop an Abort (or an Interrupt pre-empt) recorded
+        // while Running: first cause wins, cleared on every settle. A cell
+        // rather than a loop parameter: the actor processes one message
+        // fully before the next, so the actor-thread read-modify-write never
+        // races, mirroring the base loop's first-cause-wins arbitration.
+        let mutable pendingStop: (StopCause * string) option = None
+
         let rec loop (state: SessionState) (suspended: SuspendedTurn option) (resolved: HashSet<string>) =
             actor {
                 let! message = mailbox.Receive()
@@ -2469,14 +2559,7 @@ module internal SessionActor =
                             awaitTask (props.Store.ReadPendingInbox(props.Tenant, props.SessionId, cancellationToken))
 
                         let first =
-                            pending
-                            |> Seq.filter (fun candidate ->
-                                not (isNull (box candidate))
-                                && candidate.Delivery = DeliveryMode.Queue
-                                && (candidate.Payload :? UserMessagePayload))
-                            |> Seq.sortBy (fun candidate -> candidate.Position)
-                            |> Seq.tryHead
-                            |> Option.defaultValue appended
+                            selectDrainableEntries pending |> List.tryHead |> Option.defaultValue appended
 
                         startSuspendable first 1 (readGrantsNow ())
                         mailbox.Sender() <! PromptAccepted appended
@@ -2510,11 +2593,191 @@ module internal SessionActor =
 
                         mailbox.Sender() <! PromptAccepted appended
                         return! loop state suspended resolved
+                | SuspendableInjectPrompt(payload, cancellationToken) ->
+                    match state with
+                    | SessionState.Closed ->
+                        mailbox.Sender() <! PromptRejected SessionState.Closed
+                        return! loop state suspended resolved
+                    | SessionState.Idle ->
+                        let appended =
+                            awaitTask (
+                                props.Store.AppendInboxMessage(
+                                    props.Tenant,
+                                    props.SessionId,
+                                    payload,
+                                    DeliveryMode.Inject,
+                                    cancellationToken
+                                )
+                            )
+
+                        awaitTask (
+                            props.Store.UpdateSessionState(
+                                props.Tenant,
+                                props.SessionId,
+                                SessionState.Running,
+                                cancellationToken
+                            )
+                        )
+                        |> ignore
+
+                        let pending =
+                            awaitTask (props.Store.ReadPendingInbox(props.Tenant, props.SessionId, cancellationToken))
+
+                        let first =
+                            selectDrainableEntries pending |> List.tryHead |> Option.defaultValue appended
+
+                        startSuspendable first 1 (readGrantsNow ())
+                        mailbox.Sender() <! PromptAccepted appended
+                        return! loop SessionState.Running None resolved
+                    | SessionState.Running
+                    | SessionState.WaitingForInput ->
+                        // Append-and-wait: the running turn folds the entry
+                        // at its next iteration boundary through the runner's
+                        // drain hooks, and a suspended turn leaves it for the
+                        // settle drain. Never aborts.
+                        let appended =
+                            awaitTask (
+                                props.Store.AppendInboxMessage(
+                                    props.Tenant,
+                                    props.SessionId,
+                                    payload,
+                                    DeliveryMode.Inject,
+                                    cancellationToken
+                                )
+                            )
+
+                        mailbox.Sender() <! PromptAccepted appended
+                        return! loop state suspended resolved
+                    | _ ->
+                        let appended =
+                            awaitTask (
+                                props.Store.AppendInboxMessage(
+                                    props.Tenant,
+                                    props.SessionId,
+                                    payload,
+                                    DeliveryMode.Inject,
+                                    cancellationToken
+                                )
+                            )
+
+                        mailbox.Sender() <! PromptAccepted appended
+                        return! loop state suspended resolved
+                | SuspendableInterruptPrompt(payload, cancellationToken) ->
+                    match state with
+                    | SessionState.Closed ->
+                        mailbox.Sender() <! PromptRejected SessionState.Closed
+                        return! loop state suspended resolved
+                    | SessionState.Idle ->
+                        let appended =
+                            awaitTask (
+                                props.Store.AppendInboxMessage(
+                                    props.Tenant,
+                                    props.SessionId,
+                                    payload,
+                                    DeliveryMode.Interrupt,
+                                    cancellationToken
+                                )
+                            )
+
+                        awaitTask (
+                            props.Store.UpdateSessionState(
+                                props.Tenant,
+                                props.SessionId,
+                                SessionState.Running,
+                                cancellationToken
+                            )
+                        )
+                        |> ignore
+
+                        let pending =
+                            awaitTask (props.Store.ReadPendingInbox(props.Tenant, props.SessionId, cancellationToken))
+
+                        let first =
+                            selectDrainableEntries pending |> List.tryHead |> Option.defaultValue appended
+
+                        startSuspendable first 1 (readGrantsNow ())
+                        mailbox.Sender() <! PromptAccepted appended
+                        return! loop SessionState.Running None resolved
+                    | SessionState.Running ->
+                        // Pre-empt through the abort verb: the entry joins
+                        // the inbox first so the settle drain finds it
+                        // first, then the pending stop records
+                        // ExplicitAbort. The detached suspendable turn runs
+                        // un-cancellable, so the stop wins at its next
+                        // report and the settle drains the Interrupt entry
+                        // first. A stop that already won keeps the first
+                        // cause; the new entry still drains after the settle.
+                        let appended =
+                            awaitTask (
+                                props.Store.AppendInboxMessage(
+                                    props.Tenant,
+                                    props.SessionId,
+                                    payload,
+                                    DeliveryMode.Interrupt,
+                                    cancellationToken
+                                )
+                            )
+
+                        if pendingStop.IsNone then
+                            pendingStop <- Some(StopCause.ExplicitAbort, InterruptReason)
+
+                        mailbox.Sender() <! PromptAccepted appended
+                        return! loop state suspended resolved
+                    | SessionState.WaitingForInput ->
+                        // Append-and-wait: nothing runs to pre-empt and
+                        // Reply still resumes the suspended turn.
+                        let appended =
+                            awaitTask (
+                                props.Store.AppendInboxMessage(
+                                    props.Tenant,
+                                    props.SessionId,
+                                    payload,
+                                    DeliveryMode.Interrupt,
+                                    cancellationToken
+                                )
+                            )
+
+                        mailbox.Sender() <! PromptAccepted appended
+                        return! loop state suspended resolved
+                    | _ ->
+                        let appended =
+                            awaitTask (
+                                props.Store.AppendInboxMessage(
+                                    props.Tenant,
+                                    props.SessionId,
+                                    payload,
+                                    DeliveryMode.Interrupt,
+                                    cancellationToken
+                                )
+                            )
+
+                        mailbox.Sender() <! PromptAccepted appended
+                        return! loop state suspended resolved
                 | SuspendableFinished(entry, completion, attempt, allowed) ->
                     match state, suspended with
                     | SessionState.Running, None ->
-                        match completion.Suspension with
-                        | None ->
+                        // A recorded stop wins over whatever the detached
+                        // turn reported, even a success or a suspension: map
+                        // to Aborted and clear the cell. Settlement already
+                        // won when the cell is empty.
+                        let stop = pendingStop
+                        pendingStop <- None
+
+                        let carried =
+                            match stop with
+                            | Some(cause, reason) -> mapSuspendAborted cause reason completion.Result
+                            | None -> completion.Result
+
+                        // Settles one reported attempt: consumes the entry,
+                        // observes the (possibly abort-mapped) result, then
+                        // AutoCloses on the first Completed turn or drains
+                        // the next drainable entry (Interrupt tier first,
+                        // then Queue-plus-Inject in position order) into a
+                        // new turn, else returns to Idle.
+                        // <param name="entry">The entry the attempt executed.</param>
+                        // <param name="result">The result the actor settles.</param>
+                        // <returns>The next loop state.</returns>
+                        let settleEntryNow (entry: InboxEntry) (result: TurnResult) : SessionState =
                             let positions = [| entry.Position |] :> IReadOnlyList<int64>
 
                             awaitTask (
@@ -2527,10 +2790,10 @@ module internal SessionActor =
                             )
                             |> ignore
 
-                            notifySettled completion.Result
-                            dispatchCompletion props completion.Result |> ignore
+                            notifySettled result
+                            dispatchCompletion props result |> ignore
 
-                            if completion.Result.Status = TurnStatus.Completed && autoCloseEnabled props then
+                            if result.Status = TurnStatus.Completed && autoCloseEnabled props then
                                 // AutoClose (issue 82): the first Completed
                                 // turn closes the session store-first instead
                                 // of draining; the entry is already consumed
@@ -2542,7 +2805,7 @@ module internal SessionActor =
                                 )
                                 |> ignore
 
-                                return! loop SessionState.Closed None resolved
+                                SessionState.Closed
                             else
                                 let pending =
                                     awaitTask (
@@ -2553,20 +2816,11 @@ module internal SessionActor =
                                         )
                                     )
 
-                                let next =
-                                    pending
-                                    |> Seq.filter (fun candidate ->
-                                        not (isNull (box candidate))
-                                        && candidate.Delivery = DeliveryMode.Queue
-                                        && (candidate.Payload :? UserMessagePayload))
-                                    |> Seq.sortBy (fun candidate -> candidate.Position)
-                                    |> Seq.tryHead
-
-                                match next with
-                                | Some following ->
+                                match selectDrainableEntries pending with
+                                | following :: _ ->
                                     startSuspendable following 1 (readGrantsNow ())
-                                    return! loop SessionState.Running None resolved
-                                | None ->
+                                    SessionState.Running
+                                | [] ->
                                     awaitTask (
                                         props.Store.UpdateSessionState(
                                             props.Tenant,
@@ -2577,8 +2831,10 @@ module internal SessionActor =
                                     )
                                     |> ignore
 
-                                    return! loop SessionState.Idle None resolved
-                        | Some cursor ->
+                                    SessionState.Idle
+
+                        match completion.Suspension, stop with
+                        | Some cursor, None ->
                             awaitTask (
                                 props.Store.UpdateSessionState(
                                     props.Tenant,
@@ -2593,14 +2849,14 @@ module internal SessionActor =
                             | JournalWriter.JournalAppended _ ->
                                 let timeoutCts = new CancellationTokenSource()
 
-                                let carried = if isNull (box allowed) then HashSet<string>() else allowed
+                                let carriedAllowed = if isNull (box allowed) then HashSet<string>() else allowed
 
                                 let parked =
                                     {
                                         Entry = entry
                                         Cursor = Some cursor
                                         Rebuilt = None
-                                        Allowed = carried
+                                        Allowed = carriedAllowed
                                         Attempt = attempt
                                         TimeoutCts = timeoutCts
                                     }
@@ -2617,6 +2873,12 @@ module internal SessionActor =
                             | JournalWriter.JournalFailed failure ->
                                 settleJournalFailure entry failure
                                 return! loop SessionState.Idle None resolved
+                        | _ ->
+                            // Settled, or suspended after a stop won: the
+                            // stop settles Aborted with no suspend event
+                            // journaled and nothing parked for a Reply.
+                            let next = settleEntryNow entry carried
+                            return! loop next None resolved
                     | SessionState.WaitingForInput, Some parked when parked.Cursor.IsNone && parked.Rebuilt.IsSome ->
                         // Crash-retry path should never produce a running
                         // finish while still parked; ignore stale completions.
@@ -2625,6 +2887,19 @@ module internal SessionActor =
                 | SuspendableFaulted(entry, _, _) ->
                     match state, suspended with
                     | SessionState.Running, None ->
+                        // A recorded stop wins even over a real fault:
+                        // settle Aborted under the cause instead of failing
+                        // silently. The cell clears on every fault settle.
+                        let stop = pendingStop
+                        pendingStop <- None
+
+                        match stop with
+                        | Some(cause, reason) ->
+                            let settled = abortedSuspendResult cause reason
+                            notifySettled settled
+                            dispatchCompletion props settled |> ignore
+                        | None -> ()
+
                         let positions = [| entry.Position |] :> IReadOnlyList<int64>
 
                         awaitTask (
@@ -2863,6 +3138,10 @@ module internal SessionActor =
                             notifySettled result
                             dispatchCompletion props result |> ignore
 
+                            // The timeout settled the turn Failed: a
+                            // recorded stop loses to the settlement.
+                            pendingStop <- None
+
                             let positions = [| parked.Entry.Position |] :> IReadOnlyList<int64>
 
                             awaitTask (
@@ -2888,6 +3167,59 @@ module internal SessionActor =
                             return! loop SessionState.Idle None resolved
                         | _ -> return! loop state suspended resolved
                     | _ -> return! loop state suspended resolved
+                | SuspendableAbortSession(cause, reason, _) ->
+                    match state, suspended with
+                    | SessionState.Running, None when cause = StopCause.ExplicitAbort || cause = StopCause.HostShutdown ->
+                        // First cause wins: the detached suspendable turn
+                        // runs un-cancellable, so the recorded stop wins at
+                        // its next report.
+                        if pendingStop.IsNone then
+                            pendingStop <- Some(cause, reason)
+
+                        mailbox.Sender() <! takeSuspendSnapshot state suspended
+                        return! loop state suspended resolved
+                    | _ ->
+                        // Idle, WaitingForInput (a suspended turn owns
+                        // nothing running to abort), Closed, unknown states,
+                        // and non-abort-family causes: a no-op returning the
+                        // current state.
+                        mailbox.Sender() <! takeSuspendSnapshot state suspended
+                        return! loop state suspended resolved
+                | SuspendableCompactSession cancellationToken ->
+                    match state with
+                    | SessionState.Closed ->
+                        mailbox.Sender() <! CompactRejected SessionState.Closed
+                        return! loop state suspended resolved
+                    | SessionState.Idle ->
+                        match props.Compact with
+                        | None ->
+                            mailbox.Sender() <! CompactNotNeeded
+                            return! loop state suspended resolved
+                        | Some compact ->
+                            let reply = compactIdleNow props compact cancellationToken
+                            mailbox.Sender() <! reply
+                            return! loop state suspended resolved
+                    | SessionState.Running ->
+                        match props.Compact with
+                        | Some compact when not (isNull (box compact.Force)) ->
+                            compact.Force.Request()
+                            mailbox.Sender() <! CompactDeferred
+                            return! loop state suspended resolved
+                        | _ ->
+                            // Unconfigured: no boundary hook shares the
+                            // one-shot cell, so nothing can fire later.
+                            mailbox.Sender() <! CompactNotNeeded
+                            return! loop state suspended resolved
+                    | SessionState.WaitingForInput ->
+                        // A suspended turn owns the history, so an on-demand
+                        // compact no-ops.
+                        mailbox.Sender() <! CompactNotNeeded
+                        return! loop state suspended resolved
+                    | _ ->
+                        // Out-of-range stored state: stay durable but
+                        // compact nothing.
+                        mailbox.Sender() <! CompactNotNeeded
+                        return! loop state suspended resolved
                 | SuspendableCloseSession cancellationToken ->
                     match suspended with
                     | Some parked ->
@@ -2896,6 +3228,10 @@ module internal SessionActor =
                         with _ ->
                             ()
                     | None -> ()
+
+                    // A recorded stop dies with the session: Closed settles
+                    // nothing further.
+                    pendingStop <- None
 
                     let closed =
                         awaitTask (props.Store.CloseSession(props.Tenant, props.SessionId, cancellationToken))
@@ -2989,6 +3325,124 @@ module internal SessionActor =
                     )
         }
 
+    /// Prompts a suspendable session actor through one delivery wire: the
+    /// shared validation and Closed rejection behind the Inject and
+    /// Interrupt wires. Validates the session is present and not Closed
+    /// before touching the actor, so invalid transitions throw here, never
+    /// inside the actor.
+    /// <param name="store">The durable store.</param>
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="sessionId">The session to prompt.</param>
+    /// <param name="session">The suspendable session actor.</param>
+    /// <param name="message">The user message. Must not be null.</param>
+    /// <param name="ask">Builds the suspendable prompt message for the delivery.</param>
+    /// <param name="cancellationToken">Cancels the prompt.</param>
+    /// <returns>The appended inbox entry.</returns>
+    let private promptSuspendableCore
+        (store: ISessionStore)
+        (tenant: TenantId)
+        (sessionId: SessionId)
+        (session: IActorRef)
+        (message: UserMessage)
+        (ask: InboxPayload -> CancellationToken -> SuspendableActorMessage)
+        (cancellationToken: CancellationToken)
+        : Task<InboxEntry> =
+        ArgumentNullException.ThrowIfNull(store)
+        ArgumentNullException.ThrowIfNull(session)
+
+        if isNull (box message) then
+            raise (ArgumentNullException(nameof message))
+
+        if isNull (box ask) then
+            raise (ArgumentNullException(nameof ask))
+
+        task {
+            let! current = requireSessionAsync store tenant sessionId cancellationToken
+
+            if current.State = SessionState.Closed then
+                raise (
+                    InvalidSessionStateException(
+                        sessionId,
+                        current.State.ToString(),
+                        "The session is closed and accepts no further prompts."
+                    )
+                )
+
+            let payload = UserMessagePayload(message) :> InboxPayload
+
+            let! reply =
+                askSuspendableAsync<SessionPromptReply> session (ask payload cancellationToken) cancellationToken
+
+            match reply with
+            | PromptAccepted entry -> return entry
+            | PromptRejected rejectedState ->
+                return
+                    raise (
+                        InvalidSessionStateException(
+                            sessionId,
+                            rejectedState.ToString(),
+                            "The session closed before the prompt was accepted."
+                        )
+                    )
+        }
+
+    /// Injects a user message into a suspendable session actor: appends with
+    /// Inject delivery and folds into the running turn at its next iteration
+    /// boundary without interrupting it. Validates the session is present
+    /// and not Closed before touching the actor.
+    /// <param name="store">The durable store.</param>
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="sessionId">The session to prompt.</param>
+    /// <param name="session">The suspendable session actor.</param>
+    /// <param name="message">The user message. Must not be null.</param>
+    /// <param name="cancellationToken">Cancels the prompt.</param>
+    /// <returns>The appended inbox entry.</returns>
+    let injectSuspendableAsync
+        (store: ISessionStore)
+        (tenant: TenantId)
+        (sessionId: SessionId)
+        (session: IActorRef)
+        (message: UserMessage)
+        (cancellationToken: CancellationToken)
+        : Task<InboxEntry> =
+        promptSuspendableCore
+            store
+            tenant
+            sessionId
+            session
+            message
+            (fun payload token -> SuspendableInjectPrompt(payload, token))
+            cancellationToken
+
+    /// Interrupts a suspendable session actor with a user message: appends
+    /// with Interrupt delivery, records the ExplicitAbort pending stop when a
+    /// turn runs, and drains the Interrupt entry first after the settle.
+    /// Validates the session is present and not Closed before touching the
+    /// actor.
+    /// <param name="store">The durable store.</param>
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="sessionId">The session to prompt.</param>
+    /// <param name="session">The suspendable session actor.</param>
+    /// <param name="message">The user message. Must not be null.</param>
+    /// <param name="cancellationToken">Cancels the prompt.</param>
+    /// <returns>The appended inbox entry.</returns>
+    let interruptSuspendableAsync
+        (store: ISessionStore)
+        (tenant: TenantId)
+        (sessionId: SessionId)
+        (session: IActorRef)
+        (message: UserMessage)
+        (cancellationToken: CancellationToken)
+        : Task<InboxEntry> =
+        promptSuspendableCore
+            store
+            tenant
+            sessionId
+            session
+            message
+            (fun payload token -> SuspendableInterruptPrompt(payload, token))
+            cancellationToken
+
     /// Replies to a suspended turn: appends the Reply inbox entry, matches
     /// it against the pending request id, and resumes from the cursor with
     /// attempt plus 1. An unknown or already-resolved request id throws the
@@ -3078,6 +3532,132 @@ module internal SessionActor =
         ArgumentNullException.ThrowIfNull(session)
         askSuspendableAsync<SessionSnapshot> session SuspendableGetSnapshot cancellationToken
 
+    /// Aborts the turn running in a suspendable session: the client boundary
+    /// turn-level verb. Idle is a no-op returning the current snapshot, as
+    /// is WaitingForInput (a suspended turn owns nothing running to abort).
+    /// Running records the pending stop under the typed cause: the detached
+    /// suspendable turn runs un-cancellable, so the stop wins at its next
+    /// report and a second abort keeps the first cause. Unknown sessions
+    /// throw SessionNotFoundException and Closed sessions throw
+    /// InvalidSessionStateException before touching the actor; a Close
+    /// racing the abort maps to the same exception.
+    /// <param name="store">The durable store.</param>
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="sessionId">The session to abort the turn in.</param>
+    /// <param name="session">The suspendable session actor.</param>
+    /// <param name="cause">Which abort-family stop cause wins: ExplicitAbort or HostShutdown.</param>
+    /// <param name="reason">Why the turn stops. Must not be null. Never contains secrets or tool arguments.</param>
+    /// <param name="cancellationToken">Cancels the abort.</param>
+    /// <returns>The actor's snapshot after the abort was accepted.</returns>
+    let abortSuspendableAsync
+        (store: ISessionStore)
+        (tenant: TenantId)
+        (sessionId: SessionId)
+        (session: IActorRef)
+        (cause: StopCause)
+        (reason: string)
+        (cancellationToken: CancellationToken)
+        : Task<SessionSnapshot> =
+        ArgumentNullException.ThrowIfNull(store)
+        ArgumentNullException.ThrowIfNull(session)
+
+        if isNull (box reason) then
+            raise (ArgumentNullException(nameof reason))
+
+        if cause <> StopCause.ExplicitAbort && cause <> StopCause.HostShutdown then
+            raise (
+                ArgumentOutOfRangeException(
+                    nameof cause,
+                    "Only ExplicitAbort and HostShutdown abort a turn: the deadline arrives through the turn loop and lease loss through the claim fence."
+                )
+            )
+
+        task {
+            let! current = requireSessionAsync store tenant sessionId cancellationToken
+
+            if current.State = SessionState.Closed then
+                raise (
+                    InvalidSessionStateException(
+                        sessionId,
+                        current.State.ToString(),
+                        "The session is closed and accepts no abort."
+                    )
+                )
+
+            let! snapshot =
+                askSuspendableAsync<SessionSnapshot>
+                    session
+                    (SuspendableAbortSession(cause, reason, cancellationToken))
+                    cancellationToken
+
+            if snapshot.State = SessionState.Closed then
+                return
+                    raise (
+                        InvalidSessionStateException(
+                            sessionId,
+                            snapshot.State.ToString(),
+                            "The session closed before the abort was accepted."
+                        )
+                    )
+            else
+                return snapshot
+        }
+
+    /// Compacts a suspendable session on demand: the client boundary. Idle
+    /// replays the journal and compacts now without starting a turn,
+    /// answering the before/after estimates; Running arms the one-shot force
+    /// flag the turn's force-aware hook honors at the next boundary;
+    /// WaitingForInput no-ops (a suspended turn owns the history). Unknown
+    /// sessions throw SessionNotFoundException and Closed sessions throw
+    /// InvalidSessionStateException before touching the actor; a Close
+    /// racing the compact maps to the same exception.
+    /// <param name="store">The durable store.</param>
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="sessionId">The session to compact.</param>
+    /// <param name="session">The suspendable session actor.</param>
+    /// <param name="cancellationToken">Cancels the compact.</param>
+    /// <returns>The actor's compact reply.</returns>
+    let compactSuspendableAsync
+        (store: ISessionStore)
+        (tenant: TenantId)
+        (sessionId: SessionId)
+        (session: IActorRef)
+        (cancellationToken: CancellationToken)
+        : Task<SessionCompactReply> =
+        ArgumentNullException.ThrowIfNull(store)
+        ArgumentNullException.ThrowIfNull(session)
+
+        task {
+            let! current = requireSessionAsync store tenant sessionId cancellationToken
+
+            if current.State = SessionState.Closed then
+                raise (
+                    InvalidSessionStateException(
+                        sessionId,
+                        current.State.ToString(),
+                        "The session is closed and accepts no compact."
+                    )
+                )
+
+            let! reply =
+                askSuspendableAsync<SessionCompactReply>
+                    session
+                    (SuspendableCompactSession cancellationToken)
+                    cancellationToken
+
+            match reply with
+            | CompactRejected rejectedState ->
+                return
+                    raise (
+                        InvalidSessionStateException(
+                            sessionId,
+                            rejectedState.ToString(),
+                            "The session closed before the compact was accepted."
+                        )
+                    )
+            | _ -> return reply
+        }
+
     /// Builds the production child-spawn factory the session router uses:
     /// like <see cref="M:Legate.SessionActor.spawnFactory" /> but spawning
     /// the suspendable behavior (<see cref="M:Legate.SessionActor.behaviorWithSuspend" />),
@@ -3096,7 +3676,8 @@ module internal SessionActor =
     /// Claim renewal while suspended belongs to the dispatcher and heartbeat
     /// cycle: the primed lease covers the configured AskTimeout window, and
     /// a lapsed lease settles the turn Failed with the typed reason instead
-    /// of journaling half a suspension.
+    /// of journaling half a suspension. The on-demand compaction wiring
+    /// comes from compactFor per spawned child, sharing the primed token.
     /// <param name="store">The durable store session actors persist through.</param>
     /// <param name="tenant">The tenant router-spawned sessions belong to.</param>
     /// <param name="eventStore">The journal suspend and resolve events append to.</param>
@@ -3105,6 +3686,7 @@ module internal SessionActor =
     /// <param name="claimOwner">The claim owner identity the journal prime claims under. Must not be null.</param>
     /// <param name="leaseDuration">How long the primed journal claim lasts. Must be positive.</param>
     /// <param name="runSuspendable">Runs one suspendable attempt, bound to the DI-resolved policy. Never null.</param>
+    /// <param name="compactFor">Builds the on-demand compaction wiring for one session from its primed journal token, or None when the host compacts nothing. Must not be null; return None to answer CompactNotNeeded.</param>
     /// <returns>A factory mapping a session id string to a suspendable child spawn.</returns>
     let spawnSuspendFactory
         (store: ISessionStore)
@@ -3115,6 +3697,7 @@ module internal SessionActor =
         (claimOwner: string)
         (leaseDuration: TimeSpan)
         (runSuspendable: SuspendableRunner)
+        (compactFor: SessionId -> string -> CompactDeps option)
         : (string -> IActorContext -> string -> IActorRef) =
         ArgumentNullException.ThrowIfNull(store)
         ArgumentNullException.ThrowIfNull(eventStore)
@@ -3131,6 +3714,9 @@ module internal SessionActor =
 
         if isNull (box runSuspendable) then
             raise (ArgumentNullException(nameof runSuspendable))
+
+        if isNull (box compactFor) then
+            raise (ArgumentNullException(nameof compactFor))
 
         /// The base turn runner never runs on a suspendable child: the
         /// suspend behavior drives RunSuspendable only. It stays non-null
@@ -3177,6 +3763,7 @@ module internal SessionActor =
 
             if SessionId.TryParse(sessionId, &parsed) then
                 let captured = parsed
+                let token = primeToken captured
 
                 let props: SessionActorProps =
                     {
@@ -3186,7 +3773,7 @@ module internal SessionActor =
                         RunTurn = unusedRunTurn
                         OnTurnSettled = Some(fun result -> PromptWaitHubs.ObserveSettled captured result)
                         OnInjectJournaled = None
-                        Compact = None
+                        Compact = compactFor captured token
                         Logger = null
                     }
 
@@ -3195,7 +3782,7 @@ module internal SessionActor =
                         EventStore = eventStore
                         Delay = delay
                         AskTimeout = askTimeout
-                        JournalToken = primeToken captured
+                        JournalToken = token
                         RunSuspendable = runSuspendable
                     }
 

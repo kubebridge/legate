@@ -3209,3 +3209,127 @@ let ``Session actor prompt and settle carry all six scopes and leak no secret`` 
             entry.Text.Contains(secret) |> should equal false
     finally
         stopSystem system
+
+// ──────────────────────────────────────────────────────────────────────────
+// Suspendable Inject/Abort arms (issue 96)
+
+/// A permission policy asking for the gated tool, allowing the rest.
+type private SuspendAskPolicy(gated: string) =
+    interface IPermissionPolicy with
+        member _.Evaluate(request) =
+            if request.ToolName = gated then
+                PermissionVerdict.Ask
+            else
+                PermissionVerdict.Allow
+
+let private suspendScripted (steps: ScriptStep list) : ScriptedChatClient =
+    new ScriptedChatClient(ResizeArray<ScriptStep>(steps) :> IReadOnlyList<ScriptStep>)
+
+let private suspendSourced (tools: AITool list) : StaticToolSource =
+    new StaticToolSource(ResizeArray<AITool>(tools) :> IReadOnlyList<AITool>)
+
+let private suspendOptions (policy: IPermissionPolicy) : SessionHarnessOptions =
+    let options = SessionHarnessOptions()
+    options.Policy <- policy
+    options
+
+[<Fact>]
+let ``Suspendable Inject starts an Idle turn with Inject delivery`` () : Task =
+    task {
+        let client = suspendScripted [ ScriptStep.Text "folded" ]
+
+        use! harness = SessionHarness.CreateAsync(client, suspendSourced [])
+
+        let waiter = PromptWaitHubs.GetOrAdd(harness.SessionId).EnqueueSettle()
+
+        let! entry =
+            SessionActor.injectSuspendableAsync
+                harness.Store
+                harness.Tenant
+                harness.SessionId
+                harness.Actor
+                (UserMessage.Text "steer")
+                CancellationToken.None
+
+        entry.Delivery |> should equal DeliveryMode.Inject
+
+        let! result = waiter.Task.WaitAsync(TimeSpan.FromSeconds 10.0, CancellationToken.None)
+        result.Status |> should equal TurnStatus.Completed
+        result.AssistantText |> should equal "folded"
+    }
+
+[<Fact>]
+let ``Suspendable Abort on Idle answers the snapshot with no effects`` () : Task =
+    task {
+        let client = suspendScripted [ ScriptStep.Text "done" ]
+
+        use! harness = SessionHarness.CreateAsync(client, suspendSourced [])
+
+        let! snapshot =
+            SessionActor.abortSuspendableAsync
+                harness.Store
+                harness.Tenant
+                harness.SessionId
+                harness.Actor
+                StopCause.ExplicitAbort
+                "idle"
+                CancellationToken.None
+
+        snapshot.State |> should equal SessionState.Idle
+        PromptWaitHubs.GetOrAdd(harness.SessionId).Settled.Count |> should equal 0
+    }
+
+[<Fact>]
+let ``Suspendable Abort while WaitingForInput no-ops and Reply still resumes`` () : Task =
+    task {
+        let invocations = ref []
+
+        let method =
+            System.Func<string>(fun () ->
+                invocations.Value <- invocations.Value @ [ "gated" ]
+                "ok")
+
+        let gated =
+            AIFunctionFactory.Create(
+                method,
+                "gated",
+                Unchecked.defaultof<string>,
+                Unchecked.defaultof<JsonSerializerOptions>
+            )
+            :> AITool
+
+        let client =
+            suspendScripted
+                [
+                    ScriptStep.ToolCall("c1", "gated")
+                    ScriptStep.Text "resumed"
+                ]
+
+        let options = suspendOptions (SuspendAskPolicy("gated") :> IPermissionPolicy)
+
+        use! harness = SessionHarness.CreateAsync(client, suspendSourced [ gated ], options)
+
+        let! _ = harness.PromptAsync("run it", CancellationToken.None)
+        let! requestId = harness.WaitForSuspensionAsync(CancellationToken.None)
+
+        let! snapshot =
+            SessionActor.abortSuspendableAsync
+                harness.Store
+                harness.Tenant
+                harness.SessionId
+                harness.Actor
+                StopCause.ExplicitAbort
+                "suspended"
+                CancellationToken.None
+
+        snapshot.State |> should equal SessionState.WaitingForInput
+
+        let! result =
+            harness.ReplyAndSettleAsync(
+                PermissionDecision(requestId, PermissionDecisionKind.AllowOnce),
+                CancellationToken.None
+            )
+
+        result.Status |> should equal TurnStatus.Completed
+        result.AssistantText |> should equal "resumed"
+    }

@@ -101,6 +101,7 @@
     <Compile Include="CompletionRedriverTests.fs" />
     <Compile Include="PromptWaitHubTests.fs" />
     <Compile Include="PromptAndWaitTests.fs" />
+    <Compile Include="SessionClientFacadeTests.fs" />
   </ItemGroup>
 
   <ItemGroup>
