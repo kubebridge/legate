@@ -1,0 +1,38 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>Legate.Storage.Sqlite</RootNamespace>
+    <Description>SQLite implementations of the Legate store contracts: sessions, events, agents, custom tools, blobs, and agent packages over one WAL-mode file. Single-process; a second opener receives a typed error.</Description>
+  </PropertyGroup>
+
+  <!-- Compile order is explicit: register every new file here, in dependency order. -->
+  <ItemGroup>
+    <Compile Include="AssemblyInfo.fs" />
+    <Compile Include="SqliteExceptions.fs" />
+    <Compile Include="SqliteStorageOptions.fs" />
+    <Compile Include="SqliteDatabase.fs" />
+    <Compile Include="SqliteSessionStore.fs" />
+    <Compile Include="SqliteSessionEventStore.fs" />
+    <Compile Include="SqliteAgentStore.fs" />
+    <Compile Include="SqliteBlobStore.fs" />
+    <Compile Include="SqliteAgentPackageStore.fs" />
+    <Compile Include="SqliteServiceExtensions.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../Legate.Abstractions/Legate.Abstractions.fsproj" />
+    <ProjectReference Include="../Legate.Storage.Migrations/Legate.Storage.Migrations.fsproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="FSharp.Core" />
+    <PackageReference Include="FluentMigrator.Runner" />
+    <PackageReference Include="FluentMigrator.Runner.SQLite" />
+    <PackageReference Include="Microsoft.Data.Sqlite" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" />
+    <PackageReference Include="Microsoft.Extensions.Options" />
+    <PackageReference Include="Ulid" />
+  </ItemGroup>
+
+</Project>
