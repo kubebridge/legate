@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>LegateCli</RootNamespace>
+    <Description>Interactive CLI harness for Legate sessions: streaming REPL over the session client facade.</Description>
+    <IsPackable>false</IsPackable>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+  </PropertyGroup>
+
+  <!-- Compile order is explicit: register every new file here, in dependency order. -->
+  <ItemGroup>
+    <Compile Include="CliEngine.fs" />
+    <Compile Include="Program.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../src/Legate/Legate.fsproj" />
+    <ProjectReference Include="../../src/Legate.Llm.Google/Legate.Llm.Google.fsproj" />
+    <ProjectReference Include="../../src/Legate.Llm.OpenAI/Legate.Llm.OpenAI.fsproj" />
+    <ProjectReference Include="../../src/Legate.Storage.InMemory/Legate.Storage.InMemory.fsproj" />
+    <ProjectReference Include="../../src/Legate.Workspace.Process/Legate.Workspace.Process.fsproj" />
+    <ProjectReference Include="../../src/Legate.Mcp/Legate.Mcp.fsproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="FSharp.Core" />
+    <PackageReference Include="Microsoft.Extensions.AI.Abstractions" />
+    <PackageReference Include="Microsoft.Extensions.Configuration" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.EnvironmentVariables" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" />
+    <PackageReference Include="Microsoft.Extensions.Hosting" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" />
+  </ItemGroup>
+
+</Project>

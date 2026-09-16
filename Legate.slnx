@@ -12,4 +12,8 @@
   <Folder Name="/tests/">
     <Project Path="tests/Legate.Tests/Legate.Tests.fsproj" />
   </Folder>
+  <Folder Name="/samples/">
+    <Project Path="samples/LegateCli/LegateCli.fsproj" />
+    <Project Path="samples/McpFixture/McpFixture.fsproj" />
+  </Folder>
 </Solution>

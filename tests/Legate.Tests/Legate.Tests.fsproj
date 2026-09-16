@@ -102,6 +102,7 @@
     <Compile Include="PromptWaitHubTests.fs" />
     <Compile Include="PromptAndWaitTests.fs" />
     <Compile Include="SessionClientFacadeTests.fs" />
+    <Compile Include="LegateCliSmokeTests.fs" />
   </ItemGroup>
 
   <ItemGroup>
