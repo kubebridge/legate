@@ -18,10 +18,7 @@ type PostgresAgentStoreTests private (agentStore: IAgentStore, toolStore: IAgent
         let options = PostgresTestDatabase.testOptions connectionString
         let agents = PostgresAgentStore(options, clock)
 
-        new PostgresAgentStoreTests(
-            agents :> IAgentStore,
-            PostgresAgentStore(options, clock) :> IAgentCustomToolStore
-        )
+        new PostgresAgentStoreTests(agents :> IAgentStore, PostgresAgentStore(options, clock) :> IAgentCustomToolStore)
 
     interface IDisposable with
         member _.Dispose() = PostgresTestDatabase.truncate ()
