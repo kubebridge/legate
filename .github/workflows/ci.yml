@@ -20,7 +20,8 @@ env:
   DOTNET_SKIP_FIRST_TIME_EXPERIENCE: "1"
 
 jobs:
-  # The single gate for main and pull requests: format, build, test, pack.
+  # The single gate for main and pull requests: format, build, test, sample
+  # smokes, pack.
   # Every step calls a build.fsx target so the path lists and flags live once.
   build:
     name: Build and test (${{ matrix.os }})
@@ -46,6 +47,9 @@ jobs:
 
       - name: Build and test
         run: dotnet fsi build.fsx -- -t Test
+
+      - name: Smoke samples
+        run: dotnet fsi build.fsx -- -t SmokeSamples
 
       - name: Pack
         if: matrix.os == 'ubuntu-latest'

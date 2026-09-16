@@ -51,6 +51,35 @@ Target.create "Format" (fun _ -> runFantomas [])
 // fails the target without extra handling.
 Target.create "CheckFormat" (fun _ -> runFantomas [ "--check" ])
 
+// Smoke-runs both samples on scripted transports (no keys, no network):
+// Headless proves one prompt, its exit code, and its signed webhook, and
+// CSharpHost proves the C# facade path with a permission reply. Runs on the
+// Debug binaries the Build target produced, so it depends on Build.
+Target.create "SmokeSamples" (fun _ ->
+    run
+        dotnet
+        [
+            "run"
+            "--project"
+            "samples/Headless/Headless.fsproj"
+            "--no-build"
+            "--"
+            "--scripted"
+        ]
+        rootPath
+
+    run
+        dotnet
+        [
+            "run"
+            "--project"
+            "samples/CSharpHost/CSharpHost.csproj"
+            "--no-build"
+            "--"
+            "--scripted"
+        ]
+        rootPath)
+
 // Produces Release NuGet packages for every packable project into ./artifacts.
 // Builds in Release itself, so it does not depend on the Debug Build target.
 Target.create "Pack" (fun _ ->
@@ -69,6 +98,8 @@ Target.create "Pack" (fun _ ->
 open Fake.Core.TargetOperators
 
 "Clean" ==> "Restore" ==> "Build" ==> "Test"
+
+"Build" ==> "SmokeSamples"
 
 "Restore" ==> "Pack"
 

@@ -15,5 +15,7 @@
   <Folder Name="/samples/">
     <Project Path="samples/LegateCli/LegateCli.fsproj" />
     <Project Path="samples/McpFixture/McpFixture.fsproj" />
+    <Project Path="samples/Headless/Headless.fsproj" />
+    <Project Path="samples/CSharpHost/CSharpHost.csproj" />
   </Folder>
 </Solution>
