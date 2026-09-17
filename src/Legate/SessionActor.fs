@@ -1798,7 +1798,11 @@ module internal SessionActor =
     /// reply, a resume carries both. Attempt is 1-based and incremented on
     /// every resume, so a resumed run continues the same turn id. The
     /// session memory of AllowForSession decisions travels with the turn.
-    /// Tests inject scripted runners; the TurnLoop-backed runner wires
+    /// The crash seed carries the in-memory rehydrated history (with the
+    /// resumption note) on crash-resume activation and is None elsewhere:
+    /// a seeded run leads its runner history input with the seed instead
+    /// of the entry-derived message. Tests inject scripted runners; the
+    /// TurnLoop-backed runner wires
     /// TurnLoop.runSuspendableAsync plus the resume continuations.
     type SuspendableRunner =
         InboxEntry
@@ -1806,6 +1810,7 @@ module internal SessionActor =
             -> HashSet<string>
             -> TurnLoop.TurnLoopSuspension option
             -> Reply option
+            -> IList<ChatMessage> option
             -> CancellationToken
             -> Task<TurnLoop.TurnLoopCompletion>
 
@@ -2062,20 +2067,6 @@ module internal SessionActor =
     /// tool arguments.
     [<Literal>]
     let CrashFailReason = "The turn was interrupted by a restart."
-
-    /// Reads the crash-resume knob the session was opened with. A missing
-    /// row, missing options, or a store read failure reads as ResumeAttempt,
-    /// so restarts never fail a turn spuriously.
-    /// <param name="props">The session actor dependencies.</param>
-    /// <returns>How the session recovers an interrupted turn.</returns>
-    let readOnCrashResume (props: SessionActorProps) : OnCrashResume =
-        try
-            match awaitTask (props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None)) with
-            | null -> OnCrashResume.ResumeAttempt
-            | session when isNull (box session.Options) -> OnCrashResume.ResumeAttempt
-            | session -> session.Options.OnCrashResume
-        with :? SessionNotFoundException ->
-            OnCrashResume.ResumeAttempt
 
     /// Rebuilds a crash-rehydrated LLM history from transcript cells: drops
     /// the interrupted attempt's ToolCall and ToolResult cells (completed
@@ -2628,11 +2619,16 @@ module internal SessionActor =
             )
             |> ignore
 
-        let startSuspendable (entry: InboxEntry) (attempt: int) (allowed: HashSet<string>) : unit =
+        let startSuspendable
+            (entry: InboxEntry)
+            (attempt: int)
+            (allowed: HashSet<string>)
+            (seed: IList<ChatMessage> option)
+            : unit =
             let runTask =
                 try
                     let started =
-                        suspend.RunSuspendable entry attempt allowed None None CancellationToken.None
+                        suspend.RunSuspendable entry attempt allowed None None seed CancellationToken.None
 
                     if isNull (box started) then
                         Task.FromException<TurnLoop.TurnLoopCompletion>(
@@ -2680,6 +2676,7 @@ module internal SessionActor =
                             parked.Allowed
                             cursor
                             (Some reply)
+                            None
                             CancellationToken.None
 
                     if isNull (box started) then
@@ -2778,7 +2775,7 @@ module internal SessionActor =
                         let first =
                             selectDrainableEntries pending |> List.tryHead |> Option.defaultValue appended
 
-                        startSuspendable first 1 (readGrantsNow ())
+                        startSuspendable first 1 (readGrantsNow ()) None
                         mailbox.Sender() <! PromptAccepted appended
                         return! loop SessionState.Running None resolved
                     | SessionState.Running
@@ -2843,7 +2840,7 @@ module internal SessionActor =
                         let first =
                             selectDrainableEntries pending |> List.tryHead |> Option.defaultValue appended
 
-                        startSuspendable first 1 (readGrantsNow ())
+                        startSuspendable first 1 (readGrantsNow ()) None
                         mailbox.Sender() <! PromptAccepted appended
                         return! loop SessionState.Running None resolved
                     | SessionState.Running
@@ -2912,7 +2909,7 @@ module internal SessionActor =
                         let first =
                             selectDrainableEntries pending |> List.tryHead |> Option.defaultValue appended
 
-                        startSuspendable first 1 (readGrantsNow ())
+                        startSuspendable first 1 (readGrantsNow ()) None
                         mailbox.Sender() <! PromptAccepted appended
                         return! loop SessionState.Running None resolved
                     | SessionState.Running ->
@@ -3035,7 +3032,7 @@ module internal SessionActor =
 
                                 match selectDrainableEntries pending with
                                 | following :: _ ->
-                                    startSuspendable following 1 (readGrantsNow ())
+                                    startSuspendable following 1 (readGrantsNow ()) None
                                     SessionState.Running
                                 | [] ->
                                     awaitTask (
@@ -3269,7 +3266,7 @@ module internal SessionActor =
                                             // attempt. The retried run suspends again
                                             // or settles; either path re-enters this
                                             // loop.
-                                            startSuspendable parked.Entry nextAttempt parked.Allowed
+                                            startSuspendable parked.Entry nextAttempt parked.Allowed None
                                             return! loop SessionState.Running None resolved
                                     | JournalWriter.JournalRejected rejection ->
                                         // The resolve event never landed: resuming
@@ -3464,20 +3461,21 @@ module internal SessionActor =
         | SessionState.Running, Some entry ->
             // Crash resume: the interrupted turn restarts as a new attempt
             // under the fresh spawn-primed journal token (old-attempt events
-            // stay since the journal is append-only). The rehydration runs
-            // best-effort on activation: the helper path is proven by unit
-            // test, while the resumed run retries from its inbox entry per
-            // the existing crash-retry precedent.
-            try
-                match lastJournalTurnId suspend.EventStore props.Tenant props.SessionId with
-                | Some interrupted ->
-                    rehydrateCrashHistory suspend.EventStore props.Tenant props.SessionId interrupted
-                    |> ignore
-                | None -> ()
-            with _ ->
-                ()
+            // stay since the journal is append-only). The rehydrated history
+            // seeds the resumed run's runner input in-memory (never
+            // journaled, so replay cursors stay untouched); a rehydration
+            // failure falls back to a seedless retry from the inbox entry
+            // per the existing crash-retry precedent.
+            let crashSeed: IList<ChatMessage> option =
+                try
+                    match lastJournalTurnId suspend.EventStore props.Tenant props.SessionId with
+                    | Some interrupted ->
+                        Some(rehydrateCrashHistory suspend.EventStore props.Tenant props.SessionId interrupted)
+                    | None -> None
+                with _ ->
+                    None
 
-            startSuspendable entry 2 (readGrantsNow ())
+            startSuspendable entry 2 (readGrantsNow ()) crashSeed
             loop SessionState.Running None (HashSet<string>())
         | _ -> loop initialState initialSuspended (HashSet<string>())
 

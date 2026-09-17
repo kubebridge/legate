@@ -32,37 +32,54 @@ module internal SessionPermissions =
 
     /// Builds the user history for a fresh run from the entry's parts,
     /// mirroring the actor's Queue runner shape, with the composed system
-    /// prompt (issue 66) leading when present.
+    /// prompt (issue 66) leading when present. A crash seed (Some) wins:
+    /// the rehydrated transcript plus the in-memory resumption note
+    /// replaces the entry-derived message, while the composed system
+    /// prompt still leads. The seed is copied: the turn owns its history.
     /// <param name="entry">The inbox entry the run executes.</param>
     /// <param name="systemPrompt">The composed system prompt, or null for the user-only shape.</param>
-    /// <returns>The history carrying the system message (when present) and the entry's user message.</returns>
-    let private historyOf (entry: InboxEntry) (systemPrompt: string | null) : IList<ChatMessage> =
-        let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+    /// <param name="seed">The crash-resume seed history, or None for a seedless run.</param>
+    /// <returns>The history carrying the system message (when present) and the entry's user message, or the seeded history.</returns>
+    let private historyOf
+        (entry: InboxEntry)
+        (systemPrompt: string | null)
+        (seed: IList<ChatMessage> option)
+        : IList<ChatMessage> =
+        match seed with
+        | Some seeded when not (isNull (box seeded)) ->
+            let history = ResizeArray<ChatMessage>(seeded) :> IList<ChatMessage>
+            PromptComposition.prependSystemPrompt history systemPrompt
+            history
+        | _ ->
+            let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
 
-        match entry.Payload with
-        | :? UserMessagePayload as userMessage when
-            not (isNull (box userMessage))
-            && not (isNull (box userMessage.Message))
-            && not (isNull (box userMessage.Message.Parts))
-            ->
-            let parts = ResizeArray<AIContent>()
+            match entry.Payload with
+            | :? UserMessagePayload as userMessage when
+                not (isNull (box userMessage))
+                && not (isNull (box userMessage.Message))
+                && not (isNull (box userMessage.Message.Parts))
+                ->
+                let parts = ResizeArray<AIContent>()
 
-            for part in userMessage.Message.Parts do
-                if not (isNull (box part)) then
-                    parts.Add(part)
+                for part in userMessage.Message.Parts do
+                    if not (isNull (box part)) then
+                        parts.Add(part)
 
-            history.Add(ChatMessage(ChatRole.User, parts :> IList<AIContent>))
-        | _ -> history.Add(ChatMessage(ChatRole.User, ""))
+                history.Add(ChatMessage(ChatRole.User, parts :> IList<AIContent>))
+            | _ -> history.Add(ChatMessage(ChatRole.User, ""))
 
-        PromptComposition.prependSystemPrompt history systemPrompt
-        history
+            PromptComposition.prependSystemPrompt history systemPrompt
+            history
 
     /// Builds the production suspendable runner over
     /// TurnLoop.runSuspendableAsync plus the resume continuations: the
     /// runner SessionActor.spawnSuspendFactory threads into live session
     /// actors. Deny appends a denied tool result and continues the turn,
     /// Ask suspends with the unified carrier, and the per-tool
-    /// AllowForSession check runs before Evaluate on every attempt.
+    /// AllowForSession check runs before Evaluate on every attempt. The
+    /// crash seed rides the runner into both fresh-run shapes: Some seeds
+    /// the history input with the rehydrated transcript plus note, None
+    /// runs from the entry.
     /// <param name="client">The chat client turns run against. Must not be null.</param>
     /// <param name="store">The durable store the Inject drain and consume read. Must not be null.</param>
     /// <param name="tenant">The tenant runner-driven sessions belong to.</param>
@@ -131,7 +148,7 @@ module internal SessionPermissions =
                 with _ ->
                     ()
 
-        fun entry _attempt allowed cursor reply runnerToken ->
+        fun entry _attempt allowed cursor reply seed runnerToken ->
             let tools, loopOptions = resolveInputs entry
 
             // Fail fast outside the task computation: a null tool set or
@@ -180,7 +197,7 @@ module internal SessionPermissions =
                     match cursor, reply with
                     | None, None ->
                         let! systemPrompt = resolveSystem ()
-                        let history = historyOf entry systemPrompt
+                        let history = historyOf entry systemPrompt seed
 
                         return!
                             TurnLoop.runSuspendableAsync
@@ -245,7 +262,7 @@ module internal SessionPermissions =
                         // Crash-rebuild shape: no live cursor, so retry the
                         // turn from its inbox entry with the persisted grants.
                         let! rebuildPrompt = resolveSystem ()
-                        let history = historyOf entry rebuildPrompt
+                        let history = historyOf entry rebuildPrompt seed
 
                         return!
                             TurnLoop.runSuspendableAsync
