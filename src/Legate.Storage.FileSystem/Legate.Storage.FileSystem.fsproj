@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>Legate.Storage.FileSystem</RootNamespace>
+    <Description>File-system implementations of the Legate blob and agent package stores over one rooted directory: atomic temp-plus-rename writes, sidecar etag metadata, and options-bound presigned URLs. Single-node; no external services.</Description>
+  </PropertyGroup>
+
+  <!-- Compile order is explicit: register every new file here, in dependency order. -->
+  <ItemGroup>
+    <Compile Include="AssemblyInfo.fs" />
+    <Compile Include="FileSystemStorageOptions.fs" />
+    <Compile Include="FileSystemPaths.fs" />
+    <Compile Include="FileSystemSigning.fs" />
+    <Compile Include="FileSystemBlobStore.fs" />
+    <Compile Include="FileSystemAgentPackageStore.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../Legate.Abstractions/Legate.Abstractions.fsproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="FSharp.Core" />
+    <PackageReference Include="Ulid" />
+  </ItemGroup>
+
+</Project>

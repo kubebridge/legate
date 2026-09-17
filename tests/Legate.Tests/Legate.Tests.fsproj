@@ -29,6 +29,8 @@
     <Compile Include="InMemoryAgentStoreTests.fs" />
     <Compile Include="InMemoryBlobStoreTests.fs" />
     <Compile Include="InMemoryAgentPackageTests.fs" />
+    <Compile Include="FileSystemBlobStoreTests.fs" />
+    <Compile Include="FileSystemAgentPackageTests.fs" />
     <Compile Include="ProcessWorkspaceTests.fs" />
     <Compile Include="ProcessWorkspaceRuntimeTests.fs" />
     <Compile Include="SessionTests.fs" />
@@ -121,6 +123,7 @@
     <ProjectReference Include="../../src/Legate.Llm.Google/Legate.Llm.Google.fsproj" />
     <ProjectReference Include="../../src/Legate.Llm.OpenAI/Legate.Llm.OpenAI.fsproj" />
     <ProjectReference Include="../../src/Legate.Storage.InMemory/Legate.Storage.InMemory.fsproj" />
+    <ProjectReference Include="../../src/Legate.Storage.FileSystem/Legate.Storage.FileSystem.fsproj" />
     <ProjectReference Include="../../src/Legate.Storage.Sqlite/Legate.Storage.Sqlite.fsproj" />
     <ProjectReference Include="../../src/Legate.Testing/Legate.Testing.fsproj" />
     <ProjectReference Include="../../src/Legate.Workspace.Process/Legate.Workspace.Process.fsproj" />
