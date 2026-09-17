@@ -40,7 +40,7 @@ type InMemorySessionEventStore(database: InMemoryDatabase) =
         match journalRow tenant sessionId with
         | Some row -> row
         | None ->
-            let row = JournalRow(List<SessionEvent>(), false, 0L)
+            let row = JournalRow(List<SessionEvent>(), false, null, 0L)
             database.Journals[(tenant, sessionId)] <- row
             row
 
@@ -349,7 +349,8 @@ type InMemorySessionEventStore(database: InMemoryDatabase) =
                     EventReplayUnknownSession sessionId :> EventReplayOutcome
                 else
                     match database.Journals.TryGetValue((tenant, sessionId)) with
-                    | true, row when row.Archived -> EventReplayJournalExpired sessionId :> EventReplayOutcome
+                    | true, row when row.Archived ->
+                        EventReplayJournalExpired(sessionId, row.ArchiveLocation) :> EventReplayOutcome
                     | true, row ->
                         let page =
                             row.Events
@@ -399,7 +400,7 @@ type InMemorySessionEventStore(database: InMemoryDatabase) =
                             EventCleanupClaimed claim :> EventCleanupState)
             |> ok
 
-        member _.CompleteCleanup(tenant, sessionId, claimToken, _) =
+        member _.CompleteCleanup(tenant, sessionId, claimToken, archiveLocation, _) =
             if isNull (box claimToken) then
                 raise (ArgumentNullException(nameof claimToken))
 
@@ -413,6 +414,7 @@ type InMemorySessionEventStore(database: InMemoryDatabase) =
                     match database.Journals.TryGetValue((tenant, sessionId)) with
                     | true, row ->
                         row.Archived <- true
+                        row.ArchiveLocation <- archiveLocation
                         row.Events.Clear()
                         row.TotalBytes <- 0L
                     | false, _ -> ()

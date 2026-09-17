@@ -52,6 +52,8 @@
     <Compile Include="LegateBuilder.fs" />
     <Compile Include="Agents/FileAgentStore.fs" />
     <Compile Include="SessionClientFacade.fs" />
+    <Compile Include="JournalArchiveOptions.fs" />
+    <Compile Include="JournalArchiveWorker.fs" />
     <Compile Include="AddLegate.fs" />
   </ItemGroup>
 

@@ -115,17 +115,52 @@ type SqliteSessionEventStore(database: SqliteDatabase) =
         (transaction: SqliteTransaction)
         (tenant: TenantId)
         (sessionId: SessionId)
+        (archiveLocation: string | null)
         =
         use command = connection.CreateCommand()
         command.Transaction <- transaction
 
         command.CommandText <-
-            $"INSERT OR IGNORE INTO \"%s{archiveTable ()}\" (session_id, tenant, archived_at) VALUES ($session, $tenant, $at)"
+            $"INSERT INTO \"%s{archiveTable ()}\" (session_id, tenant, archived_at, archive_path) VALUES ($session, $tenant, $at, $path) ON CONFLICT (session_id) DO UPDATE SET tenant = $tenant, archived_at = $at, archive_path = $path"
 
         command.Parameters.AddWithValue("$session", sessionId.Value) |> ignore
         command.Parameters.AddWithValue("$tenant", tenant.Value) |> ignore
         command.Parameters.AddWithValue("$at", toIso database.UtcNow) |> ignore
+
+        command.Parameters.AddWithValue(
+            "$path",
+            if isNull (box archiveLocation) then
+                box DBNull.Value
+            else
+                box archiveLocation
+        )
+        |> ignore
+
         command.ExecuteNonQuery() |> ignore
+
+    let readArchivePath
+        (connection: SqliteConnection)
+        (transaction: SqliteTransaction | null)
+        (tenant: TenantId)
+        (sessionId: SessionId)
+        : string | null =
+        use command = connection.CreateCommand()
+
+        if not (isNull (box transaction)) then
+            command.Transaction <- transaction
+
+        command.CommandText <-
+            $"SELECT archive_path FROM \"%s{archiveTable ()}\" WHERE session_id = $session AND tenant = $tenant"
+
+        command.Parameters.AddWithValue("$session", sessionId.Value) |> ignore
+        command.Parameters.AddWithValue("$tenant", tenant.Value) |> ignore
+
+        use reader = command.ExecuteReader()
+
+        if reader.Read() && not (reader.IsDBNull(0)) then
+            reader.GetString(0)
+        else
+            null
 
     let clearArchived
         (connection: SqliteConnection)
@@ -304,7 +339,8 @@ type SqliteSessionEventStore(database: SqliteDatabase) =
                             if not (sessionExists connection null tenant sessionId) then
                                 EventReplayUnknownSession sessionId :> EventReplayOutcome
                             elif isArchived connection null tenant sessionId then
-                                EventReplayJournalExpired sessionId :> EventReplayOutcome
+                                let pointer = readArchivePath connection null tenant sessionId
+                                EventReplayJournalExpired(sessionId, pointer) :> EventReplayOutcome
                             else
                                 use command = connection.CreateCommand()
 
@@ -409,7 +445,7 @@ type SqliteSessionEventStore(database: SqliteDatabase) =
                 | :? SqliteException as sql -> return raise (mapSql sql)
             }
 
-        member _.CompleteCleanup(tenant, sessionId, claimToken, _) =
+        member _.CompleteCleanup(tenant, sessionId, claimToken, archiveLocation, _) =
             task {
                 if isNull (box claimToken) then
                     raise (ArgumentNullException(nameof claimToken))
@@ -463,7 +499,7 @@ type SqliteSessionEventStore(database: SqliteDatabase) =
 
                                     clear.Parameters.AddWithValue("$session", sessionId.Value) |> ignore
                                     clear.ExecuteNonQuery() |> ignore
-                                    markArchived connection transaction tenant sessionId
+                                    markArchived connection transaction tenant sessionId archiveLocation
                                     transaction.Commit()
                                     EventCleanupApplied(sessionId, true) :> EventCleanupSettlement)
                 with

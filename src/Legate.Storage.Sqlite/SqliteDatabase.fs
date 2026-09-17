@@ -311,7 +311,10 @@ type SqliteDatabase
     /// Creates the local blob and package tables the shared baseline does
     /// not cover, over the same file: one blob row per key, one package
     /// state row per agent, and one row per package version carrying its
-    /// files as JSON.
+    /// files as JSON. The journal-archive marker table carries the archive
+    /// pointer the expired replay reports; files created before the pointer
+    /// column gain it through a guarded alter, since SQLite has no
+    /// <c>ADD COLUMN IF NOT EXISTS</c>.
     /// </summary>
     member private this.EnsureLocalTables() =
         try
@@ -349,10 +352,30 @@ CREATE UNIQUE INDEX IF NOT EXISTS "IX_%s{versions}_tenant_agent_version" ON "%s{
 CREATE TABLE IF NOT EXISTS "%s{archive}" (
   session_id TEXT NOT NULL PRIMARY KEY,
   tenant TEXT NOT NULL,
-  archived_at TEXT NOT NULL
+  archived_at TEXT NOT NULL,
+  archive_path TEXT NULL
 );"""
 
             command.ExecuteNonQuery() |> ignore
+
+            // Files predating the archive pointer carry the three-column
+            // shape: the create above is a no-op for them, so add the
+            // column when it is absent.
+            use info = connection.CreateCommand()
+            info.CommandText <- $"PRAGMA table_info(\"%s{archive}\")"
+
+            use reader = info.ExecuteReader()
+
+            let columns =
+                [
+                    while reader.Read() do
+                        reader.GetString(1)
+                ]
+
+            if not (columns |> List.contains "archive_path") then
+                use alter = connection.CreateCommand()
+                alter.CommandText <- $"ALTER TABLE \"%s{archive}\" ADD COLUMN archive_path TEXT NULL"
+                alter.ExecuteNonQuery() |> ignore
         with
         | :? Legate.LegateException -> reraise ()
         | :? SqliteException as sql -> raise (SqliteErrors.ofSqliteException path sql)

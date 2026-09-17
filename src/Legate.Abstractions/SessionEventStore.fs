@@ -150,11 +150,18 @@ and [<Sealed>] EventReplayUnknownSession(sessionId: SessionId) =
 /// deleted by cleanup (or retention) before this replay. The caller must
 /// not treat this as end of stream: there are events it will never see.
 /// <param name="sessionId">The session whose journal is gone.</param>
-and [<Sealed>] EventReplayJournalExpired(sessionId: SessionId) =
+/// <param name="archiveLocation">Where the archived journal lives (the archive file path the cleanup wrote), or null when the journal was cleaned up without an archive pointer (a legacy archive).</param>
+and [<Sealed>] EventReplayJournalExpired(sessionId: SessionId, archiveLocation: string | null) =
     inherit EventReplayOutcome()
 
     /// The session whose journal is gone.
     member _.SessionId = sessionId
+
+    /// Where the archived journal lives (the archive file path the
+    /// cleanup wrote), or null when the journal was cleaned up without
+    /// an archive pointer (a legacy archive). Additive: journal JSON
+    /// written before the pointer reads null here.
+    member _.ArchiveLocation = archiveLocation
 
 // ───────────────────────────────────────────────────────────────────────────
 // Cleanup lease
@@ -397,11 +404,16 @@ type ISessionEventStore =
     /// <param name="tenant">The tenant the session belongs to.</param>
     /// <param name="sessionId">The session whose journal was cleaned up.</param>
     /// <param name="claimToken">The opaque token the granted claim carries. Must not be null.</param>
+    /// <param name="archiveLocation">Where the archived journal lives (the archive file path the worker verified), or null when the journal was cleaned up without an archive pointer. The stores persist it so a later replay reports the expired journal with its pointer.</param>
     /// <param name="cancellationToken">Token that abandons the settlement.</param>
     /// <returns>The settlement: applied (the journal is gone) or rejected with its reason.</returns>
     /// <exception cref="T:System.ArgumentNullException">The token is null.</exception>
     abstract CompleteCleanup:
-        tenant: TenantId * sessionId: SessionId * claimToken: string * cancellationToken: CancellationToken ->
+        tenant: TenantId *
+        sessionId: SessionId *
+        claimToken: string *
+        archiveLocation: string | null *
+        cancellationToken: CancellationToken ->
             Task<EventCleanupSettlement>
 
     /// Defers the cleanup lease: the worker could not finish (the archive

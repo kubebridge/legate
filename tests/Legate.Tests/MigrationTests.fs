@@ -386,6 +386,22 @@ let ``Baseline down removes every table it created`` () =
     |> should be Empty
 
 [<Fact>]
+let ``The Postgres-only archive migration skips SQLite`` () =
+    let keepAlive, connectionString = openDatabase ()
+    use _keep = keepAlive
+
+    use provider =
+        buildProvider connectionString (fun (options: MigrationOptions) -> options.Schema <- "")
+
+    migrateUp provider
+
+    // The SQLite store keeps its archive pointer in its local
+    // journal_archive table: the shared migration must leave the baseline
+    // cleanup_claims shape exactly as it found it.
+    columnNames keepAlive "cleanup_claims"
+    |> should not' (contain "archive_location")
+
+[<Fact>]
 let ``Table prefix renames every baseline table and index`` () =
     let keepAlive, connectionString = openDatabase ()
     use _keep = keepAlive

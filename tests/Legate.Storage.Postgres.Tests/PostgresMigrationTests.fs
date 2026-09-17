@@ -56,3 +56,25 @@ module PostgresMigrationTests =
 
         Assert.True(schemaExists connection, "The legate schema is missing.")
         Assert.Equal<string list>(expectedTables, tableNames connection)
+
+    /// The journal archive pointer column the additive migration owns:
+    /// nullable, so marker rows from before the migration read null.
+    let private archivePointerNullable (connection: NpgsqlConnection) : string =
+        use command =
+            new NpgsqlCommand(
+                "SELECT is_nullable FROM information_schema.columns WHERE table_schema = 'legate' AND table_name = 'cleanup_claims' AND column_name = 'archive_location'",
+                connection
+            )
+
+        use reader = command.ExecuteReader()
+
+        if reader.Read() then reader.GetString(0) else "missing"
+
+    [<Fact>]
+    let ``Archive migration adds the nullable archive pointer`` () =
+        let connectionString = PostgresTestDatabase.ensureReady ()
+
+        use connection = new NpgsqlConnection(connectionString)
+        connection.Open()
+
+        Assert.Equal("YES", archivePointerNullable connection)

@@ -136,8 +136,8 @@ type internal ObservingEventStore(inner: ISessionEventStore, onAppended: Session
         member _.TryClaimCleanup(tenant, sessionId, owner, leaseDuration, cancellationToken) =
             inner.TryClaimCleanup(tenant, sessionId, owner, leaseDuration, cancellationToken)
 
-        member _.CompleteCleanup(tenant, sessionId, claimToken, cancellationToken) =
-            inner.CompleteCleanup(tenant, sessionId, claimToken, cancellationToken)
+        member _.CompleteCleanup(tenant, sessionId, claimToken, archiveLocation, cancellationToken) =
+            inner.CompleteCleanup(tenant, sessionId, claimToken, archiveLocation, cancellationToken)
 
         member _.DeferCleanup(tenant, sessionId, claimToken, cancellationToken) =
             inner.DeferCleanup(tenant, sessionId, claimToken, cancellationToken)
