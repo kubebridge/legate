@@ -329,11 +329,21 @@ module PackageLeaseLoopTests =
     let leaseAt (clock: FakeClock) =
         AgentPackageLease(tenant, agent, "worker-a", "token-1", clock.GetUtcNow().Add(TimeSpan.FromMinutes 5.))
 
-    let parkedWork (observedCancel: bool ref) (token: CancellationToken) =
+    // Parks the work on the loop's token and observes cancellation through
+    // the work's own path: the OperationCanceledException handler signals
+    // the TCS synchronously before the work task completes, so awaiting the
+    // loop outcome (which awaited the work) makes the assertion below
+    // deterministic with no sleeps. A BCL Register callback is intentionally
+    // not used: its invocation ordering relative to the awaiting
+    // continuation differs across SDK bands and raced on CI.
+    let parkedWork (cancelled: TaskCompletionSource<unit>) (token: CancellationToken) =
         task {
-            use _registration = token.Register(Action(fun () -> observedCancel.Value <- true))
-            do! Task.Delay(Timeout.InfiniteTimeSpan, token)
-            return 0
+            try
+                do! Task.Delay(Timeout.InfiniteTimeSpan, token)
+                return 0
+            with :? OperationCanceledException ->
+                cancelled.TrySetResult(()) |> ignore
+                return raise (OperationCanceledException(token))
         }
 
     [<Fact>]
@@ -379,7 +389,7 @@ module PackageLeaseLoopTests =
         task {
             let clock = FakeClock()
             let delay = RecordingDelay()
-            let observedCancel = ref false
+            let cancelled = TaskCompletionSource<unit>()
 
             let renew (_: AgentPackageLease) (_: TimeSpan) (_: CancellationToken) =
                 Task.FromResult(PackageLeaseLost("staleToken") :> PackageLeaseRenewal)
@@ -393,14 +403,14 @@ module PackageLeaseLoopTests =
                     (TimeSpan.FromSeconds 5.)
                     clock
                     delay
-                    (parkedWork observedCancel)
+                    (parkedWork cancelled)
                     CancellationToken.None
 
             match outcome with
             | PackageLeaseLoop.Failed(_, reason) -> Assert.Equal("lost:staleToken", reason)
             | PackageLeaseLoop.Completed _ -> failwith "expected the lost renewal to fail the loop"
 
-            Assert.True(observedCancel.Value)
+            Assert.True(cancelled.Task.IsCompleted)
             Assert.Contains(TimeSpan.FromSeconds 10., delay.Recorded)
         }
 
@@ -409,7 +419,7 @@ module PackageLeaseLoopTests =
         task {
             let clock = FakeClock()
             let delay = RecordingDelay()
-            let observedCancel = ref false
+            let cancelled = TaskCompletionSource<unit>()
 
             let renew (current: AgentPackageLease) (_: TimeSpan) (_: CancellationToken) =
                 task {
@@ -428,14 +438,14 @@ module PackageLeaseLoopTests =
                     (TimeSpan.FromSeconds 5.)
                     clock
                     delay
-                    (parkedWork observedCancel)
+                    (parkedWork cancelled)
                     CancellationToken.None
 
             match outcome with
             | PackageLeaseLoop.Failed(_, reason) -> Assert.Equal("timeout", reason)
             | PackageLeaseLoop.Completed _ -> failwith "expected the slow renewal to fail the loop"
 
-            Assert.True(observedCancel.Value)
+            Assert.True(cancelled.Task.IsCompleted)
         }
 
 /// The DI surface: the service resolves over the container's clock and
