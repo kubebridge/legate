@@ -18,7 +18,9 @@ env:
 jobs:
   publish:
     name: Pack and publish
-    runs-on: ubuntu-latest
+    # Same org self-hosted Linux runner as ci.yml; see the SECURITY note there
+    # before this repository goes public (#144).
+    runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v4
         with:
