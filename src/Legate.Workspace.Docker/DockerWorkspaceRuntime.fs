@@ -325,7 +325,11 @@ type DockerWorkspaceRuntime
 
                         if options.CpuLimit.HasValue then
                             create.Add "--cpus" |> ignore
-                            create.Add(string options.CpuLimit.Value) |> ignore
+
+                            create.Add(
+                                options.CpuLimit.Value.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                            )
+                            |> ignore
 
                         match options.MemoryLimit with
                         | null -> ()
