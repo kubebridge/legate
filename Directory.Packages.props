@@ -3,6 +3,7 @@
   <!-- Central package versions. Projects reference packages without a Version
        attribute; bump versions here only. -->
   <ItemGroup>
+    <PackageVersion Include="AWSSDK.S3" Version="4.0.103.3" />
     <PackageVersion Include="Akka" Version="1.5.71" />
     <PackageVersion Include="Akka.FSharp" Version="1.5.71" />
     <PackageVersion Include="FluentMigrator" Version="8.0.1" />
@@ -38,6 +39,7 @@
     <PackageVersion Include="FsUnit.xUnit" Version="6.0.1" />
     <PackageVersion Include="Microsoft.Extensions.TimeProvider.Testing" Version="10.10.0" />
     <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageVersion Include="Testcontainers.Minio" Version="4.15.0" />
     <PackageVersion Include="Testcontainers.PostgreSql" Version="4.15.0" />
     <PackageVersion Include="xunit" Version="2.9.3" />
     <PackageVersion Include="xunit.runner.visualstudio" Version="3.1.4" />

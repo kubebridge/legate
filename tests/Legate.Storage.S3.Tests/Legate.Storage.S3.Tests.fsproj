@@ -1,0 +1,47 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <IsPackable>false</IsPackable>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <IsTestProject>true</IsTestProject>
+    <RootNamespace>Legate.Storage.S3.Tests</RootNamespace>
+  </PropertyGroup>
+
+  <!-- Compile order is explicit: register every new file here, in dependency order.
+       The Docker-backed suites compile on non-Windows only: xUnit 2.9 has no
+       dynamic-skip mechanism (verified against the 2.9.3 runner assemblies),
+       so the Windows CI leg excludes them at compile time and never attempts
+       a container. A Windows host with Linux-container Docker opts back in
+       explicitly (-p:LegateS3Docker=true). The gate
+       (S3TestEnvironment) and the Docker-free registration and presign tests
+       compile everywhere. -->
+  <ItemGroup>
+    <Compile Include="TestAssembly.fs" />
+    <Compile Include="S3TestEnvironment.fs" />
+    <Compile Include="S3PresignTests.fs" />
+    <Compile Include="S3RegistrationTests.fs" />
+    <Compile Include="S3ConditionalWriteTests.fs" />
+    <Compile Include="S3BlobStoreTests.fs" Condition="'$(OS)' != 'Windows_NT' or '$(LegateS3Docker)' == 'true'" />
+    <Compile Include="S3AgentPackageStoreTests.fs" Condition="'$(OS)' != 'Windows_NT' or '$(LegateS3Docker)' == 'true'" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../src/Legate.Abstractions/Legate.Abstractions.fsproj" />
+    <ProjectReference Include="../../src/Legate/Legate.fsproj" />
+    <ProjectReference Include="../../src/Legate.Storage.S3/Legate.Storage.S3.fsproj" />
+    <ProjectReference Include="../../src/Legate.Testing/Legate.Testing.fsproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="FSharp.Core" />
+    <PackageReference Include="Microsoft.Extensions.Configuration" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Binder" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection" />
+    <PackageReference Include="Microsoft.Extensions.Options" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="Testcontainers.Minio" />
+    <PackageReference Include="xunit" />
+    <PackageReference Include="xunit.runner.visualstudio" />
+  </ItemGroup>
+
+</Project>
