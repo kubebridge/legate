@@ -114,6 +114,7 @@
     <Compile Include="SqliteAgentPackageStoreTests.fs" />
     <Compile Include="SqliteOpenTests.fs" />
     <Compile Include="SqliteSecondProcessTests.fs" />
+    <Compile Include="PackageLeaseServiceTests.fs" />
   </ItemGroup>
 
   <ItemGroup>
@@ -124,6 +125,7 @@
     <ProjectReference Include="../../src/Legate.Llm.OpenAI/Legate.Llm.OpenAI.fsproj" />
     <ProjectReference Include="../../src/Legate.Storage.InMemory/Legate.Storage.InMemory.fsproj" />
     <ProjectReference Include="../../src/Legate.Storage.FileSystem/Legate.Storage.FileSystem.fsproj" />
+    <ProjectReference Include="../../src/Legate.Storage.Packages/Legate.Storage.Packages.fsproj" />
     <ProjectReference Include="../../src/Legate.Storage.Sqlite/Legate.Storage.Sqlite.fsproj" />
     <ProjectReference Include="../../src/Legate.Testing/Legate.Testing.fsproj" />
     <ProjectReference Include="../../src/Legate.Workspace.Process/Legate.Workspace.Process.fsproj" />

@@ -363,3 +363,209 @@ type AgentPackageStoreConformance(store: IAgentPackageStore, tenant: TenantId) =
                 |> ignore)
             |> ignore
         }
+
+    /// One entry stream that yields a single valid entry and then fails
+    /// mid-enumeration: the failed-upload fact's portable fault, proving a
+    /// broken upload leaves the previous version active on every store.
+    static member EntriesFailing(path: string, text: string, failure: exn) =
+        let bytes = System.Text.Encoding.UTF8.GetBytes text
+        let entry = AgentPackageEntry(path, new MemoryStream(bytes))
+
+        { new IAsyncEnumerable<AgentPackageEntry> with
+            member _.GetAsyncEnumerator(_: CancellationToken) =
+                let mutable step = 0
+
+                { new IAsyncEnumerator<AgentPackageEntry> with
+                    member _.MoveNextAsync() =
+                        step <- step + 1
+
+                        if step = 1 then ValueTask<bool>(true) else raise failure
+
+                    member _.Current: AgentPackageEntry = entry
+
+                    member _.DisposeAsync() : ValueTask = ValueTask()
+                }
+        }
+
+    [<Fact>]
+    member this.``Invalid versions reject on every entry point``() =
+        task {
+            let agentId = this.AgentId
+
+            let entries () =
+                AgentPackageStoreConformance.EntriesText("AGENTS.md", "Be helpful.")
+
+            Assert.Throws<ArgumentException>(fun () ->
+                store
+                    .UploadPackage(tenant, agentId, "no spaces", "bad", entries (), CancellationToken.None)
+                    .GetAwaiter()
+                    .GetResult()
+                |> ignore)
+            |> ignore
+
+            Assert.Throws<ArgumentException>(fun () ->
+                store
+                    .ReplacePackageVersion(tenant, agentId, "no spaces", "bad", entries (), CancellationToken.None)
+                    .GetAwaiter()
+                    .GetResult()
+                |> ignore)
+            |> ignore
+
+            Assert.Throws<ArgumentException>(fun () ->
+                store
+                    .DeletePackageVersion(tenant, agentId, "no spaces", CancellationToken.None)
+                    .GetAwaiter()
+                    .GetResult()
+                |> ignore)
+            |> ignore
+
+            Assert.Throws<ArgumentException>(fun () ->
+                store
+                    .ReadFile(tenant, agentId, "no spaces", "AGENTS.md", CancellationToken.None)
+                    .GetAwaiter()
+                    .GetResult()
+                |> ignore)
+            |> ignore
+
+            Assert.Throws<ArgumentException>(fun () ->
+                store
+                    .ListFiles(tenant, agentId, "no spaces", ".agent/skills", CancellationToken.None)
+                    .GetAwaiter()
+                    .GetResult()
+                |> ignore)
+            |> ignore
+
+            let! info = store.GetPackageInfo(tenant, agentId, CancellationToken.None)
+
+            Assert.Null(info)
+
+            let! versions = store.ListVersions(tenant, agentId, CancellationToken.None)
+
+            Assert.Equal(0, versions.Count)
+        }
+
+    [<Fact>]
+    member this.``A failed upload keeps the previous version active``() =
+        task {
+            let agentId = this.AgentId
+
+            let! _ =
+                store.UploadPackage(
+                    tenant,
+                    agentId,
+                    "1.0.0",
+                    "first",
+                    AgentPackageStoreConformance.EntriesText("AGENTS.md", "one"),
+                    CancellationToken.None
+                )
+
+            let failing =
+                AgentPackageStoreConformance.EntriesFailing(
+                    "AGENTS.md",
+                    "partial",
+                    InvalidOperationException("The entry stream failed mid-upload.")
+                )
+
+            Assert.Throws<InvalidOperationException>(fun () ->
+                store
+                    .UploadPackage(tenant, agentId, "2.0.0", "broken", failing, CancellationToken.None)
+                    .GetAwaiter()
+                    .GetResult()
+                |> ignore)
+            |> ignore
+
+            let! info = store.GetPackageInfo(tenant, agentId, CancellationToken.None)
+
+            match info with
+            | null -> failwith "expected the previous version to stay active after a failed upload"
+            | active ->
+                Assert.Equal("1.0.0", active.ActiveVersion)
+                Assert.Equal("one", active.Instructions)
+                Assert.Equal("first", active.Source)
+
+            let! versions = store.ListVersions(tenant, agentId, CancellationToken.None)
+
+            Assert.Equal<string list>(
+                [ "1.0.0" ],
+                versions |> Seq.map (fun packageVersion -> packageVersion.Version) |> Seq.toList
+            )
+
+            let! stream = store.ReadFile(tenant, agentId, "1.0.0", "AGENTS.md", CancellationToken.None)
+
+            match stream with
+            | null -> failwith "expected the previous version's bytes after a failed upload"
+            | readable ->
+                use reader = new StreamReader(readable)
+                let! text = reader.ReadToEndAsync()
+                Assert.Equal("one", text)
+        }
+
+    [<Fact>]
+    member this.``Deleting the active version never auto-promotes and the next upload re-activates``() =
+        task {
+            let agentId = this.AgentId
+
+            let! _ =
+                store.UploadPackage(
+                    tenant,
+                    agentId,
+                    "1.0.0",
+                    "first",
+                    AgentPackageStoreConformance.EntriesText("AGENTS.md", "one"),
+                    CancellationToken.None
+                )
+
+            let! _ =
+                store.UploadPackage(
+                    tenant,
+                    agentId,
+                    "2.0.0",
+                    "second",
+                    AgentPackageStoreConformance.EntriesText("AGENTS.md", "two"),
+                    CancellationToken.None
+                )
+
+            let! deleted = store.DeletePackageVersion(tenant, agentId, "2.0.0", CancellationToken.None)
+
+            Assert.True(deleted)
+
+            // No auto-promote: the surviving version stays stored and
+            // readable, but nothing is active until the next upload.
+            let! cleared = store.GetPackageInfo(tenant, agentId, CancellationToken.None)
+
+            Assert.Null(cleared)
+
+            let! versions = store.ListVersions(tenant, agentId, CancellationToken.None)
+
+            Assert.Equal<string list>(
+                [ "1.0.0" ],
+                versions |> Seq.map (fun packageVersion -> packageVersion.Version) |> Seq.toList
+            )
+
+            let! stream = store.ReadFile(tenant, agentId, "1.0.0", "AGENTS.md", CancellationToken.None)
+
+            match stream with
+            | null -> failwith "expected the surviving version to stay readable"
+            | readable ->
+                use reader = new StreamReader(readable)
+                let! text = reader.ReadToEndAsync()
+                Assert.Equal("one", text)
+
+            let! _ =
+                store.UploadPackage(
+                    tenant,
+                    agentId,
+                    "3.0.0",
+                    "third",
+                    AgentPackageStoreConformance.EntriesText("AGENTS.md", "three"),
+                    CancellationToken.None
+                )
+
+            let! reactivated = store.GetPackageInfo(tenant, agentId, CancellationToken.None)
+
+            match reactivated with
+            | null -> failwith "expected the next upload to re-activate the package"
+            | info ->
+                Assert.Equal("3.0.0", info.ActiveVersion)
+                Assert.Equal("three", info.Instructions)
+        }

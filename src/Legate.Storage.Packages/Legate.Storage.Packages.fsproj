@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>Legate.Storage.Packages</RootNamespace>
+    <Description>Shared renewing agent-package lease service over the Legate package contracts: an in-process IAgentPackageLeaseService with WithLease renewal on the ILlmDelay seam. File-system and S3 hosts compose it beside their stores; no store changes.</Description>
+  </PropertyGroup>
+
+  <!-- Compile order is explicit: register every new file here, in dependency order. -->
+  <ItemGroup>
+    <Compile Include="AssemblyInfo.fs" />
+    <Compile Include="PackageLeaseLoop.fs" />
+    <Compile Include="AgentPackageLeaseService.fs" />
+    <Compile Include="PackageServiceExtensions.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../Legate.Abstractions/Legate.Abstractions.fsproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="FSharp.Core" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" />
+  </ItemGroup>
+
+</Project>
