@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>Legate.Storage.S3</RootNamespace>
+    <Description>S3-compatible implementations of the Legate blob and agent package contracts: IBlobStore with ETag compare-exchange over S3 conditional writes, and IAgentPackageStore over a key layout with a pointer-commit publish. For hosted multi-tenant services on AWS, Hetzner, or MinIO.</Description>
+  </PropertyGroup>
+
+  <!-- Compile order is explicit: register every new file here, in dependency order. -->
+  <ItemGroup>
+    <Compile Include="AssemblyInfo.fs" />
+    <Compile Include="S3Exceptions.fs" />
+    <Compile Include="S3StorageOptions.fs" />
+    <Compile Include="S3Keys.fs" />
+    <Compile Include="S3Client.fs" />
+    <Compile Include="S3BlobStore.fs" />
+    <Compile Include="S3AgentPackageStore.fs" />
+    <Compile Include="S3Registration.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../Legate.Abstractions/Legate.Abstractions.fsproj" />
+    <ProjectReference Include="../Legate/Legate.fsproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="AWSSDK.S3" />
+    <PackageReference Include="FSharp.Core" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Abstractions" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Binder" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" />
+    <PackageReference Include="Microsoft.Extensions.Options" />
+  </ItemGroup>
+
+</Project>
