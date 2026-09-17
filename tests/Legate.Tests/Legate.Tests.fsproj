@@ -33,6 +33,8 @@
     <Compile Include="FileSystemAgentPackageTests.fs" />
     <Compile Include="ProcessWorkspaceTests.fs" />
     <Compile Include="ProcessWorkspaceRuntimeTests.fs" />
+    <Compile Include="HostDirectoryWorkspaceTests.fs" />
+    <Compile Include="HostDirectoryWorkspaceRuntimeTests.fs" />
     <Compile Include="SessionTests.fs" />
     <Compile Include="WorkspaceRuntimeTests.fs" />
     <Compile Include="LlmTests.fs" />
@@ -132,6 +134,7 @@
     <ProjectReference Include="../../src/Legate.Storage.Sqlite/Legate.Storage.Sqlite.fsproj" />
     <ProjectReference Include="../../src/Legate.Testing/Legate.Testing.fsproj" />
     <ProjectReference Include="../../src/Legate.Workspace.Process/Legate.Workspace.Process.fsproj" />
+    <ProjectReference Include="../../src/Legate.Workspace.HostDirectory/Legate.Workspace.HostDirectory.fsproj" />
     <ProjectReference Include="../../src/Legate.Mcp/Legate.Mcp.fsproj" />
   </ItemGroup>
 

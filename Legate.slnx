@@ -13,6 +13,7 @@
     <Project Path="src/Legate.Storage.Packages/Legate.Storage.Packages.fsproj" />
     <Project Path="src/Legate.Testing/Legate.Testing.fsproj" />
     <Project Path="src/Legate.Workspace.Process/Legate.Workspace.Process.fsproj" />
+    <Project Path="src/Legate.Workspace.HostDirectory/Legate.Workspace.HostDirectory.fsproj" />
     <Project Path="src/Legate.Mcp/Legate.Mcp.fsproj" />
   </Folder>
   <Folder Name="/tests/">

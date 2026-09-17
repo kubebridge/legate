@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>Legate.Workspace.HostDirectory</RootNamespace>
+    <Description>A Legate workspace runtime bound to a host directory with symlink-aware path confinement and host-shell exec. Unsafe for untrusted agents; the constructor logs a warning outside Development.</Description>
+  </PropertyGroup>
+
+  <!-- Compile order is explicit: register every new file here, in dependency order. -->
+  <ItemGroup>
+    <Compile Include="HostDirectoryWorkspace.fs" />
+    <Compile Include="HostDirectoryWorkspaceRuntime.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../Legate.Abstractions/Legate.Abstractions.fsproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="FSharp.Core" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
+  </ItemGroup>
+
+</Project>

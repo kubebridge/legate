@@ -1,0 +1,665 @@
+// SPDX-License-Identifier: Apache-2.0
+namespace Legate.Workspace.HostDirectory
+
+open System
+open System.Collections.Generic
+open System.Diagnostics
+open System.IO
+open System.Runtime.InteropServices
+open System.Threading
+open System.Threading.Tasks
+open Legate
+
+// The bound host-directory workspace: confined file operations over the
+// bound host directory and exec through the platform shell. Every member
+// validates the workspace-relative path against the blob-key rules first
+// (aligned with ProcessWorkspacePaths.validate, not a rival rule set),
+// then canonicalises post-symlink and requires containment within the
+// canonical root unless the runtime opted into AllowOutsideRoot. Dispose is
+// idempotent, never deletes the workspace's files (the runtime may re-bind
+// over the same directory later), and makes every member throw
+// ObjectDisposedException once disposed.
+//
+// Residuals inherited from the Process pattern and documented, not fixed in
+// scope: validate-then-act TOCTOU between the containment check and the IO,
+// and unbounded captured exec output.
+
+module internal HostDirectoryWorkspacePaths =
+
+    /// How many symbolic-link hops the canonicaliser follows before it
+    /// rejects the path: loops and runaway chains surface as
+    /// <see cref="T:Legate.WorkspaceException" /> instead of hanging.
+    let maxLinkSteps = 40
+
+    /// Validates a workspace-relative path against the blob-key rules and
+    /// returns it unchanged: non-null, non-empty, no rooted paths or drive
+    /// prefixes, no leading or trailing slash, no '.' or '..' segments, no
+    /// backslashes, and no NUL characters. All violations are
+    /// <see cref="T:Legate.WorkspaceException" /> so callers cannot reach
+    /// outside the workspace root.
+    /// <param name="path">The path to validate.</param>
+    /// <returns>The validated path, unchanged.</returns>
+    /// <exception cref="T:Legate.WorkspaceException">The path violates the workspace path rules.</exception>
+    let validate (path: string) : string =
+        if isNull (box path) then
+            raise (ArgumentNullException(nameof path))
+
+        if path = "" then
+            raise (WorkspaceException(path, "A workspace path must not be empty."))
+
+        if path.Length >= 2 && path[1] = ':' then
+            raise (WorkspaceException(path, "A workspace path must not be a rooted path or carry a drive prefix."))
+
+        if path.StartsWith('/') || path.StartsWith('\\') then
+            raise (WorkspaceException(path, "A workspace path must be relative, without a leading slash."))
+
+        if path.EndsWith('/') then
+            raise (WorkspaceException(path, "A workspace path must not end with a slash."))
+
+        let segments = path.Split('/')
+
+        for segment in segments do
+            if segment = "" then
+                raise (WorkspaceException(path, "A workspace path must not contain empty segments."))
+
+            if segment = "." || segment = ".." then
+                raise (WorkspaceException(path, "A workspace path must not contain '.' or '..' segments."))
+
+            if segment.Contains('\\') then
+                raise (WorkspaceException(path, "A workspace path must not contain backslashes."))
+
+            if segment.Contains('\u0000') then
+                raise (WorkspaceException(path, "A workspace path must not contain NUL characters."))
+
+        path
+
+    /// Validates a workspace binding against the confined-relative-directory
+    /// rules and returns it unchanged: non-null, non-empty, no rooted paths
+    /// or drive prefixes, no leading or trailing slash, no '.' or '..'
+    /// segments, no backslashes, and no NUL characters. Nested relative
+    /// paths are allowed; escapes are not.
+    /// <param name="binding">The binding to validate.</param>
+    /// <returns>The validated binding, unchanged.</returns>
+    /// <exception cref="T:Legate.WorkspaceException">The binding violates the confinement rules.</exception>
+    let validateBinding (binding: string) : string =
+        if isNull (box binding) then
+            raise (ArgumentNullException(nameof binding))
+
+        if String.IsNullOrWhiteSpace binding then
+            raise (WorkspaceException(binding, "A workspace binding must not be empty."))
+
+        if binding.Length >= 2 && binding[1] = ':' then
+            raise (
+                WorkspaceException(binding, "A workspace binding must not be a rooted path or carry a drive prefix.")
+            )
+
+        if binding.StartsWith('/') || binding.StartsWith('\\') then
+            raise (WorkspaceException(binding, "A workspace binding must be relative, without a leading slash."))
+
+        if binding.EndsWith('/') then
+            raise (WorkspaceException(binding, "A workspace binding must not end with a slash."))
+
+        let segments = binding.Split('/')
+
+        for segment in segments do
+            if segment = "" then
+                raise (WorkspaceException(binding, "A workspace binding must not contain empty segments."))
+
+            if segment = "." || segment = ".." then
+                raise (WorkspaceException(binding, "A workspace binding must not contain '.' or '..' segments."))
+
+            if segment.Contains('\\') then
+                raise (WorkspaceException(binding, "A workspace binding must not contain backslashes."))
+
+            if segment.Contains('\u0000') then
+                raise (WorkspaceException(binding, "A workspace binding must not contain NUL characters."))
+
+        binding
+
+    /// Canonicalises a workspace root once, at construction: the absolute
+    /// path without a trailing separator (except a filesystem root, which
+    /// keeps its own form), so the containment check below compares exact
+    /// paths on a separator boundary instead of string prefixes.
+    /// <param name="root">The absolute workspace root directory.</param>
+    /// <returns>The canonical root, without a trailing separator.</returns>
+    let canonicalizeRoot (root: string) : string =
+        let full = Path.GetFullPath root
+
+        let trimmed =
+            full.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+
+        if trimmed = "" then full else trimmed
+
+    // Path comparison follows the platform: case-insensitive on Windows,
+    // case-sensitive elsewhere.
+    let private pathComparison =
+        if OperatingSystem.IsWindows() then
+            StringComparison.OrdinalIgnoreCase
+        else
+            StringComparison.Ordinal
+
+    /// Reports whether a canonical candidate path is the canonical root
+    /// itself or sits under it on a directory-separator boundary, so a
+    /// sibling such as "<c>root-evil</c>" never counts as contained.
+    /// <param name="canonicalRoot">The canonical workspace root.</param>
+    /// <param name="candidate">The canonical candidate path.</param>
+    /// <returns>true when the candidate is the root or under it; otherwise false.</returns>
+    let isWithin (canonicalRoot: string) (candidate: string) : bool =
+        if String.Equals(canonicalRoot, candidate, pathComparison) then
+            true
+        else
+            candidate.StartsWith(canonicalRoot + string Path.DirectorySeparatorChar, pathComparison)
+
+    // Reads the immediate symbolic-link target of one path, or null when the
+    // path is not a link. Missing paths report null (a FileNotFound or
+    // DirectoryNotFound from the probe means "no link here"); any other host
+    // failure raises WorkspaceException so unresolvable paths are rejected,
+    // never silently allowed. Reading LinkTarget never follows the link, so
+    // dangling links still report their target.
+    let private linkTargetOf (path: string) : string | null =
+        let probe (info: FileSystemInfo) : string | null =
+            try
+                info.LinkTarget
+            with
+            | :? FileNotFoundException -> null
+            | :? DirectoryNotFoundException -> null
+            | error ->
+                raise (
+                    WorkspaceException(
+                        path,
+                        sprintf "The workspace path could not be resolved; the host reported: %s." error.Message
+                    )
+                )
+
+        let directoryTarget = probe (DirectoryInfo(path) :> FileSystemInfo)
+
+        if isNull (box directoryTarget) then
+            probe (FileInfo(path) :> FileSystemInfo)
+        else
+            directoryTarget
+
+    /// Canonicalises a combined absolute path post-symlink: the deepest
+    /// existing-or-link ancestor is resolved through its link chain, then
+    /// each remaining segment is appended and resolved in turn, so links in
+    /// any position (including a dangling final link) are followed. One
+    /// shared visited set spans the whole walk, so a loop across segments
+    /// is still a loop. Loops, over-long chains, and unresolvable paths
+    /// raise <see cref="T:Legate.WorkspaceException" />.
+    /// <param name="combined">The absolute path to canonicalise.</param>
+    /// <returns>The canonical absolute path, with all links resolved.</returns>
+    /// <exception cref="T:Legate.WorkspaceException">The path loops, exceeds the hop cap, or cannot be resolved.</exception>
+    let resolveCanonical (combined: string) : string =
+        let visited = HashSet<string>()
+        let mutable steps = 0
+
+        let normaliseKey (path: string) =
+            if OperatingSystem.IsWindows() then
+                path.ToUpperInvariant()
+            else
+                path
+
+        // Follows the link chain starting at one path and returns the first
+        // non-link path. Missing paths are returned as-is (GetFullPath only);
+        // every hop is loop-checked against the shared visited set.
+        let rec hop (current: string) : string =
+            match linkTargetOf current with
+            | null -> Path.GetFullPath current
+            | target ->
+                steps <- steps + 1
+
+                if steps > maxLinkSteps then
+                    raise (
+                        WorkspaceException(
+                            current,
+                            "The workspace path could not be resolved; too many symbolic-link levels."
+                        )
+                    )
+
+                if not (visited.Add(normaliseKey current)) then
+                    raise (
+                        WorkspaceException(
+                            current,
+                            "The workspace path could not be resolved; symbolic links form a loop."
+                        )
+                    )
+
+                let parent =
+                    match Path.GetDirectoryName current with
+                    | null -> current
+                    | directory -> directory
+
+                let next =
+                    if Path.IsPathRooted target then
+                        target
+                    else
+                        Path.Combine(parent, target)
+
+                hop next
+
+        // Resolve every component from the filesystem root down, so links
+        // in any position are followed — including intermediate
+        // directories of a path that otherwise exists. One shared visited
+        // set spans the whole walk, so a loop across segments is still a
+        // loop.
+        let anchor =
+            match Path.GetPathRoot combined with
+            | null -> raise (WorkspaceException(combined, "The workspace path could not be resolved; it has no root."))
+            | root -> root
+
+        let remainder = combined.Substring(anchor.Length)
+
+        let segments =
+            remainder.Split(
+                [|
+                    Path.DirectorySeparatorChar
+                    Path.AltDirectorySeparatorChar
+                |],
+                StringSplitOptions.RemoveEmptyEntries
+            )
+
+        let mutable current = Path.GetFullPath anchor
+
+        for segment in segments do
+            current <- hop (Path.Combine(current, segment))
+
+        Path.GetFullPath current
+
+    /// Validates a workspace-relative path, canonicalises it post-symlink,
+    /// and requires containment within the canonical root unless
+    /// <c>allowOutsideRoot</c> opts in. Violations raise
+    /// <see cref="T:Legate.WorkspaceException" /> before any IO runs.
+    /// <param name="canonicalRoot">The canonical workspace root.</param>
+    /// <param name="allowOutsideRoot">Whether paths resolving outside the root are permitted.</param>
+    /// <param name="root">The absolute workspace root directory.</param>
+    /// <param name="path">The workspace-relative path.</param>
+    /// <returns>The canonical absolute path to act on.</returns>
+    /// <exception cref="T:Legate.WorkspaceException">The path is invalid, unresolvable, or escapes the root.</exception>
+    let resolveContained (canonicalRoot: string) (allowOutsideRoot: bool) (root: string) (path: string) : string =
+        let validated = validate path
+
+        let combined =
+            Path.GetFullPath(Path.Combine(root, validated.Replace('/', Path.DirectorySeparatorChar)))
+
+        let canonical = resolveCanonical combined
+
+        if allowOutsideRoot || isWithin canonicalRoot canonical then
+            canonical
+        else
+            raise (WorkspaceException(validated, "The workspace path escapes the workspace root."))
+
+    /// Validates a workspace binding as a confined relative sub-path,
+    /// canonicalises it post-symlink, and requires containment within the
+    /// canonical root. The binding stays confined even when
+    /// <c>allowOutsideRoot</c> opts the file operations out, keeping the
+    /// Bind surface composable for per-session re-staging.
+    /// <param name="canonicalRoot">The canonical workspace root.</param>
+    /// <param name="root">The absolute workspace root directory.</param>
+    /// <param name="binding">The validated workspace binding.</param>
+    /// <returns>The canonical absolute directory to bind.</returns>
+    /// <exception cref="T:Legate.WorkspaceException">The binding is invalid, unresolvable, or escapes the root.</exception>
+    let resolveBinding (canonicalRoot: string) (root: string) (binding: string) : string =
+        let validated = validateBinding binding
+
+        let combined =
+            Path.GetFullPath(Path.Combine(root, validated.Replace('/', Path.DirectorySeparatorChar)))
+
+        let canonical = resolveCanonical combined
+
+        if isWithin canonicalRoot canonical then
+            canonical
+        else
+            raise (WorkspaceException(validated, "The session's workspace binding escapes the workspace root."))
+
+module internal HostDirectoryWorkspaceWrite =
+
+    /// The host IO failure translated into
+    /// <see cref="T:Legate.WorkspaceException" /> for the write path.
+    let writeFailed (path: string) (error: exn) : exn =
+        WorkspaceException(path, sprintf "The workspace could not write the file; the host reported: %s." error.Message)
+
+    /// Writes content to the destination through a sibling temp file with
+    /// an atomic replace, translating host IO failures into
+    /// <see cref="T:Legate.WorkspaceException" />. Cancellation propagates
+    /// as-is, the temp file is cleaned up on every failure path.
+    let atomically (path: string) (fullPath: string) (content: byte[]) (cancellationToken: CancellationToken) : Task =
+        task {
+            // Directories first so the atomic replace below never races a
+            // missing parent.
+            match Path.GetDirectoryName fullPath with
+            | null -> ()
+            | directory when not (Directory.Exists directory) -> Directory.CreateDirectory directory |> ignore
+            | _ -> ()
+
+            // Atomic replace: write to a sibling temp file, close it, then
+            // swap over the destination, so readers never see a partial
+            // file and an existing file is always overwritten.
+            let tempPath = sprintf "%s.legate-tmp-%s" fullPath (Ulid.NewUlid().ToString())
+
+            let mutable failure: exn | null = null
+
+            try
+                use stream =
+                    new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None)
+
+                do! stream.WriteAsync(content, 0, content.Length, cancellationToken)
+                do! stream.FlushAsync(cancellationToken)
+            with
+            | :? OperationCanceledException as cancelled -> failure <- cancelled
+            | error -> failure <- writeFailed path error
+
+            if isNull (box failure) then
+                try
+                    File.Move(tempPath, fullPath, overwrite = true)
+                with error ->
+                    failure <- writeFailed path error
+
+            // Clean the temp file on every failure path so a failed write
+            // leaves no litter in the workspace.
+            if not (isNull (box failure)) then
+                try
+                    File.Delete tempPath
+                with _ ->
+                    ()
+
+            match failure with
+            | null -> ()
+            | error -> return raise error
+        }
+
+/// The workspace bound by
+/// <see cref="T:Legate.Workspace.HostDirectory.HostDirectoryWorkspaceRuntime" />:
+/// confined file operations over the bound host directory and
+/// <see cref="M:Legate.IWorkspace.Exec" /> through the platform shell
+/// (<c>cmd.exe /d /s /c</c> on Windows, <c>/bin/sh -c</c> elsewhere), with
+/// the inherited environment plus any injected variables and
+/// <see cref="M:System.Diagnostics.Process.Kill(System.Boolean)" /> of the
+/// shell's entire process tree on timeout or cancellation.
+///
+/// <para>Not a sandbox: the shell runs as the host process's user with the
+/// host's environment, so the runtime is unsafe for untrusted agents. The
+/// constructor logs a warning outside Development.</para>
+///
+/// <para>Standard output and standard error are captured without a cap, so a
+/// command that prints without bound can balloon memory; the runtime never
+/// logs captured output, command lines, or environment values.</para>
+///
+/// <para>Confinement is validate-then-act: the containment check and the IO
+/// are two steps, so a concurrent rename or link swap between them can move
+/// the target (the same TOCTOU residual as the process workspace).
+/// HostDirectory never takes locks; hosts that need stronger guarantees
+/// must quiesce writers first.</para>
+[<Sealed>]
+type HostDirectoryWorkspace
+    internal (runtimeId: string, rootDirectory: string, allowOutsideRoot: bool, defaultExecTimeout: Nullable<TimeSpan>)
+    =
+
+    do
+        if String.IsNullOrWhiteSpace runtimeId then
+            raise (ArgumentException("A workspace root must name its owning runtime.", nameof runtimeId))
+
+        if isNull (box rootDirectory) then
+            raise (ArgumentNullException(nameof rootDirectory))
+
+        if not (Path.IsPathRooted rootDirectory) then
+            raise (ArgumentException("A workspace root directory must be an absolute path.", nameof rootDirectory))
+
+    let root = Path.GetFullPath rootDirectory
+    let canonicalRoot = HostDirectoryWorkspacePaths.canonicalizeRoot root
+    // The effective default exec timeout, empty when exec may run unbounded.
+    let defaultExecTimeout = defaultExecTimeout
+
+    let mutable disposed = 0
+
+    // One lock serialises the dispose transition against in-flight members;
+    // file operations themselves rely on the OS for mutual exclusion.
+    let gate = obj ()
+
+    let throwIfDisposed (operation: string) =
+        lock gate (fun () -> disposed) |> ignore
+
+        if disposed <> 0 then
+            raise (
+                ObjectDisposedException(
+                    nameof HostDirectoryWorkspace,
+                    sprintf "The workspace is disposed; %s is no longer available." operation
+                )
+            )
+
+    /// Starts the shell with the workspace as its working directory and both
+    /// streams redirected. The shell inherits the process's environment; the
+    /// caller's injected variables are added on top, overriding on name
+    /// collisions. Values may carry secrets and are never logged. The two
+    /// platforms need different transports: cmd.exe re-parses the raw
+    /// command line after <c>/c</c>, so the Windows branch builds
+    /// <c>Arguments</c> verbatim; <c>/bin/sh -c</c> must receive the payload
+    /// as one argv element, so the POSIX branch uses
+    /// <see cref="P:System.Diagnostics.ProcessStartInfo.ArgumentList" />.
+    let startShell (command: string) (env: IReadOnlyDictionary<string, string> | null) : Process =
+        let startInfo = ProcessStartInfo()
+
+        if RuntimeInformation.IsOSPlatform(OSPlatform.Windows) then
+            let comspec = Environment.GetEnvironmentVariable "ComSpec"
+
+            startInfo.FileName <-
+                (match comspec with
+                 | null -> "cmd.exe"
+                 | value -> value)
+
+            startInfo.Arguments <- sprintf "/d /s /c %s" command
+        else
+            startInfo.FileName <- "/bin/sh"
+            startInfo.ArgumentList.Add "-c"
+            startInfo.ArgumentList.Add command
+
+        startInfo.WorkingDirectory <- root
+        startInfo.UseShellExecute <- false
+        startInfo.RedirectStandardOutput <- true
+        startInfo.RedirectStandardError <- true
+        startInfo.CreateNoWindow <- true
+
+        if not (isNull (box env)) then
+            for KeyValue(key, value) in env do
+                startInfo.Environment[key] <- value
+
+        try
+            match Process.Start startInfo with
+            | null ->
+                raise (
+                    WorkspaceException(
+                        root,
+                        "The workspace could not start a shell for the command; the host returned no process."
+                    )
+                )
+            | started -> started
+        with error ->
+            raise (
+                WorkspaceException(
+                    root,
+                    sprintf
+                        "The workspace could not start a shell for the command; the shell reported: %s."
+                        error.Message
+                )
+            )
+
+    let killTree (shell: Process) =
+        try
+            shell.Kill(entireProcessTree = true)
+        with :? InvalidOperationException ->
+            // The shell already exited between the wait and the kill;
+            // nothing left to terminate.
+            ()
+
+    /// Runs the shell to completion under the timeout and the cancellation
+    /// token. The timeout and the caller's cancellation share one linked
+    /// source: either path kills the shell's entire process tree, and the
+    /// result reports the OS exit value of the killed shell with the
+    /// timed-out flag set for the timeout path.
+    let runShell
+        (command: string)
+        (timeout: Nullable<TimeSpan>)
+        (env: IReadOnlyDictionary<string, string> | null)
+        (cancellationToken: CancellationToken)
+        : Task<WorkspaceExecResult> =
+        throwIfDisposed "exec"
+
+        if isNull (box command) then
+            raise (ArgumentNullException(nameof command))
+
+        if timeout.HasValue && timeout.Value <= TimeSpan.Zero then
+            raise (ArgumentOutOfRangeException(nameof timeout, "The exec timeout must be positive when set."))
+
+        task {
+            let shell = startShell command env
+
+            use _shell = shell
+
+            // Drain both streams concurrently: a full pipe blocks a shell
+            // writing more output, which would deadlock the wait.
+            let stdoutTask: Task<string> = shell.StandardOutput.ReadToEndAsync()
+            let stderrTask: Task<string> = shell.StandardError.ReadToEndAsync()
+
+            let mutable timedOut = false
+
+            // One linked source carries both kill arms: CancelAfter arms
+            // the effective timeout (the caller's span, or the runtime's
+            // configured default, or unbounded) and the caller's
+            // cancellation flows straight through. After the wait, the
+            // timeout did the cancelling exactly when the linked token is
+            // cancelled and the caller's is not.
+            use linked = CancellationTokenSource.CreateLinkedTokenSource cancellationToken
+
+            let effectiveTimeout =
+                if timeout.HasValue then
+                    Nullable timeout.Value
+                else
+                    defaultExecTimeout
+
+            if effectiveTimeout.HasValue then
+                linked.CancelAfter effectiveTimeout.Value
+
+            use _killRegistration = linked.Token.Register(fun () -> killTree shell)
+
+            try
+                do! shell.WaitForExitAsync(linked.Token)
+            with :? OperationCanceledException ->
+                // The shell was killed by the timeout or the caller's
+                // cancellation; the exit code below is the OS-reported
+                // value of the killed process.
+                ()
+
+            timedOut <- linked.IsCancellationRequested && not cancellationToken.IsCancellationRequested
+
+            // Belt and braces: the tree is down whatever the exit path.
+            killTree shell
+
+            let! stdout = stdoutTask
+            let! stderr = stderrTask
+
+            let! _ = shell.WaitForExitAsync(CancellationToken.None)
+
+            return WorkspaceExecResult(shell.ExitCode, stdout, stderr, timedOut)
+        }
+
+    interface IWorkspace with
+
+        member _.Root: WorkspaceRoot = WorkspaceRoot(runtimeId, root)
+
+        member workspace.Exec(command, timeout, env, cancellationToken) =
+            runShell command timeout env cancellationToken
+
+        member workspace.Exists(path, cancellationToken) =
+            throwIfDisposed "Exists"
+
+            let fullPath =
+                HostDirectoryWorkspacePaths.resolveContained canonicalRoot allowOutsideRoot root path
+
+            task {
+                cancellationToken.ThrowIfCancellationRequested()
+
+                try
+                    return File.Exists fullPath
+                with error ->
+                    return
+                        raise (
+                            WorkspaceException(
+                                root,
+                                sprintf "The workspace could not probe the path; the host reported: %s." error.Message
+                            )
+                        )
+            }
+
+        member workspace.ReadFile(path, cancellationToken) =
+            throwIfDisposed "ReadFile"
+
+            let fullPath =
+                HostDirectoryWorkspacePaths.resolveContained canonicalRoot allowOutsideRoot root path
+
+            task {
+                cancellationToken.ThrowIfCancellationRequested()
+
+                if not (File.Exists fullPath) then
+                    raise (FileNotFoundException("No file exists at this workspace path.", path))
+
+                try
+                    return new FileStream(fullPath, FileMode.Open, FileAccess.Read, FileShare.Read) :> Stream
+                with error ->
+                    return
+                        raise (
+                            WorkspaceException(
+                                root,
+                                sprintf "The workspace could not open the file; the host reported: %s." error.Message
+                            )
+                        )
+            }
+
+        member workspace.WriteFile(path, content, cancellationToken) =
+            throwIfDisposed "WriteFile"
+
+            let fullPath =
+                HostDirectoryWorkspacePaths.resolveContained canonicalRoot allowOutsideRoot root path
+
+            if isNull (box content) then
+                raise (ArgumentNullException(nameof content))
+
+            task {
+                cancellationToken.ThrowIfCancellationRequested()
+                do! HostDirectoryWorkspaceWrite.atomically path fullPath content cancellationToken
+            }
+
+        member workspace.DeleteFile(path, cancellationToken) =
+            throwIfDisposed "DeleteFile"
+
+            let fullPath =
+                HostDirectoryWorkspacePaths.resolveContained canonicalRoot allowOutsideRoot root path
+
+            task {
+                cancellationToken.ThrowIfCancellationRequested()
+
+                try
+                    if File.Exists fullPath then
+                        File.Delete fullPath
+                        return true
+                    else
+                        return false
+                with error ->
+                    return
+                        raise (
+                            WorkspaceException(
+                                root,
+                                sprintf "The workspace could not delete the file; the host reported: %s." error.Message
+                            )
+                        )
+            }
+
+        member workspace.DisposeAsync() =
+            lock gate (fun () -> disposed <- 1)
+
+            // No execution vehicle of our own to destroy (each exec's shell
+            // is killed on timeout or cancellation), and the workspace's
+            // files always survive dispose: the runtime may re-bind over
+            // the same directory.
+            ValueTask.CompletedTask
+
+    interface IDisposable with
+        member this.Dispose() =
+            (this :> IAsyncDisposable).DisposeAsync().AsTask().Wait()
