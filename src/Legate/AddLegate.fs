@@ -88,6 +88,7 @@ type LegateServiceCollectionExtensions =
         SessionClientRegistration.register services
         CompletionRedriverRegistration.register services
         JournalArchiveRegistration.register services
+        SessionExpiryRegistration.register services
         services
 
 // ──────────────────────────────────────────────────────────────────────────
