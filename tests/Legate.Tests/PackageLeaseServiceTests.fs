@@ -274,19 +274,29 @@ module PackageLeaseServiceTests =
             let clock = FakeClock()
             let service, _ = freshService clock
             let options = testOptions ()
-            let mutable observedCancel = false
+            let cancelled = TaskCompletionSource<unit>()
 
             let work (token: CancellationToken) =
                 task {
-                    use _registration = token.Register(Action(fun () -> observedCancel <- true))
-
-                    // Lapse the lease before parking: the next renewal
-                    // lands lost and must cancel this token. The park
-                    // itself waits on the system clock: the manual clock
-                    // above exists only to lapse the lease.
-                    clock.Advance(TimeSpan.FromMinutes 10.)
-                    do! Task.Delay(Timeout.InfiniteTimeSpan, token)
-                    return 0
+                    try
+                        // Lapse the lease before parking: the next renewal
+                        // lands lost and must cancel this token. The park
+                        // itself waits on the system clock: the manual clock
+                        // above exists only to lapse the lease. Cancellation
+                        // is observed through the work's own path: the
+                        // OperationCanceledException handler signals the TCS
+                        // synchronously before the work task completes, so
+                        // awaiting WithLease (which awaited the work) makes
+                        // the assert below deterministic with no sleeps. A
+                        // BCL Register callback is intentionally not used:
+                        // its invocation ordering relative to the awaiting
+                        // continuation differs across SDK bands and raced on CI.
+                        clock.Advance(TimeSpan.FromMinutes 10.)
+                        do! Task.Delay(Timeout.InfiniteTimeSpan, token)
+                        return 0
+                    with :? OperationCanceledException ->
+                        cancelled.TrySetResult(()) |> ignore
+                        return raise (OperationCanceledException(token))
                 }
 
             try
@@ -307,7 +317,7 @@ module PackageLeaseServiceTests =
                 Assert.Equal(agent, exn.AgentId)
                 Assert.Equal("worker-a", exn.Owner)
 
-            Assert.True(observedCancel)
+            Assert.True(cancelled.Task.IsCompleted)
 
             // The failed run released best-effort: the package leases again.
             let! after = service.Acquire(tenant, agent, "worker-b", TimeSpan.FromMinutes 5., CancellationToken.None)
