@@ -187,16 +187,49 @@ module internal S3Client =
         : Task<int> =
         // One chunk behind its own error boundary: the outer loop below
         // holds no try/with, so no try encloses a loop containing let!.
-        // (A try wrapping a for-loop with let! inside task emits IL the
-        // Linux JIT rejects with InvalidProgramException.)
+        // The SDK await lives in a try-free task: the response (or the
+        // typed SDK failure) is boxed through ContinueWith outside the
+        // state machine, then mapped in ordinary code after the await.
+        // (A try/with enclosing let! inside task emits IL the Linux JIT
+        // rejects with InvalidProgramException.)
         let deleteChunkAsync (chunk: string list) : Task<int> =
+            let request = DeleteObjectsRequest(BucketName = bucket)
+            request.Objects <- new List<KeyVersion>(chunk |> Seq.map (fun key -> KeyVersion(Key = key)))
+
+            let sdkTask = client.DeleteObjectsAsync(request, cancellationToken)
+
+            let boxed: Task<Choice<DeleteObjectsResponse, AmazonS3Exception>> =
+                sdkTask.ContinueWith(
+                    (fun (completed: Task<DeleteObjectsResponse>) ->
+                        if completed.IsCanceled then
+                            raise (TaskCanceledException(completed))
+                        elif completed.IsFaulted then
+                            match box completed.Exception with
+                            | null ->
+                                raise (InvalidOperationException("The S3 delete task faulted without an exception."))
+                            | :? AggregateException as aggregate ->
+                                match box aggregate.InnerException with
+                                | :? AmazonS3Exception as ex -> Choice2Of2 ex
+                                | null -> raise aggregate
+                                | :? exn as inner -> raise inner
+                                | _ -> raise aggregate
+                            | :? exn as fault -> raise fault
+                            | _ ->
+                                raise (InvalidOperationException("The S3 delete task faulted without an exception."))
+                        else
+                            Choice1Of2 completed.Result),
+                    TaskContinuationOptions.ExecuteSynchronously
+                )
+
             task {
-                let request = DeleteObjectsRequest(BucketName = bucket)
-                request.Objects <- new List<KeyVersion>(chunk |> Seq.map (fun key -> KeyVersion(Key = key)))
+                let! outcome = boxed
 
-                try
-                    let! response = client.DeleteObjectsAsync(request, cancellationToken)
-
+                match outcome with
+                | Choice2Of2 ex when S3Errors.isMissing ex ->
+                    // A missing bucket deletes nothing: reads never create it.
+                    return 0
+                | Choice2Of2 ex -> return raise (S3Errors.ofS3Exception "DeletePrefix" bucket null ex)
+                | Choice1Of2 response ->
                     // The SDK leaves result collections null when empty:
                     // a quiet service reports nothing to reject and
                     // nothing to confirm beyond the request itself.
@@ -224,11 +257,6 @@ module internal S3Client =
                         return chunk.Length - rejected.Length
                     else
                         return response.DeletedObjects.Count
-                with
-                | :? AmazonS3Exception as ex when S3Errors.isMissing ex ->
-                    // A missing bucket deletes nothing: reads never create it.
-                    return 0
-                | :? AmazonS3Exception as ex -> return raise (S3Errors.ofS3Exception "DeletePrefix" bucket null ex)
             }
 
         task {
@@ -256,15 +284,41 @@ module internal S3Client =
         (key: string)
         (cancellationToken: CancellationToken)
         : Task =
-        task {
-            try
-                let! _ =
-                    client.DeleteObjectAsync(DeleteObjectRequest(BucketName = bucket, Key = key), cancellationToken)
+        // Same try-free shape as deleteChunkAsync above: the SDK await
+        // lives outside any try/with, boxed through ContinueWith, then
+        // mapped after the await. Deletes are idempotent: a missing key
+        // or bucket completes without error.
+        let sdkTask =
+            client.DeleteObjectAsync(DeleteObjectRequest(BucketName = bucket, Key = key), cancellationToken)
 
-                ()
-            with
-            | :? AmazonS3Exception as ex when S3Errors.isMissing ex -> ()
-            | :? AmazonS3Exception as ex -> raise (S3Errors.ofS3Exception "Delete" bucket key ex)
+        let boxed: Task<Choice<DeleteObjectResponse, AmazonS3Exception>> =
+            sdkTask.ContinueWith(
+                (fun (completed: Task<DeleteObjectResponse>) ->
+                    if completed.IsCanceled then
+                        raise (TaskCanceledException(completed))
+                    elif completed.IsFaulted then
+                        match box completed.Exception with
+                        | null -> raise (InvalidOperationException("The S3 delete task faulted without an exception."))
+                        | :? AggregateException as aggregate ->
+                            match box aggregate.InnerException with
+                            | :? AmazonS3Exception as ex -> Choice2Of2 ex
+                            | null -> raise aggregate
+                            | :? exn as inner -> raise inner
+                            | _ -> raise aggregate
+                        | :? exn as fault -> raise fault
+                        | _ -> raise (InvalidOperationException("The S3 delete task faulted without an exception."))
+                    else
+                        Choice1Of2 completed.Result),
+                TaskContinuationOptions.ExecuteSynchronously
+            )
+
+        task {
+            let! outcome = boxed
+
+            match outcome with
+            | Choice2Of2 ex when S3Errors.isMissing ex -> return ()
+            | Choice2Of2 ex -> return raise (S3Errors.ofS3Exception "Delete" bucket key ex)
+            | Choice1Of2 _ -> return ()
         }
 
     /// <summary>
