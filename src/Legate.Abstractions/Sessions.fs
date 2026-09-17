@@ -58,9 +58,24 @@ type SessionOutcomeMode =
     /// session completes.
     | Structured = 1
 
+/// How a session recovers a turn interrupted by a crash on activation:
+/// the knob set through <see cref="P:Legate.SessionOptions.OnCrashResume" />.
+/// A resumed turn is a new attempt with a new claim token; events from the
+/// old attempt remain in the journal.
+type OnCrashResume =
+
+    /// Resume the interrupted turn as a new attempt under a fresh claim
+    /// token. The journal-to-history rehydration drops the interrupted
+    /// attempt's tool cells and appends an in-memory resumption note.
+    | ResumeAttempt = 0
+
+    /// Settle the interrupted turn as Failed with a client-safe reason and
+    /// return the session to Idle.
+    | FailAttempt = 1
+
 /// How a session is opened: display title, headless behaviour (AutoClose
 /// and the outcome mode), the permission policy selection, the completion
-/// sink, per-turn limits, and host metadata. A reference type with mutable
+/// sink, per-turn limits, crash recovery, and host metadata. A reference type with mutable
 /// properties so absent JSON properties keep the defaults and C# object
 /// initialisers work. Defaults produce an interactive session:
 /// <see cref="P:Legate.SessionOptions.AutoClose" /> is false and
@@ -117,6 +132,12 @@ type SessionOptions() =
     /// missing, unreadable, blank, or over-bound file is skipped, so one
     /// bad path never fails a turn.
     member val HostInstructionFiles: IReadOnlyList<string> | null = null with get, set
+
+    /// How the session recovers a turn interrupted by a crash on activation.
+    /// Defaults to <see cref="F:Legate.OnCrashResume.ResumeAttempt" />: the
+    /// interrupted turn resumes as a new attempt under a fresh claim token
+    /// with its tool cells dropped and an in-memory resumption note.
+    member val OnCrashResume: OnCrashResume = OnCrashResume.ResumeAttempt with get, set
 
 /// The durable state of one conversation with one agent: what the runtime
 /// journals and what the store epic persists. Options is the snapshot taken

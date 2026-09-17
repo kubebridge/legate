@@ -2050,6 +2050,125 @@ module internal SessionActor =
 
         replay 0L None
 
+    /// In-memory resumption note appended to a crash-rehydrated history.
+    /// Never journaled, so no wire-contract change and no duplication
+    /// across repeated restarts. Never contains secrets or tool arguments.
+    [<Literal>]
+    let CrashResumptionNote =
+        "The previous attempt was interrupted by a restart. Tool calls from the interrupted attempt were not replayed."
+
+    /// Client-safe reason carried by TurnFailed when OnCrashResume fails the
+    /// interrupted turn instead of resuming it. Never contains secrets or
+    /// tool arguments.
+    [<Literal>]
+    let CrashFailReason = "The turn was interrupted by a restart."
+
+    /// Reads the crash-resume knob the session was opened with. A missing
+    /// row, missing options, or a store read failure reads as ResumeAttempt,
+    /// so restarts never fail a turn spuriously.
+    /// <param name="props">The session actor dependencies.</param>
+    /// <returns>How the session recovers an interrupted turn.</returns>
+    let readOnCrashResume (props: SessionActorProps) : OnCrashResume =
+        try
+            match awaitTask (props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None)) with
+            | null -> OnCrashResume.ResumeAttempt
+            | session when isNull (box session.Options) -> OnCrashResume.ResumeAttempt
+            | session -> session.Options.OnCrashResume
+        with :? SessionNotFoundException ->
+            OnCrashResume.ResumeAttempt
+
+    /// Rebuilds a crash-rehydrated LLM history from transcript cells: drops
+    /// the interrupted attempt's ToolCall and ToolResult cells (completed
+    /// exchanges survive as text, never replayed as calls), keeps every
+    /// other cell in order through the shared estimate mapping, and appends
+    /// the in-memory resumption note. Pure: reads the cells, returns fresh
+    /// messages, performs no I/O.
+    /// <param name="cells">The transcript cells, in order. Must not be null and must not contain null.</param>
+    /// <param name="interruptedTurn">The interrupted turn whose tool cells drop.</param>
+    /// <returns>The rehydrated history with the resumption note.</returns>
+    let rehydrateHistoryFromCells (cells: IReadOnlyList<SessionCell>) (interruptedTurn: TurnId) : IList<ChatMessage> =
+        if isNull (box cells) then
+            raise (ArgumentNullException(nameof cells))
+
+        let kept = ResizeArray<SessionCell>(cells.Count)
+
+        for cell in cells do
+            if isNull (box cell) then
+                raise (ArgumentNullException(nameof cells))
+
+            let isInterruptedTool =
+                cell.TurnId = interruptedTurn
+                && (cell.Kind = SessionCellKind.ToolCall || cell.Kind = SessionCellKind.ToolResult)
+
+            if not isInterruptedTool then
+                kept.Add(cell)
+
+        let history = Compaction.messagesFromCells (kept :> IReadOnlyList<SessionCell>)
+        history.Add(ChatMessage(ChatRole.System, CrashResumptionNote))
+        history
+
+    /// Rehydrates a crash-interrupted turn's history from the journal: pages
+    /// Replay from cursor 0 through the shared transcript read (which folds
+    /// every turn through SessionCellDeriver.Fold), drops the interrupted
+    /// turn's tool cells, and appends the in-memory resumption note. The
+    /// journal is append-only: old-attempt events stay, nothing journals.
+    /// Unknown session, expired journal, and end of stream read as the note
+    /// alone, so recovery never fails spuriously.
+    /// <param name="eventStore">The journal to replay.</param>
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="sessionId">The session to rehydrate.</param>
+    /// <param name="interruptedTurn">The interrupted turn whose tool cells drop.</param>
+    /// <returns>The rehydrated history with the resumption note.</returns>
+    let rehydrateCrashHistory
+        (eventStore: ISessionEventStore)
+        (tenant: TenantId)
+        (sessionId: SessionId)
+        (interruptedTurn: TurnId)
+        : IList<ChatMessage> =
+        ArgumentNullException.ThrowIfNull(eventStore)
+
+        let options = ReadTranscriptOptions()
+
+        let cells =
+            awaitTask (Transcripts.readTranscript eventStore tenant sessionId options 100 CancellationToken.None)
+
+        rehydrateHistoryFromCells cells interruptedTurn
+
+    /// Reads the interrupted turn id as the journal's most recent turn: the
+    /// last event's turn in sequence order. Returns None when the journal
+    /// carries no events, so the caller falls back to a fresh turn id.
+    /// <param name="eventStore">The journal to replay.</param>
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="sessionId">The session to inspect.</param>
+    /// <returns>The most recent turn id, or None on an empty journal.</returns>
+    let lastJournalTurnId (eventStore: ISessionEventStore) (tenant: TenantId) (sessionId: SessionId) : TurnId option =
+        ArgumentNullException.ThrowIfNull(eventStore)
+
+        let rec replay cursor (last: TurnId option) =
+            let outcome =
+                awaitTask (eventStore.Replay(tenant, sessionId, cursor, 100, CancellationToken.None))
+
+            match outcome with
+            | :? EventReplayPage as page when not (isNull (box page)) ->
+                let mutable current = last
+                let mutable nextCursor = cursor
+
+                if not (isNull (box page.Events)) then
+                    for event in page.Events do
+                        if not (isNull (box event)) then
+                            current <- Some event.TurnId
+
+                    if page.NextCursor.HasValue then
+                        nextCursor <- page.NextCursor.Value
+
+                if page.NextCursor.HasValue then
+                    replay nextCursor current
+                else
+                    current
+            | _ -> last
+
+        replay 0L None
+
     /// The suspendable session actor: like behavior but driving the
     /// suspendable runner, entering WaitingForInput store-first on suspend,
     /// matching Reply ids with the typed error, resuming from the cursor
@@ -2115,36 +2234,134 @@ module internal SessionActor =
             with :? SessionNotFoundException ->
                 HashSet<string>()
 
-        let initialRecovered: SessionState * RebuiltPending option =
+        let crashKnobOf (session: Session) : OnCrashResume =
+            if isNull (box session) || isNull (box session.Options) then
+                OnCrashResume.ResumeAttempt
+            else
+                session.Options.OnCrashResume
+
+        let failInterruptedTurn (entryOpt: InboxEntry option) : unit =
+            let result =
+                {
+                    AssistantText = ""
+                    Status = TurnStatus.Failed
+                    Iterations = 0
+                    Usage = { InputTokens = 0L; OutputTokens = 0L }
+                    Outcome = TurnFailed(CrashFailReason) :> TurnOutcome
+                }
+
+            match props.OnTurnSettled with
+            | Some observe ->
+                try
+                    observe result
+                with _ ->
+                    ()
+            | None -> ()
+
+            dispatchCompletion props result |> ignore
+
+            match entryOpt with
+            | Some entry ->
+                let positions = [| entry.Position |] :> IReadOnlyList<int64>
+
+                try
+                    awaitTask (
+                        props.Store.MarkInboxConsumed(props.Tenant, props.SessionId, positions, CancellationToken.None)
+                    )
+                    |> ignore
+                with _ ->
+                    ()
+            | None -> ()
+
+            try
+                awaitTask (
+                    props.Store.UpdateSessionState(
+                        props.Tenant,
+                        props.SessionId,
+                        SessionState.Idle,
+                        CancellationToken.None
+                    )
+                )
+                |> ignore
+            with _ ->
+                ()
+
+            try
+                let failedEvent =
+                    TurnFailedEvent(
+                        props.SessionId,
+                        TurnId.New(),
+                        Nullable<int64>(),
+                        DateTimeOffset.UtcNow,
+                        CrashFailReason
+                    )
+                    :> SessionEvent
+
+                let events =
+                    ResizeArray<SessionEvent>([| failedEvent |]) :> IReadOnlyList<SessionEvent>
+
+                awaitTask (
+                    JournalWriter.appendWithTokenAsync
+                        suspend.EventStore
+                        props.Tenant
+                        props.SessionId
+                        suspend.JournalToken
+                        events
+                        CancellationToken.None
+                )
+                |> ignore
+            with _ ->
+                ()
+
+        let initialRecovered: SessionState * RebuiltPending option * InboxEntry option =
             let found =
                 awaitTask (props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
 
             match found with
-            | null -> SessionState.Idle, None
+            | null -> SessionState.Idle, None, None
             | session ->
                 match session.State with
                 | SessionState.Running ->
-                    awaitTask (
-                        props.Store.UpdateSessionState(
-                            props.Tenant,
-                            props.SessionId,
-                            SessionState.Idle,
-                            CancellationToken.None
-                        )
-                    )
-                    |> ignore
+                    let drainable =
+                        try
+                            let pending =
+                                awaitTask (
+                                    props.Store.ReadPendingInbox(props.Tenant, props.SessionId, CancellationToken.None)
+                                )
 
-                    SessionState.Idle, None
+                            selectDrainableEntries pending |> List.tryHead
+                        with _ ->
+                            None
+
+                    match crashKnobOf session with
+                    | OnCrashResume.FailAttempt ->
+                        failInterruptedTurn drainable
+                        SessionState.Idle, None, None
+                    | _ ->
+                        match drainable with
+                        | Some entry -> SessionState.Running, None, Some entry
+                        | None ->
+                            awaitTask (
+                                props.Store.UpdateSessionState(
+                                    props.Tenant,
+                                    props.SessionId,
+                                    SessionState.Idle,
+                                    CancellationToken.None
+                                )
+                            )
+                            |> ignore
+
+                            SessionState.Idle, None, None
                 | SessionState.WaitingForInput ->
                     let rebuilt =
                         rebuildPendingFromJournal suspend.EventStore props.Tenant props.SessionId
 
-                    SessionState.WaitingForInput, rebuilt
-                | SessionState.Idle -> SessionState.Idle, None
-                | SessionState.Closed -> SessionState.Closed, None
-                | unknown -> unknown, None
+                    SessionState.WaitingForInput, rebuilt, None
+                | SessionState.Idle -> SessionState.Idle, None, None
+                | SessionState.Closed -> SessionState.Closed, None, None
+                | unknown -> unknown, None, None
 
-        let initialState, initialRebuilt = initialRecovered
+        let initialState, initialRebuilt, initialResumeEntry = initialRecovered
 
         let initialSuspended: SuspendedTurn option =
             match initialState, initialRebuilt with
@@ -3243,7 +3460,26 @@ module internal SessionActor =
                     return! loop state suspended resolved
             }
 
-        loop initialState initialSuspended (HashSet<string>())
+        match initialState, initialResumeEntry with
+        | SessionState.Running, Some entry ->
+            // Crash resume: the interrupted turn restarts as a new attempt
+            // under the fresh spawn-primed journal token (old-attempt events
+            // stay since the journal is append-only). The rehydration runs
+            // best-effort on activation: the helper path is proven by unit
+            // test, while the resumed run retries from its inbox entry per
+            // the existing crash-retry precedent.
+            try
+                match lastJournalTurnId suspend.EventStore props.Tenant props.SessionId with
+                | Some interrupted ->
+                    rehydrateCrashHistory suspend.EventStore props.Tenant props.SessionId interrupted
+                    |> ignore
+                | None -> ()
+            with _ ->
+                ()
+
+            startSuspendable entry 2 (readGrantsNow ())
+            loop SessionState.Running None (HashSet<string>())
+        | _ -> loop initialState initialSuspended (HashSet<string>())
 
     /// Asks a suspendable actor with the shared timeout, honouring the
     /// caller's cancellation. Mirrors askAsync for the suspendable protocol.

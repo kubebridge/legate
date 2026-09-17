@@ -3333,3 +3333,414 @@ let ``Suspendable Abort while WaitingForInput no-ops and Reply still resumes`` (
         result.Status |> should equal TurnStatus.Completed
         result.AssistantText |> should equal "resumed"
     }
+
+// ──────────────────────────────────────────────────────────────────────────
+// Journal replay and turn resumption (issue 109)
+
+/// Creates a session row carrying the given options.
+let private createSessionWith (store: ISessionStore) (options: SessionOptions) : Session =
+    let session =
+        {
+            Id = SessionId.New()
+            Tenant = tenant
+            AgentId = AgentId.New()
+            Title = "crash"
+            State = SessionState.Idle
+            CurrentTurnId = Unchecked.defaultof<Nullable<TurnId>>
+            CreatedAt = DateTimeOffset.MinValue
+            UpdatedAt = DateTimeOffset.MinValue
+            ClosedAt = Unchecked.defaultof<Nullable<DateTimeOffset>>
+            WorkspaceBinding = null
+            Options = options
+            PermissionGrants = ResizeArray<string>() :> IReadOnlyList<string>
+        }
+
+    store.CreateSession(tenant, session, CancellationToken.None).GetAwaiter().GetResult()
+
+/// Spawns a suspendable actor over any journal implementation.
+let private spawnSuspendableOver
+    (system: ActorSystem)
+    (store: ISessionStore)
+    (journal: ISessionEventStore)
+    (token: string)
+    (sessionId: SessionId)
+    (runner: ScriptSuspendRunner)
+    (settled: ResizeArray<TurnResult>)
+    : IActorRef =
+    let baseProps: SessionActorProps =
+        {
+            Store = store
+            Tenant = tenant
+            SessionId = sessionId
+            RunTurn = (fun _ _ -> Task.FromResult(completed "unused"))
+            OnTurnSettled = Some(fun result -> lock settled (fun () -> settled.Add(result)))
+            OnInjectJournaled = None
+            Logger = null
+            Compact = None
+        }
+
+    let deps: SessionActor.SuspendDeps =
+        {
+            EventStore = journal
+            Delay = (TurnLoopTests.NeverDelay() :> ILlmDelay)
+            AskTimeout = TimeSpan.FromMinutes 5.0
+            JournalToken = token
+            RunSuspendable = runner.Func
+        }
+
+    spawn system $"crash-{Guid.NewGuid():N}" (SessionActor.behaviorWithSuspend baseProps deps)
+
+/// Gated suspendable runner: the first invocation blocks until Released,
+/// later invocations settle at once. Proves a kill lands genuinely mid-turn:
+/// the first actor blocks in flight, the restart settles, and releasing the
+/// loser afterwards produces zero further effects.
+type private GatedSuspendRunner(second: TurnLoop.TurnLoopCompletion) =
+    let gate = new TaskCompletionSource<TurnLoop.TurnLoopCompletion>()
+    let attempts = ResizeArray<int>()
+    let mutable calls = 0
+
+    member _.Attempts = attempts :> IReadOnlyList<int>
+
+    member _.Release() = gate.TrySetResult(second) |> ignore
+
+    member _.Func
+        : (InboxEntry
+              -> int
+              -> HashSet<string>
+              -> TurnLoop.TurnLoopSuspension option
+              -> Reply option
+              -> CancellationToken
+              -> Task<TurnLoop.TurnLoopCompletion>) =
+        fun _ attempt _ _ _ _ ->
+            attempts.Add(attempt)
+            calls <- calls + 1
+
+            if calls = 1 then gate.Task else Task.FromResult(second)
+
+[<Fact>]
+let ``OnCrashResume round-trips through JSON`` () =
+    let options = SessionOptions()
+    options.OnCrashResume <- OnCrashResume.FailAttempt
+    let json = JsonSerializer.Serialize(options)
+
+    let restored: SessionOptions =
+        JsonSerializer.Deserialize(json, typeof<SessionOptions>) |> unbox
+
+    restored.OnCrashResume |> should equal OnCrashResume.FailAttempt
+    let defaults = SessionOptions()
+    defaults.OnCrashResume |> should equal OnCrashResume.ResumeAttempt
+
+[<Fact>]
+let ``Rehydration drops interrupted tool cells and appends the note`` () =
+    let sessionId = SessionId.New()
+    let finishedTurn = TurnId.New()
+    let interruptedTurn = TurnId.New()
+    let stamp = DateTimeOffset.UtcNow
+
+    let cell kind content toolName callId turn =
+        {
+            Id = Unchecked.defaultof<CellId>
+            SessionId = sessionId
+            TurnId = turn
+            Kind = kind
+            Content = content
+            ToolName = toolName
+            ToolCallId = callId
+            IsError = false
+            Iteration = 1
+            Metadata = Unchecked.defaultof<IReadOnlyDictionary<string, string>>
+            Artifacts = Unchecked.defaultof<IReadOnlyList<string>>
+            Timestamp = stamp
+        }
+
+    let cells =
+        ResizeArray<SessionCell>(
+            [|
+                cell SessionCellKind.User "hello" null null finishedTurn
+                cell SessionCellKind.Assistant "hi" null null finishedTurn
+                cell SessionCellKind.User "run" null null interruptedTurn
+                cell SessionCellKind.ToolCall "" "exec" "c1" interruptedTurn
+                cell SessionCellKind.ToolResult "out" "exec" "c1" interruptedTurn
+            |]
+        )
+        :> IReadOnlyList<SessionCell>
+
+    let history = SessionActor.rehydrateHistoryFromCells cells interruptedTurn
+
+    history.Count |> should equal 4
+    history[0].Role |> should equal ChatRole.User
+    history[1].Role |> should equal ChatRole.Assistant
+    history[2].Role |> should equal ChatRole.User
+    history[3].Role |> should equal ChatRole.System
+    history[3].Text |> should equal SessionActor.CrashResumptionNote
+
+    let combined =
+        history |> Seq.collect (fun message -> message.Contents) |> Seq.toList
+
+    combined
+    |> List.exists (fun content ->
+        match content with
+        | :? FunctionCallContent as call when call.Name = "exec" -> true
+        | _ -> false)
+    |> should equal false
+
+[<Fact>]
+let ``Running with FailAttempt settles Failed and returns to Idle`` () =
+    use system = createSystem ()
+    let store = createStore ()
+    let options = SessionOptions()
+    options.OnCrashResume <- OnCrashResume.FailAttempt
+    let created = createSessionWith store options
+    ignore (appendStored store created.Id "orphaned")
+
+    store.UpdateSessionState(tenant, created.Id, SessionState.Running, CancellationToken.None).GetAwaiter().GetResult()
+    |> ignore
+
+    let journal = RecordingEventStore()
+
+    let runner =
+        ScriptSuspendRunner(settledCompletion "never", settledCompletion "never")
+
+    let settled = ResizeArray<TurnResult>()
+
+    spawnSuspendableOver system store journal "fail-token" created.Id runner settled
+    |> ignore
+
+    try
+        let failed =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () ->
+                settled.Count = 1 && (storedOf store created.Id).State = SessionState.Idle)
+
+        failed |> should equal true
+        settled[0].Status |> should equal TurnStatus.Failed
+
+        match settled[0].Outcome with
+        | :? TurnFailed as outcome -> outcome.Reason |> should equal SessionActor.CrashFailReason
+        | _ -> failwith "Expected a TurnFailed outcome."
+
+        (pendingOf store created.Id).Count |> should equal 0
+        runner.Attempts.Count |> should equal 0
+    finally
+        stopSystem system
+
+[<Fact>]
+let ``Running with ResumeAttempt auto-resumes as attempt 2`` () =
+    use system = createSystem ()
+    let store = createStore ()
+    let created = createSession store
+    ignore (appendStored store created.Id "orphaned")
+
+    store.UpdateSessionState(tenant, created.Id, SessionState.Running, CancellationToken.None).GetAwaiter().GetResult()
+    |> ignore
+
+    let journal = RecordingEventStore()
+
+    let runner =
+        ScriptSuspendRunner(settledCompletion "never", settledCompletion "resumed")
+
+    let settled = ResizeArray<TurnResult>()
+
+    spawnSuspendableOver system store journal "resume-token" created.Id runner settled
+    |> ignore
+
+    try
+        let resumed =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () ->
+                settled.Count = 1 && (storedOf store created.Id).State = SessionState.Idle)
+
+        resumed |> should equal true
+        runner.Attempts |> List.ofSeq |> should equal [ 2 ]
+        settled[0].AssistantText |> should equal "resumed"
+        (pendingOf store created.Id).Count |> should equal 0
+    finally
+        stopSystem system
+
+[<Fact>]
+let ``Crash rebuilds a pending question and Reply resumes it`` () =
+    let store = createStore ()
+    let journal = RecordingEventStore()
+    let created = createSession store
+
+    let cursor =
+        suspendCursor "q-9" TurnLoop.AskUserToolName "qcall-9" TurnLoop.QuestionSuspension
+
+    let runner =
+        ScriptSuspendRunner(suspendedCompletion cursor, settledCompletion "answered")
+
+    let settled = ResizeArray<TurnResult>()
+
+    use firstSystem = createSystem ()
+
+    let first =
+        spawnSuspendable
+            firstSystem
+            store
+            journal
+            (TurnLoopTests.NeverDelay() :> ILlmDelay)
+            (TimeSpan.FromMinutes 5.0)
+            created.Id
+            runner
+            settled
+
+    try
+        promptSuspendable store created.Id first "run" |> ignore
+
+        let suspended =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () ->
+                (storedOf store created.Id).State = SessionState.WaitingForInput)
+
+        suspended |> should equal true
+    finally
+        stopSystem firstSystem
+
+    use secondSystem = createSystem ()
+
+    let second =
+        spawnSuspendable
+            secondSystem
+            store
+            journal
+            (TurnLoopTests.NeverDelay() :> ILlmDelay)
+            (TimeSpan.FromMinutes 5.0)
+            created.Id
+            runner
+            settled
+
+    try
+        let rebuilt =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () ->
+                try
+                    (suspendSnapshotOf second).PendingRequestId = "q-9"
+                with _ ->
+                    false)
+
+        rebuilt |> should equal true
+
+        reply store created.Id second (QuestionAnswer("q-9", "west")) |> ignore
+
+        let resumed =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () ->
+                settled.Count = 1 && (storedOf store created.Id).State = SessionState.Idle)
+
+        resumed |> should equal true
+        runner.Attempts |> List.ofSeq |> should equal [ 1; 2 ]
+        settled[0].AssistantText |> should equal "answered"
+    finally
+        stopSystem secondSystem
+
+[<Fact>]
+let ``Kill mid-turn restarts exactly once with the journal prefix intact`` () =
+    let clock = TestClock()
+    let database = InMemoryDatabase(clock :> TimeProvider)
+    let store = InMemorySessionStore(database) :> ISessionStore
+    let journal = InMemorySessionEventStore(database) :> ISessionEventStore
+    let created = createSession store
+
+    let bootstrap = UserMessagePayload(UserMessage.Text "prime") :> InboxPayload
+
+    store.AppendInboxMessage(tenant, created.Id, bootstrap, DeliveryMode.Queue, CancellationToken.None)
+    |> fun task -> task.GetAwaiter().GetResult()
+    |> ignore
+
+    let tokenA =
+        match
+            store.ClaimNextTurn(tenant, created.Id, "owner-a", TimeSpan.FromHours 1.0, CancellationToken.None)
+            |> fun task -> task.GetAwaiter().GetResult()
+        with
+        | :? TurnLeaseRenewed as renewed -> renewed.Claim.Token
+        | :? TurnLeaseHeld as held -> held.Claim.Token
+        | _ -> failwith "Expected the prime claim."
+
+    let markerTurn = TurnId.New()
+
+    let marker =
+        TurnStartedEvent(created.Id, markerTurn, Nullable<int64>(), DateTimeOffset.UtcNow) :> SessionEvent
+
+    match
+        journal.Append(
+            tenant,
+            created.Id,
+            tokenA,
+            (ResizeArray<SessionEvent>([| marker |]) :> IReadOnlyList<SessionEvent>),
+            CancellationToken.None
+        )
+        |> fun task -> task.GetAwaiter().GetResult()
+    with
+    | :? EventAppended -> ()
+    | _ -> failwith "Expected the marker append."
+
+    ignore (appendStored store created.Id "run")
+
+    store.UpdateSessionState(tenant, created.Id, SessionState.Running, CancellationToken.None).GetAwaiter().GetResult()
+    |> ignore
+
+    // One shared runner across both actors: the first invocation blocks in
+    // flight (the genuine mid-turn kill point), the post-restart invocation
+    // settles. Releasing the loser afterwards must produce zero effects.
+    let runner = GatedSuspendRunner(settledCompletion "recovered")
+    let settled = ResizeArray<TurnResult>()
+
+    let spawnOver (system: ActorSystem) (token: string) : IActorRef =
+        let baseProps: SessionActorProps =
+            {
+                Store = store
+                Tenant = tenant
+                SessionId = created.Id
+                RunTurn = (fun _ _ -> Task.FromResult(completed "unused"))
+                OnTurnSettled = Some(fun result -> lock settled (fun () -> settled.Add(result)))
+                OnInjectJournaled = None
+                Logger = null
+                Compact = None
+            }
+
+        let deps: SessionActor.SuspendDeps =
+            {
+                EventStore = journal
+                Delay = (TurnLoopTests.NeverDelay() :> ILlmDelay)
+                AskTimeout = TimeSpan.FromMinutes 5.0
+                JournalToken = token
+                RunSuspendable = runner.Func
+            }
+
+        spawn system $"kill-{Guid.NewGuid():N}" (SessionActor.behaviorWithSuspend baseProps deps)
+
+    use firstSystem = createSystem ()
+    spawnOver firstSystem tokenA |> ignore
+
+    try
+        let inFlight =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () -> runner.Attempts.Count = 1)
+
+        inFlight |> should equal true
+        settled.Count |> should equal 0
+    finally
+        stopSystem firstSystem
+
+    tokenA |> should not' (equal "token-b")
+
+    use secondSystem = createSystem ()
+    spawnOver secondSystem "token-b" |> ignore
+
+    try
+        let resumed =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () ->
+                settled.Count = 1 && (storedOf store created.Id).State = SessionState.Idle)
+
+        resumed |> should equal true
+        settled[0].AssistantText |> should equal "recovered"
+        runner.Attempts |> List.ofSeq |> should equal [ 2; 2 ]
+
+        match
+            journal.Replay(tenant, created.Id, 0L, 100, CancellationToken.None)
+            |> fun task -> task.GetAwaiter().GetResult()
+        with
+        | :? EventReplayPage as page -> page.Events.Count |> should be (greaterThanOrEqualTo 1)
+        | _ -> failwith "Expected the journal prefix intact."
+
+        runner.Release()
+
+        Thread.Sleep(250)
+        settled.Count |> should equal 1
+        (storedOf store created.Id).State |> should equal SessionState.Idle
+    finally
+        stopSystem secondSystem
