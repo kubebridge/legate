@@ -943,7 +943,7 @@ let private spawnWriterActor
         }
 
     let runner: SessionActor.SuspendableRunner =
-        fun _ _ _ _ _ _ -> Task.FromResult(completion)
+        fun _ _ _ _ _ _ _ -> Task.FromResult(completion)
 
     let deps: SessionActor.SuspendDeps =
         {

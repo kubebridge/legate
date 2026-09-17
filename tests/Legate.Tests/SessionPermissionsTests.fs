@@ -680,6 +680,70 @@ let ``Null policy runs the live turn with no gate`` () =
     finally
         stopService service
 
+// ──────────────────────────────────────────────────────────────────────────
+// Crash-resume seed: the rehydrated note reaches the runner history input
+
+[<Fact>]
+let ``Crash seed carries the resumption note into the runner history input`` () =
+    let store, _ = createStores TimeProvider.System
+    let created = createSession store
+    let client = scripted [ textStep "done" ]
+
+    let runner =
+        productionRunner store client (makeTools []) Unchecked.defaultof<IPermissionPolicy>
+
+    let entry: InboxEntry =
+        {
+            SessionId = created.Id
+            Position = 0L
+            Payload = UserMessagePayload(UserMessage.Text "run") :> InboxPayload
+            Delivery = DeliveryMode.Queue
+            Consumed = false
+            AppendedAt = DateTimeOffset.UtcNow
+        }
+
+    let seed =
+        ResizeArray<ChatMessage>(
+            [|
+                ChatMessage(ChatRole.User, "run")
+                ChatMessage(ChatRole.System, SessionActor.CrashResumptionNote)
+            |]
+        )
+        :> IList<ChatMessage>
+
+    let fresh =
+        runner entry 1 (HashSet<string>()) None None (Some seed) CancellationToken.None
+        |> fun task -> task.GetAwaiter().GetResult()
+
+    fresh.Result.AssistantText |> should equal "done"
+
+    let rebuildClient = scripted [ textStep "done" ]
+
+    let rebuildRunner =
+        productionRunner store rebuildClient (makeTools []) Unchecked.defaultof<IPermissionPolicy>
+
+    let rebuild =
+        rebuildRunner
+            entry
+            2
+            (HashSet<string>())
+            None
+            (Some(PermissionDecision("req-1", PermissionDecisionKind.AllowOnce) :> Reply))
+            (Some seed)
+            CancellationToken.None
+        |> fun task -> task.GetAwaiter().GetResult()
+
+    rebuild.Result.AssistantText |> should equal "done"
+
+    for received in
+        [
+            client.ReceivedMessages
+            rebuildClient.ReceivedMessages
+        ] do
+        received
+        |> Seq.exists (fun message -> not (isNull (box message)) && message.Text = SessionActor.CrashResumptionNote)
+        |> should equal true
+
 [<Fact>]
 let ``resolvePolicy resolves the container policy or null when none is registered`` () =
     let expected = ScriptPolicy(Map.empty) :> IPermissionPolicy
@@ -700,7 +764,7 @@ let ``spawnSuspendFactory rejects invalid wiring`` () =
     let _, journal = createStores TimeProvider.System
 
     let runner: SessionActor.SuspendableRunner =
-        fun _ _ _ _ _ _ -> Task.FromResult(Unchecked.defaultof<TurnLoop.TurnLoopCompletion>)
+        fun _ _ _ _ _ _ _ -> Task.FromResult(Unchecked.defaultof<TurnLoop.TurnLoopCompletion>)
 
     let store = InMemorySessionStore(InMemoryDatabase()) :> ISessionStore
 

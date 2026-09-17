@@ -241,26 +241,32 @@ type SessionHarness
     static let waitBound = TimeSpan.FromSeconds 10.0
 
     /// Builds the user history for a fresh run from the entry's parts,
-    /// mirroring the actor's Queue runner shape.
-    static let historyOf (entry: InboxEntry) : IList<ChatMessage> =
-        let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+    /// mirroring the actor's Queue runner shape. A crash seed (Some) wins:
+    /// the rehydrated transcript plus the in-memory resumption note
+    /// replaces the entry-derived message. The seed is copied: the turn
+    /// owns its history.
+    static let historyOf (entry: InboxEntry) (seed: IList<ChatMessage> option) : IList<ChatMessage> =
+        match seed with
+        | Some seeded when not (isNull (box seeded)) -> ResizeArray<ChatMessage>(seeded) :> IList<ChatMessage>
+        | _ ->
+            let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
 
-        match entry.Payload with
-        | :? UserMessagePayload as userMessage when
-            not (isNull (box userMessage))
-            && not (isNull (box userMessage.Message))
-            && not (isNull (box userMessage.Message.Parts))
-            ->
-            let parts = ResizeArray<AIContent>()
+            match entry.Payload with
+            | :? UserMessagePayload as userMessage when
+                not (isNull (box userMessage))
+                && not (isNull (box userMessage.Message))
+                && not (isNull (box userMessage.Message.Parts))
+                ->
+                let parts = ResizeArray<AIContent>()
 
-            for part in userMessage.Message.Parts do
-                if not (isNull (box part)) then
-                    parts.Add(part)
+                for part in userMessage.Message.Parts do
+                    if not (isNull (box part)) then
+                        parts.Add(part)
 
-            history.Add(ChatMessage(ChatRole.User, parts :> IList<AIContent>))
-        | _ -> history.Add(ChatMessage(ChatRole.User, ""))
+                history.Add(ChatMessage(ChatRole.User, parts :> IList<AIContent>))
+            | _ -> history.Add(ChatMessage(ChatRole.User, ""))
 
-        history
+            history
 
     /// Validates harness options synchronously: fail fast before the task.
     static let validateOptions (options: SessionHarnessOptions) : unit =
@@ -410,11 +416,11 @@ type SessionHarness
                     ResizeArray<InboxEntry>() :> IReadOnlyList<InboxEntry>
 
                 let runner: SessionActor.SuspendableRunner =
-                    fun entry _attempt allowed cursor reply runnerToken ->
+                    fun entry _attempt allowed cursor reply seed runnerToken ->
                         task {
                             match cursor, reply with
                             | None, None ->
-                                let history = historyOf entry
+                                let history = historyOf entry seed
 
                                 return!
                                     TurnLoop.runSuspendableAsync
@@ -464,7 +470,7 @@ type SessionHarness
                             | None, Some _ ->
                                 // Crash-rebuild shape: no live cursor, so
                                 // retry the turn from its inbox entry.
-                                let history = historyOf entry
+                                let history = historyOf entry seed
 
                                 return!
                                     TurnLoop.runSuspendableAsync

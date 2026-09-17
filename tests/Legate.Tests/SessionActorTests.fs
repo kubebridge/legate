@@ -1081,9 +1081,10 @@ type private ScriptSuspendRunner(first: TurnLoop.TurnLoopCompletion, second: Tur
               -> HashSet<string>
               -> TurnLoop.TurnLoopSuspension option
               -> Reply option
+              -> IList<ChatMessage> option
               -> CancellationToken
               -> Task<TurnLoop.TurnLoopCompletion>) =
-        fun _ attempt _ cursor reply _ ->
+        fun _ attempt _ cursor reply _ _ ->
             attempts.Add(attempt)
             cursors.Add(cursor)
             replies.Add(reply)
@@ -3409,9 +3410,10 @@ type private GatedSuspendRunner(second: TurnLoop.TurnLoopCompletion) =
               -> HashSet<string>
               -> TurnLoop.TurnLoopSuspension option
               -> Reply option
+              -> IList<ChatMessage> option
               -> CancellationToken
               -> Task<TurnLoop.TurnLoopCompletion>) =
-        fun _ attempt _ _ _ _ ->
+        fun _ attempt _ _ _ _ _ ->
             attempts.Add(attempt)
             calls <- calls + 1
 
