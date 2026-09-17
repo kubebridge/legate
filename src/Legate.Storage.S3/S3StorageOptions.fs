@@ -41,6 +41,7 @@ open System
 /// <para>Support matrix: compare-exchange and the package publish pointer
 /// commit require endpoint support for the <c>If-Match</c> and
 /// <c>If-None-Match</c> preconditions. AWS and recent MinIO evaluate them;
+/// Hetzner conditional-write support is unproven against a live endpoint;
 /// an endpoint that rejects them fails fast with
 /// <see cref="T:Legate.Storage.S3.S3ConditionalWriteNotSupportedException" />
 /// and writes nothing: there is deliberately no read-modify-write

@@ -121,24 +121,40 @@ module internal S3Client =
         (prefix: string)
         (cancellationToken: CancellationToken)
         : Task<string list> =
+        // One page behind its own error boundary: the outer loop below
+        // holds no try/with, so no try encloses a loop containing let!.
+        // A missing bucket surfaces as a null page: reads never create it.
+        let fetchPageAsync (token: string | null) : Task<ListObjectsV2Response> =
+            task {
+                let request =
+                    ListObjectsV2Request(BucketName = bucket, Prefix = prefix, MaxKeys = 1000)
+
+                if not (isNull token) then
+                    request.ContinuationToken <- token
+
+                try
+                    let! response = client.ListObjectsV2Async(request, cancellationToken)
+                    return response
+                with
+                | :? AmazonS3Exception as ex when S3Errors.isMissing ex ->
+                    // A missing bucket lists as empty: reads never create it.
+                    return Unchecked.defaultof<ListObjectsV2Response>
+                | :? AmazonS3Exception as ex -> return raise (S3Errors.ofS3Exception "List" bucket prefix ex)
+            }
+
         task {
             let collected = ResizeArray<string>()
             let mutable token: string | null = null
             let mutable more = true
 
-            // The try wraps the loop: F# task blocks do not allow
-            // try/with inside while. A missing bucket lists as empty on
-            // any page; any other S3 failure wraps.
-            try
-                while more do
-                    let request =
-                        ListObjectsV2Request(BucketName = bucket, Prefix = prefix, MaxKeys = 1000)
+            while more do
+                let! response = fetchPageAsync token
 
-                    if not (isNull token) then
-                        request.ContinuationToken <- token
-
-                    let! response = client.ListObjectsV2Async(request, cancellationToken)
-
+                // A null page is the missing-bucket sentinel: keep what
+                // the earlier pages collected and stop.
+                if isNull (box response) then
+                    more <- false
+                else
                     // The SDK leaves the entries null on an empty page.
                     if not (isNull (box response.S3Objects)) then
                         for entry in response.S3Objects do
@@ -148,11 +164,6 @@ module internal S3Client =
                         token <- response.NextContinuationToken
                     else
                         more <- false
-            with
-            | :? AmazonS3Exception as ex when S3Errors.isMissing ex ->
-                // A missing bucket lists as empty: reads never create it.
-                ()
-            | :? AmazonS3Exception as ex -> raise (S3Errors.ofS3Exception "List" bucket prefix ex)
 
             return collected |> Seq.toList
         }
@@ -174,16 +185,16 @@ module internal S3Client =
         (keys: string list)
         (cancellationToken: CancellationToken)
         : Task<int> =
-        task {
-            let mutable deleted = 0
+        // One chunk behind its own error boundary: the outer loop below
+        // holds no try/with, so no try encloses a loop containing let!.
+        // (A try wrapping a for-loop with let! inside task emits IL the
+        // Linux JIT rejects with InvalidProgramException.)
+        let deleteChunkAsync (chunk: string list) : Task<int> =
+            task {
+                let request = DeleteObjectsRequest(BucketName = bucket)
+                request.Objects <- new List<KeyVersion>(chunk |> Seq.map (fun key -> KeyVersion(Key = key)))
 
-            // The try wraps the loop: F# task blocks do not allow
-            // try/with inside for.
-            try
-                for chunk in keys |> List.chunkBySize 1000 do
-                    let request = DeleteObjectsRequest(BucketName = bucket)
-                    request.Objects <- new List<KeyVersion>(chunk |> Seq.map (fun key -> KeyVersion(Key = key)))
-
+                try
                     let! response = client.DeleteObjectsAsync(request, cancellationToken)
 
                     // The SDK leaves result collections null when empty:
@@ -209,18 +220,23 @@ module internal S3Client =
                             )
                         )
 
-                    let confirmed =
-                        if isNull (box response.DeletedObjects) then
-                            chunk.Length - rejected.Length
-                        else
-                            response.DeletedObjects.Count
+                    if isNull (box response.DeletedObjects) then
+                        return chunk.Length - rejected.Length
+                    else
+                        return response.DeletedObjects.Count
+                with
+                | :? AmazonS3Exception as ex when S3Errors.isMissing ex ->
+                    // A missing bucket deletes nothing: reads never create it.
+                    return 0
+                | :? AmazonS3Exception as ex -> return raise (S3Errors.ofS3Exception "DeletePrefix" bucket null ex)
+            }
 
-                    deleted <- deleted + confirmed
-            with
-            | :? AmazonS3Exception as ex when S3Errors.isMissing ex ->
-                // A missing bucket deletes nothing: reads never create it.
-                ()
-            | :? AmazonS3Exception as ex -> raise (S3Errors.ofS3Exception "DeletePrefix" bucket null ex)
+        task {
+            let mutable deleted = 0
+
+            for chunk in keys |> List.chunkBySize 1000 do
+                let! confirmed = deleteChunkAsync chunk
+                deleted <- deleted + confirmed
 
             return deleted
         }

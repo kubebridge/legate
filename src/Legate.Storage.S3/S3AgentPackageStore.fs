@@ -57,15 +57,19 @@ type S3AgentPackageStore(options: S3StorageOptions, client: AmazonS3Client, cloc
     /// and rejecting duplicate normalised paths before anything is
     /// stored.
     let materialise (entries: IAsyncEnumerable<AgentPackageEntry>) (cancellationToken: CancellationToken) =
-        task {
-            let files = Dictionary<string, byte[]>()
-            use memory = new MemoryStream()
-            let enumerator = entries.GetAsyncEnumerator cancellationToken
-            let mutable more = true
-            let mutable failure: exn | null = null
+        let files = Dictionary<string, byte[]>()
+        let memory = new MemoryStream()
+        let enumerator = entries.GetAsyncEnumerator cancellationToken
+        let mutable failure: exn | null = null
 
-            try
-                while more do
+        // One entry behind its own error boundary: the drain loop below
+        // holds no try/with, so no try encloses a loop containing let!.
+        // A failure stops the drain; the loop body reports it through
+        // the failure cell so the enumerator still disposes before the
+        // error propagates.
+        let readOneAsync () : Task<bool> =
+            task {
+                try
                     let! moved = enumerator.MoveNextAsync()
 
                     if moved then
@@ -83,16 +87,30 @@ type S3AgentPackageStore(options: S3StorageOptions, client: AmazonS3Client, cloc
                         do! entry.Content.CopyToAsync memory
                         files[normalised] <- memory.ToArray()
                         memory.SetLength 0L
+                        return true
                     else
-                        more <- false
-            with ex ->
-                failure <- ex
+                        return false
+                with ex ->
+                    failure <- ex
+                    return false
+            }
+
+        task {
+            let mutable more = true
+
+            while more do
+                let! keepGoing = readOneAsync ()
+                more <- keepGoing
 
             do! enumerator.DisposeAsync()
 
-            match failure with
-            | null -> return files
-            | ex -> return raise ex
+            let result =
+                match failure with
+                | null -> files
+                | ex -> raise ex
+
+            memory.Dispose()
+            return result
         }
 
     let namesUnder (paths: string seq) (prefix: string) (suffix: string) : List<string> =
