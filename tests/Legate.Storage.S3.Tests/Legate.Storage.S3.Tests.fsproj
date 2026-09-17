@@ -21,6 +21,7 @@
     <Compile Include="S3PresignTests.fs" />
     <Compile Include="S3RegistrationTests.fs" />
     <Compile Include="S3ConditionalWriteTests.fs" />
+    <Compile Include="S3DeleteStubTests.fs" />
     <Compile Include="S3BlobStoreTests.fs" Condition="'$(OS)' != 'Windows_NT' or '$(LegateS3Docker)' == 'true'" />
     <Compile Include="S3AgentPackageStoreTests.fs" Condition="'$(OS)' != 'Windows_NT' or '$(LegateS3Docker)' == 'true'" />
   </ItemGroup>
