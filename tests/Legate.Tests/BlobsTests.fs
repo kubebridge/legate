@@ -295,6 +295,36 @@ let ``Artifact keys use the artifacts scope`` () =
     |> should equal $"artifacts/{tenant.Value}/{sessionId.Value}/result.txt"
 
 [<Fact>]
+let ``Attempt segments name the attempt`` () =
+    BlobKeys.AttemptSegment 2 |> should equal "attempts/2"
+
+[<Fact>]
+let ``Attempt output names nest the path under output`` () =
+    BlobKeys.AttemptOutputName(2, "report.txt")
+    |> should equal "attempts/2/output/report.txt"
+
+    BlobKeys.AttemptOutputName(2, "sub/nested.txt")
+    |> should equal "attempts/2/output/sub/nested.txt"
+
+[<Fact>]
+let ``Attempt output names compose through artifact keys`` () =
+    BlobKeys.ForArtifact(tenant, sessionId, BlobKeys.AttemptOutputName(2, "report.txt"))
+    |> should equal $"artifacts/{tenant.Value}/{sessionId.Value}/attempts/2/output/report.txt"
+
+[<Fact>]
+let ``Attempt helpers reject non-positive attempts`` () =
+    (fun () -> BlobKeys.AttemptSegment 0 |> ignore)
+    |> should throw typeof<ArgumentOutOfRangeException>
+
+    (fun () -> BlobKeys.AttemptOutputName(0, "report.txt") |> ignore)
+    |> should throw typeof<ArgumentOutOfRangeException>
+
+[<Fact>]
+let ``Attempt output names validate like keys`` () =
+    (fun () -> BlobKeys.AttemptOutputName(1, "../escape") |> ignore)
+    |> should throw typeof<InvalidBlobKeyException>
+
+[<Fact>]
 let ``Session and artifact prefixes never collide`` () =
     let sessionPrefix = BlobKeys.SessionPrefix(tenant, sessionId)
     let artifactPrefix = BlobKeys.ArtifactPrefix(tenant, sessionId)

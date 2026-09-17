@@ -248,6 +248,31 @@ type BlobKeys() =
     static member ForArtifact(tenant: TenantId, sessionId: SessionId, name: string) =
         BlobKeys.ScopeKey("artifacts", tenant, sessionId, name)
 
+    /// Derives the per-attempt segment of an attempt-scoped artifact name:
+    /// <c>attempts/{n}</c>, where <c>n</c> is the 1-based attempt the blob
+    /// was persisted under.
+    /// <param name="attempt">The 1-based attempt number. Must be positive.</param>
+    /// <returns>The attempt segment, for example "attempts/2".</returns>
+    /// <exception cref="T:System.ArgumentOutOfRangeException">The attempt is not positive.</exception>
+    static member AttemptSegment(attempt: int) =
+        if attempt < 1 then
+            raise (ArgumentOutOfRangeException(nameof attempt, "The attempt number must be positive."))
+
+        sprintf "attempts/%d" attempt
+
+    /// Derives the artifact-relative name of a workspace output persisted
+    /// under an attempt: <c>attempts/{n}/output/{name}</c>. Pass the result
+    /// to <see cref="T:Legate.BlobKeys" /> artifact derivation for the full
+    /// key; the same derivation addresses the blob from
+    /// <c>get_download_url</c> and from re-bind restore, so the three paths
+    /// cannot drift.
+    /// <param name="attempt">The 1-based attempt number. Must be positive.</param>
+    /// <param name="name">The workspace-relative path under <c>output/</c>, for example "report.txt". Validated like a key.</param>
+    /// <returns>The artifact-relative attempt-output name.</returns>
+    /// <exception cref="T:Legate.InvalidBlobKeyException">The name fails key validation.</exception>
+    static member AttemptOutputName(attempt: int, name: string) =
+        sprintf "%s/output/%s" (BlobKeys.AttemptSegment attempt) (BlobKeys.Validate name)
+
     /// Derives the deterministic session-scope list prefix:
     /// <c>sessions/{escapedTenant}/{sessionId}/</c>.
     /// <param name="tenant">The tenant that owns the session.</param>
