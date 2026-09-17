@@ -38,7 +38,7 @@ type internal PackageLeaseSystemDelay(clock: TimeProvider) =
 /// <see cref="P:Legate.PackageLeaseOptions.RenewInterval" /> while the work
 /// runs, cancels the work token when a renewal is lost or exceeds
 /// <see cref="P:Legate.PackageLeaseOptions.RenewalTimeout" />, and releases
-/// best-effort in a finally block, also on failure paths.
+/// best-effort on every path, including failure paths.
 [<Sealed>]
 type AgentPackageLeaseService(clock: TimeProvider, delay: ILlmDelay) =
 
@@ -58,6 +58,53 @@ type AgentPackageLeaseService(clock: TimeProvider, delay: ILlmDelay) =
 
     /// Initialises the service over the machine clock with system waits.
     new() = AgentPackageLeaseService(TimeProvider.System, PackageLeaseSystemDelay(TimeProvider.System))
+
+    /// Flattens a task's completion (success, fault, or cancellation) to
+    /// data with a plain BCL continuation, so the caller binds the
+    /// flattened task in straight-line flow with no bind inside
+    /// try/with/finally. A fault carries the await-unwrapped exception;
+    /// cancellation carries a TaskCanceledException. Private: WithLease
+    /// orchestration only.
+    static member private Settle<'U>(work: Task<'U>) : Task<Choice<'U, exn>> =
+        if isNull (box work) then
+            raise (ArgumentNullException(nameof work))
+
+        work.ContinueWith(
+            Func<Task<'U>, Choice<'U, exn>>(fun finished ->
+                if finished.IsFaulted then
+                    match box finished.Exception with
+                    | :? AggregateException as agg ->
+                        match box agg.InnerException with
+                        | :? exn as inner -> Choice2Of2 inner
+                        | _ -> Choice2Of2(agg :> exn)
+                    | _ ->
+                        Choice2Of2(
+                            InvalidOperationException("The leased task faulted without capturing an exception.") :> exn
+                        )
+                elif finished.IsCanceled then
+                    Choice2Of2(TaskCanceledException(finished) :> exn)
+                else
+                    Choice1Of2 finished.Result),
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default
+        )
+
+    /// Quiets a best-effort task with a plain BCL continuation, so binding
+    /// it in straight-line flow cannot throw on any path: synchronous
+    /// throws are already captured by the caller, and faults or
+    /// cancellations flatten to a completed task. Private: WithLease
+    /// release only.
+    static member private Quiet(work: Task) : Task =
+        if isNull (box work) then
+            Task.CompletedTask
+        else
+            work.ContinueWith(
+                Action<Task>(fun _ -> ()),
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default
+            )
 
     /// Runs work under an acquired lease with the pinned WithLease
     /// semantics both overloads share. Private: the public surface is the
@@ -98,44 +145,62 @@ type AgentPackageLeaseService(clock: TimeProvider, delay: ILlmDelay) =
 
             match first with
             | :? PackageLeaseAcquired as acquired ->
-                let mutable current = acquired.Lease
+                // No bind sits inside a try/with/finally from here on: the
+                // loop task value is built first, a plain BCL continuation
+                // flattens its completion (success, fault, cancellation) to
+                // data, and the release task value is built the same way, so
+                // every bind runs in straight-line task flow. CI's SDK band
+                // rejects binds inside finally with FS0750, and
+                // handler-embedded binds have broken this repo's Linux legs
+                // before, so this file keeps binds out of handlers entirely.
+                let loopTask =
+                    PackageLeaseLoop.runAsync
+                        (fun lease duration token -> (this :> IAgentPackageLeaseService).Renew(lease, duration, token))
+                        acquired.Lease
+                        leaseDuration
+                        resolved.RenewInterval
+                        resolved.RenewalTimeout
+                        clock
+                        delay
+                        startWork
+                        cancellationToken
 
-                try
-                    let! outcome =
-                        PackageLeaseLoop.runAsync
-                            (fun lease duration token ->
-                                (this :> IAgentPackageLeaseService).Renew(lease, duration, token))
-                            acquired.Lease
-                            leaseDuration
-                            resolved.RenewInterval
-                            resolved.RenewalTimeout
-                            clock
-                            delay
-                            startWork
-                            cancellationToken
+                let! settled = AgentPackageLeaseService.Settle(loopTask)
 
-                    match outcome with
-                    | PackageLeaseLoop.Completed(result, final) ->
-                        current <- final
-                        return result
-                    | PackageLeaseLoop.Failed(final, reason) ->
-                        current <- final
+                // The lease the best-effort release frees on every path out:
+                // the loop's latest token when it produced one, the granted
+                // token otherwise (exactly what the finally block freed).
+                let current =
+                    match settled with
+                    | Choice1Of2(PackageLeaseLoop.Completed(_, final)) -> final
+                    | Choice1Of2(PackageLeaseLoop.Failed(final, _)) -> final
+                    | Choice2Of2 _ -> acquired.Lease
 
-                        return
-                            raise (
-                                PackageLeaseException(
-                                    agentId,
-                                    owner,
-                                    "renew",
-                                    $"The package lease renewal {reason}: the leased work was cancelled and nothing it attempted afterwards took effect."
-                                )
-                            )
-                finally
+                // Best-effort bounded release on CancellationToken.None: the
+                // task value is built in plain flow (a synchronous throw
+                // becomes an already-done task) and a plain continuation
+                // quiets faults, so the bind below cannot throw on any path.
+                let releaseTask =
                     try
-                        let! _ = (this :> IAgentPackageLeaseService).Release(current, CancellationToken.None)
-                        ()
+                        (this :> IAgentPackageLeaseService).Release(current, CancellationToken.None)
                     with _ ->
-                        ()
+                        Task.FromResult(false)
+
+                do! AgentPackageLeaseService.Quiet(releaseTask)
+
+                match settled with
+                | Choice1Of2(PackageLeaseLoop.Completed(result, _)) -> return result
+                | Choice1Of2(PackageLeaseLoop.Failed(_, reason)) ->
+                    return
+                        raise (
+                            PackageLeaseException(
+                                agentId,
+                                owner,
+                                "renew",
+                                $"The package lease renewal {reason}: the leased work was cancelled and nothing it attempted afterwards took effect."
+                            )
+                        )
+                | Choice2Of2 fault -> return raise fault
             | _ ->
                 return
                     raise (
@@ -250,7 +315,7 @@ type AgentPackageLeaseService(clock: TimeProvider, delay: ILlmDelay) =
 
         /// Runs work while holding the lease with the pinned semantics:
         /// acquire first, renew on the interval, cancel on lost or
-        /// over-timeout renewal, release best-effort in a finally block.
+        /// over-timeout renewal, release best-effort on every path.
         /// <param name="tenant">The tenant whose package to lease.</param>
         /// <param name="agentId">The agent whose package to lease.</param>
         /// <param name="owner">The caller's owner identity. Must not be null.</param>
