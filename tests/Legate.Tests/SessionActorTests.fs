@@ -986,7 +986,7 @@ type RecordingEventStore() =
         member _.TryClaimCleanup(_, sessionId, _, _, _) =
             Task.FromResult(EventCleanupNotClaimable(sessionId, "notSupported") :> EventCleanupState)
 
-        member _.CompleteCleanup(_, sessionId, _, _) =
+        member _.CompleteCleanup(_, sessionId, _, _, _) =
             Task.FromResult(EventCleanupRejected(sessionId, "staleClaim") :> EventCleanupSettlement)
 
         member _.DeferCleanup(_, sessionId, _, _) =

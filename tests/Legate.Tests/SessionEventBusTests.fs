@@ -199,7 +199,7 @@ let ``ReadEvents maps unknown session and expired journal to typed throws`` () =
             events.TryClaimCleanup(tenant, sessionId, "bus-worker", TimeSpan.FromMinutes 5., CancellationToken.None)
 
         let lease = (granted :?> EventCleanupClaimed).Claim
-        let! _ = events.CompleteCleanup(tenant, sessionId, lease.Token, CancellationToken.None)
+        let! _ = events.CompleteCleanup(tenant, sessionId, lease.Token, null, CancellationToken.None)
 
         try
             let! _ = bus.ReadEventsAsync(tenant, sessionId, 0L, 10, CancellationToken.None)
@@ -366,7 +366,7 @@ let ``Subscribe maps unknown session and expired journal distinctly`` () =
             events.TryClaimCleanup(tenant, sessionId, "bus-worker", TimeSpan.FromMinutes 5., CancellationToken.None)
 
         let lease = (granted :?> EventCleanupClaimed).Claim
-        let! _ = events.CompleteCleanup(tenant, sessionId, lease.Token, CancellationToken.None)
+        let! _ = events.CompleteCleanup(tenant, sessionId, lease.Token, null, CancellationToken.None)
 
         try
             let! _ = collectAll (bus.Subscribe(tenant, sessionId, 0L, CancellationToken.None))

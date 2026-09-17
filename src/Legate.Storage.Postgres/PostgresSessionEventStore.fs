@@ -362,7 +362,7 @@ type PostgresSessionEventStore(options: PostgresOptions, timeProvider: TimeProvi
                         command
                             connection
                             transaction
-                            $"SELECT 1 FROM {this.CleanupTable} WHERE session_id = @sid AND tenant = @t AND owner = @marker"
+                            $"SELECT archive_location FROM {this.CleanupTable} WHERE session_id = @sid AND tenant = @t AND owner = @marker"
 
                     textParam markerCmd "sid" (sessionId.ToString())
                     textParam markerCmd "t" (tenant.ToString())
@@ -370,10 +370,13 @@ type PostgresSessionEventStore(options: PostgresOptions, timeProvider: TimeProvi
 
                     use markerReader = markerCmd.ExecuteReader()
                     let archived = markerReader.Read()
+
+                    let pointer = if archived then getTextOrNull markerReader 0 else null
+
                     markerReader.Close()
 
                     if archived then
-                        EventReplayJournalExpired sessionId :> EventReplayOutcome
+                        EventReplayJournalExpired(sessionId, pointer) :> EventReplayOutcome
                     else
                         use pageCmd =
                             command
@@ -518,7 +521,7 @@ type PostgresSessionEventStore(options: PostgresOptions, timeProvider: TimeProvi
                                 EventCleanupClaimed claim :> EventCleanupState)
             |> Task.FromResult
 
-        member this.CompleteCleanup(tenant, sessionId, claimToken, _) =
+        member this.CompleteCleanup(tenant, sessionId, claimToken, archiveLocation, _) =
             if isNull (box claimToken) then
                 raise (ArgumentNullException(nameof claimToken))
 
@@ -576,12 +579,13 @@ type PostgresSessionEventStore(options: PostgresOptions, timeProvider: TimeProvi
                         command
                             connection
                             transaction
-                            $"INSERT INTO {this.CleanupTable} (session_id, tenant, token, owner, expires_at) VALUES (@sid, @t, @marker, @marker, @exp)"
+                            $"INSERT INTO {this.CleanupTable} (session_id, tenant, token, owner, expires_at, archive_location) VALUES (@sid, @t, @marker, @marker, @exp, @location)"
 
                     textParam markerCmd "sid" (sessionId.ToString())
                     textParam markerCmd "t" (tenant.ToString())
                     textParam markerCmd "marker" this.ArchiveMarker
                     textParam markerCmd "exp" (stamp this.UtcNow)
+                    textParam markerCmd "location" archiveLocation
                     markerCmd.ExecuteNonQuery() |> ignore
 
                     EventCleanupApplied(sessionId, true) :> EventCleanupSettlement)

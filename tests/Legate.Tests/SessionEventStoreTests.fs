@@ -36,6 +36,7 @@ type FakeSessionEventStore() =
     // appends under.
     let journals = Dictionary<string, Dictionary<int64, SessionEvent>>()
     let live = Dictionary<string, bool>()
+    let locations = Dictionary<string, string | null>()
     let tokens = Dictionary<string, HashSet<string>>()
     let cleanups = Dictionary<string, EventCleanupClaim>()
     let mutable claimCounter = 0
@@ -218,7 +219,13 @@ type FakeSessionEventStore() =
             | false, _ -> Task.FromResult(EventReplayUnknownSession(sessionId) :> EventReplayOutcome)
             | true, _ ->
                 match live.TryGetValue(key t sessionId) with
-                | true, false -> Task.FromResult(EventReplayJournalExpired(sessionId) :> EventReplayOutcome)
+                | true, false ->
+                    let pointer =
+                        match locations.TryGetValue(key t sessionId) with
+                        | true, stored -> stored
+                        | false, _ -> null
+
+                    Task.FromResult(EventReplayJournalExpired(sessionId, pointer) :> EventReplayOutcome)
                 | _ ->
                     let journal = journals[key t sessionId]
 
@@ -271,7 +278,7 @@ type FakeSessionEventStore() =
                         cleanups[key t sessionId] <- claim
                         Task.FromResult(EventCleanupClaimed(claim) :> EventCleanupState)
 
-        member _.CompleteCleanup(t, sessionId, claimToken, _) =
+        member _.CompleteCleanup(t, sessionId, claimToken, archiveLocation, _) =
             if isNull (box claimToken) then
                 raise (ArgumentNullException(nameof claimToken))
 
@@ -283,6 +290,7 @@ type FakeSessionEventStore() =
                 Task.FromResult(EventCleanupRejected(sessionId, "leaseExpired") :> EventCleanupSettlement)
             | true, _ ->
                 live[key t sessionId] <- false
+                locations[key t sessionId] <- archiveLocation
                 cleanups.Remove(key t sessionId) |> ignore
                 Task.FromResult(EventCleanupApplied(sessionId, true) :> EventCleanupSettlement)
 
@@ -400,12 +408,46 @@ let ``EventReplayOutcome has exactly the four documented discriminators`` () =
     unknownJson.Contains("\"$type\":\"eventReplayUnknownSession\"")
     |> should equal true
 
-    let expired: EventReplayOutcome = EventReplayJournalExpired(SessionId.New()) :> _
+    let expired: EventReplayOutcome =
+        EventReplayJournalExpired(SessionId.New(), null) :> _
 
     let expiredJson = JsonSerializer.Serialize(expired, jsonOptions)
 
     expiredJson.Contains("\"$type\":\"eventReplayJournalExpired\"")
     |> should equal true
+
+[<Fact>]
+let ``EventReplayJournalExpired round-trips its archive pointer`` () =
+    let sessionId = SessionId.New()
+
+    let pointed: EventReplayOutcome =
+        EventReplayJournalExpired(sessionId, "acme/01KArchive/events.jsonl") :> _
+
+    let pointedJson = JsonSerializer.Serialize(pointed, jsonOptions)
+
+    pointedJson.Contains("\"$type\":\"eventReplayJournalExpired\"")
+    |> should equal true
+
+    pointedJson.Contains("acme/01KArchive/events.jsonl") |> should equal true
+
+    match deserialize<EventReplayOutcome> pointedJson with
+    | :? EventReplayJournalExpired as roundTripped ->
+        roundTripped.SessionId |> should equal sessionId
+        roundTripped.ArchiveLocation |> should equal "acme/01KArchive/events.jsonl"
+    | _ -> failwith "expected the expired outcome back"
+
+[<Fact>]
+let ``EventReplayJournalExpired without a pointer reads null`` () =
+    // Journals archived before the pointer existed carry no property: the
+    // additive shape reads null rather than failing.
+    let legacyJson =
+        "{\"$type\":\"eventReplayJournalExpired\",\"SessionId\":\""
+        + SessionId.New().Value
+        + "\"}"
+
+    match deserialize<EventReplayOutcome> legacyJson with
+    | :? EventReplayJournalExpired as legacy -> legacy.ArchiveLocation |> should equal null
+    | _ -> failwith "expected the expired outcome back"
 
 [<Fact>]
 let ``EventCleanupState has exactly the two documented discriminators`` () =
@@ -815,7 +857,7 @@ let ``CompleteCleanup archives under the token and a stale token cannot settle``
             | _ -> failwith "expected a claim"
 
         // A different worker's token is stale: nothing is archived.
-        let! rejected = store.CompleteCleanup(tenant, sessionId, "someone-elses-token", CancellationToken.None)
+        let! rejected = store.CompleteCleanup(tenant, sessionId, "someone-elses-token", null, CancellationToken.None)
         (rejected :? EventCleanupRejected) |> should equal true
         (rejected :?> EventCleanupRejected).Reason |> should equal "staleClaim"
 
@@ -823,16 +865,17 @@ let ``CompleteCleanup archives under the token and a stale token cannot settle``
         let! stillThere = store.Replay(tenant, sessionId, 0L, 5, CancellationToken.None)
         (stillThere :? EventReplayEndOfStream) |> should equal true
 
-        let! applied = store.CompleteCleanup(tenant, sessionId, claim.Token, CancellationToken.None)
+        let! applied = store.CompleteCleanup(tenant, sessionId, claim.Token, null, CancellationToken.None)
         (applied :? EventCleanupApplied) |> should equal true
         (applied :?> EventCleanupApplied).Completed |> should equal true
 
-        // The journal is gone now.
+        // The journal is gone now, with no pointer on the legacy path.
         let! gone = store.Replay(tenant, sessionId, 0L, 5, CancellationToken.None)
         (gone :? EventReplayJournalExpired) |> should equal true
+        (gone :?> EventReplayJournalExpired).ArchiveLocation |> should equal null
 
         // Settling again is a stale claim: the lease is gone.
-        let! again = store.CompleteCleanup(tenant, sessionId, claim.Token, CancellationToken.None)
+        let! again = store.CompleteCleanup(tenant, sessionId, claim.Token, null, CancellationToken.None)
         (again :? EventCleanupRejected) |> should equal true
     }
     |> (fun t -> t.Wait())

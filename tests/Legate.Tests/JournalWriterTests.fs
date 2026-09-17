@@ -106,8 +106,8 @@ type private CountingEventStore(inner: ISessionEventStore) =
         member _.TryClaimCleanup(tenant, sessionId, owner, duration, cancellationToken) =
             inner.TryClaimCleanup(tenant, sessionId, owner, duration, cancellationToken)
 
-        member _.CompleteCleanup(tenant, sessionId, token, cancellationToken) =
-            inner.CompleteCleanup(tenant, sessionId, token, cancellationToken)
+        member _.CompleteCleanup(tenant, sessionId, token, archiveLocation, cancellationToken) =
+            inner.CompleteCleanup(tenant, sessionId, token, archiveLocation, cancellationToken)
 
         member _.DeferCleanup(tenant, sessionId, token, cancellationToken) =
             inner.DeferCleanup(tenant, sessionId, token, cancellationToken)
@@ -134,8 +134,8 @@ type private FlakyEventStore(inner: ISessionEventStore, failures: int, failure: 
         member _.TryClaimCleanup(tenant, sessionId, owner, duration, cancellationToken) =
             inner.TryClaimCleanup(tenant, sessionId, owner, duration, cancellationToken)
 
-        member _.CompleteCleanup(tenant, sessionId, token, cancellationToken) =
-            inner.CompleteCleanup(tenant, sessionId, token, cancellationToken)
+        member _.CompleteCleanup(tenant, sessionId, token, archiveLocation, cancellationToken) =
+            inner.CompleteCleanup(tenant, sessionId, token, archiveLocation, cancellationToken)
 
         member _.DeferCleanup(tenant, sessionId, token, cancellationToken) =
             inner.DeferCleanup(tenant, sessionId, token, cancellationToken)
@@ -156,7 +156,7 @@ type private CancelHonoringStore() =
         member _.TryClaimCleanup(_, sessionId, _, _, _) =
             Task.FromResult(EventCleanupNotClaimable(sessionId, "notSupported") :> EventCleanupState)
 
-        member _.CompleteCleanup(_, sessionId, _, _) =
+        member _.CompleteCleanup(_, sessionId, _, _, _) =
             Task.FromResult(EventCleanupRejected(sessionId, "staleClaim") :> EventCleanupSettlement)
 
         member _.DeferCleanup(_, sessionId, _, _) =

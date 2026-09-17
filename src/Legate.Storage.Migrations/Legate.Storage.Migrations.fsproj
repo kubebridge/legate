@@ -11,6 +11,7 @@
     <Compile Include="MigrationOptions.fs" />
     <Compile Include="MigrationNaming.fs" />
     <Compile Include="BaselineV1.fs" />
+    <Compile Include="CleanupClaimsArchiveLocation.fs" />
     <Compile Include="MigrationServiceExtensions.fs" />
   </ItemGroup>
 

@@ -226,15 +226,21 @@ and internal OutboxRow(tenant: TenantId, completion: SessionCompletion, createdA
     /// When the delivery lease expires.
     member val LeaseExpiresAt = Nullable<DateTimeOffset>() with get, set
 
-/// One journal row: the ordered events, the archived flag, and the running
-/// byte total.
-and internal JournalRow(events: List<SessionEvent>, archived: bool, totalBytes: int64) =
+/// One journal row: the ordered events, the archived flag, the archive
+/// pointer the expired replay reports, and the running byte total.
+and internal JournalRow(events: List<SessionEvent>, archived: bool, archiveLocation: string | null, totalBytes: int64) =
 
     /// The journal's events in sequence order.
     member val Events = events with get, set
 
     /// Whether the journal was archived away by cleanup.
     member val Archived = archived with get, set
+
+    /// Where the archived journal lives (the archive file path the cleanup
+    /// wrote), or null when the journal was cleaned up without an archive
+    /// pointer (a legacy archive). Replay reports it on the expired
+    /// outcome.
+    member val ArchiveLocation: string | null = archiveLocation with get, set
 
     /// The running byte total of the journaled events.
     member val TotalBytes = totalBytes with get, set

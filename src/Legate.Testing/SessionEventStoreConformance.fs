@@ -306,7 +306,7 @@ type SessionEventStoreConformance
 
             let lease = (replanted :?> EventCleanupClaimed).Claim
 
-            let! completed = eventStore.CompleteCleanup(tenant, sessionId, lease.Token, CancellationToken.None)
+            let! completed = eventStore.CompleteCleanup(tenant, sessionId, lease.Token, null, CancellationToken.None)
 
             Assert.True(
                 (completed :? EventCleanupApplied)
@@ -316,6 +316,64 @@ type SessionEventStoreConformance
             let! expired = eventStore.Replay(tenant, sessionId, 0L, 10, CancellationToken.None)
 
             Assert.True(expired :? EventReplayJournalExpired)
+        }
+
+    /// Completing the cleanup with an archive pointer replays the expired
+    /// journal carrying that pointer on every backend, and the journal
+    /// stays gone to further claimants.
+    [<Fact>]
+    member this.``CompleteCleanup with an archive pointer replays Expired carrying the pointer``() =
+        task {
+            let! sessionId, claim = this.ClaimedSession()
+
+            let! appended =
+                eventStore.Append(
+                    tenant,
+                    sessionId,
+                    claim.Token,
+                    [ this.Delta(sessionId, claim.TurnId) ],
+                    CancellationToken.None
+                )
+
+            Assert.True(appended :? EventAppended)
+
+            let! granted =
+                eventStore.TryClaimCleanup(
+                    tenant,
+                    sessionId,
+                    "cleanup-worker",
+                    TimeSpan.FromMinutes 5.,
+                    CancellationToken.None
+                )
+
+            let lease = (granted :?> EventCleanupClaimed).Claim
+            let pointer = "conformance/expired-pointers/events.jsonl"
+
+            let! completed = eventStore.CompleteCleanup(tenant, sessionId, lease.Token, pointer, CancellationToken.None)
+
+            Assert.True(
+                (completed :? EventCleanupApplied)
+                && (completed :?> EventCleanupApplied).Completed
+            )
+
+            let! expired = eventStore.Replay(tenant, sessionId, 0L, 10, CancellationToken.None)
+
+            match expired with
+            | :? EventReplayJournalExpired as gone -> Assert.Equal(pointer, gone.ArchiveLocation)
+            | _ -> failwith "expected the expired journal carrying the archive pointer"
+
+            let! gone =
+                eventStore.TryClaimCleanup(
+                    tenant,
+                    sessionId,
+                    "cleanup-worker",
+                    TimeSpan.FromMinutes 5.,
+                    CancellationToken.None
+                )
+
+            match gone with
+            | :? EventCleanupNotClaimable as refused -> Assert.Equal("journalGone", refused.Reason)
+            | _ -> failwith "expected journalGone after the pointed cleanup"
         }
 
     [<Fact>]
@@ -349,7 +407,8 @@ type SessionEventStoreConformance
 
             Assert.True(deferRejected :? EventCleanupRejected)
 
-            let! completeRejected = eventStore.CompleteCleanup(tenant, sessionId, "stale-token", CancellationToken.None)
+            let! completeRejected =
+                eventStore.CompleteCleanup(tenant, sessionId, "stale-token", null, CancellationToken.None)
 
             Assert.True(completeRejected :? EventCleanupRejected)
 
@@ -418,11 +477,12 @@ type SessionEventStoreConformance
             let winner = (reclaimed :?> EventCleanupClaimed).Claim
 
             // The lapsed token settles nothing.
-            let! loserComplete = eventStore.CompleteCleanup(tenant, sessionId, lease.Token, CancellationToken.None)
+            let! loserComplete =
+                eventStore.CompleteCleanup(tenant, sessionId, lease.Token, null, CancellationToken.None)
 
             Assert.True(loserComplete :? EventCleanupRejected)
 
-            let! completed = eventStore.CompleteCleanup(tenant, sessionId, winner.Token, CancellationToken.None)
+            let! completed = eventStore.CompleteCleanup(tenant, sessionId, winner.Token, null, CancellationToken.None)
 
             Assert.True(
                 (completed :? EventCleanupApplied)
