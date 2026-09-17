@@ -25,6 +25,7 @@
     <Compile Include="LlmStreaming.fs" />
     <Compile Include="StopArbitration.fs" />
     <Compile Include="WorkspaceLayout.fs" />
+    <Compile Include="WorkspaceRebind.fs" />
     <Compile Include="DownloadUrlTool.fs" />
     <Compile Include="SsrfGuard.fs" />
     <Compile Include="TurnLoop.fs" />
@@ -54,6 +55,7 @@
     <Compile Include="SessionClientFacade.fs" />
     <Compile Include="JournalArchiveOptions.fs" />
     <Compile Include="JournalArchiveWorker.fs" />
+    <Compile Include="SessionExpiryService.fs" />
     <Compile Include="AddLegate.fs" />
   </ItemGroup>
 

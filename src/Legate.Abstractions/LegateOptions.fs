@@ -107,6 +107,14 @@ type SessionsOptions() =
     /// half the lease so a missed heartbeat never loses the lease.
     member val LeaseRenewalInterval: TimeSpan = TimeSpan.FromSeconds 15.0 with get, set
 
+    /// How long a session may sit idle (no state change) before the expiry
+    /// sweeper closes it, or empty (HasValue is false) meaning expiry is
+    /// disabled and sessions live until the host closes them. Default
+    /// empty. When set, must be positive; enabling expiry without a durable
+    /// blob store fails startup, because workspace input and output
+    /// restored on re-bind would otherwise be lost.
+    member val Expiry: Nullable<TimeSpan> = Nullable<TimeSpan>() with get, set
+
     /// Sub-agent settings: the task tool's nesting depth and per-run
     /// timeout. Never null.
     member val SubAgents: SubAgentsOptions = SubAgentsOptions() with get, set
@@ -134,6 +142,8 @@ type SessionsOptions() =
                         && this.LeaseRenewalInterval >= this.LeaseDuration.Divide 2.0
                     then
                         "LeaseRenewalInterval must be less than half LeaseDuration."
+                    if this.Expiry.HasValue && this.Expiry.Value <= TimeSpan.Zero then
+                        "Expiry must be positive when set."
                 |]
 
             if violations.Length <> 0 then

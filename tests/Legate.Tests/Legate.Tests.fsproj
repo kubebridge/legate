@@ -101,6 +101,8 @@
     <Compile Include="CustomToolSourceTests.fs" />
     <Compile Include="WebhookCompletionSinkTests.fs" />
     <Compile Include="CompletionRedriverTests.fs" />
+    <Compile Include="SessionExpiryTests.fs" />
+    <Compile Include="WorkspaceRebindTests.fs" />
     <Compile Include="PromptWaitHubTests.fs" />
     <Compile Include="PromptAndWaitTests.fs" />
     <Compile Include="SessionClientFacadeTests.fs" />

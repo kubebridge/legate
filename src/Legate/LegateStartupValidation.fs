@@ -38,6 +38,68 @@ type internal LegateOptionsValidation() =
                     ValidateOptionsResult.Fail $"Invalid LegateOptions: %s{violation}"
 
 // ──────────────────────────────────────────────────────────────────────────
+// Expiry store gate
+
+/// Fails startup fast when session expiry is enabled without a durable
+/// blob store. Expiry closes idle sessions and re-bind restores workspace
+/// input/output from the blob store, so an InMemory blob store (or no blob
+/// store at all) would silently lose workspace files: that is a host
+/// misconfiguration, and the single InvalidOperationException below names
+/// it. The InMemory check is name-based because Legate never references a
+/// storage package: a host-owned store whose type name contains "InMemory"
+/// is treated as non-durable and documented as such.
+module internal SessionExpiryStartup =
+
+    /// Whether expiry is enabled in the options: the Expiry knob set to a
+    /// positive bound. A set-but-non-positive value is left to the options
+    /// validation failure, never to this gate.
+    /// <param name="sessions">The session knobs, or null for defaults.</param>
+    /// <returns>True when the sweeper will close idle sessions.</returns>
+    let isEnabled (sessions: SessionsOptions | null) : bool =
+        match sessions with
+        | null -> false
+        | present -> present.Expiry.HasValue && present.Expiry.Value > TimeSpan.Zero
+
+    /// Whether the registered blob store survives a restart: present and
+    /// not an in-memory backend.
+    /// <param name="blobStore">The registered blob store, or null when none is registered.</param>
+    /// <returns>True when expiry may rely on the store.</returns>
+    let isDurable (blobStore: IBlobStore | null) : bool =
+        match blobStore with
+        | null -> false
+        | present ->
+            match present.GetType().FullName with
+            | null -> true
+            | typeName -> not (typeName.Contains("InMemory", StringComparison.Ordinal))
+
+    /// Raises the single startup failure when expiry is enabled without a
+    /// durable blob store; otherwise returns.
+    /// <param name="serviceProvider">The container to resolve options and the blob store from.</param>
+    /// <exception cref="T:System.InvalidOperationException">Expiry is enabled without a durable blob store.</exception>
+    let requireDurableBlobStore (serviceProvider: IServiceProvider) : unit =
+        ArgumentNullException.ThrowIfNull(serviceProvider)
+
+        let sessions =
+            match serviceProvider.GetService<IOptions<LegateOptions>>() with
+            | null -> null
+            | options when isNull (box options.Value) -> null
+            | options when isNull (box options.Value.Sessions) -> null
+            | options -> options.Value.Sessions
+
+        if isEnabled sessions then
+            let blobStore = serviceProvider.GetService<IBlobStore>()
+
+            if not (isDurable blobStore) then
+                raise (
+                    InvalidOperationException(
+                        "Legate sessions expiry (Sessions:Expiry) is enabled but no durable blob store is registered: "
+                        + "expiry closes idle sessions and re-bind restores workspace input/output from the blob store, "
+                        + "so the InMemory blob store (or no blob store) loses workspace files on restart. "
+                        + "Register a durable IBlobStore (SQLite, file-system, or S3) or disable expiry by leaving Sessions:Expiry empty."
+                    )
+                )
+
+// ──────────────────────────────────────────────────────────────────────────
 // Required-registration check
 
 /// Fails host startup with one message listing every missing required
@@ -63,6 +125,8 @@ type internal LegateStartupValidation(serviceProvider: IServiceProvider) =
                 missing.Add "a workspace runtime (IWorkspaceRuntime): call Workspace.UseRuntime"
 
             if missing.Count = 0 then
+                SessionExpiryStartup.requireDurableBlobStore serviceProvider
+
                 Task.CompletedTask
             else
                 let listed = String.Join("; ", missing)
