@@ -5,6 +5,8 @@ open System
 open System.Runtime.CompilerServices
 open Microsoft.Extensions.Configuration
 open Microsoft.Extensions.DependencyInjection
+open Microsoft.Extensions.Logging
+open Microsoft.Extensions.Options
 
 // Registration over LegateBuilder: AddMcp binds the Legate:Tools:Mcp
 // section onto McpOptions, applies the optional configure callback,
@@ -23,8 +25,38 @@ module internal McpRegistration =
     let hasMcpSource (services: IServiceCollection) : bool =
         services
         |> Seq.exists (fun descriptor ->
-            descriptor.ServiceType = typeof<Legate.IToolSource>
-            && descriptor.ImplementationType = typeof<McpToolSource>)
+            (descriptor.ServiceType = typeof<Legate.IToolSource>
+             && descriptor.ImplementationType = typeof<McpToolSource>)
+            || descriptor.ServiceType = typeof<McpToolSource>)
+
+    /// Registers the MCP tool source with its quota-accounted artifact
+    /// sink factory: every tool binary stages through the artifact service
+    /// for the asking session. Without a registered artifact service the
+    /// factory is null and tools keep placeholder output.
+    /// <param name="services">The container receiving the source.</param>
+    let registerSource (services: IServiceCollection) : unit =
+        services.AddSingleton<McpToolSource>(
+            Func<IServiceProvider, McpToolSource>(fun provider ->
+                let bound = provider.GetRequiredService<IOptions<McpOptions>>().Value
+                let logger = provider.GetRequiredService<ILogger<McpToolSource>>()
+
+                let sinks =
+                    match box (provider.GetService<Legate.ISessionArtifactService>()) with
+                    | null -> null
+                    | :? Legate.ISessionArtifactService as service ->
+                        Func<Legate.ToolSourceContext, IArtifactSink>(fun context ->
+                            ServiceArtifactSink(service, context.Tenant, context.SessionId) :> IArtifactSink)
+                    | _ -> null
+
+                McpToolSource(bound, logger, sinks))
+        )
+        |> ignore
+
+        services.AddSingleton<Legate.IToolSource>(
+            Func<IServiceProvider, Legate.IToolSource>(fun provider ->
+                provider.GetRequiredService<McpToolSource>() :> Legate.IToolSource)
+        )
+        |> ignore
 
     /// Binds the section, applies the callback, validates eagerly, and
     /// registers deferred options plus the source exactly once.
@@ -65,7 +97,7 @@ module internal McpRegistration =
         | callback -> builder.Services.Configure<McpOptions>(callback) |> ignore
 
         if not (hasMcpSource builder.Services) then
-            builder.Tools.AddSource<McpToolSource>() |> ignore
+            registerSource builder.Services
 
         builder
 
@@ -153,6 +185,6 @@ type McpToolsBuilderExtensions =
         |> ignore
 
         if not (McpRegistration.hasMcpSource builder.Services) then
-            builder.AddSource<McpToolSource>() |> ignore
+            McpRegistration.registerSource builder.Services
 
         builder

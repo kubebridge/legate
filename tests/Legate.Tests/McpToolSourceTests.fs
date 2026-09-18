@@ -583,44 +583,26 @@ let private binaryConnector (session: IMcpServerSession) : IMcpServerConnector =
         member _.ConnectAsync(_, _) = Task.FromResult session
     }
 
-/// A recording in-memory artifact sink: names land under the fixed
-/// prefix.
-type internal RecordingArtifactStore(prefix: string) =
+/// A recording artifact sink: every stored binary is recorded.
+type internal RecordingArtifactSink() =
     let backing = Dictionary<string, byte[] * string>(StringComparer.Ordinal)
 
-    interface IArtifactBlobStore with
-        member _.Get(name, _) =
-            let missing: byte[] | null = null
+    interface IArtifactSink with
+        member _.StoreAsync(name, content, _) =
+            backing[name] <- content.Bytes, content.ContentType
 
-            match backing.TryGetValue(prefix + name) with
-            | true, (bytes, _) -> Task.FromResult(bytes)
-            | false, _ -> Task.FromResult(missing)
+            let dimensions =
+                if McpArtifacts.isImageMime content.ContentType then
+                    McpArtifacts.tryGetDimensions content.ContentType content.Bytes
+                else
+                    None
 
-        member _.Put(name, content, _) =
-            backing[prefix + name] <- content.Bytes, content.ContentType
-
-            Task.FromResult(BlobMetadata(content.ContentType, int64 content.Bytes.Length, Guid.NewGuid().ToString("N")))
-
-        member _.CompareExchange(_, _, _, _) : Task<BlobMetadata | null> =
-            raise (NotSupportedException("test sink only stores"))
-
-        member _.OpenRead(_, _) : Task<Stream> =
-            raise (NotSupportedException("test sink only stores"))
-
-        member _.OpenWrite(_, _, _) : Task<Stream> =
-            raise (NotSupportedException("test sink only stores"))
-
-        member _.List(_, _) : IAsyncEnumerable<string> =
-            raise (NotSupportedException("test sink only stores"))
-
-        member _.DeletePrefix(_, _) : Task<int> =
-            raise (NotSupportedException("test sink only stores"))
-
-        member _.GetMetadata(_, _) : Task<BlobMetadata | null> =
-            raise (NotSupportedException("test sink only stores"))
-
-        member _.TryGetPresignedUrl(_, _, _) : Task<Uri | null> =
-            raise (NotSupportedException("test sink only stores"))
+            Task.FromResult(
+                StoredArtifact(
+                    McpArtifacts.formatReference name content.ContentType content.Bytes.Length dimensions,
+                    name
+                )
+            )
 
     /// How many artifacts were stored.
     member _.StoredCount: int = backing.Count
@@ -631,7 +613,7 @@ let private noObserve () : Action<McpInvocation.McpCallObservation> | null = nul
 /// Builds a source over the binary session with the given factory.
 let private artifactSource
     (messages: ResizeArray<string>)
-    (factory: Func<ToolSourceContext, IArtifactBlobStore> | null)
+    (factory: Func<ToolSourceContext, IArtifactSink> | null)
     : McpToolSource =
     let session = BinaryAnswerSession(binaryAnswer ())
 
@@ -659,17 +641,16 @@ let private invokeFirst (source: McpToolSource) : string =
 [<Fact>]
 let ``Artifact factory stores binaries and substitutes references`` () =
     let messages = ResizeArray<string>()
-    let store = RecordingArtifactStore("artifacts/acme/session-1/")
+    let sink = RecordingArtifactSink()
 
-    let factory =
-        Func<ToolSourceContext, IArtifactBlobStore>(fun _ -> store :> IArtifactBlobStore)
+    let factory = Func<ToolSourceContext, IArtifactSink>(fun _ -> sink :> IArtifactSink)
 
     let text = invokeFirst (artifactSource messages factory)
 
     text.Contains("[artifact:") |> should equal true
     text.Contains("mime=\"image/png\"") |> should equal true
     text.Contains("dimensions=\"1x1\"") |> should equal true
-    store.StoredCount |> should equal 1
+    sink.StoredCount |> should equal 1
     messages.Count |> should equal 0
 
 [<Fact>]
@@ -686,7 +667,7 @@ let ``Throwing artifact factory degrades to placeholders`` () =
     let messages = ResizeArray<string>()
 
     let factory =
-        Func<ToolSourceContext, IArtifactBlobStore>(fun _ -> raise (InvalidOperationException("no sink")))
+        Func<ToolSourceContext, IArtifactSink>(fun _ -> raise (InvalidOperationException("no sink")))
 
     let text = invokeFirst (artifactSource messages factory)
 

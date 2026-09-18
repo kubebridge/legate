@@ -347,56 +347,39 @@ let private png1x1 () : byte[] =
         0xDEuy
     |]
 
-/// A scoped in-memory artifact sink: names land under the fixed prefix,
-/// every Put name is recorded, Put honors cancellation first, and Put
-/// optionally fails.
-type internal ScopedArtifactStore(prefix: string, failPut: bool) =
+/// A recording artifact sink: every stored name is recorded, Put honors
+/// cancellation first, and Put optionally fails.
+type internal ScopedArtifactSink(failStore: bool) =
     let backing = Dictionary<string, byte[] * string>(StringComparer.Ordinal)
     let names = ResizeArray<string>()
-    let missing: byte[] | null = null
 
-    interface IArtifactBlobStore with
-        member _.Get(name, _) =
-            match backing.TryGetValue(prefix + name) with
-            | true, (bytes, _) -> Task.FromResult(bytes)
-            | false, _ -> Task.FromResult(missing)
-
-        member _.Put(name, content, cancellationToken) =
+    interface IArtifactSink with
+        member _.StoreAsync(name, content, cancellationToken) =
             cancellationToken.ThrowIfCancellationRequested()
             names.Add(name)
 
-            if failPut then
+            if failStore then
                 raise (InvalidOperationException("store unavailable"))
 
-            backing[prefix + name] <- content.Bytes, content.ContentType
+            backing[name] <- content.Bytes, content.ContentType
 
-            Task.FromResult(BlobMetadata(content.ContentType, int64 content.Bytes.Length, Guid.NewGuid().ToString("N")))
+            let dimensions =
+                if McpArtifacts.isImageMime content.ContentType then
+                    McpArtifacts.tryGetDimensions content.ContentType content.Bytes
+                else
+                    None
 
-        member _.CompareExchange(_, _, _, _) : Task<BlobMetadata | null> =
-            raise (NotSupportedException("test sink only stores"))
+            Task.FromResult(
+                StoredArtifact(
+                    McpArtifacts.formatReference name content.ContentType content.Bytes.Length dimensions,
+                    name
+                )
+            )
 
-        member _.OpenRead(_, _) : Task<Stream> =
-            raise (NotSupportedException("test sink only stores"))
+    /// The names stored so far.
+    member _.StoredNames: string list = backing.Keys |> Seq.toList
 
-        member _.OpenWrite(_, _, _) : Task<Stream> =
-            raise (NotSupportedException("test sink only stores"))
-
-        member _.List(_, _) : IAsyncEnumerable<string> =
-            raise (NotSupportedException("test sink only stores"))
-
-        member _.DeletePrefix(_, _) : Task<int> =
-            raise (NotSupportedException("test sink only stores"))
-
-        member _.GetMetadata(_, _) : Task<BlobMetadata | null> =
-            raise (NotSupportedException("test sink only stores"))
-
-        member _.TryGetPresignedUrl(_, _, _) : Task<Uri | null> =
-            raise (NotSupportedException("test sink only stores"))
-
-    /// The full keys stored so far.
-    member _.StoredKeys: string list = backing.Keys |> Seq.toList
-
-    /// The relative names handed to Put, in order.
+    /// The names handed to Store, in order.
     member _.PutNames: string list = names |> Seq.toList
 
 /// One SDK image answer: text plus a 1x1 PNG, split exactly as the
@@ -439,12 +422,12 @@ let private blobAnswer () : McpCallResult =
 /// Invokes through the artifact-aware path with the given sink and caps.
 let private invokeArtifacts
     (session: IMcpServerSession)
-    (store: IArtifactBlobStore | null)
+    (sink: IArtifactSink | null)
     (caps: McpArtifacts.McpArtifactCaps)
     (observations: ResizeArray<McpInvocation.McpCallObservation>)
     (cancellationToken: CancellationToken)
     : string =
-    let sink =
+    let observe =
         Action<McpInvocation.McpCallObservation>(fun observation -> observations.Add(observation))
 
     McpInvocation.invokeWithArtifactsAsync
@@ -453,22 +436,22 @@ let private invokeArtifacts
         "read"
         (noArguments ())
         cancellationToken
+        observe
         sink
-        store
         caps
     |> fun pending -> pending.GetAwaiter().GetResult()
 
 [<Fact>]
 let ``Image block is stored and substituted with a text reference`` () =
     let observations = ResizeArray<McpInvocation.McpCallObservation>()
-    let store = ScopedArtifactStore("artifacts/tenant-a/session-1/", false)
+    let sink = ScopedArtifactSink(false)
     let answer = imageAnswer (png1x1 ()) "image/png" "snapshot"
     let session = ImmediateSession(answer, null)
 
     let result =
         invokeArtifacts
             (session :> IMcpServerSession)
-            (store :> IArtifactBlobStore)
+            (sink :> IArtifactSink)
             McpArtifacts.McpArtifactCaps.Default
             observations
             CancellationToken.None
@@ -478,7 +461,7 @@ let ``Image block is stored and substituted with a text reference`` () =
     result.Contains("dimensions=\"1x1\"") |> should equal true
     result.Contains($"{(png1x1 ()).Length} bytes") |> should equal true
     result.Contains("[non-text content:") |> should equal false
-    store.StoredKeys.Length |> should equal 1
+    sink.StoredNames.Length |> should equal 1
 
     let stamped = single observations
     stamped.Text |> should equal result
@@ -487,13 +470,13 @@ let ``Image block is stored and substituted with a text reference`` () =
 [<Fact>]
 let ``Binary resource is stored with its URI name and no dimensions`` () =
     let observations = ResizeArray<McpInvocation.McpCallObservation>()
-    let store = ScopedArtifactStore("artifacts/tenant-a/session-1/", false)
+    let sink = ScopedArtifactSink(false)
     let session = ImmediateSession(blobAnswer (), null)
 
     let result =
         invokeArtifacts
             (session :> IMcpServerSession)
-            (store :> IArtifactBlobStore)
+            (sink :> IArtifactSink)
             McpArtifacts.McpArtifactCaps.Default
             observations
             CancellationToken.None
@@ -502,7 +485,7 @@ let ``Binary resource is stored with its URI name and no dimensions`` () =
     result.Contains("mime=\"application/pdf\"") |> should equal true
     result.Contains("report-pdf") |> should equal true
     result.Contains("dimensions=") |> should equal false
-    store.StoredKeys.Length |> should equal 1
+    sink.StoredNames.Length |> should equal 1
 
     let stamped = single observations
     stamped.Text |> should equal result
@@ -511,7 +494,7 @@ let ``Binary resource is stored with its URI name and no dimensions`` () =
 [<Fact>]
 let ``Oversized image yields a bounded rejection and the turn continues`` () =
     let observations = ResizeArray<McpInvocation.McpCallObservation>()
-    let store = ScopedArtifactStore("artifacts/tenant-a/session-1/", false)
+    let sink = ScopedArtifactSink(false)
     let answer = imageAnswer (png1x1 ()) "image/png" "snapshot"
     let session = ImmediateSession(answer, null)
 
@@ -523,16 +506,11 @@ let ``Oversized image yields a bounded rejection and the turn continues`` () =
         }
 
     let result =
-        invokeArtifacts
-            (session :> IMcpServerSession)
-            (store :> IArtifactBlobStore)
-            caps
-            observations
-            CancellationToken.None
+        invokeArtifacts (session :> IMcpServerSession) (sink :> IArtifactSink) caps observations CancellationToken.None
 
     result.Contains("[artifact rejected:") |> should equal true
     result.Contains("exceeds 10-byte cap") |> should equal true
-    store.StoredKeys.Length |> should equal 0
+    sink.StoredNames.Length |> should equal 0
 
     let stamped = single observations
     stamped.Text |> should equal result
@@ -541,14 +519,14 @@ let ``Oversized image yields a bounded rejection and the turn continues`` () =
 [<Fact>]
 let ``Storage failure returns the original text and the turn continues`` () =
     let observations = ResizeArray<McpInvocation.McpCallObservation>()
-    let store = ScopedArtifactStore("artifacts/tenant-a/session-1/", true)
+    let sink = ScopedArtifactSink(true)
     let answer = imageAnswer (png1x1 ()) "image/png" "snapshot"
     let session = ImmediateSession(answer, null)
 
     let result =
         invokeArtifacts
             (session :> IMcpServerSession)
-            (store :> IArtifactBlobStore)
+            (sink :> IArtifactSink)
             McpArtifacts.McpArtifactCaps.Default
             observations
             CancellationToken.None
@@ -582,56 +560,48 @@ let ``Null sink keeps placeholder output`` () =
 [<Fact>]
 let ``Tenancy: sinks receive only pre-scoped names and never leak across tenants`` () =
     let observations = ResizeArray<McpInvocation.McpCallObservation>()
-    let storeA = ScopedArtifactStore("artifacts/tenant-a/session-1/", false)
-    let storeB = ScopedArtifactStore("artifacts/tenant-b/session-2/", false)
+    let sinkA = ScopedArtifactSink(false)
+    let sinkB = ScopedArtifactSink(false)
     let answer = imageAnswer (png1x1 ()) "image/png" "snapshot"
     let session = ImmediateSession(answer, null)
 
     invokeArtifacts
         (session :> IMcpServerSession)
-        (storeA :> IArtifactBlobStore)
+        (sinkA :> IArtifactSink)
         McpArtifacts.McpArtifactCaps.Default
         observations
         CancellationToken.None
     |> ignore
 
-    storeA.StoredKeys.Length |> should equal 1
-    storeB.StoredKeys.Length |> should equal 0
+    sinkA.StoredNames.Length |> should equal 1
+    sinkB.StoredNames.Length |> should equal 0
 
-    for name in storeA.PutNames do
+    for name in sinkA.PutNames do
         name.Contains("tenant") |> should equal false
         BlobKeys.Validate name |> ignore
 
-    for key in storeA.StoredKeys do
-        key.StartsWith("artifacts/tenant-a/session-1/", StringComparison.Ordinal)
-        |> should equal true
-
     invokeArtifacts
         (session :> IMcpServerSession)
-        (storeB :> IArtifactBlobStore)
+        (sinkB :> IArtifactSink)
         McpArtifacts.McpArtifactCaps.Default
         observations
         CancellationToken.None
     |> ignore
 
-    storeB.StoredKeys.Length |> should equal 1
-    storeA.StoredKeys.Length |> should equal 1
-
-    for key in storeB.StoredKeys do
-        key.StartsWith("artifacts/tenant-b/session-2/", StringComparison.Ordinal)
-        |> should equal true
+    sinkB.StoredNames.Length |> should equal 1
+    sinkA.StoredNames.Length |> should equal 1
 
 [<Fact>]
 let ``Cancelled store propagates with nothing stamped`` () =
     let observations = ResizeArray<McpInvocation.McpCallObservation>()
-    let store = ScopedArtifactStore("artifacts/tenant-a/session-1/", false)
+    let sink = ScopedArtifactSink(false)
     let answer = imageAnswer (png1x1 ()) "image/png" "snapshot"
     let session = ImmediateSession(answer, null)
 
     use cts = new CancellationTokenSource()
     cts.Cancel()
 
-    let sink =
+    let observe =
         Action<McpInvocation.McpCallObservation>(fun observation -> observations.Add(observation))
 
     let pending =
@@ -641,12 +611,12 @@ let ``Cancelled store propagates with nothing stamped`` () =
             "read"
             (noArguments ())
             cts.Token
-            sink
-            (store :> IArtifactBlobStore)
+            observe
+            (sink :> IArtifactSink)
             McpArtifacts.McpArtifactCaps.Default
 
     (fun () -> pending.GetAwaiter().GetResult() |> ignore)
     |> should throw typeof<OperationCanceledException>
 
     observations.Count |> should equal 0
-    store.StoredKeys.Length |> should equal 0
+    sink.StoredNames.Length |> should equal 0

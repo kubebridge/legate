@@ -97,6 +97,7 @@
     <Compile Include="McpServiceExtensionsTests.fs" />
     <Compile Include="McpConfigFileTests.fs" />
     <Compile Include="McpArtifactsTests.fs" />
+    <Compile Include="McpArtifactSinkTests.fs" />
     <Compile Include="CustomToolNamesTests.fs" />
     <Compile Include="CustomToolSchemaTests.fs" />
     <Compile Include="CustomToolFunctionTests.fs" />
@@ -122,6 +123,7 @@
     <Compile Include="PackageLeaseServiceTests.fs" />
     <Compile Include="JournalArchiveWorkerTests.fs" />
     <Compile Include="ArtifactsTests.fs" />
+    <Compile Include="SessionArtifactsTests.fs" />
   </ItemGroup>
 
   <ItemGroup>

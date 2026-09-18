@@ -493,6 +493,44 @@ type LegateBuilder internal (services: IServiceCollection) as this =
     /// Configures the permission policy gating tool calls.
     member _.Permissions: PermissionsBuilder = permissions
 
+    /// Binds the <c>Legate:Artifacts</c> configuration section onto
+    /// <see cref="T:Legate.ArtifactOptions" /> with a snapshot copy, failing
+    /// fast on the first violation like the root binder. Durations bind in
+    /// the canonical TimeSpan form (for example "7.00:00:00" for 7 days).
+    /// <param name="section">The <c>Legate</c> configuration section.</param>
+    /// <param name="services">The container receiving the configured options.</param>
+    static member private BindArtifacts(section: IConfigurationSection, services: IServiceCollection) : unit =
+        ArgumentNullException.ThrowIfNull(section)
+        ArgumentNullException.ThrowIfNull(services)
+
+        let probe = ArtifactOptions()
+        section.GetSection("Artifacts").Bind(probe)
+
+        match probe.Validate() with
+        | null -> ()
+        | violation ->
+            raise (
+                InvalidOperationException(
+                    $"Invalid Legate configuration at '%s{section.Path}:Artifacts': %s{violation}"
+                )
+            )
+
+        services.Configure<ArtifactOptions>(
+            Action<ArtifactOptions>(fun target ->
+                target.MaxEncodedBytes <- probe.MaxEncodedBytes
+                target.MaxDecodedBytes <- probe.MaxDecodedBytes
+                target.MaxWidth <- probe.MaxWidth
+                target.MaxHeight <- probe.MaxHeight
+                target.MaxPixels <- probe.MaxPixels
+                target.PreviewThresholdBytes <- probe.PreviewThresholdBytes
+                target.PreviewMaxDimension <- probe.PreviewMaxDimension
+                target.AllowedImageMediaTypes <- List<string>(probe.AllowedImageMediaTypes)
+                target.AllowedVideoMediaTypes <- List<string>(probe.AllowedVideoMediaTypes)
+                target.PresignedExpiry <- probe.PresignedExpiry
+                target.ReservationReclaimAfter <- probe.ReservationReclaimAfter)
+        )
+        |> ignore
+
     /// Binds the <c>Legate</c> configuration section onto
     /// <see cref="T:Legate.LegateOptions" /> with the shared binder
     /// (durations and flat-choice enums parse from raw strings, unknown
@@ -515,5 +553,7 @@ type LegateBuilder internal (services: IServiceCollection) as this =
                 target.Cluster <- bound.Cluster)
         )
         |> ignore
+
+        LegateBuilder.BindArtifacts(section, services) |> ignore
 
         this

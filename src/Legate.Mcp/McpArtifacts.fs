@@ -4,6 +4,7 @@ module internal Legate.Mcp.McpArtifacts
 open System
 open System.Collections.Generic
 open System.Text
+open Legate
 
 // Binary artifact validation and reference text for MCP tool results.
 // Images are validated header-only (dimensions, pixel count, byte size)
@@ -427,7 +428,9 @@ let buildStorageName (hint: string | null) (mimeType: string) : string =
     $"{sanitizeHint hint}-{Guid.NewGuid():N}{extensionFor mimeType}"
 
 /// Formats the stored-artifact reference substituting the placeholder:
-/// the storage name, mime, size, and dimensions when known.
+/// the storage name, mime, size, and dimensions when known. Shapes through
+/// the shared <see cref="T:Legate.ArtifactReference" /> helper so the
+/// service and the cell enrichment format the same text.
 /// <param name="name">The storage name.</param>
 /// <param name="mimeType">The payload mime type.</param>
 /// <param name="sizeBytes">The payload size in bytes.</param>
@@ -439,12 +442,12 @@ let formatReference
     (sizeBytes: int)
     (dimensions: McpImageDimensions option)
     : string =
-    let dims =
+    let width, height =
         match dimensions with
-        | Some parsed -> $" dimensions=\"{parsed.Width}x{parsed.Height}\""
-        | None -> ""
+        | Some parsed -> parsed.Width, parsed.Height
+        | None -> 0, 0
 
-    $"[artifact: name=\"{truncate name 128}\" mime=\"{truncate mimeType 128}\" size=\"{sizeBytes} bytes\"{dims}]"
+    ArtifactReference.Format(name, mimeType, int64 sizeBytes, width, height)
 
 /// Formats the bounded rejection replacing the placeholder: mime, size,
 /// and a fixed-set reason, never the bytes.

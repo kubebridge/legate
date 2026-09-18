@@ -21,9 +21,9 @@ open Microsoft.Extensions.Options
 // projected function carries the title, schemas, and annotation hints,
 // with a real destructiveHint == true as boolean true so the merged
 // permission policy asks before running it. Binary result blocks are
-// stored through the optional per-session artifact factory: GetTools
-// resolves the asking session's pre-scoped sink and each projected tool
-// closes over it, so the Mcp layer never derives tenant keys; a null
+// staged through the optional per-session artifact sink: GetTools
+// resolves the asking session's quota-accounted sink and each projected
+// tool closes over it, so the Mcp layer never derives tenant keys; a null
 // factory keeps today's placeholder text.
 
 /// Connects the configured MCP servers and exposes their tools as
@@ -42,7 +42,7 @@ type McpToolSource
         connector: IMcpServerConnector,
         httpClient: HttpClient | null,
         observeCall: Action<McpInvocation.McpCallObservation> | null,
-        artifactStores: Func<ToolSourceContext, IArtifactBlobStore> | null,
+        artifactSinks: Func<ToolSourceContext, IArtifactSink> | null,
         artifactCaps: McpArtifacts.McpArtifactCaps
     ) =
 
@@ -123,14 +123,14 @@ type McpToolSource
     /// Creates the source over an explicit degrade sink, connector,
     /// call-observation sink, and per-session artifact sink factory.
     /// Internal: tests resolve the factory per asking session against a
-    /// scoped in-memory sink; a null factory keeps today's placeholder
+    /// recording sink; a null factory keeps today's placeholder
     /// output. A factory that throws or returns null degrades one
     /// session's tools to placeholders, never to an error.
     /// <param name="options">The bound MCP options. Must not be null.</param>
     /// <param name="logDegrade">The degrade sink. Must not be null.</param>
     /// <param name="connector">The scripted or SDK connector. Must not be null.</param>
     /// <param name="observeCall">The call-observation sink, or null to observe nothing.</param>
-    /// <param name="artifactStores">Resolves the asking session's pre-scoped artifact sink, or null for placeholders.</param>
+    /// <param name="artifactSinks">Resolves the asking session's quota-accounted artifact sink, or null for placeholders.</param>
     /// <param name="artifactCaps">The header-only validation bounds.</param>
     internal new
         (
@@ -138,7 +138,7 @@ type McpToolSource
             logDegrade: Action<string | null>,
             connector: IMcpServerConnector,
             observeCall: Action<McpInvocation.McpCallObservation> | null,
-            artifactStores: Func<ToolSourceContext, IArtifactBlobStore> | null,
+            artifactSinks: Func<ToolSourceContext, IArtifactSink> | null,
             artifactCaps: McpArtifacts.McpArtifactCaps
         ) =
         McpToolSource(
@@ -147,8 +147,38 @@ type McpToolSource
             connector,
             Unchecked.defaultof<HttpClient>,
             observeCall,
-            artifactStores,
+            artifactSinks,
             artifactCaps
+        )
+
+    /// Creates the source over bound options, a logger, and a per-session
+    /// artifact sink factory, owning its HTTP client and SDK connector.
+    /// Internal: the service-extensions registration builds the source
+    /// this way so tool binaries stage quota-accounted.
+    /// <param name="options">The bound MCP options. Must not be null.</param>
+    /// <param name="logger">The logger carrying degrade reasons. Must not be null.</param>
+    /// <param name="artifactSinks">Resolves the asking session's quota-accounted artifact sink, or null for placeholders.</param>
+    internal new
+        (
+            options: McpOptions,
+            logger: ILogger<McpToolSource>,
+            artifactSinks: Func<ToolSourceContext, IArtifactSink> | null
+        ) =
+        ArgumentNullException.ThrowIfNull(logger)
+        let owned = new HttpClient()
+
+        let logDegrade =
+            Action<string | null>(fun reason ->
+                logger.LogWarning("MCP tool source degraded to zero tools: {Reason}.", box reason))
+
+        McpToolSource(
+            options,
+            logDegrade,
+            SdkMcpServerConnector(logger :> ILogger, owned) :> IMcpServerConnector,
+            owned,
+            null,
+            artifactSinks,
+            McpArtifacts.McpArtifactCaps.Default
         )
 
     /// The degrade reason, or null while healthy. Internal: tests assert
@@ -244,16 +274,16 @@ type McpToolSource
         | _ -> discovered
 
     /// Resolves the asking session's artifact sink: the factory's
-    /// pre-scoped store, or null when no factory is wired, the factory
+    /// quota-accounted sink, or null when no factory is wired, the factory
     /// throws, or it returns null. Sink wiring never fails tool listing.
     /// <param name="context">The tenant, agent, and session asking for its tools.</param>
     /// <returns>The session's sink, or null for placeholders.</returns>
-    member private _.ArtifactStoreFor(context: ToolSourceContext) : IArtifactBlobStore | null =
-        if isNull (box artifactStores) then
+    member private _.ArtifactSinkFor(context: ToolSourceContext) : IArtifactSink | null =
+        if isNull (box artifactSinks) then
             null
         else
             try
-                artifactStores.Invoke(context)
+                artifactSinks.Invoke(context)
             with _ ->
                 null
 
@@ -261,13 +291,13 @@ type McpToolSource
     /// Any failure degrades the whole source to zero tools.
     /// <param name="pairs">The session/discovered pairs.</param>
     /// <param name="assigned">The assigned names in discovery order.</param>
-    /// <param name="artifactStore">The asking session's pre-scoped sink, or null for placeholders.</param>
+    /// <param name="artifactSink">The asking session's quota-accounted sink, or null for placeholders.</param>
     /// <returns>The projected tools.</returns>
     member private _.ProjectTools
         (
             pairs: (IMcpServerSession * McpDiscovery.McpDiscoveredTool) list,
             assigned: string list,
-            artifactStore: IArtifactBlobStore | null
+            artifactSink: IArtifactSink | null
         ) : IReadOnlyList<AITool> =
         let tools = ResizeArray<AITool>()
 
@@ -300,7 +330,7 @@ type McpToolSource
                                     args
                                     cancellationToken
                                     observeCall
-                                    artifactStore
+                                    artifactSink
                                     effectiveCaps
                         })
 
@@ -353,7 +383,7 @@ type McpToolSource
 
                             match McpNaming.resolve options.CollisionPolicy sanitized with
                             | Ok assigned ->
-                                return this.ProjectTools(effective, assigned, this.ArtifactStoreFor(context))
+                                return this.ProjectTools(effective, assigned, this.ArtifactSinkFor(context))
                             | Error message ->
                                 logDegrade.Invoke(message)
                                 return ResizeArray<AITool>() :> IReadOnlyList<AITool>

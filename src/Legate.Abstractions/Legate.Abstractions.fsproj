@@ -22,6 +22,7 @@
     <Compile Include="LegateOptions.fs" />
     <Compile Include="Agents.fs" />
     <Compile Include="HostHooks.fs" />
+    <Compile Include="SessionArtifacts.fs" />
     <Compile Include="Sessions.fs" />
     <Compile Include="WorkspaceRuntime.fs" />
     <Compile Include="Policies.fs" />
