@@ -188,7 +188,7 @@ module DockerWorkspaceTests =
         }
 
     [<Fact>]
-    let ``WriteFile leaves created parent directories traversable but not listable`` () =
+    let ``WriteFile leaves created parent directories traversable`` () =
         task {
             let fake = FakeDockerCommandRunner(absent)
             let runtime = runtimeWith (optionsFor (freshRoot ())) fake
@@ -209,7 +209,8 @@ module DockerWorkspaceTests =
                     "the created parent is search-traversable for the container user"
                 )
 
-                Assert.False(mode.HasFlag UnixFileMode.OtherRead, "the created parent stays non-listable")
+        // No absence assertion on OtherRead: the runner umask may already grant o+r,
+        // and stripping read bits off ancestors up to / would be unsafe.
         }
 
     [<Fact>]

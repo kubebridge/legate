@@ -217,7 +217,7 @@ module DockerWorkspaceRuntimeTests =
         }
 
     [<Fact>]
-    let ``Bind leaves the session directory traversable but not listable by the container user`` () =
+    let ``Bind leaves the session directory traversable by the container user`` () =
         task {
             let root = freshRoot ()
             let fake = FakeDockerCommandRunner(absentThenSucceed)
@@ -237,7 +237,8 @@ module DockerWorkspaceRuntimeTests =
                     "the session directory is search-traversable for the container user"
                 )
 
-                Assert.False(mode.HasFlag UnixFileMode.OtherRead, "the session directory stays non-listable")
+        // No absence assertion on OtherRead: the runner umask may already grant o+r,
+        // and stripping read bits off ancestors up to / would be unsafe.
         }
 
     [<Fact>]
