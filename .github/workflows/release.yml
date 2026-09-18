@@ -14,11 +14,15 @@ permissions:
 env:
   DOTNET_NOLOGO: "1"
   DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+  # Same non-root story as ci.yml: keep setup-dotnet inside a user-owned dir.
+  DOTNET_INSTALL_DIR: /home/runner/.dotnet
 
 jobs:
   publish:
     name: Pack and publish
-    runs-on: ubuntu-latest
+    # Same org self-hosted Linux runner as ci.yml; see the SECURITY note there
+    # before this repository goes public (#144).
+    runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v4
         with:

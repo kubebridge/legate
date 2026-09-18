@@ -18,18 +18,25 @@ env:
   DOTNET_NOLOGO: "1"
   DOTNET_CLI_TELEMETRY_OPTOUT: "1"
   DOTNET_SKIP_FIRST_TIME_EXPERIENCE: "1"
+  # The runner jobs execute as the non-root runner user, which cannot write to
+  # /usr/share/dotnet. Point setup-dotnet at a user-owned directory instead;
+  # it installs the global.json-pinned SDK there and puts it on PATH.
+  DOTNET_INSTALL_DIR: /home/runner/.dotnet
 
 jobs:
   # The single gate for main and pull requests: format, build, test, sample
   # smokes, pack.
   # Every step calls a build.fsx target so the path lists and flags live once.
+  # Runs on the org self-hosted Linux runner (default labels self-hosted,
+  # linux, x64): GitHub-hosted minutes are billing-blocked, and the runner
+  # image already carries the .NET SDKs plus a Docker daemon for Testcontainers.
+  # SECURITY: before this repository goes public (#144), re-scope these jobs so
+  # untrusted fork PRs never execute on self-hosted infrastructure.
+  # Windows leg parked: windows-latest cannot start while billing is broken.
+  # Restore the matrix entry when billing is fixed.
   build:
-    name: Build and test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
+    name: Build and test (linux)
+    runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -52,11 +59,9 @@ jobs:
         run: dotnet fsi build.fsx -- -t SmokeSamples
 
       - name: Pack
-        if: matrix.os == 'ubuntu-latest'
         run: dotnet fsi build.fsx -- -t Pack
 
       - name: Upload packages
-        if: matrix.os == 'ubuntu-latest'
         uses: actions/upload-artifact@v4
         with:
           name: nuget-packages
@@ -69,7 +74,7 @@ jobs:
   dco:
     name: DCO sign-off
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v4
         with:
