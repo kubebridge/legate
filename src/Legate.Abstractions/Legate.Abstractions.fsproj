@@ -10,6 +10,7 @@
     <Compile Include="Tenancy.fs" />
     <Compile Include="Identifiers.fs" />
     <Compile Include="Exceptions.fs" />
+    <Compile Include="ArtifactOptions.fs" />
     <Compile Include="Seams.fs" />
     <Compile Include="Blobs.fs" />
     <Compile Include="Messages.fs" />

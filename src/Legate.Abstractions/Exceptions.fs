@@ -337,3 +337,44 @@ type PermissionApprovalRequiredException
 
     /// The name of the tool awaiting permission.
     member _.ToolName = toolName
+
+/// Raised when an image or video artifact breaches one of the
+/// <see cref="T:Legate.ArtifactOptions" /> caps: the encoded byte limit,
+/// the decoded byte limit, the per-side dimension limits, or the pixel
+/// count limit. The store reports the breach before any byte lands, so a
+/// rejected put never leaves a partial write. The limit values themselves
+/// are host options; only the reporting shape is contractual.
+/// <param name="limitKind">Which limit was breached: "encodedBytes", "decodedBytes", "width", "height", or "pixels".</param>
+/// <param name="limit">The configured limit that was breached.</param>
+/// <param name="observed">The observed size, dimension, or count that breached the limit.</param>
+/// <param name="message">The exception message, without secrets or tool arguments.</param>
+[<Sealed>]
+type ArtifactLimitExceededException(limitKind: string, limit: int64, observed: int64, message: string) =
+    inherit LegateException(message)
+
+    /// Which limit was breached: "encodedBytes", "decodedBytes", "width",
+    /// "height", or "pixels". Never contains secrets or tool arguments.
+    member _.LimitKind = limitKind
+
+    /// The configured limit that was breached.
+    member _.Limit = limit
+
+    /// The observed size, dimension, or count that breached the limit.
+    member _.Observed = observed
+
+/// Raised when an image or video artifact payload cannot be decoded or
+/// recognised: random bytes, a truncated image, or an unknown video
+/// container. Caps fail closed, so undecodable payloads are rejected with
+/// this instead of stored. The reason is a stable string from a fixed set
+/// ("emptyPayload", "undecodableImage", "unrecognizedVideoContainer",
+/// "unsupportedMediaType"); hosts never parse the message.
+/// <param name="reason">Why the payload was rejected, from the fixed set above.</param>
+/// <param name="message">The exception message, without secrets or tool arguments.</param>
+[<Sealed>]
+type ArtifactDecodeException(reason: string, message: string) =
+    inherit LegateException(message)
+
+    /// Why the payload was rejected: "emptyPayload", "undecodableImage",
+    /// "unrecognizedVideoContainer", or "unsupportedMediaType". Never
+    /// contains secrets or tool arguments.
+    member _.Reason = reason

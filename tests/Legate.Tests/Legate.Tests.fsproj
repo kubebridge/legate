@@ -121,6 +121,7 @@
     <Compile Include="SqliteSecondProcessTests.fs" />
     <Compile Include="PackageLeaseServiceTests.fs" />
     <Compile Include="JournalArchiveWorkerTests.fs" />
+    <Compile Include="ArtifactsTests.fs" />
   </ItemGroup>
 
   <ItemGroup>
