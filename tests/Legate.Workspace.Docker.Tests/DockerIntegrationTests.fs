@@ -147,7 +147,15 @@ module DockerIntegrationTests =
             do! workspace.WriteFile("hello.txt", Encoding.UTF8.GetBytes "round-trip", CancellationToken.None)
 
             let! cat = workspace.Exec("cat /workspace/hello.txt", Nullable(), null, CancellationToken.None)
-            Assert.Equal(0, cat.ExitCode)
+
+            // The exact OS error decides traversal (search on the mount
+            // chain) versus content (read on the file): surface stderr
+            // permanently, never just the exit code.
+            Assert.True(
+                cat.ExitCode = 0,
+                sprintf "cat /workspace/hello.txt failed with exit %d; stderr: %s" cat.ExitCode cat.StandardError
+            )
+
             Assert.Equal("round-trip", cat.StandardOutput.Trim())
             Assert.False(cat.TimedOut)
 

@@ -267,6 +267,12 @@ type DockerWorkspaceRuntime
                     )
                 )
 
+            // The session mount chain inherits the runner umask: the
+            // container user (for example 65534:65534) needs search
+            // (other-execute only, never other-read) on every directory
+            // up the chain to reach mounted files at all.
+            DockerWorkspacePaths.ensureTraversableChain directory
+
             let envFile =
                 try
                     writeEnvFile directory

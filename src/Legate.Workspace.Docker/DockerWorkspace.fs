@@ -286,6 +286,37 @@ module internal DockerWorkspacePaths =
         else
             raise (WorkspaceException(validated, "The session's workspace binding escapes the workspace root."))
 
+    /// Ensures host directory traversal for the session's container user
+    /// (for example <c>65534:65534</c>): on non-Windows, every directory
+    /// from the start up to the filesystem root that lacks other-execute
+    /// gains it (search-only), never other-read, so the chain is
+    /// traversable but not listable. Host-written content files keep only
+    /// the read bits the write path already adds; the 0600 env file never
+    /// flows through here. Per-directory failures are swallowed so a
+    /// non-owned system ancestor can never break a bind: any residual gap
+    /// surfaces later through the container's own error.
+    /// <param name="startDirectory">The deepest host directory to fix.</param>
+    let ensureTraversableChain (startDirectory: string) : unit =
+        if not (OperatingSystem.IsWindows()) then
+            try
+                let mutable current: string | null = Path.GetFullPath startDirectory
+
+                while not (isNull current) do
+                    match current with
+                    | null -> ()
+                    | directory ->
+                        try
+                            let mode = File.GetUnixFileMode directory
+
+                            if not (mode.HasFlag UnixFileMode.OtherExecute) then
+                                File.SetUnixFileMode(directory, mode ||| UnixFileMode.OtherExecute)
+                        with _ ->
+                            ()
+
+                        current <- Path.GetDirectoryName directory
+            with _ ->
+                ()
+
 module internal DockerWorkspaceWrite =
 
     /// The host IO failure translated into
@@ -304,8 +335,14 @@ module internal DockerWorkspaceWrite =
         task {
             match Path.GetDirectoryName fullPath with
             | null -> ()
-            | directory when not (Directory.Exists directory) -> Directory.CreateDirectory directory |> ignore
-            | _ -> ()
+            | directory ->
+                if not (Directory.Exists directory) then
+                    Directory.CreateDirectory directory |> ignore
+
+                // Later-created parents inherit the runner umask too: the
+                // container user needs search on them exactly as on the
+                // session directory the bind fixed.
+                DockerWorkspacePaths.ensureTraversableChain directory
 
             let tempPath = sprintf "%s.legate-tmp-%s" fullPath (Ulid.NewUlid().ToString())
 

@@ -188,6 +188,31 @@ module DockerWorkspaceTests =
         }
 
     [<Fact>]
+    let ``WriteFile leaves created parent directories traversable but not listable`` () =
+        task {
+            let fake = FakeDockerCommandRunner(absent)
+            let runtime = runtimeWith (optionsFor (freshRoot ())) fake
+            let session = sessionFor ()
+
+            use! workspace = bindAsync runtime session
+
+            do! workspace.WriteFile("notes/today.txt", Encoding.UTF8.GetBytes "hello", CancellationToken.None)
+
+            let parent = Path.Combine(runtime.DirectoryOf session, "notes")
+            Assert.True(Directory.Exists parent)
+
+            if not (OperatingSystem.IsWindows()) then
+                let mode = File.GetUnixFileMode parent
+
+                Assert.True(
+                    mode.HasFlag UnixFileMode.OtherExecute,
+                    "the created parent is search-traversable for the container user"
+                )
+
+                Assert.False(mode.HasFlag UnixFileMode.OtherRead, "the created parent stays non-listable")
+        }
+
+    [<Fact>]
     let ``File operations reject paths escaping the workspace`` () =
         task {
             let fake = FakeDockerCommandRunner(absent)

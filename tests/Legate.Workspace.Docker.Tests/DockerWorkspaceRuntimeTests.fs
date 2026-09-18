@@ -217,6 +217,30 @@ module DockerWorkspaceRuntimeTests =
         }
 
     [<Fact>]
+    let ``Bind leaves the session directory traversable but not listable by the container user`` () =
+        task {
+            let root = freshRoot ()
+            let fake = FakeDockerCommandRunner(absentThenSucceed)
+            let runtime = runtimeWith (optionsFor root) fake
+            let session = sessionFor ()
+
+            use! _workspace = (runtime :> IWorkspaceRuntime).Bind(session, null, CancellationToken.None)
+
+            let directory = runtime.DirectoryOf session
+            Assert.True(Directory.Exists directory)
+
+            if not (OperatingSystem.IsWindows()) then
+                let mode = File.GetUnixFileMode directory
+
+                Assert.True(
+                    mode.HasFlag UnixFileMode.OtherExecute,
+                    "the session directory is search-traversable for the container user"
+                )
+
+                Assert.False(mode.HasFlag UnixFileMode.OtherRead, "the session directory stays non-listable")
+        }
+
+    [<Fact>]
     let ``The env file is gone after a successful bind`` () =
         task {
             let root = freshRoot ()
