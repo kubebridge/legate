@@ -14,6 +14,8 @@ permissions:
 env:
   DOTNET_NOLOGO: "1"
   DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+  # Same non-root story as ci.yml: keep setup-dotnet inside a user-owned dir.
+  DOTNET_INSTALL_DIR: /home/runner/.dotnet
 
 jobs:
   publish:

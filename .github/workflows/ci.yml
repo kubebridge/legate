@@ -18,6 +18,10 @@ env:
   DOTNET_NOLOGO: "1"
   DOTNET_CLI_TELEMETRY_OPTOUT: "1"
   DOTNET_SKIP_FIRST_TIME_EXPERIENCE: "1"
+  # The runner jobs execute as the non-root runner user, which cannot write to
+  # /usr/share/dotnet. Point setup-dotnet at a user-owned directory instead;
+  # it installs the global.json-pinned SDK there and puts it on PATH.
+  DOTNET_INSTALL_DIR: /home/runner/.dotnet
 
 jobs:
   # The single gate for main and pull requests: format, build, test, sample
