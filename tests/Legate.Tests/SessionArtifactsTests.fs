@@ -115,6 +115,27 @@ type ThrowingQuota() =
         member _.Commit(_, _) = Task.CompletedTask
         member _.Release(_, _) = Task.CompletedTask
 
+/// A quota whose commit always throws: the staged payload must be swept
+/// and the reservation released, settling into the typed failure.
+type CommitThrowingQuota() =
+    let released = ResizeArray<string>()
+    let mutable nextId = 0
+
+    interface IArtifactQuota with
+        member _.Reserve(_, _) =
+            nextId <- nextId + 1
+            Task.FromResult(ArtifactQuotaDecision.Grant $"r-{nextId}")
+
+        member _.Commit(_, _) : Task =
+            raise (InvalidOperationException("commit unavailable"))
+
+        member _.Release(reservationId, _) =
+            released.Add(reservationId)
+            Task.CompletedTask
+
+    /// The released reservation ids, in order.
+    member _.Released: string list = released |> Seq.toList
+
 /// A quota answering every reserve with the fixed decision.
 type ScriptedQuota(decision: ArtifactQuotaDecision) =
 
@@ -355,6 +376,31 @@ let ``Upload fault releases the reservation and deletes partials`` () =
 
     let leftover =
         inner.Get(BlobKeys.ForArtifact(tenant, sessionId, "report.pdf"), CancellationToken.None)
+        |> awaitTask
+
+    (leftover |> Option.ofObj).IsNone |> should equal true
+
+[<Fact>]
+let ``Commit fault releases the reservation and deletes partials`` () =
+    let inner = InMemoryBlobStore(InMemoryDatabase()) :> IBlobStore
+    let quota = CommitThrowingQuota()
+    let service = defaultService inner quota (TestClock())
+    let sessionId = SessionId.New()
+    let payload = png1x1 ()
+
+    match stage service sessionId "shot.png" payload "image/png" with
+    | :? ArtifactStageFailed as failed -> failed.Reason |> should equal "quotaFault"
+    | outcome -> failwith $"Expected ArtifactStageFailed, observed %s{outcome.GetType().Name}."
+
+    quota.Released |> should equal [ "r-1" ]
+    (service :?> SessionArtifactService).Outstanding.Count |> should equal 0
+
+    match describe service sessionId "shot.png" with
+    | :? ArtifactMissing -> ()
+    | outcome -> failwith $"Expected ArtifactMissing after commit-fault cleanup, observed %s{outcome.GetType().Name}."
+
+    let leftover =
+        inner.Get(BlobKeys.ForArtifact(tenant, sessionId, "shot.png"), CancellationToken.None)
         |> awaitTask
 
     (leftover |> Option.ofObj).IsNone |> should equal true

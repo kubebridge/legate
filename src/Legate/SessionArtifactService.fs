@@ -508,6 +508,17 @@ type internal SessionArtifactService
                             }
 
                         if not committed then
+                            // The store holds an uncommitted payload: release
+                            // the reservation and sweep the staged names so
+                            // no orphan survives and no quota stays debited.
+                            do! SessionArtifactService.releaseQuietly quota granted.ReservationId cancellationToken
+
+                            do!
+                                SessionArtifactService.deleteNamesQuietly
+                                    store
+                                    (SessionArtifactService.StageNames name)
+                                    cancellationToken
+
                             SessionArtifactReservations.settle outstanding granted.ReservationId
                             return ArtifactStageFailed("quotaFault") :> ArtifactStageOutcome
                         else
