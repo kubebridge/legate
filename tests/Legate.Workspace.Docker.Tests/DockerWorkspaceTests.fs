@@ -167,6 +167,27 @@ module DockerWorkspaceTests =
         }
 
     [<Fact>]
+    let ``WriteFile leaves the file readable by the container user`` () =
+        task {
+            let fake = FakeDockerCommandRunner(absent)
+            let runtime = runtimeWith (optionsFor (freshRoot ())) fake
+            let session = sessionFor ()
+
+            use! workspace = bindAsync runtime session
+
+            do! workspace.WriteFile("hello.txt", Encoding.UTF8.GetBytes "round-trip", CancellationToken.None)
+
+            let fullPath = Path.Combine(runtime.DirectoryOf session, "hello.txt")
+            Assert.True(File.Exists fullPath)
+
+            if not (OperatingSystem.IsWindows()) then
+                let mode = File.GetUnixFileMode fullPath
+                Assert.True(mode.HasFlag UnixFileMode.UserRead, "the file stays owner-readable")
+                Assert.True(mode.HasFlag UnixFileMode.GroupRead, "the file is group-readable")
+                Assert.True(mode.HasFlag UnixFileMode.OtherRead, "the file is other-readable")
+        }
+
+    [<Fact>]
     let ``File operations reject paths escaping the workspace`` () =
         task {
             let fake = FakeDockerCommandRunner(absent)

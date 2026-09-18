@@ -296,7 +296,10 @@ module internal DockerWorkspaceWrite =
     /// Writes content to the destination through a sibling temp file with
     /// an atomic replace, translating host IO failures into
     /// <see cref="T:Legate.WorkspaceException" />. Cancellation propagates
-    /// as-is, the temp file is cleaned up on every failure path.
+    /// as-is, the temp file is cleaned up on every failure path. On Linux
+    /// the final file gains read for all so the session's container user
+    /// (for example <c>65534:65534</c>) can read host-written files through
+    /// the mount; the 0600 env file path never flows through here.
     let atomically (path: string) (fullPath: string) (content: byte[]) (cancellationToken: CancellationToken) : Task =
         task {
             match Path.GetDirectoryName fullPath with
@@ -321,6 +324,15 @@ module internal DockerWorkspaceWrite =
             if isNull (box failure) then
                 try
                     File.Move(tempPath, fullPath, overwrite = true)
+
+                    if not (OperatingSystem.IsWindows()) then
+                        let current = File.GetUnixFileMode fullPath
+
+                        let readable =
+                            current
+                            ||| (UnixFileMode.UserRead ||| UnixFileMode.GroupRead ||| UnixFileMode.OtherRead)
+
+                        File.SetUnixFileMode(fullPath, readable)
                 with error ->
                     failure <- writeFailed path error
 
