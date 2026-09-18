@@ -204,3 +204,123 @@ let ``Restore with empty scopes restores nothing`` () =
         inputCount |> should equal 0
         outputCount |> should equal 0
     }
+
+[<Fact>]
+let ``Restore re-stages the latest attempt while priors stay addressable`` () =
+    task {
+        let blobStore, _ = createBlobs ()
+        let runtime, _ = createRuntime ()
+        let session = sampleSession ()
+        let inputBytes = utf8 "order-id,amount\n1,42\n"
+
+        let attemptKey attempt rel =
+            BlobKeys.ForArtifact(tenant, session.Id, BlobKeys.AttemptOutputName(attempt, rel))
+
+        let! _ =
+            blobStore.Put(
+                BlobKeys.ForSession(tenant, session.Id, "input/data.csv"),
+                BlobContent(inputBytes, "text/csv"),
+                CancellationToken.None
+            )
+
+        let! _ =
+            blobStore.Put(
+                attemptKey 1 "report.txt",
+                BlobContent(utf8 "v1", "application/octet-stream"),
+                CancellationToken.None
+            )
+
+        let! _ =
+            blobStore.Put(
+                attemptKey 1 "old-only.txt",
+                BlobContent(utf8 "old", "application/octet-stream"),
+                CancellationToken.None
+            )
+
+        let! _ =
+            blobStore.Put(
+                attemptKey 2 "report.txt",
+                BlobContent(utf8 "v2", "application/octet-stream"),
+                CancellationToken.None
+            )
+
+        let! _ =
+            blobStore.Put(
+                attemptKey 2 "extra.txt",
+                BlobContent(utf8 "extra", "application/octet-stream"),
+                CancellationToken.None
+            )
+
+        let! workspace = (runtime :> IWorkspaceRuntime).Bind(session, null, CancellationToken.None)
+
+        let! inputCount, outputCount =
+            WorkspaceRebind.restoreAsync blobStore tenant session.Id workspace CancellationToken.None
+
+        inputCount |> should equal 1
+        outputCount |> should equal 2
+
+        let! restoredInput = readAllAsync workspace "input/data.csv"
+        restoredInput.SequenceEqual(inputBytes) |> should equal true
+
+        // The latest attempt wins: report lands at v2 and extra stages.
+        let! restoredReport = readAllAsync workspace "output/report.txt"
+        restoredReport.SequenceEqual(utf8 "v2") |> should equal true
+
+        let! restoredExtra = readAllAsync workspace "output/extra.txt"
+        restoredExtra.SequenceEqual(utf8 "extra") |> should equal true
+
+        // The prior attempt never stages, but stays blob-addressable.
+        let! oldExists = workspace.Exists("output/old-only.txt", CancellationToken.None)
+        oldExists |> should equal false
+
+        let! priorReport = blobStore.Get(attemptKey 1 "report.txt", CancellationToken.None)
+        priorReport.SequenceEqual(utf8 "v1") |> should equal true
+
+        let! priorOld = blobStore.Get(attemptKey 1 "old-only.txt", CancellationToken.None)
+        priorOld.SequenceEqual(utf8 "old") |> should equal true
+    }
+
+[<Fact>]
+let ``Legacy artifact blobs restore unchanged beside attempt outputs`` () =
+    task {
+        let blobStore, _ = createBlobs ()
+        let runtime, _ = createRuntime ()
+        let session = sampleSession ()
+
+        let! _ =
+            blobStore.Put(
+                BlobKeys.ForArtifact(tenant, session.Id, "legacy.txt"),
+                BlobContent(utf8 "legacy", "text/plain"),
+                CancellationToken.None
+            )
+
+        let! _ =
+            blobStore.Put(
+                BlobKeys.ForArtifact(tenant, session.Id, "shared.txt"),
+                BlobContent(utf8 "legacy-shared", "text/plain"),
+                CancellationToken.None
+            )
+
+        let! _ =
+            blobStore.Put(
+                BlobKeys.ForArtifact(tenant, session.Id, BlobKeys.AttemptOutputName(2, "shared.txt")),
+                BlobContent(utf8 "v2-shared", "application/octet-stream"),
+                CancellationToken.None
+            )
+
+        let! workspace = (runtime :> IWorkspaceRuntime).Bind(session, null, CancellationToken.None)
+
+        let! _, outputCount = WorkspaceRebind.restoreAsync blobStore tenant session.Id workspace CancellationToken.None
+
+        // Three writes land: both legacy blobs plus the latest attempt's
+        // shared name on top.
+        outputCount |> should equal 3
+
+        // Legacy blobs land at their scope-relative path; the latest attempt
+        // re-stages on top, so it wins the shared name.
+        let! restoredLegacy = readAllAsync workspace "output/legacy.txt"
+        restoredLegacy.SequenceEqual(utf8 "legacy") |> should equal true
+
+        let! restoredShared = readAllAsync workspace "output/shared.txt"
+        restoredShared.SequenceEqual(utf8 "v2-shared") |> should equal true
+    }

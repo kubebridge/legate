@@ -7,18 +7,22 @@ open System.Collections.Generic
 open System.Threading
 open System.Threading.Tasks
 
-// Workspace idle teardown and blob re-bind (issue 110). The runtime owns
-// idle teardown per IWorkspaceRuntime: disposing a bound IWorkspace
-// destroys only the execution vehicle, never the workspace's files, and
-// the next Bind re-binds over the same state honouring
-// Session.WorkspaceBinding. This file holds the two halves the expiry
-// service drives: a clock-seamed tracker of bound workspaces whose idle
-// entries the sweeper disposes, and a restore step that re-stages a
-// freshly bound workspace's input/ and output/ areas from the blob store
-// (session scope for input, artifact scope for output) through the same
-// BlobKeys derivation the DownloadUrl tool uses. Restoring output files is
-// what a later output-persistence issue feeds; this step only reads what
-// is already persisted (null means absent, never an error).
+// Workspace idle teardown and blob re-bind (issue 110, attempt-aware
+// re-stage in issue 115). The runtime owns idle teardown per
+// IWorkspaceRuntime: disposing a bound IWorkspace destroys only the
+// execution vehicle, never the workspace's files, and the next Bind
+// re-binds over the same state honouring Session.WorkspaceBinding. This
+// file holds the two halves the expiry service drives: a clock-seamed
+// tracker of bound workspaces whose idle entries the sweeper disposes, and
+// a restore step that re-stages a freshly bound workspace's input/ and
+// output/ areas from the blob store (session scope for input, artifact
+// scope for output) through the same BlobKeys derivation the DownloadUrl
+// tool uses. Attempt-scoped outputs (attempts/{n}/output/{rel}, written by
+// WorkspaceOutput.persistAsync) re-stage latest-attempt-wins: only the
+// highest attempt lands under output/, prior attempts stay
+// blob-addressable; every other artifact blob restores at its legacy path.
+// Restoring output files is what output persistence feeds; a null payload
+// means absent, never an error.
 
 // ──────────────────────────────────────────────────────────────────────────
 // Restore
@@ -98,6 +102,32 @@ module internal WorkspaceRebind =
                 return true
         }
 
+    /// Splits an artifact-scope relative name into its attempt and
+    /// output-relative path when it is a well-formed attempt-output name
+    /// (<c>attempts/{n}/output/{rel}</c> with a positive <c>n</c> and a
+    /// non-empty <c>rel</c>, the shape
+    /// <c>WorkspaceOutput.persistAsync</c> writes through
+    /// <c>BlobKeys.AttemptOutputName</c>); anything else reads as legacy
+    /// and restores at its full relative path, so pre-attempt scopes
+    /// restore exactly as before.
+    /// <param name="relative">The artifact-scope relative name.</param>
+    /// <returns>The attempt and output-relative path, or None for legacy names.</returns>
+    let private tryParseAttemptOutput (relative: string) : (int * string) option =
+        if isNull (box relative) then
+            None
+        else
+            let segments = relative.Split('/')
+
+            if segments.Length >= 4 && segments[0] = "attempts" && segments[2] = "output" then
+                match Int32.TryParse segments[1] with
+                | true, attempt when attempt >= 1 ->
+                    let rel = String.Join("/", segments[3..])
+
+                    if rel = "" then None else Some(attempt, rel)
+                | _ -> None
+            else
+                None
+
     /// Re-stages a freshly bound workspace's <c>input/</c> area from the
     /// session blob scope and its <c>output/</c> area from the artifact blob
     /// scope. Input lists the session scope under the <c>input/</c> relative
@@ -106,9 +136,13 @@ module internal WorkspaceRebind =
     /// present blob back at its scope-relative path; output lists the whole
     /// artifact scope (the scope prefix without its trailing slash, which
     /// keeps validation happy while session ids stay fixed-width, so no
-    /// sibling session can share the prefix) and writes each present blob
-    /// under <c>output/</c>. Absent blobs are skipped; an empty scope
-    /// restores nothing and still succeeds.
+    /// sibling session can share the prefix). Legacy artifact blobs (any
+    /// name that is not a well-formed <c>attempts/{n}/output/{rel}</c> name)
+    /// write under <c>output/</c> at their scope-relative name, exactly as
+    /// before; attempt-scoped outputs re-stage latest-attempt-wins on top,
+    /// so the highest attempt wins on collision while prior attempts stay
+    /// blob-addressable but never land in the workspace. Absent blobs are
+    /// skipped; an empty scope restores nothing and still succeeds.
     /// <param name="blobStore">The blob primitives to read through.</param>
     /// <param name="tenant">The tenant the session belongs to.</param>
     /// <param name="sessionId">The session being re-bound.</param>
@@ -149,17 +183,42 @@ module internal WorkspaceRebind =
             let! artifactKeys = collectAsync (blobStore.List(artifactListPrefix, cancellationToken)) cancellationToken
 
             let mutable outputCount = 0
+            let legacy = ResizeArray<string * string>()
+            let attempts = Dictionary<int, ResizeArray<string * string>>()
 
             for key in artifactKeys do
                 if key.StartsWith(artifactPrefix, StringComparison.Ordinal) then
                     let relative = key.Substring(artifactPrefix.Length)
 
-                    if not (String.IsNullOrEmpty relative) then
-                        let destination = OutputWorkspacePrefix + relative
-                        let! restored = restoreOneAsync blobStore key destination workspace cancellationToken
+                    match tryParseAttemptOutput relative with
+                    | Some(attempt, rel) ->
+                        match attempts.TryGetValue attempt with
+                        | true, bucket -> bucket.Add(key, rel)
+                        | false, _ -> attempts[attempt] <- ResizeArray([ (key, rel) ])
+                    | None ->
+                        if not (String.IsNullOrEmpty relative) then
+                            legacy.Add(key, relative)
 
-                        if restored then
-                            outputCount <- outputCount + 1
+            // Legacy first: every non-attempt blob lands under output/ at
+            // its scope-relative name, exactly as before.
+            for key, relative in legacy do
+                let destination = OutputWorkspacePrefix + relative
+                let! restored = restoreOneAsync blobStore key destination workspace cancellationToken
+
+                if restored then
+                    outputCount <- outputCount + 1
+
+            // Then the latest attempt on top, so it wins on collision;
+            // prior attempts stay blob-addressable but never stage.
+            if attempts.Count > 0 then
+                let latest = attempts.Keys |> Seq.max
+
+                for key, rel in attempts[latest] do
+                    let destination = OutputWorkspacePrefix + rel
+                    let! restored = restoreOneAsync blobStore key destination workspace cancellationToken
+
+                    if restored then
+                        outputCount <- outputCount + 1
 
             return inputCount, outputCount
         }

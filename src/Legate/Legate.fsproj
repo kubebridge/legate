@@ -25,6 +25,7 @@
     <Compile Include="LlmStreaming.fs" />
     <Compile Include="StopArbitration.fs" />
     <Compile Include="WorkspaceLayout.fs" />
+    <Compile Include="WorkspaceOutput.fs" />
     <Compile Include="WorkspaceRebind.fs" />
     <Compile Include="DownloadUrlTool.fs" />
     <Compile Include="SsrfGuard.fs" />

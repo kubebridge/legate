@@ -114,6 +114,27 @@ module DownloadUrlToolTests =
         Assert.Equal(BlobKeys.ForSession(tenant, sessionId, name), key)
 
     [<Fact>]
+    let ``The tool presigns exact attempt-output keys`` () =
+        let store = presentStore ()
+        let name = BlobKeys.AttemptOutputName(2, "report.txt")
+
+        let result =
+            invoke
+                (toolFor store)
+                [
+                    "name", box name
+                    "scope", box "artifact"
+                ]
+
+        Assert.Equal(storedUrl.ToString(), result)
+
+        // The presigned key is the attempt key the persist and restore paths
+        // derive: same BlobKeys derivation, so the three cannot drift.
+        let (key, _) = Assert.Single(store.Presigned)
+        Assert.Equal(BlobKeys.ForArtifact(tenant, sessionId, name), key)
+        Assert.Equal(BlobKeys.ForArtifact(tenant, sessionId, BlobKeys.AttemptOutputName(2, "report.txt")), key)
+
+    [<Fact>]
     let ``Scope defaults to artifact when omitted`` () =
         let store = presentStore ()
         let name = "turn-03/result.txt"
