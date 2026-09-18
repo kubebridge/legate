@@ -28,6 +28,7 @@
     <Compile Include="WorkspaceOutput.fs" />
     <Compile Include="WorkspaceRebind.fs" />
     <Compile Include="DownloadUrlTool.fs" />
+    <Compile Include="Artifacts.fs" />
     <Compile Include="SsrfGuard.fs" />
     <Compile Include="TurnLoop.fs" />
     <Compile Include="AskUserTool.fs" />
@@ -76,6 +77,7 @@
     <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" />
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
     <PackageReference Include="Microsoft.Extensions.Options" />
+    <PackageReference Include="SixLabors.ImageSharp" />
     <PackageReference Include="YamlDotNet" />
   </ItemGroup>
 
