@@ -52,7 +52,7 @@ type McpCallObservation =
 /// substituted by stored-artifact references (or bounded rejections),
 /// <c>Error from {name}: ...</c> when the server flagged the result as an
 /// error, or <c>Error calling {name}: {Type}: {message}</c> when the
-/// transport raised. A null store keeps today's placeholder text.
+/// transport raised. A null sink keeps today's placeholder text.
 /// Validation failures substitute a bounded rejection; storage failures
 /// return the original text. Cancellation propagates and stamps nothing:
 /// an abandoned call never settled. Every settled call stamps one
@@ -63,7 +63,7 @@ type McpCallObservation =
 /// <param name="arguments">The call arguments.</param>
 /// <param name="cancellationToken">The turn's token: abandoning it abandons the call and the store.</param>
 /// <param name="observe">The observation sink, or null to observe nothing.</param>
-/// <param name="artifactStore">The session-scoped artifact sink, or null to keep placeholders. Never derived here.</param>
+/// <param name="artifactSink">The session's quota-accounted artifact sink, or null to keep placeholders. Never derived here.</param>
 /// <param name="caps">The header-only validation bounds.</param>
 /// <returns>The model-facing text result.</returns>
 let invokeWithArtifactsAsync
@@ -73,7 +73,7 @@ let invokeWithArtifactsAsync
     (arguments: IReadOnlyDictionary<string, obj>)
     (cancellationToken: CancellationToken)
     (observe: Action<McpCallObservation> | null)
-    (artifactStore: IArtifactBlobStore | null)
+    (artifactSink: IArtifactSink | null)
     (caps: McpArtifacts.McpArtifactCaps)
     : Task<string> =
     task {
@@ -109,10 +109,8 @@ let invokeWithArtifactsAsync
                 observeOne mapped true
                 return mapped
             else
-                match box artifactStore with
-                | :? IArtifactBlobStore as store when
-                    not (isNull (box callResult.Binaries)) && callResult.Binaries.Count > 0
-                    ->
+                match box artifactSink with
+                | :? IArtifactSink as sink when not (isNull (box callResult.Binaries)) && callResult.Binaries.Count > 0 ->
                     let binaries = callResult.Binaries
                     let replacements = ResizeArray<string>()
                     let mutable fallback = false
@@ -143,25 +141,21 @@ let invokeWithArtifactsAsync
                                 let! stored =
                                     task {
                                         try
-                                            let! _ = store.Put(name, BlobContent(payload, mime), cancellationToken)
+                                            let! outcome =
+                                                sink.StoreAsync(name, BlobContent(payload, mime), cancellationToken)
 
-                                            return true
+                                            return Some outcome
                                         with
                                         | :? OperationCanceledException as canceled ->
-                                            return! Task.FromException<bool>(canceled)
-                                        | _ -> return false
+                                            return! Task.FromException<ArtifactSinkOutcome option>(canceled)
+                                        | _ -> return None
                                     }
 
-                                if stored then
-                                    let dimensions =
-                                        if McpArtifacts.isImageMime mime then
-                                            McpArtifacts.tryGetDimensions mime payload
-                                        else
-                                            None
-
-                                    replacements.Add(McpArtifacts.formatReference name mime payload.Length dimensions)
-                                else
-                                    fallback <- true
+                                match stored with
+                                | Some(StoredArtifact(reference, _)) -> replacements.Add(reference)
+                                | Some(RejectedArtifact reason) ->
+                                    replacements.Add(McpArtifacts.formatRejection mime payload.Length reason)
+                                | _ -> fallback <- true
                             | _ -> replacements.Add(McpArtifacts.formatRejection mime 0 "undecodable payload")
 
                         index <- index + 1

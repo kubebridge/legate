@@ -20,8 +20,9 @@ open System.Threading.Tasks
 module internal Transcripts =
 
     /// Reads one session's transcript: replays the whole journal through
-    /// bounded pages and derives the cells with
-    /// <see cref="T:Legate.TranscriptReader" />, so the result is
+    /// bounded pages, derives the cells with
+    /// <see cref="T:Legate.TranscriptReader" />, and enriches ToolResult
+    /// cells with their artifact references, so the result is
     /// identical for every page size (chunking invariance is pinned by
     /// test, not by code: pages only transport, the pure read folds the
     /// concatenated journal).
@@ -77,5 +78,7 @@ module internal Transcripts =
                         paging <- false
                 | _ -> paging <- false
 
-            return TranscriptReader.Read(journal :> IReadOnlyList<SessionEvent>, options)
+            return
+                TranscriptReader.Read(journal :> IReadOnlyList<SessionEvent>, options)
+                |> SessionArtifactEnrichment.enrichCells
         }

@@ -64,8 +64,10 @@ module internal Artifacts =
     let private PreviewContentType = "image/jpeg"
 
     /// The suffix appended to the artifact name for its deterministic preview.
+    /// Internal: the artifact service deletes it alongside the artifact on
+    /// failure-path compensation.
     [<Literal>]
-    let private PreviewSuffix = ".preview.jpg"
+    let internal PreviewSuffix = ".preview.jpg"
 
     /// Normalises a content type for allow-list matching: trims,
     /// lowercases, and strips parameters. Null reads as empty.

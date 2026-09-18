@@ -13,12 +13,14 @@ open System.Collections.Generic
 
 /// Image and video artifact caps: encoded and decoded size bounds, image
 /// dimension and pixel-count bounds, JPEG preview shaping, the allowed
-/// media types per kind, and the presigned-URL expiry the artifact service
-/// (issue 117) consumes. Bound standalone from the <c>Legate:Artifacts</c>
-/// configuration section; mutable so hosts can set properties before
-/// registering. Defaults accept 10 MiB encoded and 128 MiB decoded at up
-/// to 8192 pixels per side and 16.7M pixels total, preview images above
-/// 1 MiB down to 1024 on the long edge, and presign for 7 days.
+/// media types per kind, the presigned-URL expiry, and the reservation
+/// reclamation bound the artifact service (issue 117) consumes. Bound
+/// standalone from the <c>Legate:Artifacts</c> configuration section;
+/// mutable so hosts can set properties before registering. Defaults accept
+/// 10 MiB encoded and 128 MiB decoded at up to 8192 pixels per side and
+/// 16.7M pixels total, preview images above 1 MiB down to 1024 on the long
+/// edge, presign for 7 days, and reclaim stale reservations after
+/// 5 minutes.
 [<Sealed>]
 type ArtifactOptions() =
 
@@ -85,6 +87,13 @@ type ArtifactOptions() =
     /// artifact service (issue 117), not by validation. Default 7 days.
     member val PresignedExpiry: TimeSpan = TimeSpan.FromDays 7.0 with get, set
 
+    /// How long a granted quota reservation may sit without a commit or
+    /// release before the artifact service reclaims it. Consumed by the
+    /// artifact service reclamation pass (issue 117): a crash between
+    /// reserve and settle leaks at most this bound plus one pass interval.
+    /// Default 5 minutes.
+    member val ReservationReclaimAfter: TimeSpan = TimeSpan.FromMinutes 5.0 with get, set
+
     /// Returns null when every knob is in range, otherwise a message for the
     /// first violation.
     /// <returns>The first violation's message, or null when the settings are valid.</returns>
@@ -109,6 +118,8 @@ type ArtifactOptions() =
             "AllowedVideoMediaTypes must not be null."
         elif this.PresignedExpiry <= TimeSpan.Zero then
             "PresignedExpiry must be positive."
+        elif this.ReservationReclaimAfter <= TimeSpan.Zero then
+            "ReservationReclaimAfter must be positive."
         else
             let mutable violation: string | null = null
             let mutable index = 0

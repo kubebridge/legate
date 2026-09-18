@@ -20,6 +20,7 @@
     <Compile Include="JournalWriter.fs" />
     <Compile Include="LoggingScopes.fs" />
     <Compile Include="LlmCoordinator.fs" />
+    <Compile Include="SessionArtifactEnrichment.fs" />
     <Compile Include="Transcripts.fs" />
     <Compile Include="SessionEventBus.fs" />
     <Compile Include="LlmStreaming.fs" />
@@ -29,6 +30,7 @@
     <Compile Include="WorkspaceRebind.fs" />
     <Compile Include="DownloadUrlTool.fs" />
     <Compile Include="Artifacts.fs" />
+    <Compile Include="SessionArtifactService.fs" />
     <Compile Include="SsrfGuard.fs" />
     <Compile Include="TurnLoop.fs" />
     <Compile Include="AskUserTool.fs" />
