@@ -54,10 +54,15 @@ let ``Defaults validate to null and describe a single node`` () =
     options.AskUser.Mode |> should equal AskUserMode.Fail
     options.AskUser.CannedAnswer |> should equal null
 
+    options.Dispatcher.PollInterval |> should equal (TimeSpan.FromSeconds 5.0)
+    options.Dispatcher.MaxBatchSize |> should equal 50
+    options.Dispatcher.MaxSessionsPerAgent |> should equal 4
+
     options.Sessions.Validate() |> should equal null
     options.Sessions.SubAgents.Validate() |> should equal null
     options.Turns.Validate() |> should equal null
     options.Permissions.Validate() |> should equal null
+    options.Dispatcher.Validate() |> should equal null
     options.Llm.Validate() |> should equal null
     options.Workspace.Validate() |> should equal null
     options.Completion.Validate() |> should equal null
@@ -446,3 +451,31 @@ let ``Root Validate prefixes sub-agent violations`` () =
 
     options.Validate()
     |> should equal "Sessions: SubAgents: Timeout must be positive."
+
+// ──────────────────────────────────────────────────────────────────────────
+// Dispatcher
+
+[<Fact>]
+let ``Dispatcher Validate flags interval and batch bounds`` () =
+    DispatcherOptions(PollInterval = TimeSpan.Zero).Validate()
+    |> should equal "PollInterval must be positive."
+
+    DispatcherOptions(MaxBatchSize = 0).Validate()
+    |> should equal "MaxBatchSize must be at least 1."
+
+    DispatcherOptions(MaxSessionsPerAgent = 0).Validate()
+    |> should equal "MaxSessionsPerAgent must be at least 1."
+
+    DispatcherOptions(PollInterval = TimeSpan.FromSeconds 5.0, MaxBatchSize = 50, MaxSessionsPerAgent = 4).Validate()
+    |> should equal null
+
+[<Fact>]
+let ``Root Validate prefixes dispatcher violations`` () =
+    let options = LegateOptions()
+    options.Dispatcher.PollInterval <- TimeSpan.Zero
+
+    options.Validate() |> should equal "Dispatcher: PollInterval must be positive."
+
+    let nullSection = LegateOptions()
+    nullSection.Dispatcher <- nullRef<DispatcherOptions>
+    nullSection.Validate() |> should equal "Dispatcher must not be null."

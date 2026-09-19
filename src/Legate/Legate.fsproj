@@ -60,6 +60,8 @@
     <Compile Include="JournalArchiveOptions.fs" />
     <Compile Include="JournalArchiveWorker.fs" />
     <Compile Include="SessionExpiryService.fs" />
+    <Compile Include="DispatcherWake.fs" />
+    <Compile Include="Dispatcher.fs" />
     <Compile Include="AddLegate.fs" />
   </ItemGroup>
 

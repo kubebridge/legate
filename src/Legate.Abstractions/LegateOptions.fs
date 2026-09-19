@@ -156,6 +156,49 @@ type SessionsOptions() =
                 else
                     $"SubAgents: %s{subAgentsViolation}"
 
+/// Dispatcher settings: how often the polling dispatcher sweeps sessions
+/// with pending work, how many candidates one sweep drains at most, and how
+/// many sessions of one agent may run at once. Bound from the
+/// <c>Legate:Dispatcher</c> configuration section; mutable so hosts can set
+/// properties before registering. Defaults sweep every 5 seconds, drain at
+/// most 50 candidates per pass, and admit at most 4 sessions per agent. The
+/// poll stays authoritative: an in-process wake only shortens the wait for
+/// the next sweep, never replaces it.
+type DispatcherOptions() =
+
+    /// How often the dispatcher sweeps the tenant for sessions with pending
+    /// work. Default 5 seconds.
+    member val PollInterval: TimeSpan = TimeSpan.FromSeconds 5.0 with get, set
+
+    /// How many dispatch candidates one sweep drains at most. Default 50:
+    /// bounded batches keep a large pending backlog from growing the pass
+    /// without bound; the pass follows the batch's HasMore flag.
+    member val MaxBatchSize: int = 50 with get, set
+
+    /// How many sessions of one agent the dispatcher admits at once, the
+    /// per-agent side of the conjunctive capacity gate (process, tenant,
+    /// agent: a session stays queued while any limit trips). Default 4.
+    member val MaxSessionsPerAgent: int = 4 with get, set
+
+    /// Returns null when every knob is in range, otherwise a message for the
+    /// first violation.
+    /// <returns>The first violation's message, or null when the settings are valid.</returns>
+    member this.Validate() : string | null =
+        let violations =
+            [|
+                if this.PollInterval <= TimeSpan.Zero then
+                    "PollInterval must be positive."
+                if this.MaxBatchSize < 1 then
+                    "MaxBatchSize must be at least 1."
+                if this.MaxSessionsPerAgent < 1 then
+                    "MaxSessionsPerAgent must be at least 1."
+            |]
+
+        if violations.Length = 0 then
+            null
+        else
+            Array.head violations
+
 /// Per-turn defaults: the iteration and wall-clock budgets a turn runs
 /// under, how prompts to a busy session deliver, and what a crash does to
 /// the interrupted turn. Bound from the <c>Legate</c> configuration section;
@@ -605,6 +648,9 @@ type LegateOptions() =
     /// Session admission and lease settings. Never null.
     member val Sessions: SessionsOptions = SessionsOptions() with get, set
 
+    /// Dispatcher settings. Never null.
+    member val Dispatcher: DispatcherOptions = DispatcherOptions() with get, set
+
     /// Per-turn defaults. Never null.
     member val Turns: TurnsOptions = TurnsOptions() with get, set
 
@@ -635,6 +681,8 @@ type LegateOptions() =
     member this.Validate() : string | null =
         if isNull (box this.Sessions) then
             "Sessions must not be null."
+        elif isNull (box this.Dispatcher) then
+            "Dispatcher must not be null."
         elif isNull (box this.Turns) then
             "Turns must not be null."
         elif isNull (box this.Permissions) then
@@ -655,6 +703,7 @@ type LegateOptions() =
             let sections: (string * (unit -> string | null)) list =
                 [
                     "Sessions", (fun () -> this.Sessions.Validate())
+                    "Dispatcher", (fun () -> this.Dispatcher.Validate())
                     "Turns", (fun () -> this.Turns.Validate())
                     "Permissions", (fun () -> this.Permissions.Validate())
                     "Llm", (fun () -> this.Llm.Validate())

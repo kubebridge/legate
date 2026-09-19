@@ -1959,6 +1959,18 @@ module internal SessionActor =
         /// <see cref="T:Legate.SessionCompactReply" />.
         | SuspendableCompactSession of cancellationToken: CancellationToken
 
+        /// Wakes the suspendable session for the polling dispatcher: when
+        /// the actor is Idle and the durable inbox holds a drainable entry,
+        /// starts a suspendable turn on the oldest one through the existing
+        /// start path, otherwise a no-op. Never appends: dispatch routes
+        /// through the prompt wire would duplicate pending work, so the
+        /// wake only starts what is already stored. Idempotent by mailbox
+        /// serialization plus the in-handler Idle re-check: a wake racing a
+        /// prompt or a second wake collapses to a no-op or ordered
+        /// queueing, never a duplicate or out-of-turn start. One-way from
+        /// the dispatcher: no reply.
+        | SuspendableCheckInbox
+
     /// Reason carried by TurnFailed when AskTimeout fires while suspended.
     /// Never contains secrets or tool arguments.
     [<Literal>]
@@ -3455,6 +3467,40 @@ module internal SessionActor =
                 | SuspendableGetSnapshot ->
                     mailbox.Sender() <! takeSuspendSnapshot state suspended
                     return! loop state suspended resolved
+                | SuspendableCheckInbox ->
+                    match state with
+                    | SessionState.Idle ->
+                        // The dispatch wake: the mailbox serializes this
+                        // against prompts, and the in-memory Idle re-check
+                        // above is the last word, so a wake racing a prompt
+                        // or a second wake collapses to a no-op or ordered
+                        // queueing. Never appends: only the oldest drainable
+                        // entry already stored starts, through the same
+                        // start path the Idle prompt arms use.
+                        let pending =
+                            try
+                                awaitTask (
+                                    props.Store.ReadPendingInbox(props.Tenant, props.SessionId, CancellationToken.None)
+                                )
+                            with :? SessionNotFoundException ->
+                                ResizeArray<InboxEntry>() :> IReadOnlyList<InboxEntry>
+
+                        match selectDrainableEntries pending with
+                        | first :: _ ->
+                            awaitTask (
+                                props.Store.UpdateSessionState(
+                                    props.Tenant,
+                                    props.SessionId,
+                                    SessionState.Running,
+                                    CancellationToken.None
+                                )
+                            )
+                            |> ignore
+
+                            startSuspendable first 1 (readGrantsNow ()) None
+                            return! loop SessionState.Running None resolved
+                        | [] -> return! loop state suspended resolved
+                    | _ -> return! loop state suspended resolved
             }
 
         match initialState, initialResumeEntry with
@@ -3765,6 +3811,37 @@ module internal SessionActor =
     let getSuspendSnapshotAsync (session: IActorRef) (cancellationToken: CancellationToken) : Task<SessionSnapshot> =
         ArgumentNullException.ThrowIfNull(session)
         askSuspendableAsync<SessionSnapshot> session SuspendableGetSnapshot cancellationToken
+
+    /// Wakes a suspendable session actor for the polling dispatcher: tells
+    /// the idempotent check-inbox message, which starts a suspendable turn
+    /// on the oldest drainable entry when the actor is Idle and no-ops
+    /// otherwise. Validates the session is present and not Closed before
+    /// touching the actor, so invalid transitions skip here, never inside
+    /// the actor. One-way: the Tell carries no reply, so the dispatcher
+    /// never blocks on the actor. Never appends and never claims a turn:
+    /// claim ownership and fencing stay with the actor's start path.
+    /// <param name="store">The durable store.</param>
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="sessionId">The session to wake.</param>
+    /// <param name="session">The suspendable session actor.</param>
+    /// <param name="cancellationToken">Cancels the wake.</param>
+    /// <returns>A task that completes once the wake was told.</returns>
+    let checkInboxAsync
+        (store: ISessionStore)
+        (tenant: TenantId)
+        (sessionId: SessionId)
+        (session: IActorRef)
+        (cancellationToken: CancellationToken)
+        : Task =
+        ArgumentNullException.ThrowIfNull(store)
+        ArgumentNullException.ThrowIfNull(session)
+
+        task {
+            let! current = requireSessionAsync store tenant sessionId cancellationToken
+
+            if current.State <> SessionState.Closed then
+                session.Tell(SuspendableCheckInbox)
+        }
 
     /// Aborts the turn running in a suspendable session: the client boundary
     /// turn-level verb. Idle is a no-op returning the current snapshot, as

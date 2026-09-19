@@ -110,6 +110,7 @@ let ``Binds duration forms to TimeSpans`` () =
                 "Legate:Permissions:AskTimeout", "15m"
                 "Legate:Completion:RetryDelay", "30d"
                 "Legate:Workspace:IdleTeardownAfter", "00:00:30"
+                "Legate:Dispatcher:PollInterval", "5s"
             ]
 
     let options = LegateOptionsBinding.bind section
@@ -125,6 +126,22 @@ let ``Binds duration forms to TimeSpans`` () =
     options.Permissions.AskTimeout |> should equal (TimeSpan.FromMinutes 15.0)
     options.Completion.RetryDelay |> should equal (TimeSpan.FromDays 30.0)
     options.Workspace.IdleTeardownAfter |> should equal (TimeSpan.FromSeconds 30.0)
+    options.Dispatcher.PollInterval |> should equal (TimeSpan.FromSeconds 5.0)
+    options.Validate() |> should equal null
+
+[<Fact>]
+let ``Non-positive dispatcher poll interval fails validation with the section path`` () =
+    let section =
+        buildSection
+            [
+                "Legate:Dispatcher:PollInterval", "0s"
+            ]
+
+    let ex =
+        Assert.Throws<InvalidOperationException>(fun () -> LegateOptionsBinding.bind section |> ignore)
+
+    ex.Message.Contains("Dispatcher: PollInterval must be positive.")
+    |> should equal true
 
 [<Fact>]
 let ``Binds the compaction model override and keep count`` () =
