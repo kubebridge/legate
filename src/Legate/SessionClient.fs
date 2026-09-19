@@ -11,10 +11,11 @@ open Akka.Actor
 
 // Session client: the public receiver PromptAndWaitAsync extends. The
 // client holds the suspendable prompt path (store, tenant, actor
-// resolution), the event bus the suspension signal subscribes to, and the
-// wait-bound seam. Construction stays internal: the container facade owns
-// it once it lands, while tests construct it directly. The actor resolver
-// never crosses the public API (Akka types stay internal).
+// resolution), the event bus the suspension signal subscribes to, the
+// agent store SetAgent validates against, and the wait-bound seam.
+// Construction stays internal: the container facade owns it once it lands,
+// while tests construct it directly. The actor resolver never crosses the
+// public API (Akka types stay internal).
 /// <summary>The session client PromptAndWaitAsync extends.</summary>
 [<Sealed>]
 type SessionClient
@@ -25,7 +26,8 @@ type SessionClient
         resolve: SessionId -> CancellationToken -> Task<IActorRef>,
         eventBus: SessionEventBus,
         defaultBound: TimeSpan,
-        waitDelay: ILlmDelay
+        waitDelay: ILlmDelay,
+        agents: IAgentStore option
     ) =
 
     do ArgumentNullException.ThrowIfNull(store)
@@ -47,6 +49,11 @@ type SessionClient
 
     /// The tenant sessions belong to.
     member internal _.Tenant: TenantId = tenant
+
+    /// The agent store SetAgent validates the rebound agent against, or
+    /// None when the host runs without a managed agent catalog: validation
+    /// is skipped then and any agent id rebinds.
+    member internal _.Agents: IAgentStore option = agents
 
     /// The journal event hub suspensions subscribe to.
     member internal _.EventBus: SessionEventBus = eventBus

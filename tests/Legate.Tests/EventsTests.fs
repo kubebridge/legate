@@ -92,9 +92,20 @@ let sampleEvents: (string * (unit -> SessionEvent)) list =
         fun () ->
             AgentInvalidEvent(sessionId, turnId, noSequence, stamp, "helper", "the agent 'helper' has no description")
             :> SessionEvent
+        "agentSwitched",
+        fun () ->
+            AgentSwitchedEvent(
+                sessionId,
+                turnId,
+                noSequence,
+                stamp,
+                AgentId.Parse "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                AgentId.Parse "01ARZ3NDEKTSV4RRFFQ69G5FBW"
+            )
+            :> SessionEvent
     ]
 
-// The 22 discriminator strings the base type's XML doc documents as the
+// The 23 discriminator strings the base type's XML doc documents as the
 // wire contract, in the same order as the JsonDerivedType attributes.
 let discriminatorContract =
     [|
@@ -120,6 +131,7 @@ let discriminatorContract =
         "skillInvalid"
         "skillLoaded"
         "agentInvalid"
+        "agentSwitched"
     |]
 
 /// Reads the TypeDiscriminator values from the JsonDerivedType attributes
@@ -426,6 +438,19 @@ let ``AgentInvalid round-trips its agent name and reason`` () =
     invalid.AgentName |> should equal "helper"
     invalid.Reason |> should equal "the agent 'helper' has no description"
 
+[<Fact>]
+let ``AgentSwitched round-trips its previous and new agent`` () =
+    let previous = AgentId.Parse "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+    let next = AgentId.Parse "01ARZ3NDEKTSV4RRFFQ69G5FBW"
+
+    let restored =
+        roundTrip "agentSwitched" (fun () ->
+            AgentSwitchedEvent(sessionId, turnId, noSequence, stamp, previous, next) :> SessionEvent)
+
+    let switched = restored :?> AgentSwitchedEvent
+    switched.PreviousAgentId |> should equal previous
+    switched.NewAgentId |> should equal next
+
 // ───────────────────────────────────────────────────────────────────────────
 // Sequence and base-field nullability
 
@@ -472,7 +497,7 @@ let ``Base fields carry the constructor values the constructor set`` () =
 
 [<Fact>]
 let ``An undocumented $type value is rejected instead of guessed`` () =
-    // The 21 documented discriminators are the wire contract: anything
+    // The 23 documented discriminators are the wire contract: anything
     // outside the set must fail the read rather than deserialise to a base
     // instance. The BCL raises NotSupportedException for a discriminator
     // with no registered derived type (surfaced possibly wrapped in a

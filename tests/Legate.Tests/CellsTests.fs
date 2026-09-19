@@ -749,6 +749,7 @@ let expectedRules: (string * int * SessionCellKind) list =
         "skillInvalid", 1, SessionCellKind.System // one System failure cell per skipped skill
         "skillLoaded", 0, SessionCellKind.User // progress marker: no cells, hosts read the event stream
         "agentInvalid", 1, SessionCellKind.System // one System failure cell per flagged agent
+        "agentSwitched", 1, SessionCellKind.System // one System audit cell per agent switch
     ]
 
 [<Fact>]
@@ -851,6 +852,17 @@ let ``The fold classifies a bare event of every kind per the mapped rule`` () =
                         "the agent 'helper' has no description"
                     )
                     :> SessionEvent
+            | "agentSwitched" ->
+                fun () ->
+                    AgentSwitchedEvent(
+                        sessionId,
+                        turnId,
+                        noSequence,
+                        stamp,
+                        AgentId.Parse "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                        AgentId.Parse "01ARZ3NDEKTSV4RRFFQ69G5FBW"
+                    )
+                    :> SessionEvent
             | _ -> failwith (sprintf "unmapped discriminator '%s' in the pin table" discriminator)
 
         let cells = foldEvents [ buildEvent () ]
@@ -920,3 +932,31 @@ let ``A flagged agent derives one System error cell carrying the agent name`` ()
     | meta ->
         meta["event"] |> should equal "agentInvalid"
         meta["agentName"] |> should equal "helper"
+
+[<Fact>]
+let ``A switch event derives one System cell carrying both agents`` () =
+    let previous = AgentId.Parse "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+    let next = AgentId.Parse "01ARZ3NDEKTSV4RRFFQ69G5FBW"
+
+    let event =
+        AgentSwitchedEvent(sessionId, turnId, noSequence, stamp, previous, next) :> SessionEvent
+
+    let cells = foldEvents [ event ]
+
+    cells.Count |> should equal 1
+    cells[0].Kind |> should equal SessionCellKind.System
+    cells[0].IsError |> should equal false
+    cells[0].Timestamp |> should equal stamp
+
+    match cells[0].Metadata with
+    | null -> failwith "switch cell lost its audit metadata"
+    | meta ->
+        meta["event"] |> should equal "agentSwitched"
+        meta["previousAgentId"] |> should equal (previous.ToString())
+        meta["newAgentId"] |> should equal (next.ToString())
+
+    match cells[0].Content with
+    | null -> failwith "switch cell lost its summary content"
+    | content ->
+        content.Contains(previous.ToString()) |> should equal true
+        content.Contains(next.ToString()) |> should equal true

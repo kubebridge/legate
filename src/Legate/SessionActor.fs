@@ -1821,7 +1821,9 @@ module internal SessionActor =
     /// in-memory journal lands, and a takeover re-claims so the loser
     /// appends nothing. The heartbeat is not cancelled on suspend: renewal
     /// continues while suspended under the same claim, bounded by lease
-    /// expiry and AskTimeout.
+    /// expiry and AskTimeout. The behavior copies the token into a mutable
+    /// cell a SetAgent swap replaces, so every journal write below reads
+    /// the cell, never this initial value, after the first swap.
     type SuspendDeps =
         {
             /// The journal suspend and resolve events append to.
@@ -1834,6 +1836,22 @@ module internal SessionActor =
             JournalToken: string
             /// Runs one suspendable attempt. Never null.
             RunSuspendable: SuspendableRunner
+            /// Re-primes the journal after the actor settles its primed
+            /// claim: appends a bootstrap entry and claims it, returning the
+            /// live claim, or None when no turn is claimable (a live claim
+            /// is held) or the prime failed. The SetAgent swap calls it
+            /// after settling the old prime and again to restore the live
+            /// prime; a quiescent boundary that finds a recorded rebind
+            /// retries through it until it succeeds. None when the host
+            /// never re-primes (direct test constructions): a recorded
+            /// rebind then stays pending.
+            ReprimeJournal: (unit -> TurnClaim option) option
+            /// Rebuilds the on-demand compaction wiring for a fresh journal
+            /// token after a SetAgent swap, or None when the host drives
+            /// Compact directly. The factory supplies the spawn-time
+            /// compactFor; without one the swap keeps the wiring and only
+            /// refreshes its token, so later Compacts stay live either way.
+            RefreshCompact: (string -> CompactDeps option) option
         }
 
     /// A rebuilt pending request from the journal: the crash path carries
@@ -1885,6 +1903,30 @@ module internal SessionActor =
         /// The reply answered nothing pending: unknown or already-resolved.
         /// Carries the typed error the boundary throws.
         | ReplyRejected of error: ReplyMismatchException
+
+    /// How the suspendable actor answers a SetAgent. The actor never throws
+    /// InvalidSessionStateException: a Closed-state rebind is rejected with
+    /// the current state and the client boundary maps it to the exception.
+    /// Agent existence and enablement are enforced at the facade boundary
+    /// (which holds the agent store); the actor applies the rebound id
+    /// verbatim, at once when quiescent and at the next quiescent boundary
+    /// otherwise.
+    type internal SessionSetAgentReply =
+
+        /// The rebind applied at once: the session converses with the new
+        /// agent from the next turn. Carries the stored session after the
+        /// rebind.
+        | SetAgentApplied of session: Session
+
+        /// The rebind was recorded and applies at the next quiescent
+        /// boundary: a turn is running or entries are queued. Carries the
+        /// stored session as it stands, still conversing with the previous
+        /// agent.
+        | SetAgentPending of session: Session
+
+        /// The rebind arrived while the session was Closed; nothing was
+        /// recorded. Carries the state the session was in.
+        | SetAgentRejected of state: SessionState
 
     /// The suspendable session actor protocol extension. QueuePrompt,
     /// CloseSession, AbortSession, and GetSnapshot keep their base meaning;
@@ -1970,6 +2012,16 @@ module internal SessionActor =
         /// queueing, never a duplicate or out-of-turn start. One-way from
         /// the dispatcher: no reply.
         | SuspendableCheckInbox
+
+        /// Rebind the agent the session converses with: applies at once
+        /// through the 6-step quiescent protocol when no turn is live and
+        /// the pending inbox is empty, records the rebind as pending
+        /// otherwise (Running, WaitingForInput, or queued entries), and
+        /// rejects when Closed. A pending rebind applies at the next
+        /// quiescent boundary: the settle drain, the faulted path, or the
+        /// Idle handler before draining. Answered with
+        /// <see cref="T:Legate.SessionSetAgentReply" />.
+        | SuspendableSetAgent of agentId: AgentId * cancellationToken: CancellationToken
 
     /// Reason carried by TurnFailed when AskTimeout fires while suspended.
     /// Never contains secrets or tool arguments.
@@ -2243,6 +2295,18 @@ module internal SessionActor =
             else
                 session.Options.OnCrashResume
 
+        // The journal token fencing this actor's journal appends: the
+        // spawn-primed token at first, replaced by the SetAgent swap with
+        // each re-prime. Every journal write below reads this cell, never
+        // SuspendDeps.JournalToken, so post-swap writes stay live. A cell
+        // rather than a loop parameter, like pendingStop below.
+        let mutable journalToken = suspend.JournalToken
+
+        // The on-demand compaction wiring the Idle compact path runs: the
+        // spawn wiring at first, refreshed by the SetAgent swap with each
+        // re-prime, so later Compacts journal under the live token.
+        let mutable currentCompact = props.Compact
+
         let failInterruptedTurn (entryOpt: InboxEntry option) : unit =
             let result =
                 {
@@ -2308,7 +2372,7 @@ module internal SessionActor =
                         suspend.EventStore
                         props.Tenant
                         props.SessionId
-                        suspend.JournalToken
+                        journalToken
                         events
                         CancellationToken.None
                 )
@@ -2551,7 +2615,7 @@ module internal SessionActor =
                     suspend.EventStore
                     props.Tenant
                     props.SessionId
-                    suspend.JournalToken
+                    journalToken
                     events
                     CancellationToken.None
             )
@@ -2603,7 +2667,7 @@ module internal SessionActor =
                         suspend.EventStore
                         props.Tenant
                         props.SessionId
-                        suspend.JournalToken
+                        journalToken
                         events
                         CancellationToken.None
                 )
@@ -2625,7 +2689,7 @@ module internal SessionActor =
                     suspend.EventStore
                     props.Tenant
                     props.SessionId
-                    suspend.JournalToken
+                    journalToken
                     events
                     CancellationToken.None
             )
@@ -2749,6 +2813,231 @@ module internal SessionActor =
         // races, mirroring the base loop's first-cause-wins arbitration.
         let mutable pendingStop: (StopCause * string) option = None
 
+        // The agent rebind a SetAgent recorded while the session was not
+        // quiescent (a turn running, or entries queued): applied at the
+        // next quiescent boundary, cleared when it lands or the session
+        // closes. A crash before apply loses it (in-memory only): the host
+        // sees the unchanged AgentId on GetSession and retries.
+        let mutable pendingAgent: AgentId option = None
+
+        /// Reads whether the session's pending inbox is empty. A missing
+        /// row or a store failure reads as non-empty, so a recorded rebind
+        /// stays pending rather than applying half-informed.
+        /// <returns>True when no inbox entry is pending.</returns>
+        let inboxEmptyNow () : bool =
+            try
+                let pending =
+                    awaitTask (props.Store.ReadPendingInbox(props.Tenant, props.SessionId, CancellationToken.None))
+
+                isNull (box pending) || pending.Count = 0
+            with _ ->
+                false
+
+        /// Adopts a fresh journal claim into the mutable cells: the token
+        /// every journal write below reads, plus the on-demand compaction
+        /// wiring rebuilt for it (or the kept wiring with only its token
+        /// refreshed when the host drives Compact directly), so later
+        /// Compacts stay live. Called the moment a fresh claim is held, so
+        /// an abort below still leaves the cells fencing live writes.
+        /// <param name="fresh">The live journal claim to adopt.</param>
+        let swapJournal (fresh: TurnClaim) : unit =
+            journalToken <- fresh.Token
+
+            match suspend.RefreshCompact with
+            | Some refresh ->
+                try
+                    currentCompact <- refresh fresh.Token
+                with _ ->
+                    currentCompact <-
+                        currentCompact
+                        |> Option.map (fun wiring ->
+                            { wiring with
+                                JournalToken = fresh.Token
+                            })
+            | None ->
+                currentCompact <-
+                    currentCompact
+                    |> Option.map (fun wiring ->
+                        { wiring with
+                            JournalToken = fresh.Token
+                        })
+
+        /// Re-primes the journal through the spawn wiring: a fresh bootstrap
+        /// plus ClaimNextTurn, or None when the host never re-primes, the
+        /// prime fails, or a live claim is held (takeover, or a restart
+        /// inside the old prime's lease). Total: a throwing prime reads as
+        /// None and the recorded rebind retries at the next boundary.
+        /// <returns>The live claim, or None.</returns>
+        let reprimeNow () : TurnClaim option =
+            match suspend.ReprimeJournal with
+            | None -> None
+            | Some reprime ->
+                try
+                    reprime ()
+                with _ ->
+                    None
+
+        /// Settles a claim Completed with a null outcome, best-effort: the
+        /// first settle wins and a retry of the same outcome observes it, so
+        /// only the settled/already-settled outcomes read as settled. Total:
+        /// a rejected or faulted settle reads as false.
+        /// <param name="claim">The claim fencing the settlement. Must not be null.</param>
+        /// <returns>True when the turn settled.</returns>
+        let settleTurnQuiet (claim: TurnClaim) : bool =
+            try
+                match
+                    awaitTask (
+                        props.Store.SettleTurn(props.Tenant, claim, TurnStatus.Completed, null, CancellationToken.None)
+                    )
+                with
+                | :? TurnSettled -> true
+                | :? TurnAlreadySettled -> true
+                | _ -> false
+            with _ ->
+                false
+
+        /// Settles the primed journal claim the spawn (or a re-prime)
+        /// holds: synthesizes the claim from the row's CurrentTurnId stamp
+        /// plus the token cell, so the settle needs no plumbed claim object
+        /// and survives restarts. Live or lapsed-but-uncontested it clears
+        /// CurrentTurnIds; a stale claim rejects with no effects. Total: the
+        /// outcome is advisory (the re-prime below gates the apply), so
+        /// every failure is swallowed.
+        let settlePrimedNow () : unit =
+            try
+                match awaitTask (props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None)) with
+                | null -> ()
+                | session ->
+                    if session.CurrentTurnId.HasValue then
+                        let claim =
+                            {
+                                TurnId = session.CurrentTurnId.Value
+                                Token = journalToken
+                                Owner = ""
+                                ExpiresAt = DateTimeOffset.MinValue
+                                Attempt = 1
+                            }
+
+                        settleTurnQuiet claim |> ignore
+            with _ ->
+                ()
+
+        /// Reads the agent the session converses with now, for the switch
+        /// audit: the row before the rebind lands. Total: a missing row or
+        /// a store failure reads as the fallback.
+        /// <param name="fallback">The agent to report when the row cannot be read.</param>
+        /// <returns>The session's current agent, or the fallback.</returns>
+        let previousAgentNow (fallback: AgentId) : AgentId =
+            try
+                match awaitTask (props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None)) with
+                | null -> fallback
+                | session -> session.AgentId
+            with _ ->
+                fallback
+
+        /// Applies a recorded agent rebind through the 6-step quiescent
+        /// protocol: (1) settle the primed claim Completed with a null
+        /// outcome, (2) re-prime to a fresh claim, (3) journal the switch
+        /// under the fresh token, (4) settle the fresh claim, (5) rebind the
+        /// row, (6) re-prime to restore the steady-state live prime. Every
+        /// write and settlement stays claim-checked last-moment by the
+        /// stores; the mailbox serialization is what makes the re-primes
+        /// safe (no real entry can be stolen and no rival claim can
+        /// interleave), so the caller guarantees quiescence: no live turn
+        /// task and an empty pending inbox. The apply is inbox-neutral (each
+        /// bootstrap is consumed by its claim), so the caller's following
+        /// inbox read stays exact. An abort after the fresh claim is held
+        /// still adopts it and releases it best-effort, so the next boundary
+        /// retries cleanly; a rebind that landed but lost its re-prime stays
+        /// pending and the retry journals one duplicate switch event (turn
+        /// ids are unique, so nothing collides) before the idempotent
+        /// rebind converges.
+        /// <param name="target">The agent the session converses with from now on.</param>
+        /// <returns>True when the rebind landed.</returns>
+        let applyPendingAgent (target: AgentId) : bool =
+            settlePrimedNow ()
+
+            match reprimeNow () with
+            | None -> false
+            | Some fresh ->
+                swapJournal fresh
+
+                let previous = previousAgentNow target
+
+                let switched =
+                    AgentSwitchedEvent(
+                        props.SessionId,
+                        fresh.TurnId,
+                        Unchecked.defaultof<Nullable<int64>>,
+                        DateTimeOffset.UtcNow,
+                        previous,
+                        target
+                    )
+                    :> SessionEvent
+
+                let batch = ResizeArray<SessionEvent>([| switched |]) :> IReadOnlyList<SessionEvent>
+
+                match
+                    awaitTask (
+                        JournalWriter.appendWithTokenAsync
+                            suspend.EventStore
+                            props.Tenant
+                            props.SessionId
+                            fresh.Token
+                            batch
+                            CancellationToken.None
+                    )
+                with
+                | JournalWriter.JournalAppended _ ->
+                    if not (settleTurnQuiet fresh) then
+                        false
+                    else
+                        try
+                            awaitTask (
+                                props.Store.SetSessionAgent(
+                                    props.Tenant,
+                                    props.SessionId,
+                                    target,
+                                    CancellationToken.None
+                                )
+                            )
+                            |> ignore
+
+                            match reprimeNow () with
+                            | Some restored ->
+                                swapJournal restored
+                                true
+                            | None -> false
+                        with _ ->
+                            try
+                                match reprimeNow () with
+                                | Some restored -> swapJournal restored
+                                | None -> ()
+                            with _ ->
+                                ()
+
+                            false
+                | _ ->
+                    settleTurnQuiet fresh |> ignore
+                    false
+
+        /// Applies the recorded agent rebind when the inbox is empty. The
+        /// caller guarantees no live turn task: the Idle/WaitingForInput
+        /// handler arms (no task runs in those states), the settle drain
+        /// (the reporting task is done and no new turn started), and the
+        /// faulted path (the faulted task is done). Total: a throwing apply
+        /// keeps the rebind pending for the next boundary.
+        let tryApplyPendingWhenIdle () : unit =
+            match pendingAgent with
+            | None -> ()
+            | Some target ->
+                if inboxEmptyNow () then
+                    try
+                        if applyPendingAgent target then
+                            pendingAgent <- None
+                    with _ ->
+                        ()
+
         let rec loop (state: SessionState) (suspended: SuspendedTurn option) (resolved: HashSet<string>) =
             actor {
                 let! message = mailbox.Receive()
@@ -2760,6 +3049,13 @@ module internal SessionActor =
                         mailbox.Sender() <! PromptRejected SessionState.Closed
                         return! loop state suspended resolved
                     | SessionState.Idle ->
+                        // A recorded rebind applies before draining when
+                        // the inbox is still empty (a quiescent boundary
+                        // without its own hook settled here): the protocol
+                        // leaves the inbox as found, so the drain below
+                        // sees only real entries.
+                        tryApplyPendingWhenIdle ()
+
                         let appended =
                             awaitTask (
                                 props.Store.AppendInboxMessage(
@@ -2825,6 +3121,13 @@ module internal SessionActor =
                         mailbox.Sender() <! PromptRejected SessionState.Closed
                         return! loop state suspended resolved
                     | SessionState.Idle ->
+                        // A recorded rebind applies before draining when
+                        // the inbox is still empty (a quiescent boundary
+                        // without its own hook settled here): the protocol
+                        // leaves the inbox as found, so the drain below
+                        // sees only real entries.
+                        tryApplyPendingWhenIdle ()
+
                         let appended =
                             awaitTask (
                                 props.Store.AppendInboxMessage(
@@ -2894,6 +3197,13 @@ module internal SessionActor =
                         mailbox.Sender() <! PromptRejected SessionState.Closed
                         return! loop state suspended resolved
                     | SessionState.Idle ->
+                        // A recorded rebind applies before draining when
+                        // the inbox is still empty (a quiescent boundary
+                        // without its own hook settled here): the protocol
+                        // leaves the inbox as found, so the drain below
+                        // sees only real entries.
+                        tryApplyPendingWhenIdle ()
+
                         let appended =
                             awaitTask (
                                 props.Store.AppendInboxMessage(
@@ -3025,14 +3335,25 @@ module internal SessionActor =
                                 // of draining; the entry is already consumed
                                 // above. Aborted and Failed results never take
                                 // this path, so failed runs stay open for
-                                // inspection.
+                                // inspection. A recorded rebind dies with
+                                // the session: Closed rejects it.
                                 awaitTask (
                                     props.Store.CloseSession(props.Tenant, props.SessionId, CancellationToken.None)
                                 )
                                 |> ignore
 
+                                pendingAgent <- None
+
                                 SessionState.Closed
                             else
+                                // The settled entry is consumed: an empty
+                                // inbox is quiescent (the reporting task is
+                                // done and no new turn started), so a
+                                // recorded rebind applies before draining
+                                // next, and stays pending while entries
+                                // remain.
+                                tryApplyPendingWhenIdle ()
+
                                 let pending =
                                     awaitTask (
                                         props.Store.ReadPendingInbox(
@@ -3147,6 +3468,12 @@ module internal SessionActor =
                             )
                         )
                         |> ignore
+
+                        // The faulted entry is consumed and no turn runs:
+                        // an empty inbox is quiescent, so a recorded rebind
+                        // applies here; entries remaining keep it pending
+                        // for the Idle handler.
+                        tryApplyPendingWhenIdle ()
 
                         return! loop SessionState.Idle None resolved
                     | _ -> return! loop state suspended resolved
@@ -3417,7 +3744,7 @@ module internal SessionActor =
                         mailbox.Sender() <! CompactRejected SessionState.Closed
                         return! loop state suspended resolved
                     | SessionState.Idle ->
-                        match props.Compact with
+                        match currentCompact with
                         | None ->
                             mailbox.Sender() <! CompactNotNeeded
                             return! loop state suspended resolved
@@ -3426,7 +3753,7 @@ module internal SessionActor =
                             mailbox.Sender() <! reply
                             return! loop state suspended resolved
                     | SessionState.Running ->
-                        match props.Compact with
+                        match currentCompact with
                         | Some compact when not (isNull (box compact.Force)) ->
                             compact.Force.Request()
                             mailbox.Sender() <! CompactDeferred
@@ -3446,6 +3773,33 @@ module internal SessionActor =
                         // compact nothing.
                         mailbox.Sender() <! CompactNotNeeded
                         return! loop state suspended resolved
+                | SuspendableSetAgent(agentId, cancellationToken) ->
+                    match state with
+                    | SessionState.Closed ->
+                        mailbox.Sender() <! SetAgentRejected SessionState.Closed
+                        return! loop state suspended resolved
+                    | _ ->
+                        pendingAgent <- Some agentId
+
+                        if state = SessionState.Idle || state = SessionState.WaitingForInput then
+                            // No turn task runs in these states: an empty
+                            // inbox applies the rebind at once, queued
+                            // entries keep it pending. (A parked suspension
+                            // keeps its entry pending, so a Waiting session
+                            // applies at the post-resume settle boundary,
+                            // never mid-suspension: claiming there would
+                            // steal the parked entry and leak the protocol
+                            // bootstrap as a turn.)
+                            tryApplyPendingWhenIdle ()
+
+                        let current =
+                            awaitTask (requireSessionAsync props.Store props.Tenant props.SessionId cancellationToken)
+
+                        match pendingAgent with
+                        | None -> mailbox.Sender() <! SetAgentApplied current
+                        | Some _ -> mailbox.Sender() <! SetAgentPending current
+
+                        return! loop state suspended resolved
                 | SuspendableCloseSession cancellationToken ->
                     match suspended with
                     | Some parked ->
@@ -3456,8 +3810,10 @@ module internal SessionActor =
                     | None -> ()
 
                     // A recorded stop dies with the session: Closed settles
-                    // nothing further.
+                    // nothing further. A recorded rebind dies with it too:
+                    // Closed rejects it.
                     pendingStop <- None
+                    pendingAgent <- None
 
                     let closed =
                         awaitTask (props.Store.CloseSession(props.Tenant, props.SessionId, cancellationToken))
@@ -3969,6 +4325,65 @@ module internal SessionActor =
             | _ -> return reply
         }
 
+    /// Rebinds the agent a suspendable session converses with: the client
+    /// boundary. Applies at once when the session is quiescent and records
+    /// the rebind as pending otherwise; the recorded rebind applies at the
+    /// next quiescent boundary. Unknown sessions throw
+    /// SessionNotFoundException and Closed sessions throw
+    /// InvalidSessionStateException before touching the actor; a Close
+    /// racing the rebind maps to the same exception. Agent existence and
+    /// enablement are enforced by the facade (which holds the agent store),
+    /// never here: the actor applies the rebound id verbatim.
+    /// <param name="store">The durable store.</param>
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="sessionId">The session to rebind.</param>
+    /// <param name="session">The suspendable session actor.</param>
+    /// <param name="agentId">The agent the session converses with from now on.</param>
+    /// <param name="cancellationToken">Cancels the rebind.</param>
+    /// <returns>The stored session: rebound when the rebind applied at once, unchanged while pending.</returns>
+    let setAgentSuspendableAsync
+        (store: ISessionStore)
+        (tenant: TenantId)
+        (sessionId: SessionId)
+        (session: IActorRef)
+        (agentId: AgentId)
+        (cancellationToken: CancellationToken)
+        : Task<Session> =
+        ArgumentNullException.ThrowIfNull(store)
+        ArgumentNullException.ThrowIfNull(session)
+
+        task {
+            let! current = requireSessionAsync store tenant sessionId cancellationToken
+
+            if current.State = SessionState.Closed then
+                raise (
+                    InvalidSessionStateException(
+                        sessionId,
+                        current.State.ToString(),
+                        "The session is closed and accepts no agent change."
+                    )
+                )
+
+            let! reply =
+                askSuspendableAsync<SessionSetAgentReply>
+                    session
+                    (SuspendableSetAgent(agentId, cancellationToken))
+                    cancellationToken
+
+            match reply with
+            | SetAgentApplied rebound -> return rebound
+            | SetAgentPending unchanged -> return unchanged
+            | SetAgentRejected rejectedState ->
+                return
+                    raise (
+                        InvalidSessionStateException(
+                            sessionId,
+                            rejectedState.ToString(),
+                            "The session closed before the agent change was accepted."
+                        )
+                    )
+        }
+
     /// Builds the production child-spawn factory the session router uses:
     /// like <see cref="M:Legate.SessionActor.spawnFactory" /> but spawning
     /// the suspendable behavior (<see cref="M:Legate.SessionActor.behaviorWithSuspend" />),
@@ -4042,10 +4457,19 @@ module internal SessionActor =
         /// session row (or any prime failure) falls back to a fresh token:
         /// the child starts as an Idle shell whose mutations the boundary
         /// rejects, so the token never fences a real write.
-        let primeToken (sessionId: SessionId) : string =
+        /// Primes the journal claim for one session: appends a bootstrap
+        /// entry and claims it, returning the live claim. A missing session
+        /// row (or any prime failure) primes nothing: the child starts as an
+        /// Idle shell over a fallback token and the client boundary rejects
+        /// its mutations, so the token never fences a real write. The same
+        /// prime backs the SetAgent re-prime the behavior runs after
+        /// settling its primed claim: every call appends a fresh bootstrap
+        /// and claims it, and the claim consumes the bootstrap, so real
+        /// prompts still drain first.
+        let primeClaim (sessionId: SessionId) : TurnClaim option =
             try
                 match store.GetSession(tenant, sessionId, CancellationToken.None).GetAwaiter().GetResult() with
-                | null -> Guid.NewGuid().ToString("N")
+                | null -> None
                 | _ ->
                     let bootstrap =
                         UserMessagePayload(UserMessage.Text "legate journal prime") :> InboxPayload
@@ -4062,19 +4486,24 @@ module internal SessionActor =
                             .GetAwaiter()
                             .GetResult()
                     with
-                    | :? TurnLeaseRenewed as renewed when not (isNull (box renewed)) -> renewed.Claim.Token
-                    | :? TurnLeaseHeld as held when not (isNull (box held)) -> held.Claim.Token
-                    | :? TurnLeaseExpiring as expiring when not (isNull (box expiring)) -> expiring.Claim.Token
-                    | _ -> Guid.NewGuid().ToString("N")
+                    | :? TurnLeaseRenewed as renewed when not (isNull (box renewed)) -> Some renewed.Claim
+                    | :? TurnLeaseHeld as held when not (isNull (box held)) -> Some held.Claim
+                    | :? TurnLeaseExpiring as expiring when not (isNull (box expiring)) -> Some expiring.Claim
+                    | _ -> None
             with _ ->
-                Guid.NewGuid().ToString("N")
+                None
 
         fun sessionId context name ->
             let mutable parsed = Unchecked.defaultof<SessionId>
 
             if SessionId.TryParse(sessionId, &parsed) then
                 let captured = parsed
-                let token = primeToken captured
+                let primed = primeClaim captured
+
+                let token =
+                    match primed with
+                    | Some claim -> claim.Token
+                    | None -> Guid.NewGuid().ToString("N")
 
                 let props: SessionActorProps =
                     {
@@ -4095,6 +4524,8 @@ module internal SessionActor =
                         AskTimeout = askTimeout
                         JournalToken = token
                         RunSuspendable = runSuspendable
+                        ReprimeJournal = Some(fun () -> primeClaim captured)
+                        RefreshCompact = Some(compactFor captured)
                     }
 
                 spawn context name (behaviorWithSuspend props suspend)

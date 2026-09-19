@@ -18,9 +18,9 @@ open Legate.Agents
 
 // Host-driving facade over the suspendable session actor: the public
 // OpenSession, Prompt (+Inject/+Interrupt delivery), Reply, Abort, Compact,
-// WaitForSettle, Subscribe, ReadTranscript, and ReadEvents operations per
-// the normative Docs/ARCHITECTURE.md Client API table minus the Wave-3
-// surface (Fork/SetAgent/ListSessions stay out), plus the DI registration
+// Fork, SetAgent, WaitForSettle, Subscribe, ReadTranscript, and ReadEvents
+// operations per the normative Docs/ARCHITECTURE.md Client API table minus
+// ListSessions (which stays out), plus the DI registration
 // wiring LocalActorSystem.SessionChildFactory to behaviorWithSuspend with
 // the production suspendable runner. WaitForSettle is additive sugar the
 // table's PromptAndWait implies but does not name: the settle-wait half an
@@ -132,10 +132,10 @@ and [<Sealed>] SessionCompactFenced() =
 // Operations
 
 /// Host-driving operations on <see cref="T:Legate.SessionClient" /> per the
-/// normative <c>Docs/ARCHITECTURE.md</c> Client API table minus the Wave-3
-/// surface (Fork/SetAgent/ListSessions stay out): OpenSession, Prompt with
-/// every <see cref="T:Legate.DeliveryMode" />, Reply, Abort, Compact,
-/// WaitForSettle, Subscribe as <see cref="T:System.Collections.Generic.IAsyncEnumerable`1" />,
+/// normative <c>Docs/ARCHITECTURE.md</c> Client API table minus ListSessions
+/// (which stays out): OpenSession, Prompt with
+/// every <see cref="T:Legate.DeliveryMode" />, Reply, Abort, Compact, Fork,
+/// SetAgent, WaitForSettle, Subscribe as <see cref="T:System.Collections.Generic.IAsyncEnumerable`1" />,
 /// ReadTranscript, and ReadEvents. WaitForSettle is additive sugar beyond
 /// the table: the settle-wait half an interactive host drives beside
 /// Subscribe plus Reply. Control-plane precondition failures
@@ -162,6 +162,227 @@ type SessionClientOperations =
             | null -> return raise (SessionNotFoundException(sessionId, "The session does not exist."))
             | session -> return session
         }
+
+    /// Reads the source journal prefix a fork copies: the events with a
+    /// stamped sequence through upToSequence (inclusive), in sequence
+    /// order. Unknown session, expired journal, and end of stream resolve
+    /// to the settled tail: the prefix holds what the replay saw (none on
+    /// a fresh unknown or expired journal).
+    /// <param name="client">The session client. Must not be null.</param>
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="sessionId">The session whose journal to read.</param>
+    /// <param name="upToSequence">The inclusive sequence the prefix runs through.</param>
+    /// <param name="cancellationToken">Abandons the replay.</param>
+    static member private ReadPrefixAsync
+        (
+            client: SessionClient,
+            tenant: TenantId,
+            sessionId: SessionId,
+            upToSequence: int64,
+            cancellationToken: CancellationToken
+        ) : Task<IReadOnlyList<SessionEvent>> =
+        task {
+            let collected = ResizeArray<SessionEvent>()
+            let mutable cursor = 0L
+            let mutable paging = true
+
+            while paging do
+                cancellationToken.ThrowIfCancellationRequested()
+
+                let! outcome = client.EventBus.EventStore.Replay(tenant, sessionId, cursor, 100, cancellationToken)
+
+                match outcome with
+                | :? EventReplayPage as page when not (isNull (box page)) ->
+                    let mutable highest = cursor
+
+                    if not (isNull (box page.Events)) then
+                        for event in page.Events do
+                            if not (isNull (box event)) then
+                                if event.Sequence.HasValue then
+                                    if event.Sequence.Value > highest then
+                                        highest <- event.Sequence.Value
+
+                                    if event.Sequence.Value <= upToSequence then
+                                        collected.Add(event)
+
+                    // Sequences ascend, so a page reaching past the cursor
+                    // completes the prefix; otherwise follow it.
+                    if page.NextCursor.HasValue && highest <= upToSequence then
+                        cursor <- page.NextCursor.Value
+                    else
+                        paging <- false
+                | _ -> paging <- false
+
+            return collected :> IReadOnlyList<SessionEvent>
+        }
+
+    /// Requires a registered agent for a rebind: an unknown id throws
+    /// <see cref="T:Legate.AgentNotFoundException" /> and a disabled agent
+    /// throws <see cref="T:Legate.AgentDisabledException" />.
+    /// <param name="agents">The agent store to read. Must not be null.</param>
+    /// <param name="tenant">The tenant the agent belongs to.</param>
+    /// <param name="agentId">The agent to require.</param>
+    /// <param name="cancellationToken">Abandons the read.</param>
+    static member private RequireAgentAsync
+        (agents: IAgentStore, tenant: TenantId, agentId: AgentId, cancellationToken: CancellationToken)
+        : Task =
+        task {
+            let! registered = agents.GetAgent(tenant, agentId, cancellationToken)
+
+            match registered with
+            | null ->
+                return raise (AgentNotFoundException(agentId, sprintf "No agent %O exists in this tenant." agentId))
+            | agent ->
+                if not agent.Enabled then
+                    return raise (AgentDisabledException(agentId, sprintf "Agent %O is disabled." agentId))
+                else
+                    return ()
+        }
+
+    /// Snapshots the source options for a fork: every field verbatim, with
+    /// the source id merged under ForkedFrom metadata. Null source options
+    /// (a row from before options existed) snapshot to defaults plus the
+    /// ForkedFrom entry, so the fork always carries its parent.
+    /// <param name="source">The session being forked. Must not be null.</param>
+    /// <param name="sourceId">The source session id the ForkedFrom entry carries.</param>
+    static member private ForkOptions (source: Session) (sourceId: SessionId) : SessionOptions =
+        let options = SessionOptions()
+        let merged = Dictionary<string, string>(StringComparer.Ordinal)
+
+        match box source with
+        | null -> ()
+        | _ ->
+            match box source.Options with
+            | null -> ()
+            | _ ->
+                // Nullable option fields copy when set and keep the fresh
+                // null defaults otherwise: skipping a null is exactly
+                // assigning it on a fresh instance. Option.ofObj carries
+                // the set value as a non-null binding either way.
+                let from: SessionOptions = source.Options
+
+                match Option.ofObj from.Title with
+                | Some title -> options.Title <- title
+                | None -> ()
+
+                options.AutoClose <- from.AutoClose
+                options.Outcome <- from.Outcome
+
+                match Option.ofObj from.Permissions with
+                | Some permissions -> options.Permissions <- permissions
+                | None -> ()
+
+                match Option.ofObj from.AskUser with
+                | Some askUser -> options.AskUser <- askUser
+                | None -> ()
+
+                match Option.ofObj from.CompletionSink with
+                | Some completionSink -> options.CompletionSink <- completionSink
+                | None -> ()
+
+                options.MaxIterations <- from.MaxIterations
+                options.Timeout <- from.Timeout
+
+                match Option.ofObj from.HostInstructionFiles with
+                | Some hostInstructionFiles -> options.HostInstructionFiles <- hostInstructionFiles
+                | None -> ()
+
+                options.OnCrashResume <- from.OnCrashResume
+
+                match Option.ofObj from.Metadata with
+                | None -> ()
+                | Some metadata ->
+                    for pair in metadata do
+                        if not (merged.ContainsKey pair.Key) then
+                            let value = pair.Value
+
+                            match box value with
+                            | null -> merged[pair.Key] <- Unchecked.defaultof<string>
+                            | _ -> merged[pair.Key] <- value
+
+        merged["ForkedFrom"] <- sourceId.ToString()
+        options.Metadata <- merged :> IReadOnlyDictionary<string, string>
+        options
+
+    /// Re-keys one journaled event for a fork: the new session id with an
+    /// empty (in-flight) sequence, keeping the turn, timestamp, and payload,
+    /// so the store stamps the fork's own sequences on append and the fork's
+    /// transcript folds exactly like the source prefix.
+    /// <param name="sessionId">The forked session the copy belongs to.</param>
+    /// <param name="event">The source event to re-key. Must not be null.</param>
+    static member private RekeyForFork (sessionId: SessionId) (event: SessionEvent) : SessionEvent =
+        if isNull (box event) then
+            raise (ArgumentNullException(nameof event))
+
+        let noSequence = Unchecked.defaultof<Nullable<int64>>
+        let turnId = event.TurnId
+        let timestamp = event.Timestamp
+
+        match event with
+        | :? TurnStartedEvent -> TurnStartedEvent(sessionId, turnId, noSequence, timestamp) :> SessionEvent
+        | :? TextDeltaEvent as source ->
+            TextDeltaEvent(sessionId, turnId, noSequence, timestamp, source.Text) :> SessionEvent
+        | :? ReasoningDeltaEvent as source ->
+            ReasoningDeltaEvent(sessionId, turnId, noSequence, timestamp, source.Text) :> SessionEvent
+        | :? ToolCallStartedEvent as source ->
+            ToolCallStartedEvent(sessionId, turnId, noSequence, timestamp, source.ToolCallId, source.ToolName)
+            :> SessionEvent
+        | :? ToolCallOutputEvent as source ->
+            ToolCallOutputEvent(sessionId, turnId, noSequence, timestamp, source.ToolCallId, source.Output)
+            :> SessionEvent
+        | :? ToolCallCompletedEvent as source ->
+            ToolCallCompletedEvent(sessionId, turnId, noSequence, timestamp, source.ToolCallId, source.Error)
+            :> SessionEvent
+        | :? PermissionRequestedEvent as source ->
+            PermissionRequestedEvent(sessionId, turnId, noSequence, timestamp, source.RequestId, source.ToolName)
+            :> SessionEvent
+        | :? PermissionResolvedEvent as source ->
+            PermissionResolvedEvent(sessionId, turnId, noSequence, timestamp, source.RequestId, source.Decision)
+            :> SessionEvent
+        | :? QuestionAskedEvent as source ->
+            QuestionAskedEvent(sessionId, turnId, noSequence, timestamp, source.QuestionId, source.Question)
+            :> SessionEvent
+        | :? QuestionAnsweredEvent as source ->
+            QuestionAnsweredEvent(sessionId, turnId, noSequence, timestamp, source.QuestionId, source.Answer)
+            :> SessionEvent
+        | :? UsageEvent as source ->
+            UsageEvent(sessionId, turnId, noSequence, timestamp, source.InputTokens, source.OutputTokens)
+            :> SessionEvent
+        | :? CompactedEvent as source ->
+            CompactedEvent(sessionId, turnId, noSequence, timestamp, source.BeforeEstimate, source.AfterEstimate)
+            :> SessionEvent
+        | :? CompactionFailedEvent as source ->
+            CompactionFailedEvent(sessionId, turnId, noSequence, timestamp, source.Reason) :> SessionEvent
+        | :? TurnCompletedEvent -> TurnCompletedEvent(sessionId, turnId, noSequence, timestamp) :> SessionEvent
+        | :? TurnAbortedEvent as source ->
+            TurnAbortedEvent(sessionId, turnId, noSequence, timestamp, source.Cause, source.Reason) :> SessionEvent
+        | :? TurnFailedEvent as source ->
+            TurnFailedEvent(sessionId, turnId, noSequence, timestamp, source.Reason) :> SessionEvent
+        | :? SessionClosedEvent -> SessionClosedEvent(sessionId, turnId, noSequence, timestamp) :> SessionEvent
+        | :? UserMessageEvent as source ->
+            UserMessageEvent(sessionId, turnId, noSequence, timestamp, source.Message) :> SessionEvent
+        | :? ContextPrunedEvent as source ->
+            ContextPrunedEvent(
+                sessionId,
+                turnId,
+                noSequence,
+                timestamp,
+                source.PrunedCount,
+                source.BeforeEstimate,
+                source.AfterEstimate
+            )
+            :> SessionEvent
+        | :? SkillInvalidEvent as source ->
+            SkillInvalidEvent(sessionId, turnId, noSequence, timestamp, source.SkillName, source.Reason) :> SessionEvent
+        | :? SkillLoadedEvent as source ->
+            SkillLoadedEvent(sessionId, turnId, noSequence, timestamp, source.SkillName, source.Companions)
+            :> SessionEvent
+        | :? AgentInvalidEvent as source ->
+            AgentInvalidEvent(sessionId, turnId, noSequence, timestamp, source.AgentName, source.Reason) :> SessionEvent
+        | :? AgentSwitchedEvent as source ->
+            AgentSwitchedEvent(sessionId, turnId, noSequence, timestamp, source.PreviousAgentId, source.NewAgentId)
+            :> SessionEvent
+        | _ -> raise (ArgumentException("The journal carries an unknown event kind.", nameof event))
 
     /// Opens a session: creates the Idle row and eagerly resolves its actor
     /// while the row exists, so the journal prime claims a live token.
@@ -407,6 +628,202 @@ type SessionClientOperations =
                             "The session closed before the compact was accepted."
                         )
                     )
+        }
+
+    /// Rebinds the agent a session converses with: applies at once when the
+    /// session is quiescent (no live turn and an empty pending inbox) and
+    /// records the rebind as pending otherwise; the recorded rebind applies
+    /// at the next quiescent boundary. The actor journals one
+    /// agentSwitched event per applied rebind, and the next turn resolves
+    /// its tools and budget under the new agent. Agent validation needs the
+    /// registered agent store: an unknown id throws
+    /// <see cref="T:Legate.AgentNotFoundException" /> and a disabled agent
+    /// throws <see cref="T:Legate.AgentDisabledException" />; hosts running
+    /// without a managed agent catalog skip validation and rebind any id.
+    /// <param name="client">The session client. Must not be null.</param>
+    /// <param name="sessionId">The session to rebind.</param>
+    /// <param name="agentId">The agent the session converses with from now on.</param>
+    /// <param name="cancellationToken">Cancels the rebind.</param>
+    /// <returns>The stored session: rebound when the rebind applied at once, unchanged while pending.</returns>
+    /// <exception cref="T:Legate.SessionNotFoundException">The session id does not exist.</exception>
+    /// <exception cref="T:Legate.InvalidSessionStateException">The session is closed.</exception>
+    /// <exception cref="T:Legate.AgentNotFoundException">No registered agent carries the id.</exception>
+    /// <exception cref="T:Legate.AgentDisabledException">The registered agent is disabled.</exception>
+    [<Extension>]
+    static member SetAgentAsync
+        (client: SessionClient, sessionId: SessionId, agentId: AgentId, cancellationToken: CancellationToken)
+        : Task<Session> =
+        ArgumentNullException.ThrowIfNull(client)
+
+        task {
+            let! source = SessionClientOperations.RequireAsync(client, sessionId, cancellationToken)
+
+            if source.State = SessionState.Closed then
+                raise (
+                    InvalidSessionStateException(
+                        sessionId,
+                        source.State.ToString(),
+                        "The session is closed and accepts no agent change."
+                    )
+                )
+
+            match client.Agents with
+            | Some agents ->
+                do! SessionClientOperations.RequireAgentAsync(agents, client.Tenant, agentId, cancellationToken)
+            | None -> ()
+
+            let! actor = client.Resolve(sessionId, cancellationToken)
+
+            return!
+                SessionActor.setAgentSuspendableAsync
+                    client.Store
+                    client.Tenant
+                    sessionId
+                    actor
+                    agentId
+                    cancellationToken
+        }
+
+    /// Forks a session: creates a new Idle session whose transcript is a
+    /// prefix of the source's journal. The new row carries the source agent,
+    /// an options snapshot with the source id under ForkedFrom metadata, and
+    /// the source title; it carries no claim or lease state and no inbox
+    /// entries, and its journal holds the source events with a sequence
+    /// through upToSequence (inclusive), re-keyed to the new session.
+    /// Beyond-tail cursors clamp to the full journal; a cursor below the
+    /// first sequence forks an empty transcript. Forking never validates the
+    /// agent: the copy carries the source row's agent verbatim. The source
+    /// may be open or closed; its state is untouched, and a fork of a fork
+    /// references its immediate parent.
+    /// <param name="client">The session client. Must not be null.</param>
+    /// <param name="sessionId">The session to fork.</param>
+    /// <param name="upToSequence">The inclusive sequence the prefix runs through; beyond-tail clamps to the full journal.</param>
+    /// <param name="cancellationToken">Cancels the fork.</param>
+    /// <returns>The stored forked session.</returns>
+    /// <exception cref="T:Legate.SessionNotFoundException">The session id does not exist.</exception>
+    [<Extension>]
+    static member ForkAsync
+        (client: SessionClient, sessionId: SessionId, upToSequence: int64, cancellationToken: CancellationToken)
+        : Task<Session> =
+        ArgumentNullException.ThrowIfNull(client)
+
+        task {
+            let tenant = client.Tenant
+            let! source = SessionClientOperations.RequireAsync(client, sessionId, cancellationToken)
+
+            let! prefix =
+                SessionClientOperations.ReadPrefixAsync(client, tenant, sessionId, upToSequence, cancellationToken)
+
+            let now = DateTimeOffset.UtcNow
+
+            let forked =
+                {
+                    Id = SessionId.New()
+                    Tenant = tenant
+                    AgentId = source.AgentId
+                    Title = source.Title
+                    State = SessionState.Idle
+                    CurrentTurnId = Unchecked.defaultof<Nullable<TurnId>>
+                    CreatedAt = now
+                    UpdatedAt = now
+                    ClosedAt = Unchecked.defaultof<Nullable<DateTimeOffset>>
+                    WorkspaceBinding = null
+                    Options = SessionClientOperations.ForkOptions source sessionId
+                    PermissionGrants = ResizeArray<string>() :> IReadOnlyList<string>
+                }
+
+            let! created = client.Store.CreateSession(tenant, forked, cancellationToken)
+
+            if prefix.Count > 0 then
+                // Prime, copy, and settle under the facade-held claim before
+                // Resolve re-primes: the bootstrap is consumed by the claim,
+                // so the forked actor drains real prompts first. The owner
+                // and lease mirror the SessionClientOptions prime defaults;
+                // the client does not carry the options, and both are
+                // attribution only on a claim settled below.
+                let bootstrap =
+                    UserMessagePayload(UserMessage.Text "legate fork prime") :> InboxPayload
+
+                let! _ =
+                    client.Store.AppendInboxMessage(
+                        tenant,
+                        created.Id,
+                        bootstrap,
+                        DeliveryMode.Queue,
+                        cancellationToken
+                    )
+
+                let! lease =
+                    client.Store.ClaimNextTurn(
+                        tenant,
+                        created.Id,
+                        "legate-session-facade",
+                        TimeSpan.FromHours 1.0,
+                        cancellationToken
+                    )
+
+                let claim =
+                    match lease with
+                    | :? TurnLeaseRenewed as renewed when not (isNull (box renewed)) -> renewed.Claim
+                    | :? TurnLeaseHeld as held when not (isNull (box held)) -> held.Claim
+                    | :? TurnLeaseExpiring as expiring when not (isNull (box expiring)) -> expiring.Claim
+                    | _ ->
+                        raise (
+                            InvalidOperationException(
+                                sprintf "The fork of session %O claimed no turn on its fresh row." sessionId
+                            )
+                        )
+
+                try
+                    let rekeyed =
+                        prefix
+                        |> Seq.map (SessionClientOperations.RekeyForFork created.Id)
+                        |> List.ofSeq
+
+                    for batch in rekeyed |> List.chunkBySize 100 do
+                        let events = ResizeArray<SessionEvent>(batch) :> IReadOnlyList<SessionEvent>
+
+                        match!
+                            JournalWriter.appendWithTokenAsync
+                                client.EventBus.EventStore
+                                tenant
+                                created.Id
+                                claim.Token
+                                events
+                                cancellationToken
+                        with
+                        | JournalWriter.JournalAppended _ -> ()
+                        | JournalWriter.JournalRejected reason ->
+                            raise (
+                                InvalidOperationException(
+                                    sprintf "The fork of session %O lost its journal claim: %s." sessionId reason
+                                )
+                            )
+                        | JournalWriter.JournalFailed reason ->
+                            raise (
+                                InvalidOperationException(
+                                    sprintf "The fork of session %O failed to copy its prefix: %s." sessionId reason
+                                )
+                            )
+
+                    let! _ = client.Store.SettleTurn(tenant, claim, TurnStatus.Completed, null, cancellationToken)
+                    ()
+                with ex ->
+                    try
+                        client.Store.SettleTurn(tenant, claim, TurnStatus.Completed, null, CancellationToken.None)
+                        |> ignore
+                    with _ ->
+                        ()
+
+                    raise ex
+
+            try
+                let! _ = client.Resolve(created.Id, cancellationToken)
+                ()
+            with :? InvalidOperationException ->
+                ()
+
+            return created
         }
 
     /// Waits for the session's running turn to settle without prompting:
@@ -814,7 +1231,11 @@ module internal SessionClientWiring =
         let resolve (sessionId: SessionId) (cancellationToken: CancellationToken) : Task<IActorRef> =
             actorService.ResolveSessionAsync(sessionId.ToString(), cancellationToken)
 
-        new SessionClient(store, clientOptions.Tenant, resolve, bus, clientOptions.DefaultWaitBound, delay)
+        // The agent catalog SetAgent validates against, or None when the
+        // host runs without one: validation is skipped then.
+        let agents = Option.ofObj (provider.GetService<IAgentStore>())
+
+        new SessionClient(store, clientOptions.Tenant, resolve, bus, clientOptions.DefaultWaitBound, delay, agents)
 
 /// Registers the session client facade: the options default, the event
 /// bus over the durable journal, and the DI-owned client with its router

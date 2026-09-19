@@ -166,6 +166,19 @@ type AgentNotFoundException(agentId: AgentId, message: string) =
     /// The id of the agent that could not be found.
     member _.AgentId = agentId
 
+/// Raised when a call targets an agent that exists but is disabled, such as
+/// rebinding a session onto an agent the runtime accepts no new sessions
+/// for. Disabled agents keep their existing sessions runnable; only the
+/// rebind (or open) onto one is rejected.
+/// <param name="agentId">The id of the disabled agent.</param>
+/// <param name="message">The exception message, without secrets or tool arguments.</param>
+[<Sealed>]
+type AgentDisabledException(agentId: AgentId, message: string) =
+    inherit LegateException(message)
+
+    /// The id of the disabled agent.
+    member _.AgentId = agentId
+
 /// Raised when a write is attempted on an agent store that only implements
 /// reads, such as a file-based store that loads agents and custom tools
 /// from a directory it never writes to. Read-only implementations are

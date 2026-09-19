@@ -53,6 +53,7 @@ open System.Text.Json.Serialization
 /// <item><term>skillInvalid</term><description>a packaged skill was skipped during discovery with its reason.</description></item>
 /// <item><term>skillLoaded</term><description>a skill's content was loaded for the turn with its companion list.</description></item>
 /// <item><term>agentInvalid</term><description>an agent definition was kept despite a problem, with its reason.</description></item>
+/// <item><term>agentSwitched</term><description>the session was rebound to another agent.</description></item>
 /// </list>
 /// Every subtype is named <c>&lt;Kind&gt;Event</c> so no kind name collides
 /// with an existing Legate type (for example <see cref="T:Legate.TurnFailed" />
@@ -81,6 +82,7 @@ open System.Text.Json.Serialization
 [<JsonDerivedType(typeof<SkillInvalidEvent>, "skillInvalid")>]
 [<JsonDerivedType(typeof<SkillLoadedEvent>, "skillLoaded")>]
 [<JsonDerivedType(typeof<AgentInvalidEvent>, "agentInvalid")>]
+[<JsonDerivedType(typeof<AgentSwitchedEvent>, "agentSwitched")>]
 type SessionEvent(sessionId: SessionId, turnId: TurnId, sequence: Nullable<int64>, timestamp: DateTimeOffset) =
 
     /// The session the event belongs to. Sequence numbers are per-session,
@@ -599,3 +601,31 @@ and [<Sealed>] AgentInvalidEvent
     /// Why the agent was flagged: a missing description or unknown tools.
     /// Never contains secrets.
     member _.Reason = reason
+
+/// The session was rebound to another agent (issue 123): the actor journals
+/// one of these per applied SetAgent through its 6-step quiescent protocol,
+/// carrying the rebound turn's id. The transcript fold derives one System
+/// cell per matching-turn event, carrying the previous and new agent in
+/// metadata. Agent ids are durable identifiers, never secrets.
+/// <param name="sessionId">The session that was rebound.</param>
+/// <param name="turnId">The journaling prime's turn the switch was journaled under.</param>
+/// <param name="sequence">The event's per-session sequence number, or empty while in flight.</param>
+/// <param name="timestamp">When the switch applied.</param>
+/// <param name="previousAgentId">The agent the session conversed with before the switch.</param>
+/// <param name="newAgentId">The agent the session converses with from now on.</param>
+and [<Sealed>] AgentSwitchedEvent
+    (
+        sessionId: SessionId,
+        turnId: TurnId,
+        sequence: Nullable<int64>,
+        timestamp: DateTimeOffset,
+        previousAgentId: AgentId,
+        newAgentId: AgentId
+    ) =
+    inherit SessionEvent(sessionId, turnId, sequence, timestamp)
+
+    /// The agent the session conversed with before the switch.
+    member _.PreviousAgentId = previousAgentId
+
+    /// The agent the session converses with from now on.
+    member _.NewAgentId = newAgentId

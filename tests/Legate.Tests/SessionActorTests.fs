@@ -1130,6 +1130,8 @@ let private spawnSuspendable
             AskTimeout = askTimeout
             JournalToken = "test-token"
             RunSuspendable = runner.Func
+            ReprimeJournal = None
+            RefreshCompact = None
         }
 
     spawn system $"suspend-{Guid.NewGuid():N}" (SessionActor.behaviorWithSuspend baseProps deps)
@@ -3387,6 +3389,8 @@ let private spawnSuspendableOver
             AskTimeout = TimeSpan.FromMinutes 5.0
             JournalToken = token
             RunSuspendable = runner.Func
+            ReprimeJournal = None
+            RefreshCompact = None
         }
 
     spawn system $"crash-{Guid.NewGuid():N}" (SessionActor.behaviorWithSuspend baseProps deps)
@@ -3702,6 +3706,8 @@ let ``Kill mid-turn restarts exactly once with the journal prefix intact`` () =
                 AskTimeout = TimeSpan.FromMinutes 5.0
                 JournalToken = token
                 RunSuspendable = runner.Func
+                ReprimeJournal = None
+                RefreshCompact = None
             }
 
         spawn system $"kill-{Guid.NewGuid():N}" (SessionActor.behaviorWithSuspend baseProps deps)
@@ -3746,3 +3752,501 @@ let ``Kill mid-turn restarts exactly once with the journal prefix intact`` () =
         (storedOf store created.Id).State |> should equal SessionState.Idle
     finally
         stopSystem secondSystem
+
+// ──────────────────────────────────────────────────────────────────────────
+// Fork and SetAgent (issue 123)
+//
+// The actor half of the repaired plan: every rebind routes through the
+// actor as SuspendableSetAgent and applies through the 6-step quiescent
+// protocol (settle, re-prime, journal the switch, settle, rebind,
+// re-prime with the token swap). Quiescence means no live turn task and an
+// empty pending inbox: a parked suspension keeps its entry pending, so a
+// Waiting session applies at the post-resume settle boundary, never
+// mid-suspension (claiming there would steal the parked entry and leak the
+// protocol bootstrap as a turn).
+
+/// Rebinds through the actor boundary, blocking.
+let private setAgent
+    (store: ISessionStore)
+    (tenantId: TenantId)
+    (sessionId: SessionId)
+    (session: IActorRef)
+    (agentId: AgentId)
+    : Session =
+    SessionActor.setAgentSuspendableAsync store tenantId sessionId session agentId CancellationToken.None
+    |> fun task -> task.GetAwaiter().GetResult()
+
+/// Reads the pending inbox, blocking. Tests only read inboxes they own, so
+/// a store failure is a test bug.
+let private pendingEntries
+    (store: ISessionStore)
+    (tenantId: TenantId)
+    (sessionId: SessionId)
+    : IReadOnlyList<InboxEntry> =
+    store.ReadPendingInbox(tenantId, sessionId, CancellationToken.None).GetAwaiter().GetResult()
+
+/// Reads the stored session row, blocking.
+let private storedRow (store: ISessionStore) (tenantId: TenantId) (sessionId: SessionId) : Session =
+    match store.GetSession(tenantId, sessionId, CancellationToken.None).GetAwaiter().GetResult() with
+    | null -> failwith "Expected the session row to exist."
+    | session -> session
+
+/// Collects the session journal in sequence order, blocking.
+let private collectJournal
+    (journal: ISessionEventStore)
+    (tenantId: TenantId)
+    (sessionId: SessionId)
+    : SessionEvent list =
+    let collected = ResizeArray<SessionEvent>()
+    let mutable cursor = 0L
+    let mutable paging = true
+
+    while paging do
+        match journal.Replay(tenantId, sessionId, cursor, 100, CancellationToken.None).GetAwaiter().GetResult() with
+        | :? EventReplayPage as page when not (isNull (box page)) ->
+            if not (isNull (box page.Events)) then
+                for event in page.Events do
+                    if not (isNull (box event)) then
+                        collected.Add(event)
+
+            if page.NextCursor.HasValue then
+                cursor <- page.NextCursor.Value
+            else
+                paging <- false
+        | _ -> paging <- false
+
+    List.ofSeq collected
+
+/// The agent-switch events in a journal, in sequence order.
+let private switchEvents (events: SessionEvent list) : AgentSwitchedEvent list =
+    [
+        for event in events do
+            match event with
+            | :? AgentSwitchedEvent as switched when not (isNull (box switched)) -> yield switched
+            | _ -> ()
+    ]
+
+/// A tool that signals entry, then blocks until released: keeps a turn
+/// Running so SetAgent meets it mid-flight. Async-gated, so the actor
+/// thread stays free to answer while the turn parks.
+let private blockingTool (entered: ManualResetEventSlim) (release: TaskCompletionSource<string>) : AITool =
+    let method =
+        System.Func<Task<string>>(fun () ->
+            entered.Set() |> ignore
+            release.Task)
+
+    AIFunctionFactory.Create(method, "gated", Unchecked.defaultof<string>, Unchecked.defaultof<JsonSerializerOptions>)
+    :> AITool
+
+/// Re-primes a directly constructed suspendable actor's journal: a fresh
+/// bootstrap plus ClaimNextTurn, mirroring the spawn prime.
+let private reprimeFor
+    (store: ISessionStore)
+    (tenantId: TenantId)
+    (sessionId: SessionId)
+    (owner: string)
+    ()
+    : TurnClaim option =
+    try
+        let bootstrap =
+            UserMessagePayload(UserMessage.Text "legate journal prime") :> InboxPayload
+
+        store
+            .AppendInboxMessage(tenantId, sessionId, bootstrap, DeliveryMode.Queue, CancellationToken.None)
+            .GetAwaiter()
+            .GetResult()
+        |> ignore
+
+        match
+            store.ClaimNextTurn(tenantId, sessionId, owner, TimeSpan.FromSeconds 120.0, CancellationToken.None)
+            |> fun task -> task.GetAwaiter().GetResult()
+        with
+        | :? TurnLeaseRenewed as renewed when not (isNull (box renewed)) -> Some renewed.Claim
+        | :? TurnLeaseHeld as held when not (isNull (box held)) -> Some held.Claim
+        | :? TurnLeaseExpiring as expiring when not (isNull (box expiring)) -> Some expiring.Claim
+        | _ -> None
+    with _ ->
+        None
+
+/// Spawns a suspendable actor with a live re-prime, for SetAgent protocol
+/// tests that drive the runner directly.
+let private spawnReprimeable
+    (system: ActorSystem)
+    (store: ISessionStore)
+    (tenantId: TenantId)
+    (journal: ISessionEventStore)
+    (sessionId: SessionId)
+    (token: string)
+    (runner: ScriptSuspendRunner)
+    (settled: ResizeArray<TurnResult>)
+    (compact: CompactDeps option)
+    (refresh: (string -> CompactDeps option) option)
+    : IActorRef =
+    let baseProps: SessionActorProps =
+        {
+            Store = store
+            Tenant = tenantId
+            SessionId = sessionId
+            RunTurn = (fun _ _ -> Task.FromResult(completed "unused"))
+            OnTurnSettled = Some(fun result -> lock settled (fun () -> settled.Add(result)))
+            OnInjectJournaled = None
+            Logger = null
+            Compact = compact
+        }
+
+    let deps: SessionActor.SuspendDeps =
+        {
+            EventStore = journal
+            Delay = (TurnLoopTests.NeverDelay() :> ILlmDelay)
+            AskTimeout = TimeSpan.FromMinutes 5.0
+            JournalToken = token
+            RunSuspendable = runner.Func
+            ReprimeJournal = Some(reprimeFor store tenantId sessionId "owner-a")
+            RefreshCompact = refresh
+        }
+
+    spawn system $"setagent-{Guid.NewGuid():N}" (SessionActor.behaviorWithSuspend baseProps deps)
+
+/// Compacts a suspendable actor through the client boundary, blocking.
+let private compactSuspendable
+    (store: ISessionStore)
+    (sessionId: SessionId)
+    (session: IActorRef)
+    : SessionCompactReply =
+    SessionActor.compactSuspendableAsync store tenant sessionId session CancellationToken.None
+    |> fun task -> task.GetAwaiter().GetResult()
+
+[<Fact>]
+let ``SetAgent on Idle applies at once and journals the switch`` () : Task =
+    task {
+        let client = suspendScripted [ ScriptStep.Text "done" ]
+
+        use! harness = SessionHarness.CreateAsync(client, suspendSourced [])
+
+        let! before = harness.GetSessionAsync(CancellationToken.None)
+        let target = AgentId.New()
+
+        let! rebound =
+            SessionActor.setAgentSuspendableAsync
+                harness.Store
+                harness.Tenant
+                harness.SessionId
+                harness.Actor
+                target
+                CancellationToken.None
+
+        rebound.AgentId |> should equal target
+
+        let! after = harness.GetSessionAsync(CancellationToken.None)
+        after.AgentId |> should equal target
+
+        let! collected = harness.CollectEventsAsync(CancellationToken.None)
+        let switches = switchEvents (List.ofSeq collected)
+
+        switches.Length |> should equal 1
+        switches[0].PreviousAgentId |> should equal before.AgentId
+        switches[0].NewAgentId |> should equal target
+
+        // Nothing pending: the protocol bootstraps were consumed by their
+        // claims, so no message was stolen and none leaked as a turn.
+        (pendingEntries harness.Store harness.Tenant harness.SessionId).Count
+        |> should equal 0
+    }
+
+[<Fact>]
+let ``SetAgent while Running defers to the quiescent boundary without stealing`` () : Task =
+    task {
+        use entered = new ManualResetEventSlim(false)
+        let release = TaskCompletionSource<string>()
+
+        let client =
+            suspendScripted
+                [
+                    ScriptStep.ToolCall("c1", "gated")
+                    ScriptStep.Text "first"
+                    ScriptStep.Text "second"
+                ]
+
+        use! harness = SessionHarness.CreateAsync(client, suspendSourced [ blockingTool entered release ])
+
+        let! before = harness.GetSessionAsync(CancellationToken.None)
+
+        let! _ = harness.PromptAsync("run it", CancellationToken.None)
+
+        entered.Wait(TimeSpan.FromSeconds 10.0) |> should equal true
+
+        let! running = SessionActor.getSuspendSnapshotAsync harness.Actor CancellationToken.None
+
+        running.State |> should equal SessionState.Running
+
+        // The rebind records as pending: the row still converses with the
+        // previous agent while the turn runs.
+        let target = AgentId.New()
+
+        let! recorded =
+            SessionActor.setAgentSuspendableAsync
+                harness.Store
+                harness.Tenant
+                harness.SessionId
+                harness.Actor
+                target
+                CancellationToken.None
+
+        recorded.AgentId |> should equal before.AgentId
+
+        // A second prompt queues behind the running turn.
+        let! _ = harness.PromptAsync("follow-up", CancellationToken.None)
+
+        release.TrySetResult("ok") |> ignore
+
+        let applied =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () ->
+                (storedRow harness.Store harness.Tenant harness.SessionId).AgentId = target)
+
+        applied |> should equal true
+
+        // Settle barrier: the snapshot round-trips the mailbox after the
+        // apply, making the following journal read exact.
+        let! _ = SessionActor.getSuspendSnapshotAsync harness.Actor CancellationToken.None
+
+        // Both prompts ran, in order: the queued entry was never stolen by
+        // the protocol's re-prime claims.
+        harness.SettledResults.Count |> should equal 2
+        harness.SettledResults[0].AssistantText |> should equal "first"
+        harness.SettledResults[1].AssistantText |> should equal "second"
+
+        let! collected = harness.CollectEventsAsync(CancellationToken.None)
+        let switches = switchEvents (List.ofSeq collected)
+
+        switches.Length |> should equal 1
+        switches[0].PreviousAgentId |> should equal before.AgentId
+        switches[0].NewAgentId |> should equal target
+
+        (pendingEntries harness.Store harness.Tenant harness.SessionId).Count
+        |> should equal 0
+    }
+
+[<Fact>]
+let ``SetAgent while Waiting stays pending until the resumed turn settles`` () : Task =
+    task {
+        let invocations = ref []
+
+        let method =
+            System.Func<string>(fun () ->
+                invocations.Value <- invocations.Value @ [ "gated" ]
+                "ok")
+
+        let gated =
+            AIFunctionFactory.Create(
+                method,
+                "gated",
+                Unchecked.defaultof<string>,
+                Unchecked.defaultof<JsonSerializerOptions>
+            )
+            :> AITool
+
+        let client =
+            suspendScripted
+                [
+                    ScriptStep.ToolCall("c1", "gated")
+                    ScriptStep.Text "resumed"
+                ]
+
+        let options = suspendOptions (SuspendAskPolicy("gated") :> IPermissionPolicy)
+
+        use! harness = SessionHarness.CreateAsync(client, suspendSourced [ gated ], options)
+
+        let! _ = harness.PromptAsync("run it", CancellationToken.None)
+        let! requestId = harness.WaitForSuspensionAsync(CancellationToken.None)
+
+        let! before = harness.GetSessionAsync(CancellationToken.None)
+        before.State |> should equal SessionState.WaitingForInput
+
+        // The parked suspension keeps its entry pending, so the inbox is
+        // never empty mid-suspension: the rebind records as pending instead
+        // of stealing the parked entry.
+        let target = AgentId.New()
+
+        let! recorded =
+            SessionActor.setAgentSuspendableAsync
+                harness.Store
+                harness.Tenant
+                harness.SessionId
+                harness.Actor
+                target
+                CancellationToken.None
+
+        recorded.AgentId |> should equal before.AgentId
+
+        let! result =
+            harness.ReplyAndSettleAsync(
+                PermissionDecision(requestId, PermissionDecisionKind.AllowOnce),
+                CancellationToken.None
+            )
+
+        result.Status |> should equal TurnStatus.Completed
+        result.AssistantText |> should equal "resumed"
+
+        let applied =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () ->
+                (storedRow harness.Store harness.Tenant harness.SessionId).AgentId = target)
+
+        applied |> should equal true
+
+        let! _ = SessionActor.getSuspendSnapshotAsync harness.Actor CancellationToken.None
+
+        let! collected = harness.CollectEventsAsync(CancellationToken.None)
+        let switches = switchEvents (List.ofSeq collected)
+
+        switches.Length |> should equal 1
+        switches[0].PreviousAgentId |> should equal before.AgentId
+        switches[0].NewAgentId |> should equal target
+    }
+
+[<Fact>]
+let ``SetAgent on Idle with queued entries stays pending until the drain`` () : Task =
+    task {
+        let client =
+            suspendScripted
+                [
+                    ScriptStep.Text "queued"
+                    ScriptStep.Text "prompted"
+                ]
+
+        use! harness = SessionHarness.CreateAsync(client, suspendSourced [])
+
+        let! before = harness.GetSessionAsync(CancellationToken.None)
+
+        // Queue straight to the store: the actor stays Idle with one entry
+        // pending and no turn running.
+        let payload = UserMessagePayload(UserMessage.Text "queued") :> InboxPayload
+
+        let! _ =
+            harness.Store.AppendInboxMessage(
+                harness.Tenant,
+                harness.SessionId,
+                payload,
+                DeliveryMode.Queue,
+                CancellationToken.None
+            )
+
+        let target = AgentId.New()
+
+        let! recorded =
+            SessionActor.setAgentSuspendableAsync
+                harness.Store
+                harness.Tenant
+                harness.SessionId
+                harness.Actor
+                target
+                CancellationToken.None
+
+        recorded.AgentId |> should equal before.AgentId
+
+        // The next prompt drains the queued entry first (still pending),
+        // then its own entry; the empty inbox applies the rebind.
+        let! _ = harness.PromptAsync("prompted", CancellationToken.None)
+
+        let applied =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () ->
+                (storedRow harness.Store harness.Tenant harness.SessionId).AgentId = target)
+
+        applied |> should equal true
+
+        let! _ = SessionActor.getSuspendSnapshotAsync harness.Actor CancellationToken.None
+
+        harness.SettledResults.Count |> should equal 2
+        harness.SettledResults[0].AssistantText |> should equal "queued"
+        harness.SettledResults[1].AssistantText |> should equal "prompted"
+
+        let! collected = harness.CollectEventsAsync(CancellationToken.None)
+        let switches = switchEvents (List.ofSeq collected)
+
+        switches.Length |> should equal 1
+        switches[0].NewAgentId |> should equal target
+    }
+
+[<Fact>]
+let ``SetAgent on Closed rejects with InvalidSessionStateException`` () : Task =
+    task {
+        let client = suspendScripted [ ScriptStep.Text "done" ]
+
+        use! harness = SessionHarness.CreateAsync(client, suspendSourced [])
+
+        let! _ = harness.CloseAsync(CancellationToken.None)
+
+        let! before = harness.GetSessionAsync(CancellationToken.None)
+        before.State |> should equal SessionState.Closed
+
+        try
+            let! _ =
+                SessionActor.setAgentSuspendableAsync
+                    harness.Store
+                    harness.Tenant
+                    harness.SessionId
+                    harness.Actor
+                    (AgentId.New())
+                    CancellationToken.None
+
+            failwith "Expected InvalidSessionStateException for a Closed session."
+        with
+        | :? InvalidSessionStateException as rejected -> rejected.SessionId |> should equal harness.SessionId
+        | ex -> failwith $"Expected InvalidSessionStateException, observed %s{ex.GetType().Name}."
+    }
+
+[<Fact>]
+let ``Compact after SetAgent journals under the refreshed token`` () =
+    use system = createSystem ()
+    let store, journal = createJournalStores ()
+    let created = createSession store
+    appendStored store created.Id "prime" |> ignore
+    let primed = claimTurn store created.Id "owner-a"
+    seedJournal journal created.Id primed.Token (overThresholdTexts ())
+
+    let summariser =
+        new ScriptedChatClient(
+            ResizeArray<ScriptStep>(
+                [|
+                    ScriptStep.Text("swap gist", 4L, 6L)
+                |]
+            )
+        )
+
+    let force = Compaction.CompactForce()
+
+    let wiring =
+        compactDeps (summariser :> IChatClient) Unchecked.defaultof<IModelPolicy> journal primed.Token force
+
+    let runner =
+        ScriptSuspendRunner(settledCompletion "unused", settledCompletion "unused")
+
+    let settled = ResizeArray<TurnResult>()
+
+    let refresh (token: string) : CompactDeps option =
+        Some(compactDeps (summariser :> IChatClient) Unchecked.defaultof<IModelPolicy> journal token force)
+
+    let session =
+        spawnReprimeable system store tenant journal created.Id primed.Token runner settled (Some wiring) (Some refresh)
+
+    try
+        let target = AgentId.New()
+        let rebound = setAgent store tenant created.Id session target
+        rebound.AgentId |> should equal target
+
+        // A stale compact token would fence the write into CompactFenced:
+        // completing proves the swap refreshed the wiring.
+        match compactSuspendable store created.Id session with
+        | CompactCompleted(beforeEstimate, afterEstimate) -> (beforeEstimate > afterEstimate) |> should equal true
+        | reply -> failwith $"Expected CompactCompleted, observed %O{reply}."
+
+        let events = collectJournal journal tenant created.Id
+
+        events
+        |> List.exists (fun event -> event :? CompactedEvent)
+        |> should equal true
+
+        let switches = switchEvents events
+        switches.Length |> should equal 1
+        switches[0].NewAgentId |> should equal target
+    finally
+        stopSystem system

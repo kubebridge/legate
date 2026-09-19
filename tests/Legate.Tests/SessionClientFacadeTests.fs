@@ -1152,3 +1152,566 @@ let ``Invalid facade options fail client resolution`` () =
 
     (fun () -> provider.GetRequiredService<SessionClient>() |> ignore)
     |> should throw typeof<InvalidOperationException>
+
+// ──────────────────────────────────────────────────────────────────────────
+// Fork and SetAgent (issue 123)
+
+/// Builds a container with the facade registered plus the agent catalog:
+/// the agent store SetAgent validates the rebound agent against.
+let private createServicesWithAgents
+    (chatClient: ScriptedChatClient)
+    (tools: StaticToolSource)
+    (agents: IAgentStore)
+    : IServiceCollection =
+    let database = InMemoryDatabase()
+
+    let services = ServiceCollection() :> IServiceCollection
+
+    LegateServiceCollectionExtensions.AddLegate(
+        services,
+        ?configure =
+            Some(fun (builder: LegateBuilder) ->
+                builder.Storage.UseSessionStore(InMemorySessionStore(database)) |> ignore
+                builder.Tools.AddSource(tools) |> ignore
+                builder.Agents.UseStore(agents) |> ignore)
+    )
+    |> ignore
+
+    services.AddSingleton<ISessionEventStore>(InMemorySessionEventStore(database))
+    |> ignore
+
+    services.AddSingleton<IChatClient>(chatClient) |> ignore
+    services
+
+/// An agent definition for the catalog, enabled or not.
+let private agentDefinition (id: AgentId) (enabled: bool) : Agent =
+    {
+        Id = id
+        Tenant = TenantId.Default
+        Name = "rebindable"
+        Description = "Handles rebinding questions"
+        Model = ModelReference.Parse "anthropic/claude-sonnet"
+        SystemPrompt = "You help with rebinding."
+        EnvironmentVariables = null
+        PermissionDefaults = null
+        ToolSelection = null
+        PackageReference = null
+        Enabled = enabled
+        Schedule = null
+        RowVersion = 0UL
+        CreatedAt = DateTimeOffset.UtcNow
+        UpdatedAt = DateTimeOffset.UtcNow
+    }
+
+/// Inserts the agent into the catalog, failing the test on conflict.
+let private insertAgent (agents: IAgentStore) (agent: Agent) : Task =
+    task {
+        let! outcome = agents.UpdateIfUnchanged(TenantId.Default, agent, 0UL, CancellationToken.None)
+
+        match outcome with
+        | :? AgentUpdated -> ()
+        | _ -> failwith "Expected the agent insert to apply."
+    }
+
+/// Reads the whole journal in sequence order through the facade.
+let private readAllEvents (client: SessionClient) (sessionId: SessionId) : Task<SessionEvent list> =
+    task {
+        let collected = ResizeArray<SessionEvent>()
+        let mutable cursor = 0L
+        let mutable paging = true
+
+        while paging do
+            let! page = SessionClientOperations.ReadEventsAsync(client, sessionId, cursor, 100, CancellationToken.None)
+
+            if isNull (box page) || page.Count = 0 then
+                paging <- false
+            else
+                for event in page do
+                    if not (isNull (box event)) then
+                        collected.Add(event)
+
+                        if event.Sequence.HasValue && event.Sequence.Value > cursor then
+                            cursor <- event.Sequence.Value
+
+                if page.Count < 100 then
+                    paging <- false
+
+        return List.ofSeq collected
+    }
+
+/// The agent-switch events in a journal, in sequence order.
+let private switchEventsOf (events: SessionEvent list) : AgentSwitchedEvent list =
+    [
+        for event in events do
+            match event with
+            | :? AgentSwitchedEvent as switched when not (isNull (box switched)) -> yield switched
+            | _ -> ()
+    ]
+
+[<Fact>]
+let ``SetAgent on Idle rebinds at once through the DI actor system`` () : Task =
+    task {
+        // No agent catalog registered: validation is skipped and any id
+        // rebinds, so this also pins the catalog-less path.
+        use provider =
+            (createServices (scripted [ ScriptStep.Text "done" ]) (sourced [])).BuildServiceProvider()
+
+        return!
+            withClient provider (fun client ->
+                task {
+                    let! created = openSession client
+                    let target = AgentId.New()
+
+                    let! rebound =
+                        SessionClientOperations.SetAgentAsync(client, created.Id, target, CancellationToken.None)
+
+                    rebound.AgentId |> should equal target
+
+                    let! stored = storedOf client created.Id
+                    stored.AgentId |> should equal target
+
+                    let! events = readAllEvents client created.Id
+                    let switches = switchEventsOf events
+
+                    switches.Length |> should equal 1
+                    switches[0].PreviousAgentId |> should equal created.AgentId
+                    switches[0].NewAgentId |> should equal target
+
+                    let! pending = client.Store.ReadPendingInbox(client.Tenant, created.Id, CancellationToken.None)
+
+                    pending.Count |> should equal 0
+                })
+    }
+
+[<Fact>]
+let ``SetAgent with an unknown agent throws AgentNotFoundException`` () : Task =
+    task {
+        let agents = InMemoryStoreFactory.agentStore (InMemoryDatabase())
+
+        use provider =
+            (createServicesWithAgents (scripted [ ScriptStep.Text "done" ]) (sourced []) agents).BuildServiceProvider()
+
+        return!
+            withClient provider (fun client ->
+                task {
+                    let! created = openSession client
+                    let missing = AgentId.New()
+
+                    let! rejected =
+                        Assert.ThrowsAsync<AgentNotFoundException>(fun () ->
+                            SessionClientOperations.SetAgentAsync(client, created.Id, missing, CancellationToken.None))
+
+                    rejected.AgentId |> should equal missing
+
+                    // Nothing rebound: the row still converses with the
+                    // previous agent.
+                    let! stored = storedOf client created.Id
+                    stored.AgentId |> should equal created.AgentId
+                })
+    }
+
+[<Fact>]
+let ``SetAgent with a disabled agent throws AgentDisabledException`` () : Task =
+    task {
+        let agents = InMemoryStoreFactory.agentStore (InMemoryDatabase())
+        let target = AgentId.New()
+        do! insertAgent agents (agentDefinition target false)
+
+        use provider =
+            (createServicesWithAgents (scripted [ ScriptStep.Text "done" ]) (sourced []) agents).BuildServiceProvider()
+
+        return!
+            withClient provider (fun client ->
+                task {
+                    let! created = openSession client
+
+                    let! rejected =
+                        Assert.ThrowsAsync<AgentDisabledException>(fun () ->
+                            SessionClientOperations.SetAgentAsync(client, created.Id, target, CancellationToken.None))
+
+                    rejected.AgentId |> should equal target
+
+                    let! stored = storedOf client created.Id
+                    stored.AgentId |> should equal created.AgentId
+                })
+    }
+
+[<Fact>]
+let ``SetAgent with an enabled registered agent rebinds`` () : Task =
+    task {
+        let agents = InMemoryStoreFactory.agentStore (InMemoryDatabase())
+        let target = AgentId.New()
+        do! insertAgent agents (agentDefinition target true)
+
+        use provider =
+            (createServicesWithAgents (scripted [ ScriptStep.Text "done" ]) (sourced []) agents).BuildServiceProvider()
+
+        return!
+            withClient provider (fun client ->
+                task {
+                    let! created = openSession client
+
+                    let! rebound =
+                        SessionClientOperations.SetAgentAsync(client, created.Id, target, CancellationToken.None)
+
+                    rebound.AgentId |> should equal target
+
+                    let! stored = storedOf client created.Id
+                    stored.AgentId |> should equal target
+                })
+    }
+
+[<Fact>]
+let ``SetAgent on closed and missing sessions throws`` () : Task =
+    task {
+        use provider =
+            (createServices (scripted [ ScriptStep.Text "done" ]) (sourced [])).BuildServiceProvider()
+
+        return!
+            withClient provider (fun client ->
+                task {
+                    let! missing =
+                        Assert.ThrowsAsync<SessionNotFoundException>(fun () ->
+                            SessionClientOperations.SetAgentAsync(
+                                client,
+                                SessionId.New(),
+                                AgentId.New(),
+                                CancellationToken.None
+                            ))
+
+                    (isNull (box missing)) |> should equal false
+
+                    let! created = openSession client
+                    let! _ = client.Store.CloseSession(client.Tenant, created.Id, CancellationToken.None)
+
+                    let! closed =
+                        Assert.ThrowsAsync<InvalidSessionStateException>(fun () ->
+                            SessionClientOperations.SetAgentAsync(
+                                client,
+                                created.Id,
+                                AgentId.New(),
+                                CancellationToken.None
+                            ))
+
+                    closed.SessionId |> should equal created.Id
+                })
+    }
+
+[<Fact>]
+let ``SetAgent while Running defers to the quiescent boundary without stealing`` () : Task =
+    task {
+        let entered = new ManualResetEventSlim(false)
+        let release = new TaskCompletionSource<string>()
+
+        let chat =
+            scripted
+                [
+                    ScriptStep.ToolCall("c1", "gated")
+                    ScriptStep.Text "first"
+                    ScriptStep.Text "second"
+                ]
+
+        let tools = sourced [ blockingTool "gated" entered release ]
+
+        use provider = (createServices chat tools).BuildServiceProvider()
+
+        try
+            return!
+                withClient provider (fun client ->
+                    task {
+                        let! created = openSession client
+                        let waiter = settleWaiter created.Id
+
+                        let prompt =
+                            SessionClientOperations.PromptAsync(
+                                client,
+                                created.Id,
+                                UserMessage.Text "start",
+                                DeliveryMode.Queue,
+                                CancellationToken.None
+                            )
+
+                        let! _ = awaitWhat prompt "the prompt to land"
+                        Assert.True(entered.Wait(waitBound))
+
+                        // The rebind records as pending: the row still
+                        // converses with the previous agent while the turn
+                        // runs.
+                        let target = AgentId.New()
+
+                        let! recorded =
+                            SessionClientOperations.SetAgentAsync(client, created.Id, target, CancellationToken.None)
+
+                        recorded.AgentId |> should equal created.AgentId
+
+                        let! _ =
+                            SessionClientOperations.PromptAsync(
+                                client,
+                                created.Id,
+                                UserMessage.Text "follow-up",
+                                DeliveryMode.Queue,
+                                CancellationToken.None
+                            )
+
+                        let secondWaiter = settleWaiter created.Id
+                        release.TrySetResult("unblocked") |> ignore
+
+                        let! first = awaitWhat waiter.Task "the running turn to settle"
+                        first.Status |> should equal TurnStatus.Completed
+                        first.AssistantText |> should equal "first"
+
+                        let! second = awaitWhat secondWaiter.Task "the queued turn to settle"
+                        second.Status |> should equal TurnStatus.Completed
+                        second.AssistantText |> should equal "second"
+
+                        // Snapshot barrier: the snapshot answers after the
+                        // finish handling (apply included) completed, making
+                        // the following row and journal reads exact without
+                        // polling.
+                        let! actor = client.Resolve(created.Id, CancellationToken.None)
+                        let! _ = SessionActor.getSuspendSnapshotAsync actor CancellationToken.None
+
+                        // Both prompts ran, in order, and the empty inbox
+                        // applied the recorded rebind at the boundary.
+                        (settledOf created.Id).Count |> should equal 2
+
+                        let! stored = storedOf client created.Id
+                        stored.AgentId |> should equal target
+
+                        let! events = readAllEvents client created.Id
+                        let switches = switchEventsOf events
+
+                        switches.Length |> should equal 1
+                        switches[0].PreviousAgentId |> should equal created.AgentId
+                        switches[0].NewAgentId |> should equal target
+
+                        let! pending = client.Store.ReadPendingInbox(client.Tenant, created.Id, CancellationToken.None)
+
+                        pending.Count |> should equal 0
+                    })
+        finally
+            entered.Dispose()
+    }
+
+[<Fact>]
+let ``Fork copies the prefix and references the source`` () : Task =
+    task {
+        // The source turn suspends on the Ask verdict and resumes: the
+        // suspendable flow journals suspend and resolve events only, so the
+        // suspend/resume cycle is what makes the prefix non-empty (a bare
+        // text turn journals nothing).
+        let invocations = ref []
+
+        let services =
+            createServices
+                (scripted
+                    [
+                        ScriptStep.ToolCall("c1", "gated")
+                        ScriptStep.Text "src"
+                        ScriptStep.Text "forked"
+                    ])
+                (sourced [ tool "gated" "ok" invocations ])
+
+        services.AddSingleton<IPermissionPolicy>(AskPolicy("gated")) |> ignore
+
+        use provider = services.BuildServiceProvider()
+
+        return!
+            withClient provider (fun client ->
+                task {
+                    let agent = AgentId.New()
+                    let options = SessionOptions()
+                    options.Title <- "checkout"
+                    options.MaxIterations <- 7
+
+                    let metadata = Dictionary<string, string>(StringComparer.Ordinal)
+                    metadata["lane"] <- "evening"
+                    options.Metadata <- metadata :> IReadOnlyDictionary<string, string>
+
+                    let! created =
+                        SessionClientOperations.OpenSessionAsync(client, agent, options, CancellationToken.None)
+
+                    let waiter = settleWaiter created.Id
+                    let stream = collectStream client created.Id 0L 1
+
+                    let! _ =
+                        SessionClientOperations.PromptAsync(
+                            client,
+                            created.Id,
+                            UserMessage.Text "start",
+                            DeliveryMode.Queue,
+                            CancellationToken.None
+                        )
+
+                    let! suspended = awaitWhat stream "the suspend lifecycle"
+
+                    let asked =
+                        suspended
+                        |> List.pick (fun event ->
+                            match event with
+                            | :? PermissionRequestedEvent as asked when not (isNull (box asked)) -> Some asked
+                            | _ -> None)
+
+                    let! _ =
+                        SessionClientOperations.ReplyAsync(
+                            client,
+                            created.Id,
+                            PermissionDecision(asked.RequestId, PermissionDecisionKind.AllowOnce),
+                            CancellationToken.None
+                        )
+
+                    let! first = awaitWhat waiter.Task "the source turn to settle"
+                    first.Status |> should equal TurnStatus.Completed
+                    first.AssistantText |> should equal "src"
+
+                    let! sourceEvents = readAllEvents client created.Id
+                    Assert.True(sourceEvents.Length > 0)
+                    let prefixLength = int64 sourceEvents.Length
+
+                    let! forked =
+                        SessionClientOperations.ForkAsync(client, created.Id, prefixLength, CancellationToken.None)
+
+                    forked.Id |> should not' (equal created.Id)
+                    forked.AgentId |> should equal agent
+                    forked.Title |> should equal "checkout"
+                    forked.State |> should equal SessionState.Idle
+                    forked.CurrentTurnId.HasValue |> should equal false
+
+                    match Option.ofObj forked.Options.Metadata with
+                    | None -> failwith "Expected the fork to carry metadata."
+                    | Some forkedMetadata ->
+                        forked.Options.MaxIterations |> should equal 7
+                        forkedMetadata["ForkedFrom"] |> should equal (created.Id.ToString())
+                        forkedMetadata["lane"] |> should equal "evening"
+
+                    let! forkedEvents = readAllEvents client forked.Id
+                    forkedEvents.Length |> should equal sourceEvents.Length
+
+                    (forkedEvents |> List.map (fun event -> event.GetType().Name))
+                    |> should equal (sourceEvents |> List.map (fun event -> event.GetType().Name))
+
+                    for event in forkedEvents do
+                        event.SessionId |> should equal forked.Id
+
+                    let! forkedPending =
+                        client.Store.ReadPendingInbox(client.Tenant, forked.Id, CancellationToken.None)
+
+                    forkedPending.Count |> should equal 0
+
+                    // The fork is live: it prompts and settles on its own
+                    // actor with the copied agent.
+                    let forkWaiter = settleWaiter forked.Id
+
+                    let! _ =
+                        SessionClientOperations.PromptAsync(
+                            client,
+                            forked.Id,
+                            UserMessage.Text "hello",
+                            DeliveryMode.Queue,
+                            CancellationToken.None
+                        )
+
+                    let! forkedResult = awaitWhat forkWaiter.Task "the forked turn to settle"
+                    forkedResult.Status |> should equal TurnStatus.Completed
+                    forkedResult.AssistantText |> should equal "forked"
+                })
+    }
+
+[<Fact>]
+let ``Fork clamps beyond-tail and allows closed and empty prefixes`` () : Task =
+    task {
+        let invocations = ref []
+
+        let services =
+            createServices
+                (scripted
+                    [
+                        ScriptStep.ToolCall("c1", "gated")
+                        ScriptStep.Text "src"
+                    ])
+                (sourced [ tool "gated" "ok" invocations ])
+
+        services.AddSingleton<IPermissionPolicy>(AskPolicy("gated")) |> ignore
+
+        use provider = services.BuildServiceProvider()
+
+        return!
+            withClient provider (fun client ->
+                task {
+                    let! created = openSession client
+                    let waiter = settleWaiter created.Id
+                    let stream = collectStream client created.Id 0L 1
+
+                    let! _ =
+                        SessionClientOperations.PromptAsync(
+                            client,
+                            created.Id,
+                            UserMessage.Text "start",
+                            DeliveryMode.Queue,
+                            CancellationToken.None
+                        )
+
+                    let! suspended = awaitWhat stream "the suspend lifecycle"
+
+                    let asked =
+                        suspended
+                        |> List.pick (fun event ->
+                            match event with
+                            | :? PermissionRequestedEvent as asked when not (isNull (box asked)) -> Some asked
+                            | _ -> None)
+
+                    let! _ =
+                        SessionClientOperations.ReplyAsync(
+                            client,
+                            created.Id,
+                            PermissionDecision(asked.RequestId, PermissionDecisionKind.AllowOnce),
+                            CancellationToken.None
+                        )
+
+                    let! _ = awaitWhat waiter.Task "the source turn to settle"
+
+                    let! sourceEvents = readAllEvents client created.Id
+                    Assert.True(sourceEvents.Length > 0)
+
+                    let! _ = client.Store.CloseSession(client.Tenant, created.Id, CancellationToken.None)
+
+                    // A closed source forks fine, clamping past the tail to
+                    // the full journal.
+                    let! clamped =
+                        SessionClientOperations.ForkAsync(client, created.Id, Int64.MaxValue, CancellationToken.None)
+
+                    clamped.AgentId |> should equal created.AgentId
+                    clamped.Title |> should equal created.Title
+
+                    let! clampedEvents = readAllEvents client clamped.Id
+                    clampedEvents.Length |> should equal sourceEvents.Length
+
+                    // A cursor below the first sequence forks an empty
+                    // transcript that still references its parent.
+                    let! empty = SessionClientOperations.ForkAsync(client, created.Id, 0L, CancellationToken.None)
+
+                    match Option.ofObj empty.Options.Metadata with
+                    | None -> failwith "Expected the empty fork to carry metadata."
+                    | Some emptyMetadata -> emptyMetadata["ForkedFrom"] |> should equal (created.Id.ToString())
+
+                    let! emptyEvents = readAllEvents client empty.Id
+                    emptyEvents.Length |> should equal 0
+                })
+    }
+
+[<Fact>]
+let ``Fork of a missing session throws SessionNotFoundException`` () : Task =
+    task {
+        use provider =
+            (createServices (scripted [ ScriptStep.Text "done" ]) (sourced [])).BuildServiceProvider()
+
+        return!
+            withClient provider (fun client ->
+                task {
+                    let! missing =
+                        Assert.ThrowsAsync<SessionNotFoundException>(fun () ->
+                            SessionClientOperations.ForkAsync(client, SessionId.New(), 1L, CancellationToken.None))
+
+                    (isNull (box missing)) |> should equal false
+                })
+    }

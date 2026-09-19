@@ -407,6 +407,44 @@ type SessionStoreConformance(store: ISessionStore, clock: TestClock, tenant: Ten
             | null -> failwith "expected the session"
             | session -> Assert.False(session.CurrentTurnId.HasValue)
         }
+
+    // ── Settle-then-rebind: the SetAgent protocol's precondition ──
+
+    [<Fact>]
+    member this.``SetSessionAgent succeeds after the claim settles``() =
+        task {
+            let! created = store.CreateSession(tenant, this.SampleSession(), CancellationToken.None)
+
+            let message =
+                UserMessagePayload(UserMessage.Text("settle then rebind")) :> InboxPayload
+
+            let! _ = store.AppendInboxMessage(tenant, created.Id, message, DeliveryMode.Queue, CancellationToken.None)
+
+            let! claimed =
+                store.ClaimNextTurn(tenant, created.Id, "rebinder", TimeSpan.FromMinutes 5., CancellationToken.None)
+
+            let claim = (claimed :?> TurnLeaseRenewed).Claim
+
+            // The primed claim stamps CurrentTurnId, so the rebind is
+            // blocked while it is held: the actor settles before rebinding.
+            Assert.Throws<InvalidSessionStateException>(fun () ->
+                store
+                    .SetSessionAgent(tenant, created.Id, AgentId.New(), CancellationToken.None)
+                    .GetAwaiter()
+                    .GetResult()
+                |> ignore)
+            |> ignore
+
+            let! settled = store.SettleTurn(tenant, claim, TurnStatus.Completed, null, CancellationToken.None)
+
+            Assert.True(settled :? TurnSettled)
+
+            let rebound = AgentId.New()
+
+            let! afterRebind = store.SetSessionAgent(tenant, created.Id, rebound, CancellationToken.None)
+
+            Assert.Equal(rebound, afterRebind.AgentId)
+        }
     // ── Settlement idempotency ──
 
     [<Fact>]

@@ -173,6 +173,9 @@ type PostgresSessionEventStore(options: PostgresOptions, timeProvider: TimeProvi
             | :? AgentInvalidEvent as source ->
                 AgentInvalidEvent(sessionId, turnId, stamped, timestamp, source.AgentName, source.Reason)
                 :> SessionEvent
+            | :? AgentSwitchedEvent as source ->
+                AgentSwitchedEvent(sessionId, turnId, stamped, timestamp, source.PreviousAgentId, source.NewAgentId)
+                :> SessionEvent
             | _ -> raise (ArgumentException("The event batch carries an unknown event kind.", "events")))
         |> Seq.toList
 
