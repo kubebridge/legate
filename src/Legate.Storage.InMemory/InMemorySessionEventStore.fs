@@ -318,6 +318,16 @@ type InMemorySessionEventStore(database: InMemoryDatabase) =
                                         source.Companions
                                     )
                                     :> SessionEvent
+                                | :? AgentSwitchedEvent as source ->
+                                    AgentSwitchedEvent(
+                                        sessionId,
+                                        turnId,
+                                        sequence,
+                                        timestamp,
+                                        source.PreviousAgentId,
+                                        source.NewAgentId
+                                    )
+                                    :> SessionEvent
                                 | _ ->
                                     raise (
                                         ArgumentException(

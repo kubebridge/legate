@@ -56,7 +56,8 @@ let private makeClient (harness: SessionHarness) (waitDelay: ILlmDelay) (default
         (fun _ _ -> Task.FromResult(harness.Actor)),
         new SessionEventBus(harness.Journal),
         defaultBound,
-        waitDelay
+        waitDelay,
+        None
     )
 
 let private questionArgs (question: string) : IDictionary<string, obj> =

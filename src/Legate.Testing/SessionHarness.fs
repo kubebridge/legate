@@ -412,6 +412,45 @@ type SessionHarness
                 let token = claimTokenOf claimed
                 let toolsDict = tools.AsDictionary()
 
+                // The SetAgent re-prime: a fresh bootstrap plus ClaimNextTurn
+                // under the harness owner and lease, mirroring the spawn
+                // prime. The claim consumes the bootstrap, so real prompts
+                // still drain first; a held live claim (or any prime
+                // failure) reads as None and the recorded rebind retries at
+                // the next quiescent boundary.
+                let reprime () : TurnClaim option =
+                    try
+                        let fresh = UserMessagePayload(UserMessage.Text "harness bootstrap") :> InboxPayload
+
+                        store
+                            .AppendInboxMessage(
+                                resolved.Tenant,
+                                created.Id,
+                                fresh,
+                                DeliveryMode.Queue,
+                                CancellationToken.None
+                            )
+                            .GetAwaiter()
+                            .GetResult()
+                        |> ignore
+
+                        match
+                            store.ClaimNextTurn(
+                                resolved.Tenant,
+                                created.Id,
+                                "harness",
+                                TimeSpan.FromHours 1.0,
+                                CancellationToken.None
+                            )
+                            |> fun task -> task.GetAwaiter().GetResult()
+                        with
+                        | :? TurnLeaseRenewed as renewed when not (isNull (box renewed)) -> Some renewed.Claim
+                        | :? TurnLeaseHeld as held when not (isNull (box held)) -> Some held.Claim
+                        | :? TurnLeaseExpiring as expiring when not (isNull (box expiring)) -> Some expiring.Claim
+                        | _ -> None
+                    with _ ->
+                        None
+
                 let noDrain () : IReadOnlyList<InboxEntry> =
                     ResizeArray<InboxEntry>() :> IReadOnlyList<InboxEntry>
 
@@ -535,6 +574,8 @@ type SessionHarness
                         AskTimeout = resolved.AskTimeout
                         JournalToken = token
                         RunSuspendable = runner
+                        ReprimeJournal = Some reprime
+                        RefreshCompact = None
                     }
 
                 let actor =

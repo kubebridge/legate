@@ -670,6 +670,28 @@ type SessionCellDeriver() =
                         (Some(metadata :> IReadOnlyDictionary<string, string>))
                         invalid.Timestamp
 
+                | :? AgentSwitchedEvent as switched ->
+                    // Rule 11: one system cell carrying the agent switch
+                    // audit: the previous and new agent. Metadata carries
+                    // the discriminator plus both agent ids, so hosts can
+                    // filter on either, exactly like the prune remark.
+                    flushRun ()
+
+                    let metadata = Dictionary<string, string>()
+                    metadata["event"] <- "agentSwitched"
+                    metadata["previousAgentId"] <- switched.PreviousAgentId.ToString()
+                    metadata["newAgentId"] <- switched.NewAgentId.ToString()
+
+                    addCell
+                        SessionCellKind.System
+                        ($"switched agent {switched.PreviousAgentId} -> {switched.NewAgentId}")
+                        null
+                        null
+                        false
+                        iteration
+                        (Some(metadata :> IReadOnlyDictionary<string, string>))
+                        switched.Timestamp
+
                 | _ ->
                     // Progress markers (turnStarted, usage, compacted,
                     // turnCompleted, turnAborted, sessionClosed,

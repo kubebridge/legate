@@ -952,6 +952,8 @@ let private spawnWriterActor
             AskTimeout = TimeSpan.FromMinutes 5.0
             JournalToken = token
             RunSuspendable = runner
+            ReprimeJournal = None
+            RefreshCompact = None
         }
 
     spawn system $"journal-{Guid.NewGuid():N}" (SessionActor.behaviorWithSuspend baseProps deps)

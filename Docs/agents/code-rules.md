@@ -64,7 +64,8 @@ so the public boundary follows these rules; internal code stays idiomatic F#.
 - The throw family lives in `src/Legate.Abstractions/Exceptions.fs`:
   `SessionNotFoundException`, `InvalidSessionStateException`,
   `AdmissionRejectedException`, `ProviderException`, `DeadlineExceededException`,
-  `WorkspaceException`, `ToolException`, and `InvalidBlobKeyException`. Each carries
+  `WorkspaceException`, `ToolException`, `AgentNotFoundException`,
+  `AgentDisabledException`, and `InvalidBlobKeyException`. Each carries
   structured context (ids, provider id, HTTP status, retry-after, offending blob
   key) on properties; hosts never
   parse exception messages, and messages never embed secrets or tool
@@ -73,8 +74,8 @@ so the public boundary follows these rules; internal code stays idiomatic F#.
   failures throw. Unknown session ids throw `SessionNotFoundException`
   (`OpenSession` with an unknown agent, `ResumeSession`, `GetSession`,
   `SetAgent` on a missing session), a session in a disallowed state throws
-  `InvalidSessionStateException` (prompting, replying, forking, aborting, or
-  compacting a closed session; `SetAgent` while a turn is running), admission
+  `InvalidSessionStateException` (prompting, replying, aborting, compacting,
+  or rebinding a closed session; forking allows closed sources), admission
   rejection throws `AdmissionRejectedException`, provider failures outside a
   turn outcome throw `ProviderException`, bounded operations that outrun their
   deadline throw `DeadlineExceededException`, workspace binding or teardown
