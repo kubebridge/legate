@@ -308,6 +308,8 @@ let private spawnSuspendable
             AskTimeout = TimeSpan.FromMinutes 5.0
             JournalToken = "test-token"
             RunSuspendable = runner
+            ReprimeJournal = None
+            RefreshCompact = None
         }
 
     spawn system $"dispatch-{Guid.NewGuid():N}" (SessionActor.behaviorWithSuspend baseProps deps)
@@ -951,7 +953,7 @@ let private buildServiceProvider
         new SessionEventBus(journal :> ISessionEventStore, SessionSubscriptionOptions(), null)
 
     let client =
-        new SessionClient(store, tenant, resolve, bus, TimeSpan.FromMinutes 1.0, RecordingDelay() :> ILlmDelay)
+        new SessionClient(store, tenant, resolve, bus, TimeSpan.FromMinutes 1.0, RecordingDelay() :> ILlmDelay, None)
 
     let services = ServiceCollection()
     services.AddSingleton<ISessionStore>(store) |> ignore
