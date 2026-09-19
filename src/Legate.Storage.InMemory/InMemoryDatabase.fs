@@ -104,6 +104,11 @@ type InMemoryDatabase(timeProvider: TimeProvider, options: InMemoryStoreOptions)
     // Agents keyed by (tenant, agent id).
     let agents = Dictionary<(TenantId * AgentId), Agent>()
 
+    // Consumed schedule occurrences keyed by (tenant, occurrence key): the
+    // first consume wins the firing and every later consume observes the
+    // race loss. One row per key per tenant.
+    let scheduleOccurrences = Dictionary<(TenantId * string), ScheduleOccurrenceRow>()
+
     // Custom tools per (tenant, agent id), keyed by tool name.
     let customTools =
         Dictionary<(TenantId * AgentId), Dictionary<string, AgentCustomTool>>()
@@ -168,6 +173,10 @@ type InMemoryDatabase(timeProvider: TimeProvider, options: InMemoryStoreOptions)
     /// The agent rows keyed by (tenant, agent id).
     member internal _.Agents = agents
 
+    /// The consumed schedule occurrences keyed by (tenant, occurrence key).
+    /// Internal: stores mutate through the gate only.
+    member internal _.ScheduleOccurrences = scheduleOccurrences
+
     /// The custom tools per (tenant, agent id), name-keyed.
     member internal _.CustomTools = customTools
 
@@ -186,6 +195,34 @@ type InMemoryDatabase(timeProvider: TimeProvider, options: InMemoryStoreOptions)
     /// The instant the stores read now from; exposed so stores on the same
     /// database stamp with one clock.
     member db.UtcNow = db.TimeProvider.GetUtcNow()
+
+/// One consumed schedule occurrence row: the agent the occurrence fired
+/// for, the occurrence instant in UTC the key was derived from, and when
+/// this database consumed the key. The first consume wins the firing;
+/// every later consume of the same key observes the race loss.
+and internal ScheduleOccurrenceRow
+    (
+        tenant: TenantId,
+        agentId: AgentId,
+        occurrenceKey: string,
+        occurrenceUtc: DateTimeOffset,
+        consumedAt: DateTimeOffset
+    ) =
+
+    /// The tenant the agent belongs to.
+    member val Tenant = tenant with get, set
+
+    /// The agent the occurrence fired for.
+    member val AgentId = agentId with get, set
+
+    /// The occurrence key shaped {agentId}:{cron}:{occurrenceTicks}.
+    member val OccurrenceKey = occurrenceKey with get, set
+
+    /// The occurrence instant in UTC the key was derived from.
+    member val OccurrenceUtc = occurrenceUtc with get, set
+
+    /// When this database consumed the key.
+    member val ConsumedAt = consumedAt with get, set
 
 /// One open turn row: the claim model's minting state. A turn is open from
 /// the claim that consumed its message until the settle or abort that

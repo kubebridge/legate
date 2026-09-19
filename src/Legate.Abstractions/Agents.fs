@@ -4,6 +4,7 @@ namespace Legate
 open System
 open System.Collections.Generic
 open System.Text.RegularExpressions
+open Cronos
 
 // Agent definition contracts. An Agent is what a host stores and what the
 // runtime reads to run a session: identity, tenant, model configuration,
@@ -143,6 +144,181 @@ type AgentSchedule =
         /// and skipped.
         Enabled: bool
     }
+
+// Windows display names mapped to their IANA equivalents, so hosts that
+// still configure Windows time-zone names keep working on machines whose
+// time-zone data carries only IANA ids. The lookup tries the id verbatim
+// first (IANA on Linux and modern Windows, Windows names on Windows), so
+// this map only covers the common names the verbatim lookup misses.
+module internal AgentScheduleZoneInternals =
+
+    let WindowsToIana: IReadOnlyDictionary<string, string> =
+        readOnlyDict
+            [
+                "Eastern Standard Time", "America/New_York"
+                "Central Standard Time", "America/Chicago"
+                "Mountain Standard Time", "America/Denver"
+                "Pacific Standard Time", "America/Los_Angeles"
+                "GMT Standard Time", "Europe/London"
+                "W. Europe Standard Time", "Europe/Berlin"
+                "Central European Standard Time", "Europe/Warsaw"
+                "Romance Standard Time", "Europe/Paris"
+                "Tokyo Standard Time", "Asia/Tokyo"
+                "China Standard Time", "Asia/Shanghai"
+                "AUS Eastern Standard Time", "Australia/Sydney"
+            ]
+
+    let tryFindZone (id: string) : TimeZoneInfo option =
+        let mutable zone = Unchecked.defaultof<TimeZoneInfo>
+
+        if TimeZoneInfo.TryFindSystemTimeZoneById(id, &zone) then
+            Some zone
+        else
+            match WindowsToIana.TryGetValue(id) with
+            | true, iana when TimeZoneInfo.TryFindSystemTimeZoneById(iana, &zone) -> Some zone
+            | _ -> None
+
+/// Static validation for the cron expression and time zone an
+/// <see cref="T:Legate.AgentSchedule" /> may carry. Cron is the 5-field
+/// standard form (minute, hour, day of month, month, day of week) parsed by
+/// the pinned Cronos package; the time zone is an IANA id resolved through
+/// <see cref="T:System.TimeZoneInfo" /> with a Windows-name fallback for the
+/// common display names. Both stay strings on the contract: this type owns
+/// the formats the schedule evaluator evaluates.
+/// <exception cref="T:System.ArgumentException">A value passed to Validate fails its rule.</exception>
+type AgentScheduleRules() =
+
+    /// Tests one cron expression against the 5-field standard form.
+    /// <param name="cron">The cron expression to test.</param>
+    /// <returns>true when Cronos parses the expression as a 5-field schedule; otherwise false.</returns>
+    static member private CronIsValid(cron: string) =
+        let mutable parsed = Unchecked.defaultof<CronExpression>
+
+        CronExpression.TryParse(cron, CronFormat.Standard, &parsed)
+
+    /// Validates a cron expression and returns it unchanged.
+    /// <param name="cron">The cron expression, for example "0 9 * * 1-5".</param>
+    /// <returns>The validated cron expression, unchanged.</returns>
+    /// <exception cref="T:System.ArgumentNullException">The cron expression is null.</exception>
+    /// <exception cref="T:System.ArgumentException">The cron expression is empty or is not a 5-field standard-form expression (6-field seconds forms included).</exception>
+    static member ValidateCron(cron: string) : string =
+        if isNull (box cron) then
+            raise (ArgumentNullException(nameof cron))
+
+        if String.IsNullOrWhiteSpace cron || not (AgentScheduleRules.CronIsValid cron) then
+            raise (
+                ArgumentException(
+                    "A schedule cron must be a 5-field standard-form expression (minute, hour, day of month, month, day of week), for example '0 9 * * 1-5'.",
+                    nameof cron
+                )
+            )
+
+        cron
+
+    /// Attempts to validate a cron expression; returns false for null and
+    /// for any expression that fails the 5-field standard form.
+    /// <param name="cron">The cron expression to test.</param>
+    /// <returns>true when the expression parses as a 5-field schedule; otherwise false.</returns>
+    static member TryValidateCron(cron: string | null) : bool =
+        match cron with
+        | null -> false
+        | text when String.IsNullOrWhiteSpace text -> false
+        | text -> AgentScheduleRules.CronIsValid text
+
+    /// Validates a time-zone id and returns it unchanged: the id verbatim
+    /// when the system knows it, else one of the mapped Windows display
+    /// names.
+    /// <param name="timeZone">The time-zone id, for example "Europe/Berlin".</param>
+    /// <returns>The validated time-zone id, unchanged.</returns>
+    /// <exception cref="T:System.ArgumentNullException">The time-zone id is null.</exception>
+    /// <exception cref="T:System.ArgumentException">The id is empty, whitespace, or unknown to the system and the Windows-name fallback.</exception>
+    static member ValidateTimeZone(timeZone: string) : string =
+        if isNull (box timeZone) then
+            raise (ArgumentNullException(nameof timeZone))
+
+        if String.IsNullOrWhiteSpace timeZone then
+            raise (
+                ArgumentException(
+                    "A schedule time zone must be an IANA id the system knows (for example 'Europe/Berlin') or a mapped Windows display name (for example 'W. Europe Standard Time').",
+                    nameof timeZone
+                )
+            )
+
+        match AgentScheduleZoneInternals.tryFindZone timeZone with
+        | Some _ -> timeZone
+        | None ->
+            raise (
+                ArgumentException(
+                    "A schedule time zone must be an IANA id the system knows (for example 'Europe/Berlin') or a mapped Windows display name (for example 'W. Europe Standard Time').",
+                    nameof timeZone
+                )
+            )
+
+    /// Attempts to validate a time-zone id; returns false for null and for
+    /// any id the system and the Windows-name fallback do not know.
+    /// <param name="timeZone">The time-zone id to test.</param>
+    /// <returns>true when the id resolves; otherwise false.</returns>
+    static member TryValidateTimeZone(timeZone: string | null) : bool =
+        match timeZone with
+        | null -> false
+        | id when String.IsNullOrWhiteSpace id -> false
+        | id -> AgentScheduleZoneInternals.tryFindZone id |> Option.isSome
+
+    /// Resolves a validated time-zone id to its system zone: the verbatim
+    /// id when known, else its Windows-fallback mapping.
+    /// <param name="timeZone">The time-zone id to resolve. Must pass validation.</param>
+    /// <returns>The system time zone the schedule fires in.</returns>
+    /// <exception cref="T:System.ArgumentNullException">The time-zone id is null.</exception>
+    /// <exception cref="T:System.ArgumentException">The id is unknown to the system and the Windows-name fallback.</exception>
+    static member ResolveTimeZone(timeZone: string) : TimeZoneInfo =
+        AgentScheduleRules.ValidateTimeZone timeZone |> ignore
+
+        match AgentScheduleZoneInternals.tryFindZone timeZone with
+        | Some zone -> zone
+        | None ->
+            raise (
+                ArgumentException(
+                    "A schedule time zone must be an IANA id the system knows (for example 'Europe/Berlin') or a mapped Windows display name (for example 'W. Europe Standard Time').",
+                    nameof timeZone
+                )
+            )
+
+    /// Validates the schedule an agent carries, if any: a null schedule is
+    /// on-demand only and always valid, while a present schedule must carry
+    /// a 5-field cron and a resolvable time zone.
+    /// <param name="schedule">The agent's schedule, or null when the agent runs on demand only.</param>
+    /// <param name="agentId">The agent the schedule belongs to, carried on the typed error.</param>
+    /// <exception cref="T:Legate.InvalidAgentScheduleException">The schedule carries an invalid cron expression or time zone.</exception>
+    static member ValidateSchedule(schedule: AgentSchedule | null, agentId: AgentId) : unit =
+        match schedule with
+        | null -> ()
+        | present ->
+            let cron: string | null = present.Cron
+            let zone: string | null = present.TimeZone
+
+            if not (AgentScheduleRules.TryValidateCron cron) then
+                raise (
+                    InvalidAgentScheduleException(
+                        agentId,
+                        cron,
+                        zone,
+                        sprintf
+                            "The agent %O carries an invalid schedule cron: expected a 5-field standard-form expression."
+                            agentId
+                    )
+                )
+
+            if not (AgentScheduleRules.TryValidateTimeZone zone) then
+                raise (
+                    InvalidAgentScheduleException(
+                        agentId,
+                        cron,
+                        zone,
+                        sprintf
+                            "The agent %O carries an unknown schedule time zone: expected an IANA id or a mapped Windows display name."
+                            agentId
+                    )
+                )
 
 /// One custom HTTP tool an agent may call: a model-facing name, the HTTP
 /// endpoint to invoke, and the signing secret that authenticates each call.

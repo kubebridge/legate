@@ -210,6 +210,7 @@ let ``Baseline creates all ten tables with their indexes`` () =
             "IX_custom_tools_agent_enabled"
             "IX_custom_tools_uq_tool"
             "IX_schedule_occurrences_uq_occurrence"
+            "IX_schedule_occurrences_uq_occurrence_key"
             "IX_outbox_pending_created"
             "IX_outbox_delivered_at"
             "IX_session_grants_uq_grant"
@@ -343,6 +344,10 @@ let ``Baseline columns carry the contract shapes`` () =
             "consumed"
             "consumed_at"
             "created_at"
+            // The schedule evaluator's additive migration (issue 121)
+            // carries the full occurrence key the store consumes exactly
+            // once; the baseline columns stay for observability.
+            "occurrence_key"
         ]
 
     columnNames keepAlive "outbox"

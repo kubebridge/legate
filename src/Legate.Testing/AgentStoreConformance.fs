@@ -76,6 +76,19 @@ type AgentStoreConformance(agentStore: IAgentStore, toolStore: IAgentCustomToolS
             UpdatedAt = DateTimeOffset.MinValue
         }
 
+    /// A minimal agent carrying the given schedule, for the save-time
+    /// schedule validation facts.
+    member this.ScheduledAgent(cron: string, timeZone: string) =
+        { this.SampleAgent() with
+            Schedule =
+                {
+                    AgentSchedule.Cron = cron
+                    TimeZone = timeZone
+                    Message = "tick"
+                    Enabled = true
+                }
+        }
+
     [<Fact>]
     member this.``Expected version 0 inserts and version checks update``() =
         task {
@@ -196,4 +209,92 @@ type AgentStoreConformance(agentStore: IAgentStore, toolStore: IAgentCustomToolS
             let! wrongTenantTools = toolStore.ListCustomTools(this.OtherTenant, agentId, CancellationToken.None)
 
             Assert.Equal(0, wrongTenantTools.Count)
+        }
+
+    [<Fact>]
+    member this.``The first consume wins and the second observes already-consumed``() =
+        task {
+            let key = "conformance-agent:*:634000000000000000"
+            let instant = DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero)
+
+            let! first =
+                agentStore.TryConsumeScheduleOccurrence(tenant, AgentId.New(), key, instant, CancellationToken.None)
+
+            Assert.True(first :? ScheduleOccurrenceConsumed)
+            Assert.Equal(key, (first :?> ScheduleOccurrenceConsumed).OccurrenceKey)
+
+            let! second =
+                agentStore.TryConsumeScheduleOccurrence(tenant, AgentId.New(), key, instant, CancellationToken.None)
+
+            Assert.True(second :? ScheduleOccurrenceAlreadyConsumed)
+            Assert.Equal(key, (second :?> ScheduleOccurrenceAlreadyConsumed).OccurrenceKey)
+        }
+
+    [<Fact>]
+    member this.``Schedule occurrence consumption is tenant-isolated``() =
+        task {
+            let key = "conformance-agent:*:634000000000000001"
+            let instant = DateTimeOffset(2026, 1, 1, 0, 1, 0, TimeSpan.Zero)
+
+            let! first =
+                agentStore.TryConsumeScheduleOccurrence(tenant, AgentId.New(), key, instant, CancellationToken.None)
+
+            Assert.True(first :? ScheduleOccurrenceConsumed)
+
+            let! other =
+                agentStore.TryConsumeScheduleOccurrence(
+                    this.OtherTenant,
+                    AgentId.New(),
+                    key,
+                    instant,
+                    CancellationToken.None
+                )
+
+            Assert.True(other :? ScheduleOccurrenceConsumed)
+        }
+
+    [<Fact>]
+    member this.``An invalid cron throws the typed schedule error at save``() =
+        task {
+            let agent = this.ScheduledAgent("not a cron", "UTC")
+
+            try
+                let! _ = agentStore.UpdateIfUnchanged(tenant, agent, 0UL, CancellationToken.None)
+                Assert.Fail("The save should have rejected the invalid cron.")
+            with :? InvalidAgentScheduleException as rejected ->
+                Assert.Equal(agent.Id, rejected.AgentId)
+                Assert.Equal("not a cron", rejected.Cron)
+        }
+
+    [<Fact>]
+    member this.``An invalid time zone throws the typed schedule error at save``() =
+        task {
+            let agent = this.ScheduledAgent("* * * * *", "Mars/Olympus_Mons")
+
+            try
+                let! _ = agentStore.UpdateIfUnchanged(tenant, agent, 0UL, CancellationToken.None)
+                Assert.Fail("The save should have rejected the unknown time zone.")
+            with :? InvalidAgentScheduleException as rejected ->
+                Assert.Equal(agent.Id, rejected.AgentId)
+                Assert.Equal("Mars/Olympus_Mons", rejected.TimeZone)
+        }
+
+    [<Fact>]
+    member this.``IANA and Windows-fallback time zones save cleanly``() =
+        task {
+            for timeZone in
+                [
+                    "America/New_York"
+                    "Eastern Standard Time"
+                    "UTC"
+                ] do
+                let! outcome =
+                    agentStore.UpdateIfUnchanged(
+                        tenant,
+                        this.ScheduledAgent("0 9 * * 1-5", timeZone),
+                        0UL,
+                        CancellationToken.None
+                    )
+
+                Assert.True(outcome :? AgentUpdated)
         }

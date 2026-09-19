@@ -106,6 +106,7 @@
     <Compile Include="CompletionRedriverTests.fs" />
     <Compile Include="SessionExpiryTests.fs" />
     <Compile Include="DispatcherTests.fs" />
+    <Compile Include="ScheduleEvaluatorTests.fs" />
     <Compile Include="WorkspaceRebindTests.fs" />
     <Compile Include="WorkspaceOutputTests.fs" />
     <Compile Include="PromptWaitHubTests.fs" />

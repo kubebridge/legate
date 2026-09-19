@@ -190,6 +190,14 @@ type internal FileAgentStore
                     :> IReadOnlyList<Agent>
             }
 
+        member _.TryConsumeScheduleOccurrence(_, _, _, _, _) =
+            Task.FromException<ScheduleOccurrenceOutcome>(
+                ReadOnlyAgentStoreException(
+                    "TryConsumeScheduleOccurrence",
+                    "The file-based agent store is read-only: schedule occurrences are consumed through the backing store, never through file definitions."
+                )
+            )
+
 // ──────────────────────────────────────────────────────────────────────────
 // Builder composition
 

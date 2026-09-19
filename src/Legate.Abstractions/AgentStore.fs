@@ -61,6 +61,41 @@ and [<Sealed>] AgentUpdateConflict(agent: Agent | null) =
     member _.Agent: Agent | null = agent
 
 // ───────────────────────────────────────────────────────────────────────────
+// Schedule occurrence consumption outcomes
+
+/// What the store decided when
+/// <see cref="M:Legate.IAgentStore.TryConsumeScheduleOccurrence*" /> landed:
+/// the caller must branch on the outcome. A result object, never an
+/// exception: a lost race is an expected branch of two evaluator instances
+/// sweeping the same due occurrence, never a failure. Serialises
+/// polymorphically: every concrete outcome carries a stable <c>$type</c>
+/// discriminator on the wire, mirroring
+/// <see cref="T:Legate.AgentUpdateOutcome" />.
+[<AbstractClass>]
+[<JsonPolymorphic(TypeDiscriminatorPropertyName = "$type")>]
+[<JsonDerivedType(typeof<ScheduleOccurrenceConsumed>, "scheduleOccurrenceConsumed")>]
+[<JsonDerivedType(typeof<ScheduleOccurrenceAlreadyConsumed>, "scheduleOccurrenceAlreadyConsumed")>]
+type ScheduleOccurrenceOutcome() = class end
+
+/// This caller consumed the occurrence first: it owns the firing and must
+/// prompt the agent once for it.
+/// <param name="occurrenceKey">The occurrence key that was consumed.</param>
+and [<Sealed>] ScheduleOccurrenceConsumed(occurrenceKey: string) =
+    inherit ScheduleOccurrenceOutcome()
+
+    /// The occurrence key that was consumed.
+    member _.OccurrenceKey = occurrenceKey
+
+/// Another caller consumed the occurrence first: this caller must produce
+/// zero effects for it.
+/// <param name="occurrenceKey">The occurrence key that was already consumed.</param>
+and [<Sealed>] ScheduleOccurrenceAlreadyConsumed(occurrenceKey: string) =
+    inherit ScheduleOccurrenceOutcome()
+
+    /// The occurrence key that was already consumed.
+    member _.OccurrenceKey = occurrenceKey
+
+// ───────────────────────────────────────────────────────────────────────────
 // The store contracts
 
 /// The durable store contract for agent definitions: get by id, list by
@@ -141,6 +176,31 @@ type IAgentStore =
     /// <returns>The agents with an enabled schedule; empty when it has none.</returns>
     abstract ListAgentsWithEnabledSchedules:
         tenant: TenantId * cancellationToken: CancellationToken -> Task<IReadOnlyList<Agent>>
+
+    /// Atomically consumes one schedule occurrence key shaped
+    /// <c>{agentId}:{cron}:{occurrenceTicks}</c>: the first caller wins the
+    /// firing, every later caller observes the race loss. A result object,
+    /// never an exception: two evaluator instances sweeping the same due
+    /// occurrence race here on purpose, and the loser must produce zero
+    /// effects. Consume-first-then-fire gives at-most-once firing with
+    /// exactly-once consumption: a crash between the consume and the prompt
+    /// loses one firing, never duplicates one.
+    /// <param name="tenant">The tenant the agent belongs to.</param>
+    /// <param name="agentId">The agent the occurrence fired for.</param>
+    /// <param name="occurrenceKey">The occurrence key to consume. Must not be null.</param>
+    /// <param name="occurrenceUtc">The occurrence instant in UTC the key was derived from.</param>
+    /// <param name="cancellationToken">Token that abandons the consume.</param>
+    /// <returns>The consumed outcome when this caller won, or the already-consumed outcome when another caller won first.</returns>
+    /// <exception cref="T:System.ArgumentNullException">The occurrence key is null.</exception>
+    /// <exception cref="T:System.ArgumentException">The occurrence key is empty or whitespace.</exception>
+    /// <exception cref="T:Legate.ReadOnlyAgentStoreException">The store is read-only.</exception>
+    abstract TryConsumeScheduleOccurrence:
+        tenant: TenantId *
+        agentId: AgentId *
+        occurrenceKey: string *
+        occurrenceUtc: DateTimeOffset *
+        cancellationToken: CancellationToken ->
+            Task<ScheduleOccurrenceOutcome>
 
 /// The durable store contract for the custom HTTP tools enabled per agent.
 /// Tools are keyed by <see cref="T:Legate.AgentCustomTool" />.Name within

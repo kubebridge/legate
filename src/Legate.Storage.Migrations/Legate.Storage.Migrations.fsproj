@@ -12,6 +12,7 @@
     <Compile Include="MigrationNaming.fs" />
     <Compile Include="BaselineV1.fs" />
     <Compile Include="CleanupClaimsArchiveLocation.fs" />
+    <Compile Include="ScheduleOccurrenceKey.fs" />
     <Compile Include="MigrationServiceExtensions.fs" />
   </ItemGroup>
 

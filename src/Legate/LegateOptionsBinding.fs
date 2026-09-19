@@ -35,6 +35,7 @@ module internal LegateOptionsBinding =
             "Completion:RedriveInterval"
             "Completion:ClaimLeaseDuration"
             "Cluster:ShutdownGraceSeconds"
+            "Schedules:PollInterval"
         ]
 
     // Relative paths of every flat-choice enum with its type and the phrase

@@ -250,6 +250,24 @@ let ``DeleteAgent throws the typed read-only exception`` () : Task =
         ex.Operation |> should equal "DeleteAgent"
     }
 
+[<Fact>]
+let ``TryConsumeScheduleOccurrence throws the typed read-only exception`` () : Task =
+    task {
+        let store = composite (InMemoryDatabase()) [] []
+
+        let! ex =
+            Assert.ThrowsAsync<ReadOnlyAgentStoreException>(fun () ->
+                store.TryConsumeScheduleOccurrence(
+                    TenantId.Default,
+                    AgentId.New(),
+                    "agent:cron:ticks",
+                    DateTimeOffset.UtcNow,
+                    CancellationToken.None
+                ))
+
+        ex.Operation |> should equal "TryConsumeScheduleOccurrence"
+    }
+
 // ──────────────────────────────────────────────────────────────────────────
 // Reload and tenancy
 
