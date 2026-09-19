@@ -33,6 +33,7 @@ type SqliteAgentStore(database: SqliteDatabase) =
 
     let agentsTable () = database.Table "agents"
     let toolsTable () = database.Table "custom_tools"
+    let occurrencesTable () = database.Table "schedule_occurrences"
 
     let readAgent (reader: SqliteDataReader) : Agent =
         let json = reader.GetString(4)
@@ -120,6 +121,8 @@ type SqliteAgentStore(database: SqliteDatabase) =
             task {
                 if isNull (box agent) then
                     raise (ArgumentNullException(nameof agent))
+
+                AgentScheduleRules.ValidateSchedule(agent.Schedule, agent.Id)
 
                 try
                     return
@@ -294,6 +297,45 @@ type SqliteAgentStore(database: SqliteDatabase) =
                                 agents.Add(readAgent reader)
 
                             agents :> IReadOnlyList<Agent>)
+                with
+                | :? LegateException as ex -> return raise ex
+                | :? SqliteException as sql -> return raise (mapSql sql)
+            }
+
+        member _.TryConsumeScheduleOccurrence(tenant, agentId, occurrenceKey, occurrenceUtc, _) =
+            task {
+                if isNull (box occurrenceKey) then
+                    raise (ArgumentNullException(nameof occurrenceKey))
+
+                if String.IsNullOrWhiteSpace occurrenceKey then
+                    raise (ArgumentException("The occurrence key must be a non-empty string.", nameof occurrenceKey))
+
+                try
+                    return
+                        lock database.Gate (fun () ->
+                            use connection = database.OpenConnection()
+
+                            use command = connection.CreateCommand()
+
+                            // The baseline unique key is an index, not a table
+                            // constraint, so the consume is INSERT OR IGNORE:
+                            // the first caller inserts and wins, every later
+                            // caller ignores into the existing row.
+                            command.CommandText <-
+                                $"INSERT OR IGNORE INTO \"%s{occurrencesTable ()}\" (tenant, agent_id, occurrence_key, occurrence_utc, consumed, consumed_at, created_at) VALUES ($tenant, $agent, $key, $utc, 1, $now, $now)"
+
+                            let now = database.UtcNow
+
+                            command.Parameters.AddWithValue("$tenant", tenant.Value) |> ignore
+                            command.Parameters.AddWithValue("$agent", agentId.Value) |> ignore
+                            command.Parameters.AddWithValue("$key", occurrenceKey) |> ignore
+                            command.Parameters.AddWithValue("$utc", toIso occurrenceUtc) |> ignore
+                            command.Parameters.AddWithValue("$now", toIso now) |> ignore
+
+                            if command.ExecuteNonQuery() > 0 then
+                                ScheduleOccurrenceConsumed occurrenceKey :> ScheduleOccurrenceOutcome
+                            else
+                                ScheduleOccurrenceAlreadyConsumed occurrenceKey :> ScheduleOccurrenceOutcome)
                 with
                 | :? LegateException as ex -> return raise ex
                 | :? SqliteException as sql -> return raise (mapSql sql)

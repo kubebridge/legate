@@ -78,3 +78,26 @@ module PostgresMigrationTests =
         connection.Open()
 
         Assert.Equal("YES", archivePointerNullable connection)
+
+    /// The occurrence-key column the schedule evaluator's additive
+    /// migration owns: non-nullable, so every consumed row carries the full
+    /// key the store deduplicates on.
+    let private occurrenceKeyNullable (connection: NpgsqlConnection) : string =
+        use command =
+            new NpgsqlCommand(
+                "SELECT is_nullable FROM information_schema.columns WHERE table_schema = 'legate' AND table_name = 'schedule_occurrences' AND column_name = 'occurrence_key'",
+                connection
+            )
+
+        use reader = command.ExecuteReader()
+
+        if reader.Read() then reader.GetString(0) else "missing"
+
+    [<Fact>]
+    let ``Schedule migration adds the non-nullable occurrence key`` () =
+        let connectionString = PostgresTestDatabase.ensureReady ()
+
+        use connection = new NpgsqlConnection(connectionString)
+        connection.Open()
+
+        Assert.Equal("NO", occurrenceKeyNullable connection)

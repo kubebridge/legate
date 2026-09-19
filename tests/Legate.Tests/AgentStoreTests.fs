@@ -71,6 +71,7 @@ let sampleCustomTool (agentId: AgentId) =
 type FakeAgentStore() =
     let agents = Dictionary<string, Agent>()
     let tools = Dictionary<string, AgentCustomTool>()
+    let consumed = HashSet<string>()
 
     let agentKey (tenantId: TenantId) (agentId: AgentId) =
         sprintf "%s|%s" tenantId.Value agentId.Value
@@ -142,6 +143,17 @@ type FakeAgentStore() =
             let result = ResizeArray<Agent>()
             result.AddRange listed
             Task.FromResult(result :> IReadOnlyList<Agent>)
+
+        member _.TryConsumeScheduleOccurrence(t, _agentId, occurrenceKey, _occurrenceUtc, _) =
+            if box occurrenceKey |> isNull then
+                raise (ArgumentNullException(nameof occurrenceKey))
+
+            let key = sprintf "%s|%s" t.Value occurrenceKey
+
+            if consumed.Add key then
+                Task.FromResult(ScheduleOccurrenceConsumed occurrenceKey :> ScheduleOccurrenceOutcome)
+            else
+                Task.FromResult(ScheduleOccurrenceAlreadyConsumed occurrenceKey :> ScheduleOccurrenceOutcome)
 
     interface IAgentCustomToolStore with
         member _.ListCustomTools(t, agentId, _) =
@@ -672,6 +684,9 @@ type ReadOnlyAgentStore() =
         member _.ListAgentsWithEnabledSchedules(_, _) =
             Task.FromResult(ResizeArray<Agent>() :> IReadOnlyList<Agent>)
 
+        member _.TryConsumeScheduleOccurrence(_, _, _, _, _) =
+            raise (ReadOnlyAgentStoreException("TryConsumeScheduleOccurrence", "The agent store is read-only."))
+
 /// A read-only IAgentCustomToolStore: serves every read, refuses every
 /// write with the typed exception.
 type ReadOnlyAgentCustomToolStore() =
@@ -711,6 +726,20 @@ let ``A read-only IAgentStore serves reads and throws the typed exception on wri
             failwith "expected ReadOnlyAgentStoreException"
         with :? ReadOnlyAgentStoreException as exn ->
             exn.Operation |> should equal "DeleteAgent"
+
+        try
+            let! _ =
+                store.TryConsumeScheduleOccurrence(
+                    tenant,
+                    AgentId.New(),
+                    "agent:cron:ticks",
+                    DateTimeOffset.UtcNow,
+                    CancellationToken.None
+                )
+
+            failwith "expected ReadOnlyAgentStoreException"
+        with :? ReadOnlyAgentStoreException as exn ->
+            exn.Operation |> should equal "TryConsumeScheduleOccurrence"
     }
     |> (fun t -> t.Wait())
 

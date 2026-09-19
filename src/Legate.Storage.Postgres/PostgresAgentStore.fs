@@ -173,6 +173,8 @@ type PostgresAgentStore(options: PostgresOptions, timeProvider: TimeProvider) =
             if isNull (box agent) then
                 raise (ArgumentNullException(nameof agent))
 
+            AgentScheduleRules.ValidateSchedule(agent.Schedule, agent.Id)
+
             this.EnsureMigrated()
 
             transact options (fun connection transaction ->
@@ -306,6 +308,37 @@ type PostgresAgentStore(options: PostgresOptions, timeProvider: TimeProvider) =
 
                 reader.Close()
                 agents :> IReadOnlyList<Agent>)
+            |> Task.FromResult
+
+        member this.TryConsumeScheduleOccurrence(tenant, agentId, occurrenceKey, occurrenceUtc, _) =
+            if isNull (box occurrenceKey) then
+                raise (ArgumentNullException(nameof occurrenceKey))
+
+            if String.IsNullOrWhiteSpace occurrenceKey then
+                raise (ArgumentException("The occurrence key must be a non-empty string.", nameof occurrenceKey))
+
+            this.EnsureMigrated()
+
+            transact options (fun connection transaction ->
+                let occurrences = qualified options "schedule_occurrences"
+                let now = this.UtcNow
+
+                use cmd =
+                    command
+                        connection
+                        transaction
+                        $"INSERT INTO {occurrences} (tenant, agent_id, occurrence_key, occurrence_utc, consumed, consumed_at, created_at) VALUES (@t, @agent, @key, @utc, TRUE, @now, @now) ON CONFLICT (tenant, occurrence_key) DO NOTHING"
+
+                textParam cmd "t" (tenant.ToString())
+                textParam cmd "agent" (agentId.ToString())
+                textParam cmd "key" occurrenceKey
+                textParam cmd "utc" (stamp occurrenceUtc)
+                textParam cmd "now" (stamp now)
+
+                if cmd.ExecuteNonQuery() > 0 then
+                    ScheduleOccurrenceConsumed occurrenceKey :> ScheduleOccurrenceOutcome
+                else
+                    ScheduleOccurrenceAlreadyConsumed occurrenceKey :> ScheduleOccurrenceOutcome)
             |> Task.FromResult
 
     interface IAgentCustomToolStore with

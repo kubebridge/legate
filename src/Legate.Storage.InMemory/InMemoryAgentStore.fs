@@ -55,6 +55,8 @@ type InMemoryAgentStore(database: InMemoryDatabase) =
             if isNull (box agent) then
                 raise (ArgumentNullException(nameof agent))
 
+            AgentScheduleRules.ValidateSchedule(agent.Schedule, agent.Id)
+
             lock database.Gate (fun () ->
                 match agentRow tenant agent.Id with
                 | None ->
@@ -108,6 +110,23 @@ type InMemoryAgentStore(database: InMemoryDatabase) =
                 |> Seq.sortBy (fun agent -> agent.Name)
                 |> Seq.toList
                 :> IReadOnlyList<Agent>)
+            |> ok
+
+        member _.TryConsumeScheduleOccurrence(tenant, agentId, occurrenceKey, occurrenceUtc, _) =
+            if isNull (box occurrenceKey) then
+                raise (ArgumentNullException(nameof occurrenceKey))
+
+            if String.IsNullOrWhiteSpace occurrenceKey then
+                raise (ArgumentException("The occurrence key must be a non-empty string.", nameof occurrenceKey))
+
+            lock database.Gate (fun () ->
+                match database.ScheduleOccurrences.TryGetValue((tenant, occurrenceKey)) with
+                | true, _ -> ScheduleOccurrenceAlreadyConsumed occurrenceKey :> ScheduleOccurrenceOutcome
+                | false, _ ->
+                    database.ScheduleOccurrences[(tenant, occurrenceKey)] <-
+                        ScheduleOccurrenceRow(tenant, agentId, occurrenceKey, occurrenceUtc, database.UtcNow)
+
+                    ScheduleOccurrenceConsumed occurrenceKey :> ScheduleOccurrenceOutcome)
             |> ok
 
     interface IAgentCustomToolStore with

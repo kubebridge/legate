@@ -588,6 +588,30 @@ type ClusterOptions() =
             violation
 
 // ──────────────────────────────────────────────────────────────────────────
+// Schedules
+
+/// Agent schedule settings: how often the schedule evaluator sweeps agents
+/// with enabled schedules for due occurrences. Bound from the
+/// <c>Legate:Schedules</c> configuration section; mutable so hosts can set
+/// properties before registering. Defaults sweep every 60 seconds: 5-field
+/// cron ticks at minute boundaries, so a 60 s sweep fires each occurrence
+/// within a minute of its time without busy-looping.
+type ScheduleOptions() =
+
+    /// How often the evaluator sweeps the tenant for agents with enabled
+    /// schedules. Default 60 seconds.
+    member val PollInterval: TimeSpan = TimeSpan.FromSeconds 60.0 with get, set
+
+    /// Returns null when every knob is in range, otherwise a message for the
+    /// first violation.
+    /// <returns>The first violation's message, or null when the settings are valid.</returns>
+    member this.Validate() : string | null =
+        if this.PollInterval <= TimeSpan.Zero then
+            "PollInterval must be positive."
+        else
+            null
+
+// ──────────────────────────────────────────────────────────────────────────
 // Root
 
 /// Context-pruning settings: how much of the model's context window pruning
@@ -675,6 +699,9 @@ type LegateOptions() =
     /// Context-pruning settings. Never null.
     member val Pruning: ContextPruningOptions = ContextPruningOptions() with get, set
 
+    /// Agent schedule settings. Never null.
+    member val Schedules: ScheduleOptions = ScheduleOptions() with get, set
+
     /// Returns null when every section is in range, otherwise the first
     /// violation prefixed with its section path.
     /// <returns>The first violation's message, or null when the settings are valid.</returns>
@@ -699,6 +726,8 @@ type LegateOptions() =
             "Cluster must not be null."
         elif isNull (box this.Pruning) then
             "Pruning must not be null."
+        elif isNull (box this.Schedules) then
+            "Schedules must not be null."
         else
             let sections: (string * (unit -> string | null)) list =
                 [
@@ -712,6 +741,7 @@ type LegateOptions() =
                     "AskUser", (fun () -> this.AskUser.Validate())
                     "Cluster", (fun () -> this.Cluster.Validate())
                     "Pruning", (fun () -> this.Pruning.Validate())
+                    "Schedules", (fun () -> this.Schedules.Validate())
                 ]
 
             let mutable violation: string | null = null

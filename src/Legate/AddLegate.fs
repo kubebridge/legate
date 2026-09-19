@@ -91,6 +91,7 @@ type LegateServiceCollectionExtensions =
         JournalArchiveRegistration.register services
         SessionExpiryRegistration.register services
         DispatcherRegistration.register services
+        ScheduleEvaluatorRegistration.register services
         services
 
 // ──────────────────────────────────────────────────────────────────────────

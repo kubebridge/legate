@@ -378,3 +378,28 @@ type ArtifactDecodeException(reason: string, message: string) =
     /// "unrecognizedVideoContainer", or "unsupportedMediaType". Never
     /// contains secrets or tool arguments.
     member _.Reason = reason
+
+/// Raised when an agent is saved with a schedule whose cron expression or
+/// time zone is invalid: the cron is not a 5-field standard-form expression
+/// or the time zone is unknown to the system and the Windows-name fallback.
+/// The offending values travel on properties so hosts can report them
+/// without parsing messages; the message never embeds the schedule text
+/// beyond naming the failure.
+/// <param name="agentId">The id of the agent whose schedule was rejected.</param>
+/// <param name="cron">The offending cron expression exactly as passed, or null when none was supplied.</param>
+/// <param name="timeZone">The offending time-zone id exactly as passed, or null when none was supplied.</param>
+/// <param name="message">The exception message, without secrets or tool arguments.</param>
+[<Sealed>]
+type InvalidAgentScheduleException(agentId: AgentId, cron: string | null, timeZone: string | null, message: string) =
+    inherit LegateException(message)
+
+    /// The id of the agent whose schedule was rejected.
+    member _.AgentId = agentId
+
+    /// The offending cron expression exactly as passed, or null when none
+    /// was supplied.
+    member _.Cron: string | null = cron
+
+    /// The offending time-zone id exactly as passed, or null when none was
+    /// supplied.
+    member _.TimeZone: string | null = timeZone

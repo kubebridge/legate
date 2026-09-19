@@ -62,6 +62,7 @@
     <Compile Include="SessionExpiryService.fs" />
     <Compile Include="DispatcherWake.fs" />
     <Compile Include="Dispatcher.fs" />
+    <Compile Include="ScheduleEvaluatorService.fs" />
     <Compile Include="AddLegate.fs" />
   </ItemGroup>
 
@@ -72,6 +73,7 @@
   <ItemGroup>
     <PackageReference Include="Akka" />
     <PackageReference Include="Akka.FSharp" />
+    <PackageReference Include="Cronos" />
     <PackageReference Include="FSharp.Core" />
     <PackageReference Include="Microsoft.Extensions.AI.Abstractions" />
     <PackageReference Include="Microsoft.Extensions.Configuration" />
