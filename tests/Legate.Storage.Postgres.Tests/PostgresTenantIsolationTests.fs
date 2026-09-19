@@ -16,7 +16,7 @@ module PostgresTenantIsolationTests =
     [<Fact>]
     let ``Sessions resolve null and count zero across tenants`` () =
         task {
-            let _, sessions, _, _ = createStores ()
+            let clock, sessions, _, _ = createStores ()
             let tenant = freshTenant "iso-sessions"
             let other = freshTenant "iso-sessions-other"
 
@@ -75,7 +75,7 @@ module PostgresTenantIsolationTests =
                     tenant,
                     Nullable(),
                     Nullable(),
-                    Nullable(DateTimeOffset.UtcNow.AddHours 1.0),
+                    Nullable(clock.Instant.AddHours 1.0),
                     Nullable(),
                     10,
                     null,
@@ -89,8 +89,8 @@ module PostgresTenantIsolationTests =
                     tenant,
                     Nullable(),
                     Nullable(),
-                    Nullable(DateTimeOffset.UtcNow.AddHours -1.0),
-                    Nullable(DateTimeOffset.UtcNow.AddHours 1.0),
+                    Nullable(clock.Instant.AddHours -1.0),
+                    Nullable(clock.Instant.AddHours 1.0),
                     10,
                     null,
                     CancellationToken.None
