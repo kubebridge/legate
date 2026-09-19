@@ -23,7 +23,7 @@ open System.Diagnostics.Metrics
 // Instrument names (the documented surface the mirror test asserts):
 // legate.turns.started, legate.turns.settled, legate.provider.calls,
 // legate.provider.latency, legate.tool.calls, legate.tool.latency,
-// legate.session.queue.depth, legate.lease.renewals.
+// legate.session.queue.depth, legate.lease.renewals, legate.dispatch.latency.
 // Span operations: Legate.Turn, Legate.ProviderCall, Legate.ToolCall.
 //
 // Rejected: per-module Meter/ActivitySource instances (one named pair keeps
@@ -84,6 +84,12 @@ module internal Telemetry =
     /// leaseLost, cancelled).
     [<Literal>]
     let LeaseRenewalsName = "legate.lease.renewals"
+
+    /// Histogram (milliseconds): dispatch latency from the oldest pending
+    /// inbox entry's append to the dispatcher starting its session. No tags:
+    /// per-session series would explode with sessions.
+    [<Literal>]
+    let DispatchLatencyName = "legate.dispatch.latency"
 
     /// Span operation: one turn of the ReAct loop.
     [<Literal>]
@@ -224,6 +230,13 @@ module internal Telemetry =
 
     let private leaseRenewalsCounter: Counter<int64> =
         meter.CreateCounter<int64>(LeaseRenewalsName, description = "Claim-heartbeat renewals, by outcome.")
+
+    let private dispatchLatencyHistogram: Histogram<double> =
+        meter.CreateHistogram<double>(
+            DispatchLatencyName,
+            "ms",
+            "Dispatch latency from the oldest pending inbox append to the session start."
+        )
 
     /// Treats a null string as empty: ids and names always emit something.
     /// <param name="value">The value to normalise, or null.</param>
@@ -506,5 +519,19 @@ module internal Telemetry =
             let mutable tags = TagList()
             tags.Add(OutcomeTag, ((boundedStatus outcome) :> obj))
             leaseRenewalsCounter.Add(1L, &tags)
+        with _ ->
+            ()
+
+    /// Records one dispatch-latency sample in milliseconds: how long the
+    /// oldest pending inbox entry waited before the dispatcher started its
+    /// session. No tags, so per-session waits never explode the series.
+    /// The session queue depth rides the existing queue-depth gauge (plus
+    /// one on inbox append, minus one on settle consume), so dispatch adds
+    /// no depth instrument of its own. Never throws.
+    /// <param name="milliseconds">The elapsed milliseconds.</param>
+    let recordDispatchLatency (milliseconds: float) : unit =
+        try
+            let mutable tags = TagList()
+            dispatchLatencyHistogram.Record(max 0.0 milliseconds, &tags)
         with _ ->
             ()

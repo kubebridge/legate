@@ -157,6 +157,7 @@ let ``Instrument names carry the documented legate names`` () =
     Telemetry.ToolLatencyName |> should equal "legate.tool.latency"
     Telemetry.QueueDepthName |> should equal "legate.session.queue.depth"
     Telemetry.LeaseRenewalsName |> should equal "legate.lease.renewals"
+    Telemetry.DispatchLatencyName |> should equal "legate.dispatch.latency"
     Telemetry.TurnActivityName |> should equal "Legate.Turn"
     Telemetry.ProviderActivityName |> should equal "Legate.ProviderCall"
     Telemetry.ToolActivityName |> should equal "Legate.ToolCall"
@@ -211,7 +212,8 @@ let ``MeterListener observes every counter and histogram with its tags`` () =
             Telemetry.recordToolLatency 3.25 "probe-tool"
             Telemetry.addQueueDepth 1
             Telemetry.addQueueDepth -1
-            Telemetry.recordLeaseRenewal Telemetry.LeaseContinued)
+            Telemetry.recordLeaseRenewal Telemetry.LeaseContinued
+            Telemetry.recordDispatchLatency 7.5)
 
     shouldHold measurements Telemetry.TurnsStartedName []
     shouldHold measurements Telemetry.TurnsSettledName [ "status", "Completed" ]
@@ -245,6 +247,7 @@ let ``MeterListener observes every counter and histogram with its tags`` () =
     shouldHold measurements Telemetry.QueueDepthName []
 
     shouldHold measurements Telemetry.LeaseRenewalsName [ "outcome", Telemetry.LeaseContinued ]
+    shouldHold measurements Telemetry.DispatchLatencyName []
 
     let latency =
         measurements
