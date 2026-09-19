@@ -72,9 +72,10 @@ streamable-HTTP entries) attaches the same way.
   scratch binds under it) until #113 (HostDirectory) lands.
 - `/agent <name>` is stubbed: agent switching arrives with Wave 3
   (#122-124), which also owns Fork/SetAgent/ListSessions. The facade and
-  the CLI surface exactly the ARCHITECTURE.md Client API table minus those
-  ops, plus the `WaitForSettleAsync` sugar an interactive host needs
-  beside Subscribe plus Reply.
+  the CLI surface exactly the ARCHITECTURE.md Client API table (Fork and
+  SetAgent merged; `/sessions` renders the facade `ListSessionsAsync`
+  page with id, title, and state), plus the `WaitForSettleAsync` sugar an
+  interactive host needs beside Subscribe plus Reply.
 - Tool calls come from MCP servers only in this sample: every call asks
   for console approval (allow once, allow for session, deny). Built-in
   file/exec tools over the workspace arrive in a later sample pass.

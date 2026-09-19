@@ -18,9 +18,9 @@ open Legate.Agents
 
 // Host-driving facade over the suspendable session actor: the public
 // OpenSession, Prompt (+Inject/+Interrupt delivery), Reply, Abort, Compact,
-// Fork, SetAgent, WaitForSettle, Subscribe, ReadTranscript, and ReadEvents
-// operations per the normative Docs/ARCHITECTURE.md Client API table minus
-// ListSessions (which stays out), plus the DI registration
+// Fork, SetAgent, ListSessions, WaitForSettle, Subscribe, ReadTranscript,
+// and ReadEvents operations per the normative Docs/ARCHITECTURE.md Client
+// API table, plus the DI registration
 // wiring LocalActorSystem.SessionChildFactory to behaviorWithSuspend with
 // the production suspendable runner. WaitForSettle is additive sugar the
 // table's PromptAndWait implies but does not name: the settle-wait half an
@@ -132,10 +132,10 @@ and [<Sealed>] SessionCompactFenced() =
 // Operations
 
 /// Host-driving operations on <see cref="T:Legate.SessionClient" /> per the
-/// normative <c>Docs/ARCHITECTURE.md</c> Client API table minus ListSessions
-/// (which stays out): OpenSession, Prompt with
+/// normative <c>Docs/ARCHITECTURE.md</c> Client API table: OpenSession,
+/// Prompt with
 /// every <see cref="T:Legate.DeliveryMode" />, Reply, Abort, Compact, Fork,
-/// SetAgent, WaitForSettle, Subscribe as <see cref="T:System.Collections.Generic.IAsyncEnumerable`1" />,
+/// SetAgent, ListSessions, WaitForSettle, Subscribe as <see cref="T:System.Collections.Generic.IAsyncEnumerable`1" />,
 /// ReadTranscript, and ReadEvents. WaitForSettle is additive sugar beyond
 /// the table: the settle-wait half an interactive host drives beside
 /// Subscribe plus Reply. Control-plane precondition failures
@@ -476,6 +476,12 @@ type SessionClientOperations =
 
         task {
             let! _ = SessionClientOperations.RequireAsync(client, sessionId, cancellationToken)
+
+            // Titling never blocks or fails the prompt: the shared helper
+            // no-ops unless the host opted in and the stored title is
+            // still empty.
+            SessionAutoTitle.fire client sessionId message
+
             let! actor = client.Resolve(sessionId, cancellationToken)
 
             match delivery with
@@ -963,6 +969,93 @@ type SessionClientOperations =
         client.EventBus.ReadEventsAsync(client.Tenant, sessionId, fromSequence, limit, cancellationToken)
 
 // ──────────────────────────────────────────────────────────────────────────
+// Listing
+
+/// Filter and paging options for
+/// <see cref="M:Legate.SessionClientOperations.ListSessionsAsync*" />. A
+/// plain class with mutable properties and defaults, so C# object
+/// initialisers work and absent configuration keeps the defaults.
+[<Sealed>]
+type SessionListOptions() =
+    let mutable continuation: string | null = null
+
+    /// The lifecycle state to filter by, or empty for every state.
+    /// Default empty.
+    member val State: Nullable<SessionState> = Nullable() with get, set
+
+    /// The agent to filter by, or empty for every agent. Default empty.
+    member val AgentId: Nullable<AgentId> = Nullable() with get, set
+
+    /// Only sessions created at or after this instant, or empty for no
+    /// lower bound. Default empty.
+    member val CreatedFrom: Nullable<DateTimeOffset> = Nullable() with get, set
+
+    /// Only sessions created at or before this instant, or empty for no
+    /// upper bound. Default empty.
+    member val CreatedTo: Nullable<DateTimeOffset> = Nullable() with get, set
+
+    /// The maximum number of sessions on the page. Defaults to 50 and
+    /// clamps to 200; must be positive.
+    member val PageSize: int = 50 with get, set
+
+    /// The continuation token from the previous page, or null for the
+    /// first page. Callers pass it verbatim. Default null. An explicit
+    /// property (not an auto-property) so the setter keeps the nullable
+    /// annotation F# callers rely on.
+    member _.Continuation
+        with get (): string | null = continuation
+        and set (value: string | null) = continuation <- value
+
+/// Listing operations on <see cref="T:Legate.SessionClient" />.
+[<Sealed; AbstractClass; Extension>]
+type SessionClientListingOperations =
+
+    /// The largest page <c>ListSessionsAsync</c> asks the store for: the
+    /// store pages stay bounded no matter what the host sets.
+    static member MaxPageSize = 200
+
+    /// The page size <c>ListSessionsAsync</c> asks for when the host leaves
+    /// it unset.
+    static member DefaultPageSize = 50
+
+    /// Lists the client's tenant sessions newest-first with the
+    /// <see cref="T:Legate.SessionListOptions" /> filters, delegating to
+    /// the store: filtering stays store-side so paging walks the filtered
+    /// set. The continuation is opaque and store-owned; callers pass it
+    /// verbatim into the next call.
+    /// <param name="client">The session client. Must not be null.</param>
+    /// <param name="options">The filters and paging, or null for the defaults.</param>
+    /// <param name="cancellationToken">Abandons the list.</param>
+    /// <returns>One bounded page of sessions.</returns>
+    /// <exception cref="T:System.ArgumentOutOfRangeException">The page size is not positive.</exception>
+    [<Extension>]
+    static member ListSessionsAsync
+        (client: SessionClient, options: SessionListOptions | null, cancellationToken: CancellationToken)
+        : Task<SessionPage> =
+        ArgumentNullException.ThrowIfNull(client)
+
+        let effective =
+            match options with
+            | null -> SessionListOptions()
+            | present -> present
+
+        if effective.PageSize <= 0 then
+            raise (ArgumentOutOfRangeException(nameof options, "The session list page size must be positive."))
+
+        let take = min effective.PageSize SessionClientListingOperations.MaxPageSize
+
+        client.Store.ListSessions(
+            client.Tenant,
+            effective.State,
+            effective.AgentId,
+            effective.CreatedFrom,
+            effective.CreatedTo,
+            take,
+            effective.Continuation,
+            cancellationToken
+        )
+
+// ──────────────────────────────────────────────────────────────────────────
 // Wiring
 
 /// Builds the facade client from the container and wires the session
@@ -1174,8 +1267,11 @@ module internal SessionClientWiring =
             | seam -> seam
 
         // Opt-in: without a chat client the identity-only children stay and
-        // the client still serves Open and the reads.
-        match provider.GetService<IChatClient>() with
+        // the client still serves Open and the reads. The same client
+        // serves the auto-title call; without one titling no-ops.
+        let titleClient = provider.GetService<IChatClient>()
+
+        match titleClient with
         | null -> ()
         | client ->
             let sources =
@@ -1235,7 +1331,38 @@ module internal SessionClientWiring =
         // host runs without one: validation is skipped then.
         let agents = Option.ofObj (provider.GetService<IAgentStore>())
 
-        new SessionClient(store, clientOptions.Tenant, resolve, bus, clientOptions.DefaultWaitBound, delay, agents)
+        let built =
+            new SessionClient(store, clientOptions.Tenant, resolve, bus, clientOptions.DefaultWaitBound, delay, agents)
+
+        // Auto-title rides the resolved options: off unless the host opts
+        // in, the title model falling back to the compaction model and
+        // then the session/default resolution, through the registered
+        // chat client (no new provider wiring).
+        let sessions =
+            match box legateOptions.Sessions with
+            | null -> SessionsOptions()
+            | _ -> legateOptions.Sessions
+
+        let llm =
+            match box legateOptions.Llm with
+            | null -> LlmOptions()
+            | _ -> legateOptions.Llm
+
+        built.AutoTitle <-
+            Some(
+                {
+                    Enabled = sessions.AutoTitle
+                    TitleModel = sessions.AutoTitleModel
+                    CompactionModel = llm.Compaction
+                    FacadeDefaultModel = clientOptions.DefaultModel
+                    LlmDefaultModel = llm.DefaultModel
+                    FallbackModel = AgentFileParser.defaultModel
+                    ChatClient = titleClient
+                    Logger = provider.GetService<ILogger<SessionClient>>()
+                }
+            )
+
+        built
 
 /// Registers the session client facade: the options default, the event
 /// bus over the durable journal, and the DI-owned client with its router

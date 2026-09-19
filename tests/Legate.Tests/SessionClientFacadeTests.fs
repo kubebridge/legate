@@ -6,6 +6,7 @@ open System.Collections.Generic
 open System.Text.Json
 open System.Threading
 open System.Threading.Tasks
+open Akka.Actor
 open FsUnit.Xunit
 open Legate
 open Legate.Storage.InMemory
@@ -13,6 +14,7 @@ open Legate.Testing
 open Microsoft.Extensions.AI
 open Microsoft.Extensions.DependencyInjection
 open Microsoft.Extensions.Hosting
+open Microsoft.Extensions.Logging
 open Xunit
 
 // Session client facade (issue 96): the DI-registered SessionClient over
@@ -1713,5 +1715,668 @@ let ``Fork of a missing session throws SessionNotFoundException`` () : Task =
                             SessionClientOperations.ForkAsync(client, SessionId.New(), 1L, CancellationToken.None))
 
                     (isNull (box missing)) |> should equal false
+                })
+    }
+
+// ──────────────────────────────────────────────────────────────────────────
+// ListSessions and automatic titles (issue 124)
+
+/// An ILogger capturing formatted lines for the no-prompt-content proof.
+type private RecordingLogger() =
+    let entries = ResizeArray<string * string>()
+
+    /// The captured (level, line) pairs in call order.
+    member _.Entries: IReadOnlyList<string * string> =
+        entries :> IReadOnlyList<string * string>
+
+    interface ILogger with
+        member _.BeginScope<'TState when 'TState: not null>(_state: 'TState) : IDisposable =
+            Unchecked.defaultof<IDisposable>
+
+        member _.IsEnabled(_) = true
+
+        member _.Log<'TState>
+            (logLevel: LogLevel, _eventId: EventId, state: 'TState, ex: exn, formatter: Func<'TState, exn, string>)
+            : unit =
+            entries.Add(logLevel.ToString(), formatter.Invoke(state, ex))
+
+/// Builds auto-title deps over the given title client for direct-client
+/// and override tests.
+let private titleDeps (enabled: bool) (chat: IChatClient | null) (logger: ILogger | null) : AutoTitleDeps =
+    {
+        Enabled = enabled
+        TitleModel = null
+        CompactionModel = null
+        FacadeDefaultModel = null
+        LlmDefaultModel = null
+        FallbackModel = ModelReference.Parse "legate/default"
+        ChatClient = chat
+        Logger = logger
+    }
+
+/// Builds a session row with the given agent and title for direct-store
+/// setup (the store stamps the tenant, state, and timestamps).
+let private storedSession (agent: AgentId) (title: string) : Session =
+    {
+        Id = SessionId.New()
+        Tenant = TenantId.Default
+        AgentId = agent
+        Title = title
+        State = SessionState.Idle
+        CurrentTurnId = Unchecked.defaultof<Nullable<TurnId>>
+        CreatedAt = DateTimeOffset.UtcNow
+        UpdatedAt = DateTimeOffset.UtcNow
+        ClosedAt = Unchecked.defaultof<Nullable<DateTimeOffset>>
+        WorkspaceBinding = null
+        Options = SessionOptions()
+        PermissionGrants = ResizeArray<string>() :> IReadOnlyList<string>
+    }
+
+/// Builds a SessionClient over a fresh in-memory store and journal for
+/// direct auto-title tests: no actor system, since titling touches only
+/// the store and the chat client.
+let private directTitleSetup () : SessionClient * ISessionStore * TenantId =
+    let database = InMemoryDatabase()
+    let store = InMemorySessionStore(database) :> ISessionStore
+    let journal = InMemorySessionEventStore(database) :> ISessionEventStore
+    let bus = new SessionEventBus(journal, SessionSubscriptionOptions(), null)
+
+    let client =
+        new SessionClient(
+            store,
+            TenantId.Default,
+            (fun (_: SessionId) (_: CancellationToken) -> Task.FromResult(Unchecked.defaultof<IActorRef>)),
+            bus,
+            TimeSpan.FromMinutes 1.0,
+            SystemLlmDelay(TimeProvider.System) :> ILlmDelay,
+            None
+        )
+
+    client, store, TenantId.Default
+
+/// Requires the session row or fails the test: GetSession returns null
+/// when the id does not exist in the tenant.
+let private require (session: Session | null) =
+    match session with
+    | null -> failwith "The session row is missing."
+    | live -> live
+
+/// Polls the stored title until it lands or the ten-second bound lapses:
+/// the fire-and-forget title write races the assertion.
+let private awaitTitle (client: SessionClient) (sessionId: SessionId) : Task<string> =
+    task {
+        let deadline = DateTimeOffset.UtcNow.AddSeconds 10.0
+        let mutable title = ""
+
+        while title = "" && DateTimeOffset.UtcNow < deadline do
+            let! found = client.Store.GetSession(client.Tenant, sessionId, CancellationToken.None)
+
+            match found with
+            | null -> do! Task.Delay(50, CancellationToken.None)
+            | live when not (String.IsNullOrWhiteSpace live.Title) -> title <- live.Title
+            | _ -> do! Task.Delay(50, CancellationToken.None)
+
+        return title
+    }
+
+[<Fact>]
+let ``resolveTitleModel falls back through title compaction facade default and agent default`` () =
+    let chat = scripted [ ScriptStep.Text "x" ]
+
+    let depsWith (title: string | null) (compaction: string | null) (facade: string | null) (llm: string | null) =
+        { titleDeps false (chat :> IChatClient) null with
+            TitleModel = title
+            CompactionModel = compaction
+            FacadeDefaultModel = facade
+            LlmDefaultModel = llm
+        }
+
+    SessionAutoTitle.resolveTitleModel (depsWith "a/m1" "b/m2" "c/m3" "d/m4")
+    |> should equal (ModelReference.Parse "a/m1")
+
+    SessionAutoTitle.resolveTitleModel (depsWith null "b/m2" "c/m3" "d/m4")
+    |> should equal (ModelReference.Parse "b/m2")
+
+    SessionAutoTitle.resolveTitleModel (depsWith null null "c/m3" "d/m4")
+    |> should equal (ModelReference.Parse "c/m3")
+
+    SessionAutoTitle.resolveTitleModel (depsWith null null null "d/m4")
+    |> should equal (ModelReference.Parse "d/m4")
+
+    SessionAutoTitle.resolveTitleModel (depsWith null null null null)
+    |> should equal (ModelReference.Parse "legate/default")
+
+[<Fact>]
+let ``normalizeTitle takes the first trimmed line within bounds`` () =
+    SessionAutoTitle.normalizeTitle "  Harvest Moon  \nsecond line"
+    |> should equal "Harvest Moon"
+
+    SessionAutoTitle.normalizeTitle "\"Quoted\"" |> should equal "Quoted"
+    SessionAutoTitle.normalizeTitle "   " |> should equal null
+    SessionAutoTitle.normalizeTitle null |> should equal null
+
+    let long = String.replicate 100 "a"
+
+    match SessionAutoTitle.normalizeTitle long with
+    | null -> failwith "Expected the long title to bound, not vanish."
+    | bounded -> bounded.Length |> should equal SessionAutoTitle.MaxTitleLength
+
+[<Fact>]
+let ``promptTextOf joins text parts with newlines`` () =
+    SessionAutoTitle.promptTextOf (UserMessage.Text "hello") |> should equal "hello"
+
+    SessionAutoTitle.promptTextOf (Unchecked.defaultof<UserMessage>)
+    |> should equal ""
+
+    let parts =
+        ResizeArray<AIContent>(
+            [|
+                TextContent("first") :> AIContent
+                TextContent("second") :> AIContent
+            |]
+        )
+        :> IReadOnlyList<AIContent>
+
+    SessionAutoTitle.promptTextOf (UserMessage(parts, null))
+    |> should equal ("first\nsecond")
+
+[<Fact>]
+let ``titleAsync on a disabled client makes no chat call`` () : Task =
+    task {
+        let client, store, tenant = directTitleSetup ()
+        let chat = scripted [ ScriptStep.Text "Unused" ]
+        client.AutoTitle <- Some(titleDeps false (chat :> IChatClient) null)
+
+        let! created = store.CreateSession(tenant, storedSession (AgentId.New()) "", CancellationToken.None)
+
+        do! SessionAutoTitle.titleAsync client created.Id (UserMessage.Text "hello") CancellationToken.None
+
+        chat.Calls |> should equal 0
+
+        let! stored = store.GetSession(tenant, created.Id, CancellationToken.None)
+        (require stored).Title |> should equal ""
+    }
+
+[<Fact>]
+let ``titleAsync without a chat client no-ops`` () : Task =
+    task {
+        let client, store, tenant = directTitleSetup ()
+        client.AutoTitle <- Some(titleDeps true null null)
+
+        let! created = store.CreateSession(tenant, storedSession (AgentId.New()) "", CancellationToken.None)
+
+        do! SessionAutoTitle.titleAsync client created.Id (UserMessage.Text "hello") CancellationToken.None
+
+        let! stored = store.GetSession(tenant, created.Id, CancellationToken.None)
+        (require stored).Title |> should equal ""
+    }
+
+[<Fact>]
+let ``titleAsync on a titled session makes no chat call`` () : Task =
+    task {
+        let client, store, tenant = directTitleSetup ()
+        let chat = scripted [ ScriptStep.Text "Unused" ]
+        client.AutoTitle <- Some(titleDeps true (chat :> IChatClient) null)
+
+        let! created = store.CreateSession(tenant, storedSession (AgentId.New()) "Kept", CancellationToken.None)
+
+        do! SessionAutoTitle.titleAsync client created.Id (UserMessage.Text "hello") CancellationToken.None
+
+        chat.Calls |> should equal 0
+
+        let! stored = store.GetSession(tenant, created.Id, CancellationToken.None)
+        (require stored).Title |> should equal "Kept"
+    }
+
+[<Fact>]
+let ``titleAsync on textless and missing sessions makes no chat call`` () : Task =
+    task {
+        let client, store, tenant = directTitleSetup ()
+        let chat = scripted [ ScriptStep.Text "Unused" ]
+        client.AutoTitle <- Some(titleDeps true (chat :> IChatClient) null)
+
+        let! created = store.CreateSession(tenant, storedSession (AgentId.New()) "", CancellationToken.None)
+
+        let fileParts =
+            ResizeArray<AIContent>(
+                [|
+                    UserMessage.WithFile(ReadOnlyMemory [| 1uy |], "application/pdf").Parts[0]
+                |]
+            )
+            :> IReadOnlyList<AIContent>
+
+        do! SessionAutoTitle.titleAsync client created.Id (UserMessage(fileParts, null)) CancellationToken.None
+
+        do! SessionAutoTitle.titleAsync client (SessionId.New()) (UserMessage.Text "hello") CancellationToken.None
+
+        do! SessionAutoTitle.titleAsync client created.Id (Unchecked.defaultof<UserMessage>) CancellationToken.None
+
+        chat.Calls |> should equal 0
+    }
+
+[<Fact>]
+let ``titleAsync writes the normalized title through the store`` () : Task =
+    task {
+        let client, store, tenant = directTitleSetup ()
+
+        let chat =
+            scripted
+                [
+                    ScriptStep.Text "  Harvest Moon  \nignored second line"
+                ]
+
+        client.AutoTitle <- Some(titleDeps true (chat :> IChatClient) null)
+
+        let! created = store.CreateSession(tenant, storedSession (AgentId.New()) "", CancellationToken.None)
+
+        do!
+            SessionAutoTitle.titleAsync
+                client
+                created.Id
+                (UserMessage.Text "a quiet farming game")
+                CancellationToken.None
+
+        chat.Calls |> should equal 1
+
+        // The title call carries the instruction plus the first prompt.
+        chat.ReceivedMessages.Count |> should equal 2
+        chat.ReceivedMessages[0].Role |> should equal ChatRole.System
+        chat.ReceivedMessages[1].Role |> should equal ChatRole.User
+
+        chat.ReceivedMessages[1].Text.Contains("a quiet farming game", StringComparison.Ordinal)
+        |> should equal true
+
+        let! stored = store.GetSession(tenant, created.Id, CancellationToken.None)
+        (require stored).Title |> should equal "Harvest Moon"
+    }
+
+[<Fact>]
+let ``titleAsync failure leaves the title empty and retries on the next prompt`` () : Task =
+    task {
+        let client, store, tenant = directTitleSetup ()
+
+        let chat =
+            scripted
+                [
+                    ScriptStep.Failure(Exception "boom")
+                    ScriptStep.Text "Second Try"
+                ]
+
+        client.AutoTitle <- Some(titleDeps true (chat :> IChatClient) null)
+
+        let! created = store.CreateSession(tenant, storedSession (AgentId.New()) "", CancellationToken.None)
+
+        // A provider failure never throws and writes nothing.
+        do! SessionAutoTitle.titleAsync client created.Id (UserMessage.Text "hello") CancellationToken.None
+
+        let! afterFailure = store.GetSession(tenant, created.Id, CancellationToken.None)
+        (require afterFailure).Title |> should equal ""
+
+        // The failed flight clears, so the next prompt retries and lands.
+        do! SessionAutoTitle.titleAsync client created.Id (UserMessage.Text "hello") CancellationToken.None
+
+        let! stored = store.GetSession(tenant, created.Id, CancellationToken.None)
+        (require stored).Title |> should equal "Second Try"
+    }
+
+[<Fact>]
+let ``titleAsync fires once under concurrent prompts`` () : Task =
+    task {
+        let client, store, tenant = directTitleSetup ()
+        let chat = scripted [ ScriptStep.Text "Only Once" ]
+        client.AutoTitle <- Some(titleDeps true (chat :> IChatClient) null)
+
+        let! created = store.CreateSession(tenant, storedSession (AgentId.New()) "", CancellationToken.None)
+
+        let! _ =
+            Task.WhenAll(
+                [|
+                    SessionAutoTitle.titleAsync client created.Id (UserMessage.Text "hello") CancellationToken.None
+                    SessionAutoTitle.titleAsync client created.Id (UserMessage.Text "hello") CancellationToken.None
+                |]
+            )
+
+        chat.Calls |> should equal 1
+
+        let! stored = store.GetSession(tenant, created.Id, CancellationToken.None)
+        (require stored).Title |> should equal "Only Once"
+    }
+
+[<Fact>]
+let ``titleAsync never logs prompt content`` () : Task =
+    task {
+        let client, store, tenant = directTitleSetup ()
+        let chat = scripted [ ScriptStep.Text "Logged Title" ]
+        let logger = RecordingLogger()
+        client.AutoTitle <- Some(titleDeps true (chat :> IChatClient) (logger :> ILogger))
+
+        let! created = store.CreateSession(tenant, storedSession (AgentId.New()) "", CancellationToken.None)
+
+        do!
+            SessionAutoTitle.titleAsync
+                client
+                created.Id
+                (UserMessage.Text "secret phrase alpha bravo 12345")
+                CancellationToken.None
+
+        let! stored = store.GetSession(tenant, created.Id, CancellationToken.None)
+        (require stored).Title |> should equal "Logged Title"
+
+        (logger.Entries.Count = 0) |> should equal false
+
+        for _, line in logger.Entries do
+            line.Contains("secret phrase alpha bravo 12345", StringComparison.Ordinal)
+            |> should equal false
+    }
+
+[<Fact>]
+let ``ListSessionsAsync pages the default size newest walk`` () : Task =
+    task {
+        use provider =
+            (createServices (scripted [ ScriptStep.Text "done" ]) (sourced [])).BuildServiceProvider()
+
+        return!
+            withClient provider (fun client ->
+                task {
+                    for _ in 1..55 do
+                        let! _ =
+                            client.Store.CreateSession(
+                                client.Tenant,
+                                storedSession (AgentId.New()) "",
+                                CancellationToken.None
+                            )
+
+                        ()
+
+                    // Null options read as the defaults: 50 per page.
+                    let! first = SessionClientListingOperations.ListSessionsAsync(client, null, CancellationToken.None)
+
+                    first.Items.Count |> should equal 50
+                    (isNull (box first.Continuation)) |> should equal false
+
+                    let seen = ResizeArray<SessionId>()
+                    let mutable continuation: string | null = first.Continuation
+                    let mutable more = true
+
+                    for item in first.Items do
+                        seen.Add(item.Id)
+
+                    while more do
+                        let options = SessionListOptions()
+                        options.Continuation <- continuation
+
+                        let! page =
+                            SessionClientListingOperations.ListSessionsAsync(client, options, CancellationToken.None)
+
+                        for item in page.Items do
+                            seen.Add(item.Id)
+
+                        continuation <- page.Continuation
+                        more <- not (isNull (box page.Continuation))
+
+                    seen.Count |> should equal 55
+                    seen |> Seq.distinct |> Seq.length |> should equal 55
+                })
+    }
+
+[<Fact>]
+let ``ListSessionsAsync clamps oversized pages to 200`` () : Task =
+    task {
+        use provider =
+            (createServices (scripted [ ScriptStep.Text "done" ]) (sourced [])).BuildServiceProvider()
+
+        return!
+            withClient provider (fun client ->
+                task {
+                    for _ in 1..205 do
+                        let! _ =
+                            client.Store.CreateSession(
+                                client.Tenant,
+                                storedSession (AgentId.New()) "",
+                                CancellationToken.None
+                            )
+
+                        ()
+
+                    let options = SessionListOptions()
+                    options.PageSize <- 500
+
+                    let! first =
+                        SessionClientListingOperations.ListSessionsAsync(client, options, CancellationToken.None)
+
+                    first.Items.Count |> should equal 200
+                    (isNull (box first.Continuation)) |> should equal false
+
+                    let seen = ResizeArray<SessionId>()
+
+                    for item in first.Items do
+                        seen.Add(item.Id)
+
+                    let follow = SessionListOptions()
+                    follow.Continuation <- first.Continuation
+
+                    let! rest =
+                        SessionClientListingOperations.ListSessionsAsync(client, follow, CancellationToken.None)
+
+                    for item in rest.Items do
+                        seen.Add(item.Id)
+
+                    seen.Count |> should equal 205
+                    seen |> Seq.distinct |> Seq.length |> should equal 205
+                    (isNull (box rest.Continuation)) |> should equal true
+                })
+    }
+
+[<Fact>]
+let ``ListSessionsAsync honors state agent and created filters`` () : Task =
+    task {
+        use provider =
+            (createServices (scripted [ ScriptStep.Text "done" ]) (sourced [])).BuildServiceProvider()
+
+        return!
+            withClient provider (fun client ->
+                task {
+                    let target = AgentId.New()
+                    let now = DateTimeOffset.UtcNow
+
+                    let! tagged =
+                        client.Store.CreateSession(client.Tenant, storedSession target "", CancellationToken.None)
+
+                    let! _ =
+                        client.Store.CreateSession(
+                            client.Tenant,
+                            storedSession (AgentId.New()) "",
+                            CancellationToken.None
+                        )
+
+                    let! _ =
+                        client.Store.UpdateSessionState(
+                            client.Tenant,
+                            tagged.Id,
+                            SessionState.Running,
+                            CancellationToken.None
+                        )
+
+                    let byState = SessionListOptions()
+                    byState.State <- Nullable SessionState.Running
+
+                    let! running =
+                        SessionClientListingOperations.ListSessionsAsync(client, byState, CancellationToken.None)
+
+                    running.Items.Count |> should equal 1
+                    running.Items[0].Id |> should equal tagged.Id
+
+                    let byAgent = SessionListOptions()
+                    byAgent.AgentId <- Nullable target
+
+                    let! agentOnly =
+                        SessionClientListingOperations.ListSessionsAsync(client, byAgent, CancellationToken.None)
+
+                    agentOnly.Items.Count |> should equal 1
+                    agentOnly.Items[0].Id |> should equal tagged.Id
+
+                    let future = SessionListOptions()
+                    future.CreatedFrom <- Nullable(now.AddHours 1.0)
+
+                    let! noneFuture =
+                        SessionClientListingOperations.ListSessionsAsync(client, future, CancellationToken.None)
+
+                    noneFuture.Items.Count |> should equal 0
+
+                    let past = SessionListOptions()
+                    past.CreatedTo <- Nullable(now.AddHours -1.0)
+
+                    let! nonePast =
+                        SessionClientListingOperations.ListSessionsAsync(client, past, CancellationToken.None)
+
+                    nonePast.Items.Count |> should equal 0
+
+                    let wide = SessionListOptions()
+                    wide.CreatedFrom <- Nullable(now.AddHours -1.0)
+                    wide.CreatedTo <- Nullable(now.AddHours 1.0)
+
+                    let! both = SessionClientListingOperations.ListSessionsAsync(client, wide, CancellationToken.None)
+
+                    both.Items.Count |> should equal 2
+                })
+    }
+
+[<Fact>]
+let ``ListSessionsAsync rejects a non-positive page size`` () : Task =
+    task {
+        use provider =
+            (createServices (scripted [ ScriptStep.Text "done" ]) (sourced [])).BuildServiceProvider()
+
+        return!
+            withClient provider (fun client ->
+                task {
+                    let options = SessionListOptions()
+                    options.PageSize <- 0
+
+                    let! _ =
+                        Assert.ThrowsAsync<ArgumentOutOfRangeException>(fun () ->
+                            SessionClientListingOperations.ListSessionsAsync(client, options, CancellationToken.None))
+
+                    return ()
+                })
+    }
+
+[<Fact>]
+let ``buildClient wires auto-title from Sessions options`` () =
+    let services = createServices (scripted [ ScriptStep.Text "done" ]) (sourced [])
+
+    services.Configure<LegateOptions>(
+        Action<LegateOptions>(fun options ->
+            options.Sessions.AutoTitle <- true
+            options.Sessions.AutoTitleModel <- "anthropic/claude-sonnet")
+    )
+    |> ignore
+
+    use provider = services.BuildServiceProvider()
+    let client = provider.GetRequiredService<SessionClient>()
+
+    match client.AutoTitle with
+    | None -> failwith "Expected the container to wire auto-title deps."
+    | Some deps ->
+        deps.Enabled |> should equal true
+
+        match deps.TitleModel with
+        | null -> failwith "Expected the title model to carry through."
+        | model -> model |> should equal "anthropic/claude-sonnet"
+
+        SessionAutoTitle.resolveTitleModel deps
+        |> should equal (ModelReference.Parse "anthropic/claude-sonnet")
+
+        (isNull (box deps.ChatClient)) |> should equal false
+
+[<Fact>]
+let ``PromptAsync titles the untitled session without failing the prompt`` () : Task =
+    task {
+        let titleClient = scripted [ ScriptStep.Text "Pumpkin Soup" ]
+
+        use provider =
+            (createServices (scripted [ ScriptStep.Text "done" ]) (sourced [])).BuildServiceProvider()
+
+        return!
+            withClient provider (fun client ->
+                task {
+                    client.AutoTitle <- Some(titleDeps true (titleClient :> IChatClient) null)
+
+                    let! created = openSession client
+
+                    let! _ =
+                        SessionClientOperations.PromptAsync(
+                            client,
+                            created.Id,
+                            UserMessage.Text "tell me a bedtime story",
+                            DeliveryMode.Queue,
+                            CancellationToken.None
+                        )
+
+                    let! title = awaitTitle client created.Id
+                    title |> should equal "Pumpkin Soup"
+                })
+    }
+
+[<Fact>]
+let ``PromptAndWaitAsync titles the untitled session and still settles`` () : Task =
+    task {
+        let titleClient = scripted [ ScriptStep.Text "Pumpkin Soup" ]
+
+        use provider =
+            (createServices (scripted [ ScriptStep.Text "done" ]) (sourced [])).BuildServiceProvider()
+
+        return!
+            withClient provider (fun client ->
+                task {
+                    client.AutoTitle <- Some(titleDeps true (titleClient :> IChatClient) null)
+
+                    let! created = openSession client
+
+                    let! result =
+                        awaitWhat
+                            (SessionClientExtensions.PromptAndWaitAsync(
+                                client,
+                                created.Id,
+                                UserMessage.Text "tell me a bedtime story",
+                                CancellationToken.None
+                            ))
+                            "the PromptAndWait settle"
+
+                    result.Status |> should equal TurnStatus.Completed
+
+                    let! title = awaitTitle client created.Id
+                    title |> should equal "Pumpkin Soup"
+                })
+    }
+
+[<Fact>]
+let ``PromptAsync on a missing session throws and fires no title`` () : Task =
+    task {
+        let titleClient = scripted [ ScriptStep.Text "Unused" ]
+
+        use provider =
+            (createServices (scripted [ ScriptStep.Text "done" ]) (sourced [])).BuildServiceProvider()
+
+        return!
+            withClient provider (fun client ->
+                task {
+                    client.AutoTitle <- Some(titleDeps true (titleClient :> IChatClient) null)
+
+                    try
+                        let! _ =
+                            SessionClientOperations.PromptAsync(
+                                client,
+                                SessionId.New(),
+                                UserMessage.Text "hi",
+                                DeliveryMode.Queue,
+                                CancellationToken.None
+                            )
+
+                        failwith "expected SessionNotFoundException"
+                    with :? SessionNotFoundException ->
+                        ()
+
+                    titleClient.Calls |> should equal 0
                 })
     }

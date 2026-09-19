@@ -116,6 +116,7 @@
     <Compile Include="MigrationTests.fs" />
     <Compile Include="SqliteTestFixture.fs" />
     <Compile Include="SqliteSessionStoreTests.fs" />
+    <Compile Include="SqliteSessionListTests.fs" />
     <Compile Include="SqliteSessionEventStoreTests.fs" />
     <Compile Include="SqliteAgentStoreTests.fs" />
     <Compile Include="SqliteBlobStoreTests.fs" />

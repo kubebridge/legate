@@ -19,6 +19,8 @@ let deserialize<'T> (json: string) : 'T =
 
 let nullString = Unchecked.defaultof<string>
 let noState = Unchecked.defaultof<Nullable<SessionState>>
+let noAgent = Unchecked.defaultof<Nullable<AgentId>>
+let noInstant = Unchecked.defaultof<Nullable<DateTimeOffset>>
 let jsonOptions = JsonSerializerOptions()
 
 let tenant = TenantId.Create "acme"
@@ -98,7 +100,7 @@ type FakeSessionStore() =
                 | false, _ -> Unchecked.defaultof<Session>
             )
 
-        member _.ListSessions(t, state, pageSize, continuation, _) =
+        member _.ListSessions(t, state, agentId, createdFrom, createdTo, pageSize, continuation, _) =
             if pageSize <= 0 then
                 raise (ArgumentOutOfRangeException(nameof pageSize))
 
@@ -106,6 +108,9 @@ type FakeSessionStore() =
                 sessions.Values
                 |> Seq.filter (fun s -> s.Tenant.Equals t)
                 |> Seq.filter (fun s -> not state.HasValue || s.State = state.Value)
+                |> Seq.filter (fun s -> not agentId.HasValue || s.AgentId.Equals(agentId.Value))
+                |> Seq.filter (fun s -> not createdFrom.HasValue || s.CreatedAt >= createdFrom.Value)
+                |> Seq.filter (fun s -> not createdTo.HasValue || s.CreatedAt <= createdTo.Value)
                 |> Seq.sortByDescending (fun s -> s.UpdatedAt)
                 |> Array.ofSeq
 
@@ -828,11 +833,22 @@ let ``ListSessions pages bounded results with a continuation`` () =
             let! _ = store.CreateSession(tenant, sampleSession (), CancellationToken.None)
             ()
 
-        let! first = store.ListSessions(tenant, noState, 2, null, CancellationToken.None)
+        let! first = store.ListSessions(tenant, noState, noAgent, noInstant, noInstant, 2, null, CancellationToken.None)
         first.Items.Count |> should equal 2
         first.Continuation |> should not' (equal null)
 
-        let! second = store.ListSessions(tenant, noState, 2, first.Continuation, CancellationToken.None)
+        let! second =
+            store.ListSessions(
+                tenant,
+                noState,
+                noAgent,
+                noInstant,
+                noInstant,
+                2,
+                first.Continuation,
+                CancellationToken.None
+            )
+
         second.Items.Count |> should equal 1
         second.Continuation |> should equal null
     }
@@ -848,12 +864,243 @@ let ``ListSessions filters by state`` () =
 
         let! _ = store.UpdateSessionState(tenant, first.Id, SessionState.Running, CancellationToken.None)
 
-        let! runningOnly = store.ListSessions(tenant, Nullable SessionState.Running, 10, null, CancellationToken.None)
+        let! runningOnly =
+            store.ListSessions(
+                tenant,
+                Nullable SessionState.Running,
+                noAgent,
+                noInstant,
+                noInstant,
+                10,
+                null,
+                CancellationToken.None
+            )
 
         runningOnly.Items.Count |> should equal 1
         runningOnly.Items[0].Id |> should equal first.Id
     }
     |> (fun t -> t.Wait())
+
+[<Fact>]
+let ``ListSessions filters by agent`` () =
+    let store = FakeSessionStore() :> ISessionStore
+
+    task {
+        let! first = store.CreateSession(tenant, sampleSession (), CancellationToken.None)
+        let! second = store.CreateSession(tenant, sampleSession (), CancellationToken.None)
+
+        let! onlyFirst =
+            store.ListSessions(
+                tenant,
+                noState,
+                Nullable first.AgentId,
+                noInstant,
+                noInstant,
+                10,
+                null,
+                CancellationToken.None
+            )
+
+        onlyFirst.Items.Count |> should equal 1
+        onlyFirst.Items[0].Id |> should equal first.Id
+
+        let! onlySecond =
+            store.ListSessions(
+                tenant,
+                noState,
+                Nullable second.AgentId,
+                noInstant,
+                noInstant,
+                10,
+                null,
+                CancellationToken.None
+            )
+
+        onlySecond.Items.Count |> should equal 1
+        onlySecond.Items[0].Id |> should equal second.Id
+
+        let! missing =
+            store.ListSessions(
+                tenant,
+                noState,
+                Nullable(AgentId.New()),
+                noInstant,
+                noInstant,
+                10,
+                null,
+                CancellationToken.None
+            )
+
+        missing.Items.Count |> should equal 0
+        missing.Continuation |> should equal null
+    }
+    |> (fun t -> t.Wait())
+
+[<Fact>]
+let ``ListSessions filters by created range`` () =
+    let store = FakeSessionStore() :> ISessionStore
+    let before = sessionStamp.AddHours -1.0
+    let middle = sessionStamp
+    let after = sessionStamp.AddHours 1.0
+
+    let sessionAt (created: DateTimeOffset) =
+        { sampleSession () with
+            CreatedAt = created
+        }
+
+    task {
+        let! _ = store.CreateSession(tenant, sessionAt before, CancellationToken.None)
+        let! expected = store.CreateSession(tenant, sessionAt middle, CancellationToken.None)
+        let! _ = store.CreateSession(tenant, sessionAt after, CancellationToken.None)
+
+        let! fromOnly =
+            store.ListSessions(tenant, noState, noAgent, Nullable middle, noInstant, 10, null, CancellationToken.None)
+
+        fromOnly.Items.Count |> should equal 2
+
+        let! toOnly =
+            store.ListSessions(tenant, noState, noAgent, noInstant, Nullable middle, 10, null, CancellationToken.None)
+
+        toOnly.Items.Count |> should equal 2
+
+        let! both =
+            store.ListSessions(
+                tenant,
+                noState,
+                noAgent,
+                Nullable middle,
+                Nullable middle,
+                10,
+                null,
+                CancellationToken.None
+            )
+
+        both.Items.Count |> should equal 1
+        both.Items[0].Id |> should equal expected.Id
+
+        // The bounds are inclusive: an exact instant on both sides still
+        // matches, while an inverted range matches nothing.
+        let! inverted =
+            store.ListSessions(
+                tenant,
+                noState,
+                noAgent,
+                Nullable after,
+                Nullable before,
+                10,
+                null,
+                CancellationToken.None
+            )
+
+        inverted.Items.Count |> should equal 0
+        inverted.Continuation |> should equal null
+    }
+    |> (fun t -> t.Wait())
+
+[<Fact>]
+let ``ListSessions paging walks filtered rows exactly once`` () =
+    let store = FakeSessionStore() :> ISessionStore
+
+    task {
+        let target = AgentId.New()
+
+        for _ in 1..5 do
+            let! _ =
+                store.CreateSession(
+                    tenant,
+                    { sampleSession () with
+                        AgentId = target
+                    },
+                    CancellationToken.None
+                )
+
+            ()
+
+        for _ in 1..3 do
+            let! _ = store.CreateSession(tenant, sampleSession (), CancellationToken.None)
+            ()
+
+        let seen = ResizeArray<SessionId>()
+        let mutable continuation: string | null = null
+        let mutable more = true
+
+        while more do
+            let! page =
+                store.ListSessions(
+                    tenant,
+                    noState,
+                    Nullable target,
+                    noInstant,
+                    noInstant,
+                    2,
+                    continuation,
+                    CancellationToken.None
+                )
+
+            for item in page.Items do
+                seen.Add(item.Id)
+
+            continuation <- page.Continuation
+            more <- not (isNull (box page.Continuation))
+
+        seen.Count |> should equal 5
+
+        seen |> Seq.distinct |> Seq.length |> should equal 5
+    }
+    |> (fun t -> t.Wait())
+
+[<Fact>]
+let ``ListSessions isolates tenants under filters`` () =
+    let store = FakeSessionStore() :> ISessionStore
+
+    task {
+        let! created = store.CreateSession(tenant, sampleSession (), CancellationToken.None)
+
+        let! otherTenant =
+            store.ListSessions(
+                otherTenant,
+                noState,
+                Nullable created.AgentId,
+                Nullable created.CreatedAt,
+                Nullable created.CreatedAt,
+                10,
+                null,
+                CancellationToken.None
+            )
+
+        otherTenant.Items.Count |> should equal 0
+        otherTenant.Continuation |> should equal null
+
+        let! ownTenant =
+            store.ListSessions(
+                tenant,
+                noState,
+                Nullable created.AgentId,
+                Nullable created.CreatedAt,
+                Nullable created.CreatedAt,
+                10,
+                null,
+                CancellationToken.None
+            )
+
+        ownTenant.Items.Count |> should equal 1
+        ownTenant.Items[0].Id |> should equal created.Id
+    }
+    |> (fun t -> t.Wait())
+
+[<Fact>]
+let ``ListSessions rejects a non-positive page size`` () =
+    let store = FakeSessionStore() :> ISessionStore
+
+    Assert.Throws<ArgumentOutOfRangeException>(fun () ->
+        store.ListSessions(tenant, noState, noAgent, noInstant, noInstant, 0, null, CancellationToken.None)
+        |> ignore)
+    |> ignore
+
+    Assert.Throws<ArgumentOutOfRangeException>(fun () ->
+        store.ListSessions(tenant, noState, noAgent, noInstant, noInstant, -1, null, CancellationToken.None)
+        |> ignore)
+    |> ignore
 
 [<Fact>]
 let ``Inbox appends carry the delivery mode and round-trip pending order`` () =

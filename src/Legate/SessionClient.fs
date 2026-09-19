@@ -5,9 +5,12 @@ open System
 open System.Collections.Concurrent
 open System.Collections.Generic
 open System.Runtime.CompilerServices
+open System.Text
 open System.Threading
 open System.Threading.Tasks
 open Akka.Actor
+open Microsoft.Extensions.AI
+open Microsoft.Extensions.Logging
 
 // Session client: the public receiver PromptAndWaitAsync extends. The
 // client holds the suspendable prompt path (store, tenant, actor
@@ -16,6 +19,37 @@ open Akka.Actor
 // Construction stays internal: the container facade owns it once it lands,
 // while tests construct it directly. The actor resolver never crosses the
 // public API (Akka types stay internal).
+/// What the shared auto-title helper needs: the enablement flag, the
+/// title-model fallback chain, the chat client the title call goes
+/// through, and the logger titling reports to. The container wiring sets
+/// it on the client; a missing value (or a missing client) degrades to
+/// no-op titling.
+type internal AutoTitleDeps =
+    {
+        /// Whether untitled sessions title from their first prompt.
+        Enabled: bool
+        /// The configured title model in provider/model form, or null to
+        /// fall back.
+        TitleModel: string | null
+        /// The configured compaction model in provider/model form, or null
+        /// to fall back.
+        CompactionModel: string | null
+        /// The facade default model in provider/model form, or null to fall
+        /// back.
+        FacadeDefaultModel: string | null
+        /// The configured Llm:DefaultModel in provider/model form, or null
+        /// to fall back to the agent-file default.
+        LlmDefaultModel: string | null
+        /// The agent-file default model: the last fallback when no
+        /// configured model names one.
+        FallbackModel: ModelReference
+        /// The chat client the title call goes through, or null when the
+        /// host registered none (identity-only mode: titling no-ops).
+        ChatClient: IChatClient | null
+        /// The logger titling reports to, or null for silent titling.
+        Logger: ILogger | null
+    }
+
 /// <summary>The session client PromptAndWaitAsync extends.</summary>
 [<Sealed>]
 type SessionClient
@@ -43,6 +77,7 @@ type SessionClient
             raise (ArgumentOutOfRangeException(nameof defaultBound, "The default wait bound must be positive."))
 
     let semaphores = ConcurrentDictionary<SessionId, SemaphoreSlim>()
+    let mutable autoTitle: AutoTitleDeps option = None
 
     /// The durable store prompts, aborts, and session reads go through.
     member internal _.Store: ISessionStore = store
@@ -68,10 +103,282 @@ type SessionClient
     member internal _.Resolve(sessionId: SessionId, cancellationToken: CancellationToken) : Task<IActorRef> =
         resolve sessionId cancellationToken
 
+    /// The auto-title knobs the shared facade helper reads, or None when
+    /// the host never configured them: without them both prompt entries
+    /// skip titling. Set once by the container wiring; tests set it
+    /// directly.
+    member internal _.AutoTitle
+        with get (): AutoTitleDeps option = autoTitle
+        and set (value: AutoTitleDeps option) = autoTitle <- value
+
     /// The per-session gate serialising enqueue-plus-prompt so FIFO waiter
     /// order matches Queue append order under concurrent waits.
     member internal _.SemaphoreFor(sessionId: SessionId) : SemaphoreSlim =
         semaphores.GetOrAdd(sessionId, fun _ -> new SemaphoreSlim(1, 1))
+
+// ────────────────── Shared auto-title helper ──────────────────
+
+/// One shared auto-title helper for both prompt entries
+/// (<c>SessionClientOperations.PromptAsync</c> and
+/// <c>SessionClientExtensions.PromptAndWaitAsync</c>): titles an untitled
+/// session once from its first prompt when the host opted in through
+/// <c>SessionsOptions.AutoTitle</c>. Generation runs fire-and-forget on a
+/// non-caller token, failures are swallowed and logged without prompt
+/// content, and the normalised title lands through
+/// <c>ISessionStore.SetSessionTitle</c>, never blocking or failing the
+/// turn. Internal: tests drive <c>titleAsync</c> directly.
+module internal SessionAutoTitle =
+
+    /// The instruction leading the title call: the first prompt follows as
+    /// the user message, and the model replies with the title text only.
+    let TitleInstruction =
+        "Generate a short title for the chat session that starts with the user message below. Reply with the title text only: one line, at most 60 characters, no quotation marks."
+
+    /// The longest title written to the store: model replies past it are
+    /// truncated.
+    let MaxTitleLength = 80
+
+    /// The longest first-prompt excerpt sent to the title call: longer
+    /// prompts truncate, so one huge first message never becomes a huge
+    /// title call.
+    let MaxPromptChars = 2000
+
+    /// Sessions with a title call in flight or completed: at most one
+    /// generation fires per session per process. Entries clear when the
+    /// call fails or yields nothing, so a later prompt retries; a titled
+    /// session never refires because the stored title is non-empty.
+    let private fired = ConcurrentDictionary<SessionId, byte>()
+
+    /// Concatenates a message's text parts with newlines, mirroring the
+    /// transcript folding; a message with no text parts reads as empty.
+    /// <param name="message">The message to read, or null.</param>
+    /// <returns>The joined text, or empty when there is none.</returns>
+    let promptTextOf (message: UserMessage) : string =
+        if isNull (box message) then
+            ""
+        else
+            let builder = Text.StringBuilder()
+
+            if not (isNull (box message.Parts)) then
+                let mutable parts = 0
+
+                for part in message.Parts do
+                    match part with
+                    | :? TextContent as text when not (isNull (box text)) && not (isNull (box text.Text)) ->
+                        if parts > 0 then
+                            builder.Append '\n' |> ignore
+
+                        builder.Append(text.Text) |> ignore
+                        parts <- parts + 1
+                    | _ -> ()
+
+            builder.ToString()
+
+    /// Normalises a title response to one trimmed line within
+    /// <c>MaxTitleLength</c>: blank responses read as null and skip the
+    /// write.
+    /// <param name="text">The model response text, or null.</param>
+    /// <returns>The title to store, or null when there is nothing to write.</returns>
+    let normalizeTitle (text: string | null) : string | null =
+        match text with
+        | null -> null
+        | value ->
+            let first =
+                value.Split([| '\r'; '\n' |], StringSplitOptions.RemoveEmptyEntries)
+                |> Array.tryHead
+
+            match first with
+            | None -> null
+            | Some line ->
+                let trimmed = line.Trim().Trim('"').Trim()
+
+                let bounded =
+                    if trimmed.Length > MaxTitleLength then
+                        trimmed.Substring(0, MaxTitleLength).TrimEnd()
+                    else
+                        trimmed
+
+                if String.IsNullOrWhiteSpace bounded then null else bounded
+
+    /// Resolves which model the title call is attributed to: the
+    /// configured title model, then the compaction model, then the facade
+    /// default, then the configured default, then the agent-file default.
+    /// <param name="deps">The auto-title knobs. Must not be null.</param>
+    /// <returns>The model the title call is attributed to.</returns>
+    let resolveTitleModel (deps: AutoTitleDeps) : ModelReference =
+        if isNull (box deps) then
+            raise (ArgumentNullException(nameof deps))
+
+        let first =
+            [
+                deps.TitleModel
+                deps.CompactionModel
+                deps.FacadeDefaultModel
+                deps.LlmDefaultModel
+            ]
+            |> List.tryPick (fun raw ->
+                match raw with
+                | null -> None
+                | text when String.IsNullOrWhiteSpace text -> None
+                | text -> Some(text.Trim()))
+
+        match first with
+        | Some model -> ModelReference.Parse(model)
+        | None -> deps.FallbackModel
+
+    /// Logs one auto-title line without prompt content: ids, the model,
+    /// and lengths only.
+    /// <param name="logger">The logger, or null for silent titling.</param>
+    /// <param name="level">True for warning, false for debug.</param>
+    /// <param name="sessionId">The session being titled.</param>
+    /// <param name="detail">The detail line, already free of prompt content.</param>
+    let private log (logger: ILogger | null) (warning: bool) (sessionId: SessionId) (detail: string) : unit =
+        match logger with
+        | null -> ()
+        | live ->
+            if warning then
+                live.LogWarning("Auto-title for session {SessionId}: {Detail}", sessionId, detail)
+            else
+                live.LogDebug("Auto-title for session {SessionId}: {Detail}", sessionId, detail)
+
+    /// Titles one untitled session: re-reads the row, generates through
+    /// the configured chat client, and writes the normalised title. Every
+    /// failure (a missing row, a set title, no text, a provider error, an
+    /// empty response, a lost write) returns without throwing and without
+    /// logging prompt content; the caller never awaits this on the
+    /// prompt path.
+    /// <param name="client">The session client. Must not be null.</param>
+    /// <param name="sessionId">The session to title.</param>
+    /// <param name="message">The first prompt, or null.</param>
+    /// <param name="cancellationToken">Abandons the title call (callers pass a non-caller token).</param>
+    let titleAsync
+        (client: SessionClient)
+        (sessionId: SessionId)
+        (message: UserMessage)
+        (cancellationToken: CancellationToken)
+        : Task<unit> =
+        task {
+            try
+                if isNull (box client) then
+                    ()
+                else
+                    match client.AutoTitle with
+                    | None -> ()
+                    | Some deps when not deps.Enabled -> ()
+                    | Some deps ->
+                        match deps.ChatClient with
+                        | null -> ()
+                        | chat ->
+                            let promptText = promptTextOf message
+
+                            if String.IsNullOrWhiteSpace promptText then
+                                ()
+                            elif not (fired.TryAdd(sessionId, 0uy)) then
+                                ()
+                            else
+                                let mutable keep = false
+
+                                try
+                                    try
+                                        let! session =
+                                            client.Store.GetSession(client.Tenant, sessionId, cancellationToken)
+
+                                        match session with
+                                        | null -> ()
+                                        | titled when not (String.IsNullOrWhiteSpace titled.Title) -> ()
+                                        | _ ->
+                                            let model = resolveTitleModel deps
+
+                                            log deps.Logger false sessionId (sprintf "generating with model %O." model)
+
+                                            let excerpt =
+                                                if promptText.Length > MaxPromptChars then
+                                                    promptText.Substring(0, MaxPromptChars)
+                                                else
+                                                    promptText
+
+                                            let history =
+                                                ResizeArray<ChatMessage>(
+                                                    [|
+                                                        ChatMessage(ChatRole.System, TitleInstruction)
+                                                        ChatMessage(ChatRole.User, excerpt)
+                                                    |]
+                                                )
+                                                :> IList<ChatMessage>
+
+                                            let! response =
+                                                chat.GetResponseAsync(history, ChatOptions(), cancellationToken)
+
+                                            let raw =
+                                                if isNull (box response) || isNull (box response.Text) then
+                                                    null
+                                                else
+                                                    response.Text
+
+                                            match normalizeTitle raw with
+                                            | null ->
+                                                log deps.Logger false sessionId "the model returned no usable title."
+                                            | title ->
+                                                let! _ =
+                                                    client.Store.SetSessionTitle(
+                                                        client.Tenant,
+                                                        sessionId,
+                                                        title,
+                                                        cancellationToken
+                                                    )
+
+                                                keep <- true
+
+                                                log
+                                                    deps.Logger
+                                                    false
+                                                    sessionId
+                                                    (sprintf "titled (%d characters)." title.Length)
+                                    with ex ->
+                                        // Client-safe like the compaction
+                                        // mapping: the message only, never
+                                        // secrets, arguments, or prompt
+                                        // content (the prompt travels only
+                                        // to the model, never to the logs).
+                                        let reason =
+                                            if isNull (box ex) || String.IsNullOrEmpty ex.Message then
+                                                ex.GetType().Name
+                                            else
+                                                ex.Message
+
+                                        log deps.Logger true sessionId (sprintf "failed: %s" reason)
+                                finally
+                                    if not keep then
+                                        fired.TryRemove(sessionId) |> ignore
+            with _ ->
+                ()
+        }
+
+    /// Fires <c>titleAsync</c> without awaiting it: the prompt path never
+    /// blocks on titling. Fast sync pre-checks (enabled, a chat client, a
+    /// text prompt) skip the task entirely when titling cannot run; the
+    /// task itself swallows everything else.
+    /// <param name="client">The session client, or null.</param>
+    /// <param name="sessionId">The session to title.</param>
+    /// <param name="message">The first prompt, or null.</param>
+    let fire (client: SessionClient) (sessionId: SessionId) (message: UserMessage) : unit =
+        try
+            if isNull (box client) then
+                ()
+            else
+                match client.AutoTitle with
+                | None -> ()
+                | Some deps when not deps.Enabled -> ()
+                | Some deps ->
+                    match deps.ChatClient with
+                    | null -> ()
+                    | _ ->
+                        if String.IsNullOrWhiteSpace(promptTextOf message) then
+                            ()
+                        else
+                            titleAsync client sessionId message CancellationToken.None |> ignore
+        with _ ->
+            ()
 
 // ────────────────── PromptAndWait ──────────────────
 
@@ -123,6 +430,11 @@ type SessionClientExtensions =
                 waiterOpt <- Some(hub.EnqueueSettle())
 
                 let! _ = SessionActor.promptSuspendableAsync store tenant sessionId resolved message cancellationToken
+
+                // Titling never blocks or fails the turn: the shared
+                // helper no-ops unless the host opted in and the stored
+                // title is still empty.
+                SessionAutoTitle.fire client sessionId message
 
                 ()
             with ex ->

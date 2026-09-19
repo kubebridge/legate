@@ -593,6 +593,9 @@ module internal JournalArchive =
                         sessionStore.ListSessions(
                             tenant,
                             Nullable(SessionState.Closed),
+                            Nullable(),
+                            Nullable(),
+                            Nullable(),
                             MaxBatchSize,
                             continuation,
                             cancellationToken

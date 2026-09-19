@@ -62,6 +62,7 @@ let private smokeScript: string =
             "/agent my-agent"
             "/new second"
             "/resume 1"
+            "/sessions"
             "again"
             "/quit"
         ]
@@ -153,6 +154,7 @@ let ``Scripted run streams events approves tools calls the fixture and resumes``
         check "ABORTED"
         check "AGENT-STUBBED my-agent"
         check "RESUMED "
+        check "SESSIONS 2"
         check "scripted answer two"
 
         if output.Contains("ERROR ", StringComparison.Ordinal) then

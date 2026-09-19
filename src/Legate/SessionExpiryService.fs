@@ -109,6 +109,9 @@ module internal SessionExpiry =
                         store.ListSessions(
                             tenant,
                             Nullable(SessionState.Idle),
+                            Nullable(),
+                            Nullable(),
+                            Nullable(),
                             MaxBatchSize,
                             continuation,
                             cancellationToken
