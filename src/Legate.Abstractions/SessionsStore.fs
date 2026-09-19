@@ -421,9 +421,15 @@ type ISessionStore =
 
     /// Lists sessions of one tenant, newest first by
     /// <see cref="T:Legate.Session" />.UpdatedAt, optionally filtered by
-    /// state, bounded to one page with a continuation token.
+    /// state, agent, and created-time range, bounded to one page with a
+    /// continuation token. The ordering and the opaque continuation token
+    /// are stable under the filters: paging walks the filtered set, so a
+    /// multi-page walk returns each matching row once.
     /// <param name="tenant">The tenant whose sessions to list.</param>
-    /// <param name="state">The state to filter by, or null for every state.</param>
+    /// <param name="state">The state to filter by, or empty for every state.</param>
+    /// <param name="agentId">The agent to filter by, or empty for every agent.</param>
+    /// <param name="createdFrom">Only sessions created at or after this instant, or empty for no lower bound.</param>
+    /// <param name="createdTo">Only sessions created at or before this instant, or empty for no upper bound.</param>
     /// <param name="pageSize">The maximum number of sessions on the page; must be positive.</param>
     /// <param name="continuation">The continuation token from the previous page, or null for the first page.</param>
     /// <param name="cancellationToken">Token that abandons the list.</param>
@@ -432,6 +438,9 @@ type ISessionStore =
     abstract ListSessions:
         tenant: TenantId *
         state: Nullable<SessionState> *
+        agentId: Nullable<AgentId> *
+        createdFrom: Nullable<DateTimeOffset> *
+        createdTo: Nullable<DateTimeOffset> *
         pageSize: int *
         continuation: string | null *
         cancellationToken: CancellationToken ->

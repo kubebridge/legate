@@ -25,8 +25,78 @@ module PostgresTenantIsolationTests =
             let! wrongTenant = sessions.GetSession(other, created.Id, CancellationToken.None)
             Assert.Null(wrongTenant)
 
-            let! listed = sessions.ListSessions(other, Nullable(), 10, null, CancellationToken.None)
+            let! listed =
+                sessions.ListSessions(
+                    other,
+                    Nullable(),
+                    Nullable(),
+                    Nullable(),
+                    Nullable(),
+                    10,
+                    null,
+                    CancellationToken.None
+                )
+
             Assert.Empty(listed.Items)
+
+            // Filtered listing stays tenant-scoped: the agent and
+            // created-time filters narrow within the tenant, never across
+            // it.
+            let! ownAgent =
+                sessions.ListSessions(
+                    tenant,
+                    Nullable(),
+                    Nullable created.AgentId,
+                    Nullable(),
+                    Nullable(),
+                    10,
+                    null,
+                    CancellationToken.None
+                )
+
+            Assert.Single(ownAgent.Items) |> ignore
+
+            let! otherAgent =
+                sessions.ListSessions(
+                    other,
+                    Nullable(),
+                    Nullable created.AgentId,
+                    Nullable(),
+                    Nullable(),
+                    10,
+                    null,
+                    CancellationToken.None
+                )
+
+            Assert.Empty(otherAgent.Items)
+
+            let! tooNew =
+                sessions.ListSessions(
+                    tenant,
+                    Nullable(),
+                    Nullable(),
+                    Nullable(DateTimeOffset.UtcNow.AddHours 1.0),
+                    Nullable(),
+                    10,
+                    null,
+                    CancellationToken.None
+                )
+
+            Assert.Empty(tooNew.Items)
+
+            let! wide =
+                sessions.ListSessions(
+                    tenant,
+                    Nullable(),
+                    Nullable(),
+                    Nullable(DateTimeOffset.UtcNow.AddHours -1.0),
+                    Nullable(DateTimeOffset.UtcNow.AddHours 1.0),
+                    10,
+                    null,
+                    CancellationToken.None
+                )
+
+            Assert.Single(wide.Items) |> ignore
 
             let! otherCount = sessions.CountSessionsByTenant(other, CancellationToken.None)
             Assert.Equal(0, otherCount)

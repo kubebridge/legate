@@ -446,11 +446,38 @@ type Engine(client: SessionClient, reader: System.IO.TextReader, writer: System.
 
                 return true
             elif text = "/sessions" then
-                line $"SESSIONS {sessions.Count}"
+                try
+                    // The store-backed listing, not just the in-process
+                    // REPL list: the facade page carries every session in
+                    // the store with its title and state. The marker names
+                    // the REPL's current session.
+                    let! page =
+                        SessionClientListingOperations.ListSessionsAsync(
+                            client,
+                            SessionListOptions(),
+                            cancellationToken
+                        )
 
-                for index = 0 to sessions.Count - 1 do
-                    let marker = if index = current then "*" else " "
-                    line $"{marker} [{index + 1}] {sessions[index].Id} {sessions[index].Title}"
+                    let items =
+                        if isNull (box page) || isNull (box page.Items) then
+                            ResizeArray<Session>() :> IReadOnlyList<Session>
+                        else
+                            page.Items
+
+                    line $"SESSIONS {items.Count}"
+
+                    let currentId =
+                        if current >= 0 && current < sessions.Count then
+                            sessions[current].Id
+                        else
+                            Unchecked.defaultof<SessionId>
+
+                    for session in items do
+                        if not (isNull (box session)) then
+                            let marker = if session.Id.Equals(currentId) then "*" else " "
+                            line $"{marker} {session.Id} {session.Title} [{session.State}]"
+                with error ->
+                    line $"ERROR {error.Message}"
 
                 return true
             elif text.StartsWith("/resume", StringComparison.Ordinal) then

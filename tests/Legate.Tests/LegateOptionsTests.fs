@@ -114,6 +114,21 @@ let ``Sessions Validate requires renewal below half the lease`` () =
     // The default 15 s renewal against a 60 s lease passes.
     SessionsOptions().Validate() |> should equal null
 
+[<Fact>]
+let ``Sessions Validate defaults auto-title off without a model`` () =
+    let options = SessionsOptions()
+    options.AutoTitle |> should equal false
+    options.AutoTitleModel |> should equal null
+    options.Validate() |> should equal null
+
+[<Fact>]
+let ``Sessions Validate flags an invalid auto-title model`` () =
+    SessionsOptions(AutoTitleModel = "bogus").Validate()
+    |> should equal "AutoTitleModel must be a valid model reference in provider/model form."
+
+    SessionsOptions(AutoTitle = true, AutoTitleModel = "anthropic/claude-sonnet").Validate()
+    |> should equal null
+
 // ──────────────────────────────────────────────────────────────────────────
 // Turns
 

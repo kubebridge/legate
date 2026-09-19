@@ -451,7 +451,7 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
                 row |> Option.toObj)
             |> Task.FromResult
 
-        member this.ListSessions(tenant, state, pageSize, continuation, _) =
+        member this.ListSessions(tenant, state, agentId, createdFrom, createdTo, pageSize, continuation, _) =
             if pageSize <= 0 then
                 raise (ArgumentOutOfRangeException(nameof pageSize, "The page size must be positive."))
 
@@ -460,6 +460,22 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
             transact options (fun connection transaction ->
                 let stateText: string | null =
                     if state.HasValue then state.Value.ToString() else null
+
+                // Nullable filters travel as NULL text: the IS NULL legs
+                // keep the unfiltered shape, and instants stamp to UTC
+                // ISO-8601 like the stored rows, so the text comparison is
+                // chronological.
+                let agentText: string | null =
+                    if agentId.HasValue then agentId.Value.ToString() else null
+
+                let fromText: string | null =
+                    if createdFrom.HasValue then
+                        stamp createdFrom.Value
+                    else
+                        null
+
+                let toText: string | null =
+                    if createdTo.HasValue then stamp createdTo.Value else null
 
                 // A continuation the store never minted resolves to an
                 // empty page, matching the in-memory reference.
@@ -491,10 +507,13 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
                         command
                             connection
                             transaction
-                            $"SELECT {this.SessionColumns} FROM {this.SessionsTable} WHERE tenant = @t AND (@state IS NULL OR state = @state) {continuationClause} ORDER BY updated_at DESC, id DESC LIMIT @take"
+                            $"SELECT {this.SessionColumns} FROM {this.SessionsTable} WHERE tenant = @t AND (@state IS NULL OR state = @state) AND (@agent IS NULL OR agent_id = @agent) AND (@from IS NULL OR created_at >= @from) AND (@to IS NULL OR created_at <= @to) {continuationClause} ORDER BY updated_at DESC, id DESC LIMIT @take"
 
                     textParam cmd "t" (tenant.ToString())
                     textParam cmd "state" stateText
+                    textParam cmd "agent" agentText
+                    textParam cmd "from" fromText
+                    textParam cmd "to" toText
 
                     if continuationClause <> "" then
                         textParam cmd "cts" continuationTs

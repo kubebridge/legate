@@ -484,7 +484,7 @@ type SqliteSessionStore(database: SqliteDatabase) =
                 | :? SqliteException as sql -> return raise (mapSql sql)
             }
 
-        member _.ListSessions(tenant, state, pageSize, continuation, _) =
+        member _.ListSessions(tenant, state, agentId, createdFrom, createdTo, pageSize, continuation, _) =
             task {
                 if pageSize <= 0 then
                     raise (ArgumentOutOfRangeException(nameof pageSize, "The page size must be positive."))
@@ -517,7 +517,19 @@ type SqliteSessionStore(database: SqliteDatabase) =
                             let tokenOf (session: Session) =
                                 sprintf "%s|%O" (session.UpdatedAt.ToString "O") session.Id
 
-                            let ordered = rows |> Seq.toList
+                            // The agent and created-time filters narrow the
+                            // ordered rows before the token applies, so
+                            // paging walks the filtered set. Instant
+                            // comparison (not text) keeps offsets honest.
+                            let ordered =
+                                rows
+                                |> Seq.filter (fun session ->
+                                    agentId.HasValue |> not || session.AgentId.Equals(agentId.Value))
+                                |> Seq.filter (fun session ->
+                                    createdFrom.HasValue |> not || session.CreatedAt >= createdFrom.Value)
+                                |> Seq.filter (fun session ->
+                                    createdTo.HasValue |> not || session.CreatedAt <= createdTo.Value)
+                                |> Seq.toList
 
                             let remaining =
                                 match continuation with

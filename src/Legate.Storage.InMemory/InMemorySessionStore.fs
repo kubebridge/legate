@@ -178,14 +178,16 @@ type InMemorySessionStore(database: InMemoryDatabase) =
         member _.GetSession(tenant, sessionId, _) =
             lock database.Gate (fun () -> sessionRow tenant sessionId) |> Option.toObj |> ok
 
-        member _.ListSessions(tenant, state, pageSize, continuation, _) =
+        member _.ListSessions(tenant, state, agentId, createdFrom, createdTo, pageSize, continuation, _) =
             if pageSize <= 0 then
                 raise (ArgumentOutOfRangeException(nameof pageSize, "The page size must be positive."))
 
             lock database.Gate (fun () ->
                 // The stable ordering key is the (updatedAt, id) pair; both
                 // are rendered as fixed-width ordinal strings so the
-                // comparison is total and independent of clock offsets.
+                // comparison is total and independent of clock offsets. The
+                // agent and created-time filters narrow the set before the
+                // ordering applies, so paging walks the filtered set.
                 let tokenOf (session: Session) =
                     sprintf "%s|%O" (session.UpdatedAt.ToString "O") session.Id
 
@@ -193,6 +195,10 @@ type InMemorySessionStore(database: InMemoryDatabase) =
                     database.Sessions.Values
                     |> Seq.filter (fun session -> session.Tenant.Equals tenant)
                     |> Seq.filter (fun session -> state.HasValue |> not || session.State = state.Value)
+                    |> Seq.filter (fun session -> agentId.HasValue |> not || session.AgentId.Equals(agentId.Value))
+                    |> Seq.filter (fun session ->
+                        createdFrom.HasValue |> not || session.CreatedAt >= createdFrom.Value)
+                    |> Seq.filter (fun session -> createdTo.HasValue |> not || session.CreatedAt <= createdTo.Value)
                     |> Seq.sortByDescending tokenOf
                     |> Seq.toList
 

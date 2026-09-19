@@ -119,6 +119,18 @@ type SessionsOptions() =
     /// timeout. Never null.
     member val SubAgents: SubAgentsOptions = SubAgentsOptions() with get, set
 
+    /// Whether the session facade titles untitled sessions from their first
+    /// prompt. Default false: sessions keep the host's title (or the empty
+    /// string) unless the host opts in. Bound from
+    /// <c>Legate:Sessions:AutoTitle</c>.
+    member val AutoTitle: bool = false with get, set
+
+    /// The title model in <c>provider/model</c> form, or null to fall back
+    /// to <c>Legate:Llm:Compaction</c> and then the session/default model
+    /// resolution. Only read when <see cref="P:Legate.SessionsOptions.AutoTitle" />
+    /// is enabled. Bound from <c>Legate:Sessions:AutoTitleModel</c>.
+    member val AutoTitleModel: string | null = null with get, set
+
     /// Returns null when every knob is in range, otherwise a message for the
     /// first violation.
     /// <returns>The first violation's message, or null when the settings are valid.</returns>
@@ -126,6 +138,13 @@ type SessionsOptions() =
         if isNull (box this.SubAgents) then
             "SubAgents must not be null."
         else
+            let mutable parsed = Unchecked.defaultof<ModelReference>
+
+            let titleModelInvalid =
+                match Option.ofObj this.AutoTitleModel with
+                | Some model when not (String.IsNullOrWhiteSpace model) -> not (ModelReference.TryParse(model, &parsed))
+                | _ -> false
+
             let violations =
                 [|
                     if this.Capacity < 1 then
@@ -144,6 +163,8 @@ type SessionsOptions() =
                         "LeaseRenewalInterval must be less than half LeaseDuration."
                     if this.Expiry.HasValue && this.Expiry.Value <= TimeSpan.Zero then
                         "Expiry must be positive when set."
+                    if titleModelInvalid then
+                        "AutoTitleModel must be a valid model reference in provider/model form."
                 |]
 
             if violations.Length <> 0 then
