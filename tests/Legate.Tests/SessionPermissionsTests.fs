@@ -102,6 +102,7 @@ let private startService
                 leaseDuration
                 runner
                 (fun _ _ -> None)
+                null
         )
 
     (service :> IHostedService).StartAsync(CancellationToken.None).GetAwaiter().GetResult()
@@ -779,6 +780,7 @@ let ``spawnSuspendFactory rejects invalid wiring`` () =
             (TimeSpan.FromHours 1.0)
             runner
             (fun _ _ -> None)
+            null
         |> ignore)
     |> should throw typeof<ArgumentNullException>
 
@@ -793,6 +795,7 @@ let ``spawnSuspendFactory rejects invalid wiring`` () =
             (TimeSpan.FromHours 1.0)
             runner
             (fun _ _ -> None)
+            null
         |> ignore)
     |> should throw typeof<ArgumentException>
 
@@ -807,6 +810,7 @@ let ``spawnSuspendFactory rejects invalid wiring`` () =
             (TimeSpan.FromHours 1.0)
             runner
             (fun _ _ -> None)
+            null
         |> ignore)
     |> should throw typeof<ArgumentOutOfRangeException>
 
@@ -821,5 +825,6 @@ let ``spawnSuspendFactory rejects invalid wiring`` () =
             (TimeSpan.FromHours 1.0)
             runner
             Unchecked.defaultof<SessionId -> string -> CompactDeps option>
+            null
         |> ignore)
     |> should throw typeof<ArgumentNullException>

@@ -129,6 +129,7 @@
     <Compile Include="JournalArchiveWorkerTests.fs" />
     <Compile Include="ArtifactsTests.fs" />
     <Compile Include="SessionArtifactsTests.fs" />
+    <Compile Include="AgentAuthorityTests.fs" />
   </ItemGroup>
 
   <ItemGroup>

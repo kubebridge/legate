@@ -1852,6 +1852,11 @@ module internal SessionActor =
             /// compactFor; without one the swap keeps the wiring and only
             /// refreshes its token, so later Compacts stay live either way.
             RefreshCompact: (string -> CompactDeps option) option
+            /// The agent catalog the per-turn authority gate reads, or null
+            /// when the host runs without one: the gate is skipped then (the
+            /// SetAgent facade validation precedent). Never drives tool
+            /// resolution.
+            AgentStore: IAgentStore | null
         }
 
     /// A rebuilt pending request from the journal: the crash path carries
@@ -2695,6 +2700,119 @@ module internal SessionActor =
             )
             |> ignore
 
+        /// Builds the Failed result an authority refusal settles: zero
+        /// iterations and usage, the typed rejection carrying which branch
+        /// refused and why.
+        /// <param name="failure">Which authority branch refused the turn.</param>
+        /// <param name="reason">Why the turn refused to run. Never contains secrets or tool arguments.</param>
+        /// <returns>The result the actor settles.</returns>
+        let authorityRefusalResult (failure: AgentAuthorityFailure) (reason: string) : TurnResult =
+            {
+                AssistantText = ""
+                Status = TurnStatus.Failed
+                Iterations = 0
+                Usage = { InputTokens = 0L; OutputTokens = 0L }
+                Outcome = TurnAgentRejected(failure, reason) :> TurnOutcome
+            }
+
+        /// Journals an authority refusal as a TurnFailedEvent, best-effort:
+        /// the turn already settles Failed, so a rejected or failed write
+        /// carries no further turn to fail (the AskTimeout journalTimeout
+        /// precedent).
+        /// <param name="reason">Why the turn refused to run. Never contains secrets or tool arguments.</param>
+        let journalAuthorityFailure (reason: string) : unit =
+            try
+                let turnId = TurnId.New()
+                let stamp = DateTimeOffset.UtcNow
+
+                let event =
+                    TurnFailedEvent(props.SessionId, turnId, Nullable<int64>(), stamp, reason) :> SessionEvent
+
+                let events = ResizeArray<SessionEvent>([| event |]) :> IReadOnlyList<SessionEvent>
+
+                awaitTask (
+                    JournalWriter.appendWithTokenAsync
+                        suspend.EventStore
+                        props.Tenant
+                        props.SessionId
+                        journalToken
+                        events
+                        CancellationToken.None
+                )
+                |> ignore
+            with _ ->
+                ()
+
+        /// Checks the per-turn execution authority for a fresh turn start:
+        /// re-reads the session's agent from the store. Missing, disabled,
+        /// or tenant-mismatched agents refuse without ever invoking the
+        /// runner.
+        /// A null agent catalog, a missing session row, or a store failure
+        /// authorizes (the no-catalog and empty-shell precedents): the turn
+        /// runs and the failure surfaces where it always has.
+        /// <returns>The refusal branch and reason, or None when authorized.</returns>
+        let checkAgentAuthority () : (AgentAuthorityFailure * string) option =
+            match suspend.AgentStore with
+            | null -> None
+            | agentStore ->
+                try
+                    match awaitTask (props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None)) with
+                    | null -> None
+                    | session ->
+                        let agentId = session.AgentId
+
+                        match awaitTask (agentStore.GetAgent(props.Tenant, agentId, CancellationToken.None)) with
+                        | null ->
+                            Some(AgentAuthorityFailure.NotFound, sprintf "No agent %O exists in this tenant." agentId)
+                        | agent when not agent.Enabled ->
+                            Some(AgentAuthorityFailure.Disabled, sprintf "Agent %O is disabled." agentId)
+                        | agent when not (agent.Tenant.Equals(props.Tenant)) ->
+                            Some(
+                                AgentAuthorityFailure.TenantMismatch,
+                                sprintf "Agent %O belongs to another tenant." agentId
+                            )
+                        | _ -> None
+                with _ ->
+                    None
+
+        /// Settles an authority refusal as Failed with the typed outcome:
+        /// journals the TurnFailedEvent best-effort, observes and dispatches
+        /// the result, consumes the entry, and returns the session to Idle.
+        /// The caller drains next or stays Idle (the settleEntryNow drain
+        /// precedent, minus AutoClose: Failed turns never close).
+        /// <param name="entry">The turn's inbox entry to consume.</param>
+        /// <param name="failure">Which authority branch refused the turn.</param>
+        /// <param name="reason">Why the turn refused to run. Never contains secrets or tool arguments.</param>
+        let settleAuthorityRefusal (entry: InboxEntry) (failure: AgentAuthorityFailure) (reason: string) : unit =
+            journalAuthorityFailure reason
+
+            let result = authorityRefusalResult failure reason
+            notifySettled result
+            dispatchCompletion props result |> ignore
+
+            let positions = [| entry.Position |] :> IReadOnlyList<int64>
+
+            try
+                awaitTask (
+                    props.Store.MarkInboxConsumed(props.Tenant, props.SessionId, positions, CancellationToken.None)
+                )
+                |> ignore
+            with _ ->
+                ()
+
+            try
+                awaitTask (
+                    props.Store.UpdateSessionState(
+                        props.Tenant,
+                        props.SessionId,
+                        SessionState.Idle,
+                        CancellationToken.None
+                    )
+                )
+                |> ignore
+            with _ ->
+                ()
+
         let startSuspendable
             (entry: InboxEntry)
             (attempt: int)
@@ -3038,6 +3156,51 @@ module internal SessionActor =
                     with _ ->
                         ()
 
+        /// Drains the next fresh turn after an authority refusal: applies a
+        /// recorded rebind when quiescent, then gates the oldest drainable
+        /// entry. Authorized entries start (the session returns to Running);
+        /// refused entries settle Failed and the drain recurses; an empty
+        /// inbox returns the session to Idle. Resume paths never enter here:
+        /// only fresh-turn starts gate.
+        /// <returns>The next loop state.</returns>
+        let rec drainAfterRefusal () : SessionState =
+            tryApplyPendingWhenIdle ()
+
+            let pending =
+                awaitTask (props.Store.ReadPendingInbox(props.Tenant, props.SessionId, CancellationToken.None))
+
+            match selectDrainableEntries pending with
+            | following :: _ ->
+                match checkAgentAuthority () with
+                | None ->
+                    awaitTask (
+                        props.Store.UpdateSessionState(
+                            props.Tenant,
+                            props.SessionId,
+                            SessionState.Running,
+                            CancellationToken.None
+                        )
+                    )
+                    |> ignore
+
+                    startSuspendable following 1 (readGrantsNow ()) None
+                    SessionState.Running
+                | Some(failure, reason) ->
+                    settleAuthorityRefusal following failure reason
+                    drainAfterRefusal ()
+            | [] ->
+                awaitTask (
+                    props.Store.UpdateSessionState(
+                        props.Tenant,
+                        props.SessionId,
+                        SessionState.Idle,
+                        CancellationToken.None
+                    )
+                )
+                |> ignore
+
+                SessionState.Idle
+
         let rec loop (state: SessionState) (suspended: SuspendedTurn option) (resolved: HashSet<string>) =
             actor {
                 let! message = mailbox.Receive()
@@ -3067,25 +3230,36 @@ module internal SessionActor =
                                 )
                             )
 
-                        awaitTask (
-                            props.Store.UpdateSessionState(
-                                props.Tenant,
-                                props.SessionId,
-                                SessionState.Running,
-                                cancellationToken
-                            )
-                        )
-                        |> ignore
-
                         let pending =
                             awaitTask (props.Store.ReadPendingInbox(props.Tenant, props.SessionId, cancellationToken))
 
                         let first =
                             selectDrainableEntries pending |> List.tryHead |> Option.defaultValue appended
 
-                        startSuspendable first 1 (readGrantsNow ()) None
-                        mailbox.Sender() <! PromptAccepted appended
-                        return! loop SessionState.Running None resolved
+                        // The per-turn authority gate runs at this fresh-turn
+                        // boundary only: authorized entries run, refused ones
+                        // settle Failed without ever invoking the runner and
+                        // the drain moves on.
+                        match checkAgentAuthority () with
+                        | None ->
+                            awaitTask (
+                                props.Store.UpdateSessionState(
+                                    props.Tenant,
+                                    props.SessionId,
+                                    SessionState.Running,
+                                    cancellationToken
+                                )
+                            )
+                            |> ignore
+
+                            startSuspendable first 1 (readGrantsNow ()) None
+                            mailbox.Sender() <! PromptAccepted appended
+                            return! loop SessionState.Running None resolved
+                        | Some(failure, reason) ->
+                            settleAuthorityRefusal first failure reason
+                            mailbox.Sender() <! PromptAccepted appended
+                            let next = drainAfterRefusal ()
+                            return! loop next None resolved
                     | SessionState.Running
                     | SessionState.WaitingForInput ->
                         let appended =
@@ -3139,25 +3313,36 @@ module internal SessionActor =
                                 )
                             )
 
-                        awaitTask (
-                            props.Store.UpdateSessionState(
-                                props.Tenant,
-                                props.SessionId,
-                                SessionState.Running,
-                                cancellationToken
-                            )
-                        )
-                        |> ignore
-
                         let pending =
                             awaitTask (props.Store.ReadPendingInbox(props.Tenant, props.SessionId, cancellationToken))
 
                         let first =
                             selectDrainableEntries pending |> List.tryHead |> Option.defaultValue appended
 
-                        startSuspendable first 1 (readGrantsNow ()) None
-                        mailbox.Sender() <! PromptAccepted appended
-                        return! loop SessionState.Running None resolved
+                        // The per-turn authority gate runs at this fresh-turn
+                        // boundary only: authorized entries run, refused ones
+                        // settle Failed without ever invoking the runner and
+                        // the drain moves on.
+                        match checkAgentAuthority () with
+                        | None ->
+                            awaitTask (
+                                props.Store.UpdateSessionState(
+                                    props.Tenant,
+                                    props.SessionId,
+                                    SessionState.Running,
+                                    cancellationToken
+                                )
+                            )
+                            |> ignore
+
+                            startSuspendable first 1 (readGrantsNow ()) None
+                            mailbox.Sender() <! PromptAccepted appended
+                            return! loop SessionState.Running None resolved
+                        | Some(failure, reason) ->
+                            settleAuthorityRefusal first failure reason
+                            mailbox.Sender() <! PromptAccepted appended
+                            let next = drainAfterRefusal ()
+                            return! loop next None resolved
                     | SessionState.Running
                     | SessionState.WaitingForInput ->
                         // Append-and-wait: the running turn folds the entry
@@ -3215,25 +3400,36 @@ module internal SessionActor =
                                 )
                             )
 
-                        awaitTask (
-                            props.Store.UpdateSessionState(
-                                props.Tenant,
-                                props.SessionId,
-                                SessionState.Running,
-                                cancellationToken
-                            )
-                        )
-                        |> ignore
-
                         let pending =
                             awaitTask (props.Store.ReadPendingInbox(props.Tenant, props.SessionId, cancellationToken))
 
                         let first =
                             selectDrainableEntries pending |> List.tryHead |> Option.defaultValue appended
 
-                        startSuspendable first 1 (readGrantsNow ()) None
-                        mailbox.Sender() <! PromptAccepted appended
-                        return! loop SessionState.Running None resolved
+                        // The per-turn authority gate runs at this fresh-turn
+                        // boundary only: authorized entries run, refused ones
+                        // settle Failed without ever invoking the runner and
+                        // the drain moves on.
+                        match checkAgentAuthority () with
+                        | None ->
+                            awaitTask (
+                                props.Store.UpdateSessionState(
+                                    props.Tenant,
+                                    props.SessionId,
+                                    SessionState.Running,
+                                    cancellationToken
+                                )
+                            )
+                            |> ignore
+
+                            startSuspendable first 1 (readGrantsNow ()) None
+                            mailbox.Sender() <! PromptAccepted appended
+                            return! loop SessionState.Running None resolved
+                        | Some(failure, reason) ->
+                            settleAuthorityRefusal first failure reason
+                            mailbox.Sender() <! PromptAccepted appended
+                            let next = drainAfterRefusal ()
+                            return! loop next None resolved
                     | SessionState.Running ->
                         // Pre-empt through the abort verb: the entry joins
                         // the inbox first so the settle drain finds it
@@ -3365,8 +3561,18 @@ module internal SessionActor =
 
                                 match selectDrainableEntries pending with
                                 | following :: _ ->
-                                    startSuspendable following 1 (readGrantsNow ()) None
-                                    SessionState.Running
+                                    // The per-turn authority gate runs at this
+                                    // settle-drain boundary only: authorized
+                                    // entries run, refused ones settle Failed
+                                    // without ever invoking the runner and
+                                    // the drain moves on.
+                                    match checkAgentAuthority () with
+                                    | None ->
+                                        startSuspendable following 1 (readGrantsNow ()) None
+                                        SessionState.Running
+                                    | Some(failure, reason) ->
+                                        settleAuthorityRefusal following failure reason
+                                        drainAfterRefusal ()
                                 | [] ->
                                     awaitTask (
                                         props.Store.UpdateSessionState(
@@ -3843,18 +4049,28 @@ module internal SessionActor =
 
                         match selectDrainableEntries pending with
                         | first :: _ ->
-                            awaitTask (
-                                props.Store.UpdateSessionState(
-                                    props.Tenant,
-                                    props.SessionId,
-                                    SessionState.Running,
-                                    CancellationToken.None
+                            // The per-turn authority gate runs at this Idle
+                            // wake boundary too: authorized entries run,
+                            // refused ones settle Failed without ever invoking
+                            // the runner and the drain moves on.
+                            match checkAgentAuthority () with
+                            | None ->
+                                awaitTask (
+                                    props.Store.UpdateSessionState(
+                                        props.Tenant,
+                                        props.SessionId,
+                                        SessionState.Running,
+                                        CancellationToken.None
+                                    )
                                 )
-                            )
-                            |> ignore
+                                |> ignore
 
-                            startSuspendable first 1 (readGrantsNow ()) None
-                            return! loop SessionState.Running None resolved
+                                startSuspendable first 1 (readGrantsNow ()) None
+                                return! loop SessionState.Running None resolved
+                            | Some(failure, reason) ->
+                                settleAuthorityRefusal first failure reason
+                                let next = drainAfterRefusal ()
+                                return! loop next None resolved
                         | [] -> return! loop state suspended resolved
                     | _ -> return! loop state suspended resolved
             }
@@ -4413,6 +4629,7 @@ module internal SessionActor =
     /// <param name="leaseDuration">How long the primed journal claim lasts. Must be positive.</param>
     /// <param name="runSuspendable">Runs one suspendable attempt, bound to the DI-resolved policy. Never null.</param>
     /// <param name="compactFor">Builds the on-demand compaction wiring for one session from its primed journal token, or None when the host compacts nothing. Must not be null; return None to answer CompactNotNeeded.</param>
+    /// <param name="agentStore">The agent catalog the per-turn authority gate reads, or null when the host runs without one: the gate is skipped then.</param>
     /// <returns>A factory mapping a session id string to a suspendable child spawn.</returns>
     let spawnSuspendFactory
         (store: ISessionStore)
@@ -4424,6 +4641,7 @@ module internal SessionActor =
         (leaseDuration: TimeSpan)
         (runSuspendable: SuspendableRunner)
         (compactFor: SessionId -> string -> CompactDeps option)
+        (agentStore: IAgentStore | null)
         : (string -> IActorContext -> string -> IActorRef) =
         ArgumentNullException.ThrowIfNull(store)
         ArgumentNullException.ThrowIfNull(eventStore)
@@ -4526,6 +4744,7 @@ module internal SessionActor =
                         RunSuspendable = runSuspendable
                         ReprimeJournal = Some(fun () -> primeClaim captured)
                         RefreshCompact = Some(compactFor captured)
+                        AgentStore = agentStore
                     }
 
                 spawn context name (behaviorWithSuspend props suspend)

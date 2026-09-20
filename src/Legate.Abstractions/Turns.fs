@@ -136,6 +136,28 @@ type Turn =
         StopCause: Nullable<StopCause>
     }
 
+/// Why a turn refused to run without invoking the runner: the actor-side
+/// per-turn authority gate's exactly-one reason, so hosts branch on it
+/// without parsing messages.
+/// <see cref="T:Legate.TurnAgentRejected" /> carries the winner plus the
+/// human-readable reason.
+type AgentAuthorityFailure =
+
+    /// No agent with the session's agent id exists in the session's tenant.
+    /// Settles the turn as <see cref="F:Legate.TurnStatus.Failed" /> with a
+    /// <see cref="T:Legate.TurnAgentRejected" /> outcome.
+    | NotFound = 0
+
+    /// The agent exists but is disabled for new turns. Settles the turn as
+    /// <see cref="F:Legate.TurnStatus.Failed" /> with a
+    /// <see cref="T:Legate.TurnAgentRejected" /> outcome.
+    | Disabled = 1
+
+    /// The agent exists but belongs to another tenant than the session.
+    /// Settles the turn as <see cref="F:Legate.TurnStatus.Failed" /> with a
+    /// <see cref="T:Legate.TurnAgentRejected" /> outcome.
+    | TenantMismatch = 2
+
 /// The structured completion of a settled turn, delivered only when the
 /// session ran with the structured outcome mode. Serialises
 /// polymorphically: every concrete outcome carries a stable <c>$type</c>
@@ -146,6 +168,7 @@ type Turn =
 [<JsonDerivedType(typeof<TurnPartiallyFinished>, "turnPartiallyFinished")>]
 [<JsonDerivedType(typeof<TurnAborted>, "turnAborted")>]
 [<JsonDerivedType(typeof<TurnFailed>, "turnFailed")>]
+[<JsonDerivedType(typeof<TurnAgentRejected>, "turnAgentRejected")>]
 type TurnOutcome() = class end
 
 /// The turn settled normally: the model stopped calling tools.
@@ -193,6 +216,21 @@ and [<Sealed>] TurnFailed(reason: string) =
     inherit TurnOutcome()
 
     /// Why the turn failed. Never contains secrets or tool arguments.
+    member _.Reason = reason
+
+/// The turn refused to run: the agent was missing, disabled, or belongs to
+/// another tenant, so the actor-side authority gate settled the turn without
+/// ever invoking the runner. Carries the typed failure (which branch refused)
+/// and the reason (why), never a stringly reason alone.
+/// <param name="failure">Which authority branch refused the turn.</param>
+/// <param name="reason">Why the turn refused to run. Never contains secrets or tool arguments.</param>
+and [<Sealed>] TurnAgentRejected(failure: AgentAuthorityFailure, reason: string) =
+    inherit TurnOutcome()
+
+    /// Which authority branch refused the turn.
+    member _.Failure = failure
+
+    /// Why the turn refused to run. Never contains secrets or tool arguments.
     member _.Reason = reason
 
 /// What a host that waits on a turn receives when the turn settles: the

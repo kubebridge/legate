@@ -310,6 +310,7 @@ let private spawnSuspendable
             RunSuspendable = runner
             ReprimeJournal = None
             RefreshCompact = None
+            AgentStore = null
         }
 
     spawn system $"dispatch-{Guid.NewGuid():N}" (SessionActor.behaviorWithSuspend baseProps deps)
