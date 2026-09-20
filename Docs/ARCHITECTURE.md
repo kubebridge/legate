@@ -234,6 +234,81 @@ defer are all point lookups by session.
   where a host's business rules enter the runtime. Legate reports tokens; it
   never prices them.
 
+## Wire serialization
+
+Actor, router, and entity protocol messages cross a node boundary only as
+token-less DTOs under a versioned envelope. Each wire case owns one
+`legate.<family>.<MessageName>.v<version>` manifest, one DTO type, one
+version (all v1 today), and one per-case byte bound. The reader accepts the
+current and the current-minus-one version and refuses anything newer or
+older; older-than-current records `failed`. Every refusal (unknown
+manifest, newer version, oversized payload, failed deserialisation or
+mapping) records `legate.serialization.rejected` with its reason tag, logs
+a warning, and throws so Akka drops the message: fail-closed throughout.
+Oversized payloads are refused before deserialising. The global
+`Cluster:MaxWirePayloadBytes` (default 1 MiB) caps every manifest on top of
+its per-case bound. JSON is field-additive, so minor payload changes cross
+versions silently; a structural change bumps the wire-case version. Adding
+a wire case means adding a manifest-table row, its DTO, and (with issue
+131) its golden file.
+
+Translation rule: `CancellationToken` is never serialised and is
+re-attached by the receiver from its own scope (Ask timeouts and
+actor-local sources own cancellation cross-node); live `Exception` values
+cross as reason strings and rebuild as generic faults (both fault handlers
+ignore the payload, so the fault/consume-and-drain path is preserved);
+suspension resume delegates never cross (nested resumes are parent-local)
+and rebuild as `None`; the typed reply-mismatch error crosses as its
+session id, request id, and message. Actor logic is shared: translation
+happens at the send/receive serialization boundary, never in the actors.
+
+Small bound is 32,768 bytes (control DTOs); large bound is 1,048,576 bytes
+(data-carrying DTOs).
+
+| Manifest | DTO type | Version | Bound |
+|---|---|---|---|
+| `legate.actor.AbortSession.v1` | `WireDtos.AbortSessionDto` | 1 | large |
+| `legate.actor.CloseSession.v1` | `WireDtos.CloseSessionDto` | 1 | small |
+| `legate.actor.CompactCompleted.v1` | `WireDtos.CompactCompletedDto` | 1 | small |
+| `legate.actor.CompactDeferred.v1` | `WireDtos.CompactDeferredDto` | 1 | small |
+| `legate.actor.CompactFenced.v1` | `WireDtos.CompactFencedDto` | 1 | small |
+| `legate.actor.CompactNotNeeded.v1` | `WireDtos.CompactNotNeededDto` | 1 | small |
+| `legate.actor.CompactRejected.v1` | `WireDtos.CompactRejectedDto` | 1 | small |
+| `legate.actor.CompactSession.v1` | `WireDtos.CompactSessionDto` | 1 | small |
+| `legate.actor.GetSnapshot.v1` | `WireDtos.GetSnapshotDto` | 1 | small |
+| `legate.actor.InjectPrompt.v1` | `WireDtos.InjectPromptDto` | 1 | large |
+| `legate.actor.InterruptPrompt.v1` | `WireDtos.InterruptPromptDto` | 1 | large |
+| `legate.actor.PromptAccepted.v1` | `WireDtos.PromptAcceptedDto` | 1 | large |
+| `legate.actor.PromptRejected.v1` | `WireDtos.PromptRejectedDto` | 1 | small |
+| `legate.actor.QueuePrompt.v1` | `WireDtos.QueuePromptDto` | 1 | large |
+| `legate.actor.SessionClosed.v1` | `WireDtos.SessionClosedDto` | 1 | large |
+| `legate.actor.SessionSnapshot.v1` | `WireDtos.SnapshotDto` | 1 | small |
+| `legate.actor.TurnFaulted.v1` | `WireDtos.TurnFaultedDto` | 1 | large |
+| `legate.actor.TurnSettled.v1` | `WireDtos.TurnSettledDto` | 1 | large |
+| `legate.router.ResolveSession.v1` | `WireDtos.ResolveSessionDto` | 1 | small |
+| `legate.entity.ReplyAccepted.v1` | `WireDtos.ReplyAcceptedDto` | 1 | large |
+| `legate.entity.ReplyEntry.v1` | `WireDtos.ReplyEntryDto` | 1 | large |
+| `legate.entity.ReplyRejected.v1` | `WireDtos.ReplyRejectedDto` | 1 | small |
+| `legate.entity.SetAgentApplied.v1` | `WireDtos.SetAgentAppliedDto` | 1 | large |
+| `legate.entity.SetAgentPending.v1` | `WireDtos.SetAgentPendingDto` | 1 | large |
+| `legate.entity.SetAgentRejected.v1` | `WireDtos.SetAgentRejectedDto` | 1 | small |
+| `legate.entity.SuspendTimedOut.v1` | `WireDtos.SuspendTimedOutDto` | 1 | small |
+| `legate.entity.SuspendableAbortSession.v1` | `WireDtos.SuspendableAbortSessionDto` | 1 | large |
+| `legate.entity.SuspendableCheckInbox.v1` | `WireDtos.SuspendableCheckInboxDto` | 1 | small |
+| `legate.entity.SuspendableCloseSession.v1` | `WireDtos.SuspendableCloseSessionDto` | 1 | small |
+| `legate.entity.SuspendableCompactSession.v1` | `WireDtos.SuspendableCompactSessionDto` | 1 | small |
+| `legate.entity.SuspendableFinished.v1` | `WireDtos.SuspendableFinishedDto` | 1 | large |
+| `legate.entity.SuspendableFaulted.v1` | `WireDtos.SuspendableFaultedDto` | 1 | large |
+| `legate.entity.SuspendableGetSnapshot.v1` | `WireDtos.SuspendableGetSnapshotDto` | 1 | small |
+| `legate.entity.SuspendableInjectPrompt.v1` | `WireDtos.SuspendableInjectPromptDto` | 1 | large |
+| `legate.entity.SuspendableInterruptPrompt.v1` | `WireDtos.SuspendableInterruptPromptDto` | 1 | large |
+| `legate.entity.SuspendableQueuePrompt.v1` | `WireDtos.SuspendableQueuePromptDto` | 1 | large |
+| `legate.entity.SuspendableSetAgent.v1` | `WireDtos.SuspendableSetAgentDto` | 1 | small |
+
+Reserved (no DTO yet; refused as unknown manifests until their owning
+issue promotes them to table rows): `legate.subscription.Subscribe.v1`
+(issue 132), `legate.event.SessionEvent.v1` (issue 133).
+
 ## Observability
 
 - `ILogger<T>` with structured scopes (`SessionId`, `TurnId`, `AgentId`,

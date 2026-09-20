@@ -227,6 +227,36 @@ let ``Non-positive shutdown grace fails validation with the section path`` () =
     |> should equal true
 
 [<Fact>]
+let ``Binds the cluster wire maximum`` () =
+    let section =
+        buildSection
+            [
+                "Legate:Cluster:MaxWirePayloadBytes", "262144"
+            ]
+
+    let options = LegateOptionsBinding.bind section
+
+    options.Cluster.MaxWirePayloadBytes |> should equal 262144
+
+    options.Validate() |> should equal null
+
+[<Fact>]
+let ``Non-positive wire maximum fails validation with the section path`` () =
+    let section =
+        buildSection
+            [
+                "Legate:Cluster:MaxWirePayloadBytes", "0"
+            ]
+
+    let ex =
+        Assert.Throws<InvalidOperationException>(fun () -> LegateOptionsBinding.bind section |> ignore)
+
+    ex.Message.Contains("Cluster") |> should equal true
+
+    ex.Message.Contains("MaxWirePayloadBytes must be at least 1.")
+    |> should equal true
+
+[<Fact>]
 let ``Invalid duration fails with the section path`` () =
     let section =
         buildSection

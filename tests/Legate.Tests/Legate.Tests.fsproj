@@ -130,6 +130,7 @@
     <Compile Include="ArtifactsTests.fs" />
     <Compile Include="SessionArtifactsTests.fs" />
     <Compile Include="AgentAuthorityTests.fs" />
+    <Compile Include="WireSerializationTests.fs" />
   </ItemGroup>
 
   <ItemGroup>

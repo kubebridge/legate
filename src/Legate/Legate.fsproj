@@ -45,6 +45,9 @@
     <Compile Include="SessionPermissions.fs" />
     <Compile Include="ClusterSharding.fs" />
     <Compile Include="LocalActorSystem.fs" />
+    <Compile Include="WireDtos.fs" />
+    <Compile Include="WireManifests.fs" />
+    <Compile Include="WireSerializer.fs" />
     <Compile Include="SessionClient.fs" />
     <Compile Include="Agents/AgentFileParser.fs" />
     <Compile Include="Agents/SubAgents.fs" />

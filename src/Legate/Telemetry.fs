@@ -23,7 +23,8 @@ open System.Diagnostics.Metrics
 // Instrument names (the documented surface the mirror test asserts):
 // legate.turns.started, legate.turns.settled, legate.provider.calls,
 // legate.provider.latency, legate.tool.calls, legate.tool.latency,
-// legate.session.queue.depth, legate.lease.renewals, legate.dispatch.latency.
+// legate.session.queue.depth, legate.lease.renewals, legate.dispatch.latency,
+// legate.serialization.rejected.
 // Span operations: Legate.Turn, Legate.ProviderCall, Legate.ToolCall.
 //
 // Rejected: per-module Meter/ActivitySource instances (one named pair keeps
@@ -90,6 +91,39 @@ module internal Telemetry =
     /// per-session series would explode with sessions.
     [<Literal>]
     let DispatchLatencyName = "legate.dispatch.latency"
+
+    /// Counter: wire payloads the versioned envelope refused, by reason
+    /// (unknownManifest, newerVersion, oversized, failed). Every refusal
+    /// fails closed: the payload never deserialises and Akka drops the
+    /// message. Older-than-current manifests record failed, never a
+    /// distinct tag.
+    [<Literal>]
+    let SerializationRejectedName = "legate.serialization.rejected"
+
+    /// Metric tag: why the wire envelope refused a payload. One of the
+    /// Rejection reason names below.
+    [<Literal>]
+    let ReasonTag = "reason"
+
+    /// Rejection reason: the manifest names no registered wire case.
+    [<Literal>]
+    let RejectionUnknownManifest = "unknownManifest"
+
+    /// Rejection reason: the manifest version is newer than the registered
+    /// wire-case version.
+    [<Literal>]
+    let RejectionNewerVersion = "newerVersion"
+
+    /// Rejection reason: the payload exceeds the wire-case byte bound (or
+    /// the configured global maximum) and is refused before deserialising.
+    [<Literal>]
+    let RejectionOversized = "oversized"
+
+    /// Rejection reason: the payload failed to deserialise or to map back
+    /// onto its domain message, including older-than-current manifests and
+    /// known manifests carrying an unknown inner $type.
+    [<Literal>]
+    let RejectionFailed = "failed"
 
     /// Span operation: one turn of the ReAct loop.
     [<Literal>]
@@ -236,6 +270,12 @@ module internal Telemetry =
             DispatchLatencyName,
             "ms",
             "Dispatch latency from the oldest pending inbox append to the session start."
+        )
+
+    let private serializationRejectedCounter: Counter<int64> =
+        meter.CreateCounter<int64>(
+            SerializationRejectedName,
+            description = "Wire payloads the versioned envelope refused, by reason."
         )
 
     /// Treats a null string as empty: ids and names always emit something.
@@ -533,5 +573,25 @@ module internal Telemetry =
         try
             let mutable tags = TagList()
             dispatchLatencyHistogram.Record(max 0.0 milliseconds, &tags)
+        with _ ->
+            ()
+
+    /// Bounds a rejection reason: null or blank never emits blank.
+    /// <param name="reason">The reason to bound, or null.</param>
+    /// <returns>The reason, or failed when it was blank.</returns>
+    let private boundedReason (reason: string | null) : string =
+        match reason with
+        | null -> RejectionFailed
+        | live when String.IsNullOrWhiteSpace live -> RejectionFailed
+        | live -> live
+
+    /// Records one wire payload the versioned envelope refused, by reason.
+    /// Never throws.
+    /// <param name="reason">One of the Rejection reason names.</param>
+    let recordSerializationRejected (reason: string | null) : unit =
+        try
+            let mutable tags = TagList()
+            tags.Add(ReasonTag, ((boundedReason reason) :> obj))
+            serializationRejectedCounter.Add(1L, &tags)
         with _ ->
             ()
