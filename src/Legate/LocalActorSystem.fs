@@ -16,8 +16,9 @@ open Microsoft.Extensions.Options
 // creates one Akka.NET ActorSystem with minimal inline HOCON (no remoting,
 // cluster, or sharding) when Cluster:Mode is Local, fronts it with a session
 // router that spawns one child per session id, and stops through coordinated
-// shutdown bounded by Cluster:ShutdownGraceSeconds. Clustered mode is
-// untouched: this service starts nothing and stops nothing there. Each child
+// shutdown bounded by Cluster:ShutdownGraceSeconds. The cluster modes
+// (StaticSeeds, Kubernetes) are untouched: this service starts nothing and
+// stops nothing there. Each child
 // is the SessionActor state machine when a child factory is configured, or
 // the legacy identity-only child otherwise (no store or turn runner is
 // available until the session client facade configures one): resolving an
@@ -146,7 +147,8 @@ module internal LocalActorSystem =
 // Hosted service
 
 /// Singleton hosted service owning the local actor system. Starts only in
-/// Local cluster mode; Clustered mode resolves no system and no router.
+/// Local cluster mode; the cluster modes (StaticSeeds, Kubernetes)
+/// resolve no system and no router here.
 /// Stop bounds coordinated shutdown by
 /// <c>Cluster:ShutdownGraceSeconds</c>.
 type internal LocalActorSystemService(options: IOptions<LegateOptions>, timeProvider: TimeProvider) as this =
@@ -185,7 +187,7 @@ type internal LocalActorSystemService(options: IOptions<LegateOptions>, timeProv
     /// <param name="sessionId">The session whose child to resolve.</param>
     /// <param name="cancellationToken">Cancels the resolve.</param>
     /// <returns>The session child actor.</returns>
-    member _.ResolveSessionAsync(sessionId: string, cancellationToken: CancellationToken) : Task<IActorRef> =
+    member private _.resolveInner (sessionId: string) (cancellationToken: CancellationToken) : Task<IActorRef> =
         if String.IsNullOrWhiteSpace sessionId then
             raise (ArgumentException("Session id must be a non-empty string.", nameof sessionId))
 
@@ -209,6 +211,18 @@ type internal LocalActorSystemService(options: IOptions<LegateOptions>, timeProv
                 return child
             }
 
+    /// Resolves the session child for a session id: the same id returns
+    /// the same actor, distinct ids return distinct actors.
+    /// <param name="sessionId">The session whose child to resolve.</param>
+    /// <param name="cancellationToken">Cancels the resolve.</param>
+    /// <returns>The session child actor.</returns>
+    member this.ResolveSessionAsync(sessionId: string, cancellationToken: CancellationToken) : Task<IActorRef> =
+        this.resolveInner sessionId cancellationToken
+
+    interface ISessionResolver with
+        member this.ResolveSessionAsync(sessionId, cancellationToken) =
+            this.resolveInner sessionId cancellationToken
+
     interface IHostedService with
         member _.StartAsync(_cancellationToken: CancellationToken) =
             task {
@@ -225,7 +239,7 @@ type internal LocalActorSystemService(options: IOptions<LegateOptions>, timeProv
                     router <- routerRef
                     lastColdStart <- timeProvider.GetElapsedTime startTimestamp
                 else
-                    // Clustered mode is untouched: sharding bootstraps elsewhere.
+                    // The cluster modes are untouched: sharding bootstraps elsewhere.
                     ()
             }
             :> Task

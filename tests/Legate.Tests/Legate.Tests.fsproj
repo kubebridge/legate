@@ -55,6 +55,8 @@
     <Compile Include="LegateOptionsBindingTests.fs" />
     <Compile Include="BuilderTests.fs" />
     <Compile Include="ActorSystemColdStartTests.fs" />
+    <Compile Include="ClusterShardingTests.fs" />
+    <Compile Include="ClusterActorSystemTests.fs" />
     <Compile Include="SessionActorTests.fs" />
     <Compile Include="StopArbitrationTests.fs" />
     <Compile Include="ClaimHeartbeatTests.fs" />
@@ -147,6 +149,8 @@
 
   <ItemGroup>
     <PackageReference Include="Akka" />
+    <PackageReference Include="Akka.Cluster" />
+    <PackageReference Include="Akka.Cluster.Sharding" />
     <PackageReference Include="Akka.FSharp" />
     <PackageReference Include="FSharp.Core" />
     <PackageReference Include="FsCheck.Xunit" />

@@ -22,12 +22,19 @@ open System.Collections.Generic
 /// deployment. Bound from configuration; unknown values fail binding.
 type ClusterMode =
 
-    /// A single process with local session actors. The default: no Redis,
-    /// no Kubernetes, no external coordination.
+    /// A single process with local session actors. The default: no
+    /// remoting, no Kubernetes, no external coordination.
     | Local = 0
 
-    /// A sharded Akka.NET cluster with seed-node discovery.
-    | Clustered = 1
+    /// A sharded Akka.NET cluster with seed-node discovery. Session
+    /// entities run on nodes carrying the session role; nodes without
+    /// it hold sharding proxies.
+    | StaticSeeds = 1
+
+    /// A sharded Akka.NET cluster bootstrapped through Akka.Management
+    /// Kubernetes discovery (issue 138). Until that bootstrap lands this
+    /// mode joins nothing and runs as a singleton: SeedNodes is ignored.
+    | Kubernetes = 2
 
 /// What a session does with the turn interrupted by a crash once the
 /// runtime resumes. Bound from configuration; unknown values fail binding.
@@ -566,22 +573,44 @@ type CompletionOptions() =
         else
             Array.head violations
 
-/// Cluster settings: the deployment mode, the seed nodes clustered mode
-/// discovers through, and how long the local actor system waits for graceful
-/// shutdown. Bound from the <c>Legate</c> configuration section; mutable so
-/// hosts can set properties before registering. Defaults run a single node
-/// with no seed nodes and a 30 s shutdown grace.
+/// Cluster settings: the deployment mode, the seed nodes StaticSeeds
+/// mode discovers through, this node's roles, the session sharding knobs,
+/// and how long the actor systems wait for graceful shutdown. Bound from
+/// the <c>Legate</c> configuration section; mutable so hosts can set
+/// properties before registering. Defaults run a single node with no seed
+/// nodes, no roles, 128 shards at hash version 1, and a 30 s shutdown
+/// grace.
 type ClusterOptions() =
 
     /// How the runtime is deployed. Default
     /// <see cref="F:Legate.ClusterMode.Local" />.
     member val Mode: ClusterMode = ClusterMode.Local with get, set
 
-    /// The seed nodes clustered mode discovers through, in host:port form.
-    /// Empty means no seed nodes.
+    /// The seed nodes StaticSeeds mode discovers through, in host:port
+    /// form. Empty means no seed nodes. Ignored in Kubernetes mode until
+    /// issue 138 ships the Akka.Management bootstrap.
     member val SeedNodes: List<string> = List<string>() with get, set
 
-    /// How long the local actor system waits for graceful shutdown
+    /// This node's cluster roles, for example session or api. Empty means
+    /// the node carries no role: it still joins, but sharding hosts no
+    /// session entities on it. Entries must be non-empty.
+    member val Roles: List<string> = List<string>() with get, set
+
+    /// The role sharding hosts session entities on: nodes without this
+    /// role hold proxies. Default session. Must be a non-empty string.
+    member val SessionRole: string = "session" with get, set
+
+    /// How many shards the session region spreads entities over. Part of
+    /// the cluster version stamp: every node must agree, and a mismatch
+    /// fails the node. Default 128. Must be at least 1.
+    member val ShardCount: int = 128 with get, set
+
+    /// The shard hash version mixed into the cluster version stamp. Bump
+    /// when the extractor changes so mixed nodes fail fast instead of
+    /// mis-routing. Default 1. Must be at least 1.
+    member val ShardHashVersion: int = 1 with get, set
+
+    /// How long the actor systems wait for graceful shutdown
     /// (coordinated shutdown on host stop) before the host continues
     /// stopping. Default 30 s; must stay positive.
     member val ShutdownGraceSeconds: TimeSpan = TimeSpan.FromSeconds 30.0 with get, set
@@ -596,6 +625,16 @@ type ClusterOptions() =
             "ShutdownGraceSeconds must be positive."
         elif isNull (box this.SeedNodes) then
             "SeedNodes must not be null."
+        elif this.Mode = ClusterMode.StaticSeeds && this.SeedNodes.Count = 0 then
+            "SeedNodes must not be empty in StaticSeeds mode."
+        elif this.ShardCount < 1 then
+            "ShardCount must be at least 1."
+        elif this.ShardHashVersion < 1 then
+            "ShardHashVersion must be at least 1."
+        elif String.IsNullOrWhiteSpace this.SessionRole then
+            "SessionRole must be a non-empty string."
+        elif isNull (box this.Roles) then
+            "Roles must not be null."
         else
             let mutable violation: string | null = null
             let mutable index = 0
@@ -603,6 +642,14 @@ type ClusterOptions() =
             while isNull (box violation) && index < this.SeedNodes.Count do
                 if String.IsNullOrWhiteSpace this.SeedNodes[index] then
                     violation <- $"SeedNodes[%d{index}] must be a non-empty host:port value."
+
+                index <- index + 1
+
+            index <- 0
+
+            while isNull (box violation) && index < this.Roles.Count do
+                if String.IsNullOrWhiteSpace this.Roles[index] then
+                    violation <- $"Roles[%d{index}] must be a non-empty string."
 
                 index <- index + 1
 

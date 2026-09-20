@@ -1246,18 +1246,52 @@ module internal SessionClientWiring =
         | null -> ()
         | violation -> raise (InvalidOperationException($"Invalid SessionClientOptions: %s{violation}"))
 
-        let actorService =
-            provider.GetServices<IHostedService>()
-            |> Seq.tryFind (fun service -> service :? LocalActorSystemService)
-            |> Option.map (fun service -> service :?> LocalActorSystemService)
+        let hostedServices = provider.GetServices<IHostedService>() |> List.ofSeq
 
-        let actorService =
-            match actorService with
+        let localService =
+            match
+                hostedServices
+                |> List.tryPick (fun service ->
+                    match service with
+                    | :? LocalActorSystemService as typed -> Some typed
+                    | _ -> None)
+            with
             | Some service -> service
             | None ->
                 raise (
                     InvalidOperationException(
                         "The Legate local actor system is not registered: AddLegate registers it, so a replaced service collection breaks the session client."
+                    )
+                )
+
+        let clusterService =
+            match
+                hostedServices
+                |> List.tryPick (fun service ->
+                    match service with
+                    | :? ClusterActorSystemService as typed -> Some typed
+                    | _ -> None)
+            with
+            | Some service -> service
+            | None ->
+                raise (
+                    InvalidOperationException(
+                        "The Legate cluster actor system is not registered: AddLegate registers it, so a replaced service collection breaks the session client."
+                    )
+                )
+
+        // The mode seam: Local resolves through the in-process router,
+        // the cluster modes through the shard region proxy. Both spawn
+        // the same SessionActor through the factory wired below.
+        let resolver: ISessionResolver =
+            match legateOptions.Cluster.Mode with
+            | ClusterMode.Local -> localService :> ISessionResolver
+            | ClusterMode.StaticSeeds
+            | ClusterMode.Kubernetes -> clusterService :> ISessionResolver
+            | _ ->
+                raise (
+                    InvalidOperationException(
+                        $"Unknown Legate cluster mode '%O{legateOptions.Cluster.Mode}'. Expected one of: Local, StaticSeeds, Kubernetes."
                     )
                 )
 
@@ -1310,7 +1344,7 @@ module internal SessionClientWiring =
                     }
                 )
 
-            actorService.SessionChildFactory <-
+            let entityFactory =
                 Some(
                     SessionActor.spawnSuspendFactory
                         store
@@ -1324,8 +1358,20 @@ module internal SessionClientWiring =
                         compactFor
                 )
 
+            // The factory lands on the mode-active service only; the idle
+            // service keeps identity children either way.
+            match resolver with
+            | :? LocalActorSystemService as local -> local.SessionChildFactory <- entityFactory
+            | :? ClusterActorSystemService as clustered -> clustered.SessionEntityFactory <- entityFactory
+            | _ ->
+                raise (
+                    InvalidOperationException(
+                        "The Legate actor system resolver is neither local nor clustered: AddLegate registers both, so a replaced service collection breaks the session client."
+                    )
+                )
+
         let resolve (sessionId: SessionId) (cancellationToken: CancellationToken) : Task<IActorRef> =
-            actorService.ResolveSessionAsync(sessionId.ToString(), cancellationToken)
+            resolver.ResolveSessionAsync(sessionId.ToString(), cancellationToken)
 
         // The agent catalog SetAgent validates against, or None when the
         // host runs without one: validation is skipped then.
