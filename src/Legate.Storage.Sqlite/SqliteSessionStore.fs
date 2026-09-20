@@ -1077,7 +1077,27 @@ type SqliteSessionStore(database: SqliteDatabase) =
                                 let live = { claim with ExpiresAt = expiresAt }
 
                                 TurnLeaseHeld live :> TurnLeaseState
-                            | TakenOver -> TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState
+                            | TakenOver ->
+                                // Distinguish expiry from takeover by reading the live row.
+                                use command = connection.CreateCommand()
+
+                                command.CommandText <-
+                                    $"SELECT claim_token, claim_expires_at FROM \"%s{turnsTable ()}\" WHERE turn_id = $turn AND tenant = $tenant"
+
+                                command.Parameters.AddWithValue("$turn", claim.TurnId.Value) |> ignore
+                                command.Parameters.AddWithValue("$tenant", tenant.Value) |> ignore
+
+                                use reader = command.ExecuteReader()
+
+                                if reader.Read() && not (reader.IsDBNull(0)) then
+                                    let stored = reader.GetString(0)
+
+                                    if String.Equals(stored, claim.Token, StringComparison.Ordinal) then
+                                        TurnLeaseLost(claim.TurnId, "expired") :> TurnLeaseState
+                                    else
+                                        TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState
+                                else
+                                    TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState
                             | Absent -> TurnLeaseMissing claim.TurnId :> TurnLeaseState)
                 with
                 | :? LegateException as ex -> return raise ex
