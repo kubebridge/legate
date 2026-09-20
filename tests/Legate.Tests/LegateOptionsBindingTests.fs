@@ -37,7 +37,7 @@ let ``Binds nested sections rules list and providers dictionary`` () =
                 "Legate:Permissions:Rules:0:Decision", "Ask"
                 "Legate:Llm:DefaultModel", "anthropic/claude-sonnet"
                 "Legate:Llm:Providers:anthropic:ApiKey", "test-key"
-                "Legate:Cluster:Mode", "Clustered"
+                "Legate:Cluster:Mode", "StaticSeeds"
                 "Legate:Cluster:SeedNodes:0", "127.0.0.1:5115"
                 "Legate:Workspace:Mode", "HostDirectory"
                 "Legate:Workspace:RootPath", "/tmp/work"
@@ -66,7 +66,7 @@ let ``Binds a full valid section with camelCase keys`` () =
                 "Legate:llm:defaultModel", "anthropic/claude-sonnet"
                 "Legate:llm:providers:anthropic:apiKey", "test-key"
                 "Legate:llm:distributedCoordination", "true"
-                "Legate:cluster:mode", "clustered"
+                "Legate:cluster:mode", "staticSeeds"
                 "Legate:cluster:seedNodes:0", "127.0.0.1:5115"
                 "Legate:workspace:mode", "hostDirectory"
                 "Legate:workspace:rootPath", "/tmp/work"
@@ -91,7 +91,7 @@ let ``Binds a full valid section with camelCase keys`` () =
     options.Llm.DefaultModel |> should equal "anthropic/claude-sonnet"
     options.Llm.Providers["anthropic"].ApiKey |> should equal "test-key"
     options.Llm.DistributedCoordination |> should equal true
-    options.Cluster.Mode |> should equal ClusterMode.Clustered
+    options.Cluster.Mode |> should equal ClusterMode.StaticSeeds
     options.Cluster.SeedNodes[0] |> should equal "127.0.0.1:5115"
     options.Workspace.Mode |> should equal WorkspaceMode.HostDirectory
     options.Workspace.RootPath |> should equal "/tmp/work"
@@ -290,6 +290,55 @@ let ``Unknown cluster mode fails with the section path`` () =
 
     ex.Message.Contains("Legate:Cluster:Mode") |> should equal true
     ex.Message.Contains("unknown cluster mode") |> should equal true
+    ex.Message.Contains("Local") |> should equal true
+    ex.Message.Contains("StaticSeeds") |> should equal true
+    ex.Message.Contains("Kubernetes") |> should equal true
+
+[<Fact>]
+let ``Binds the cluster section with modes roles and shard knobs`` () =
+    let staticSeeds =
+        buildSection
+            [
+                "Legate:Cluster:Mode", "StaticSeeds"
+                "Legate:Cluster:SeedNodes:0", "127.0.0.1:5115"
+                "Legate:Cluster:Roles:0", "session"
+                "Legate:Cluster:Roles:1", "api"
+                "Legate:Cluster:SessionRole", "session"
+                "Legate:Cluster:ShardCount", "32"
+                "Legate:Cluster:ShardHashVersion", "2"
+            ]
+
+    let seeded = LegateOptionsBinding.bind staticSeeds
+    seeded.Cluster.Mode |> should equal ClusterMode.StaticSeeds
+    seeded.Cluster.SeedNodes[0] |> should equal "127.0.0.1:5115"
+    seeded.Cluster.Roles |> List.ofSeq |> should equal [ "session"; "api" ]
+    seeded.Cluster.SessionRole |> should equal "session"
+    seeded.Cluster.ShardCount |> should equal 32
+    seeded.Cluster.ShardHashVersion |> should equal 2
+    seeded.Validate() |> should equal null
+
+    let kubernetes =
+        buildSection
+            [
+                "Legate:Cluster:Mode", "Kubernetes"
+                "Legate:Cluster:Roles:0", "session"
+            ]
+
+    let clustered = LegateOptionsBinding.bind kubernetes
+    clustered.Cluster.Mode |> should equal ClusterMode.Kubernetes
+    clustered.Cluster.SeedNodes.Count |> should equal 0
+    clustered.Cluster.Roles[0] |> should equal "session"
+    clustered.Validate() |> should equal null
+
+[<Fact>]
+let ``StaticSeeds without seed nodes fails validation`` () =
+    let section = buildSection [ "Legate:Cluster:Mode", "StaticSeeds" ]
+
+    let ex =
+        Assert.Throws<InvalidOperationException>(fun () -> LegateOptionsBinding.bind section |> ignore)
+
+    ex.Message.Contains("SeedNodes must not be empty in StaticSeeds mode.")
+    |> should equal true
 
 [<Fact>]
 let ``Unknown permission decision fails with the section path`` () =

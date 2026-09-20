@@ -199,8 +199,14 @@ let ``Local mode starts the system through AddLegate`` () =
         stopHosted provider
 
 [<Fact>]
-let ``Clustered mode skips the local system through AddLegate`` () =
-    let section = buildSection [ "Legate:Cluster:Mode", "Clustered" ]
+let ``StaticSeeds mode skips the local system through AddLegate`` () =
+    let section =
+        buildSection
+            [
+                "Legate:Cluster:Mode", "StaticSeeds"
+                "Legate:Cluster:SeedNodes:0", "127.0.0.1:5115"
+            ]
+
     let services = ServiceCollection()
 
     addLegateFSharp services (fun builder ->

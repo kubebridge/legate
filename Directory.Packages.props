@@ -5,6 +5,8 @@
   <ItemGroup>
     <PackageVersion Include="AWSSDK.S3" Version="4.0.103.3" />
     <PackageVersion Include="Akka" Version="1.5.71" />
+    <PackageVersion Include="Akka.Cluster" Version="1.5.71" />
+    <PackageVersion Include="Akka.Cluster.Sharding" Version="1.5.71" />
     <PackageVersion Include="Akka.FSharp" Version="1.5.71" />
     <PackageVersion Include="Cronos" Version="0.13.0" />
     <PackageVersion Include="FluentMigrator" Version="8.0.1" />

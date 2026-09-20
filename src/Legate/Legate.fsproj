@@ -43,6 +43,7 @@
     <Compile Include="PromptWaitHub.fs" />
     <Compile Include="SessionActor.fs" />
     <Compile Include="SessionPermissions.fs" />
+    <Compile Include="ClusterSharding.fs" />
     <Compile Include="LocalActorSystem.fs" />
     <Compile Include="SessionClient.fs" />
     <Compile Include="Agents/AgentFileParser.fs" />
@@ -56,6 +57,7 @@
     <Compile Include="CompletionRedriver.fs" />
     <Compile Include="LegateBuilder.fs" />
     <Compile Include="Agents/FileAgentStore.fs" />
+    <Compile Include="ClusterActorSystem.fs" />
     <Compile Include="SessionClientFacade.fs" />
     <Compile Include="JournalArchiveOptions.fs" />
     <Compile Include="JournalArchiveWorker.fs" />
@@ -72,6 +74,8 @@
 
   <ItemGroup>
     <PackageReference Include="Akka" />
+    <PackageReference Include="Akka.Cluster" />
+    <PackageReference Include="Akka.Cluster.Sharding" />
     <PackageReference Include="Akka.FSharp" />
     <PackageReference Include="Cronos" />
     <PackageReference Include="FSharp.Core" />

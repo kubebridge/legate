@@ -299,6 +299,10 @@ let ``Cluster defaults run local with no seeds`` () =
     let options = ClusterOptions()
     options.Mode |> should equal ClusterMode.Local
     options.SeedNodes.Count |> should equal 0
+    options.Roles.Count |> should equal 0
+    options.SessionRole |> should equal "session"
+    options.ShardCount |> should equal 128
+    options.ShardHashVersion |> should equal 1
     options.ShutdownGraceSeconds |> should equal (TimeSpan.FromSeconds 30.0)
     options.Validate() |> should equal null
 
@@ -323,9 +327,52 @@ let ``Cluster Validate flags unknown mode and bad seeds`` () =
     blankSeed.Validate()
     |> should equal "SeedNodes[0] must be a non-empty host:port value."
 
-    let seeded = ClusterOptions(Mode = ClusterMode.Clustered)
+    let seeded = ClusterOptions(Mode = ClusterMode.StaticSeeds)
     seeded.SeedNodes.Add("127.0.0.1:5115") |> ignore
     seeded.Validate() |> should equal null
+
+[<Fact>]
+let ``Cluster Validate requires seeds in StaticSeeds but not in Kubernetes`` () =
+    let missing = ClusterOptions(Mode = ClusterMode.StaticSeeds)
+
+    missing.Validate()
+    |> should equal "SeedNodes must not be empty in StaticSeeds mode."
+
+    let kubernetes = ClusterOptions(Mode = ClusterMode.Kubernetes)
+    kubernetes.Validate() |> should equal null
+
+    let kubernetesSeeded = ClusterOptions(Mode = ClusterMode.Kubernetes)
+    kubernetesSeeded.SeedNodes.Add("127.0.0.1:5115") |> ignore
+    kubernetesSeeded.Validate() |> should equal null
+
+[<Fact>]
+let ``Cluster Validate flags bad shard knobs roles and session role`` () =
+    ClusterOptions(ShardCount = 0).Validate()
+    |> should equal "ShardCount must be at least 1."
+
+    ClusterOptions(ShardHashVersion = 0).Validate()
+    |> should equal "ShardHashVersion must be at least 1."
+
+    ClusterOptions(SessionRole = "  ").Validate()
+    |> should equal "SessionRole must be a non-empty string."
+
+    let nullRoles = ClusterOptions()
+    nullRoles.Roles <- nullRef<List<string>>
+    nullRoles.Validate() |> should equal "Roles must not be null."
+
+    let blankRole = ClusterOptions()
+    blankRole.Roles.Add("session") |> ignore
+    blankRole.Roles.Add("  ") |> ignore
+
+    blankRole.Validate() |> should equal "Roles[1] must be a non-empty string."
+
+    let roleful = ClusterOptions(Mode = ClusterMode.StaticSeeds)
+    roleful.SeedNodes.Add("127.0.0.1:5115") |> ignore
+    roleful.Roles.Add("session") |> ignore
+    roleful.SessionRole <- "session"
+    roleful.ShardCount <- 32
+    roleful.ShardHashVersion <- 2
+    roleful.Validate() |> should equal null
 
 // ──────────────────────────────────────────────────────────────────────────
 // Pruning

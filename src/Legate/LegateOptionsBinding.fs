@@ -53,7 +53,7 @@ module internal LegateOptionsBinding =
                 "AllowForSession"
                 "Deny"
             ]
-            "Cluster:Mode", typeof<ClusterMode>, "cluster mode", [ "Local"; "Clustered" ]
+            "Cluster:Mode", typeof<ClusterMode>, "cluster mode", [ "Local"; "StaticSeeds"; "Kubernetes" ]
             "Workspace:Mode", typeof<WorkspaceMode>, "workspace mode", [ "Process"; "HostDirectory"; "Docker" ]
             "AskUser:Mode", typeof<AskUserMode>, "ask-user mode", [ "Fail"; "AnswerWith" ]
         ]
