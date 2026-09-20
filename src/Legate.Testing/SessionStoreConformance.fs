@@ -186,6 +186,10 @@ type SessionStoreConformance(store: ISessionStore, clock: TestClock, tenant: Ten
             | _ -> failwith "expected the resume claim"
 
             // The loser's fenced calls all reject with zero effects.
+            let! verifyLost = store.VerifyClaim(tenant, claim, CancellationToken.None)
+            Assert.True(verifyLost :? TurnLeaseLost)
+            Assert.Equal("takenOver", (verifyLost :?> TurnLeaseLost).Reason)
+
             let! renewLost = store.RenewClaim(tenant, claim, TimeSpan.FromMinutes 5., CancellationToken.None)
             Assert.True(renewLost :? TurnLeaseLost || renewLost :? TurnLeaseMissing)
 
@@ -266,17 +270,17 @@ type SessionStoreConformance(store: ISessionStore, clock: TestClock, tenant: Ten
             let claim = (claimed :?> TurnLeaseRenewed).Claim
 
             // Past the lease with no takeover: the claim is lost to
-            // expiry, distinctly not missing. The shared rule pins the
-            // outcome type, not the reason string: SQLite reports
-            // "takenOver" here where the contract reads "expired"
-            // (tracked as a provider follow-up under #101/#102).
+            // expiry, distinctly not missing. The shared rule pins both
+            // the outcome type and the reason string.
             this.Clock.Advance(TimeSpan.FromMinutes 10.)
 
             let! expired = store.VerifyClaim(tenant, claim, CancellationToken.None)
             Assert.True(expired :? TurnLeaseLost)
+            Assert.Equal("expired", (expired :?> TurnLeaseLost).Reason)
 
             let! renewExpired = store.RenewClaim(tenant, claim, TimeSpan.FromMinutes 5., CancellationToken.None)
             Assert.True(renewExpired :? TurnLeaseLost)
+            Assert.Equal("expired", (renewExpired :?> TurnLeaseLost).Reason)
 
             // A turn the store never issued resolves missing, never
             // lost: the two branches stay distinct.
