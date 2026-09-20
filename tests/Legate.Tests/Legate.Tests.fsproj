@@ -132,6 +132,11 @@
     <Compile Include="SessionArtifactsTests.fs" />
     <Compile Include="AgentAuthorityTests.fs" />
     <Compile Include="WireSerializationTests.fs" />
+    <Compile Include="WireSerializationGoldenTests.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="TestData/Wire/**/*" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
   <ItemGroup>
