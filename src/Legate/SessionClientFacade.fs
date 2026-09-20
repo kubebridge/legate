@@ -1360,10 +1360,14 @@ module internal SessionClientWiring =
                 )
 
             // The factory lands on the mode-active service only; the idle
-            // service keeps identity children either way.
+            // service keeps identity children either way. The cluster
+            // service also takes the store so its stop path can poll
+            // running turns while draining.
             match resolver with
             | :? LocalActorSystemService as local -> local.SessionChildFactory <- entityFactory
-            | :? ClusterActorSystemService as clustered -> clustered.SessionEntityFactory <- entityFactory
+            | :? ClusterActorSystemService as clustered ->
+                clustered.SessionEntityFactory <- entityFactory
+                clustered.SessionStore <- Some store
             | _ ->
                 raise (
                     InvalidOperationException(

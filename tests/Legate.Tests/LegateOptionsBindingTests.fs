@@ -325,6 +325,86 @@ let ``Unknown cluster mode fails with the section path`` () =
     ex.Message.Contains("Kubernetes") |> should equal true
 
 [<Fact>]
+let ``Binds SBR durations including the Legate-level exit deadline`` () =
+    let section =
+        buildSection
+            [
+                "Legate:Cluster:StableAfter", "30s"
+                "Legate:Cluster:DownRemovalMargin", "10s"
+                "Legate:Cluster:DownAllWhenUnstable", "5s"
+                "Legate:Cluster:JoinTimeout", "7s"
+                "Legate:Cluster:HostExitDeadline", "90s"
+            ]
+
+    let options = LegateOptionsBinding.bind section
+
+    options.Cluster.StableAfter |> should equal (TimeSpan.FromSeconds 30.0)
+
+    options.Cluster.DownRemovalMargin |> should equal (TimeSpan.FromSeconds 10.0)
+
+    options.Cluster.DownAllWhenUnstable.HasValue |> should equal true
+
+    options.Cluster.DownAllWhenUnstable.Value
+    |> should equal (TimeSpan.FromSeconds 5.0)
+
+    options.Cluster.JoinTimeout |> should equal (TimeSpan.FromSeconds 7.0)
+
+    options.Cluster.HostExitDeadline |> should equal (TimeSpan.FromSeconds 90.0)
+
+    options.Validate() |> should equal null
+
+[<Fact>]
+let ``Unset SBR knobs keep on and off conventions`` () =
+    let options = LegateOptionsBinding.bind (buildSection [])
+
+    options.Cluster.StableAfter |> should equal (TimeSpan.FromSeconds 20.0)
+    options.Cluster.DownRemovalMargin |> should equal TimeSpan.Zero
+    options.Cluster.DownAllWhenUnstable.HasValue |> should equal false
+    options.Cluster.JoinTimeout |> should equal (TimeSpan.FromSeconds 5.0)
+    options.Cluster.HostExitDeadline |> should equal (TimeSpan.FromSeconds 60.0)
+    options.Validate() |> should equal null
+
+[<Fact>]
+let ``Zero SBR durations bind the off convention`` () =
+    let section =
+        buildSection
+            [
+                "Legate:Cluster:DownRemovalMargin", "0s"
+                "Legate:Cluster:DownAllWhenUnstable", "0s"
+            ]
+
+    let options = LegateOptionsBinding.bind section
+
+    options.Cluster.DownRemovalMargin |> should equal TimeSpan.Zero
+    options.Cluster.DownAllWhenUnstable.HasValue |> should equal true
+    options.Cluster.DownAllWhenUnstable.Value |> should equal TimeSpan.Zero
+    options.Validate() |> should equal null
+
+[<Fact>]
+let ``Non-positive SBR timings fail validation with the section path`` () =
+    let section = buildSection [ "Legate:Cluster:StableAfter", "0s" ]
+
+    let ex =
+        Assert.Throws<InvalidOperationException>(fun () -> LegateOptionsBinding.bind section |> ignore)
+
+    ex.Message.Contains("Cluster") |> should equal true
+    ex.Message.Contains("StableAfter must be positive.") |> should equal true
+
+    let deadlineSection =
+        buildSection
+            [
+                "Legate:Cluster:HostExitDeadline", "0s"
+            ]
+
+    let deadlineEx =
+        Assert.Throws<InvalidOperationException>(fun () -> LegateOptionsBinding.bind deadlineSection |> ignore)
+
+    deadlineEx.Message.Contains("Cluster") |> should equal true
+
+    deadlineEx.Message.Contains("HostExitDeadline must be positive.")
+    |> should equal true
+
+[<Fact>]
 let ``Binds the cluster section with modes roles and shard knobs`` () =
     let staticSeeds =
         buildSection

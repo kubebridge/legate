@@ -75,6 +75,36 @@ module internal ClusterActorSystem =
     /// arrive with the production bootstrap work.
     let remotingHostname = "127.0.0.1"
 
+    /// Formats a positive TimeSpan as HOCON duration: whole seconds as
+    /// Ns, anything smaller as Nms. Validation keeps SBR knobs in range;
+    /// this only renders what Validate already accepted.
+    /// <param name="value">The duration to render.</param>
+    /// <returns>The HOCON duration.</returns>
+    let formatHoconDuration (value: TimeSpan) : string =
+        if value.Ticks % TimeSpan.TicksPerSecond = 0L then
+            $"%d{int64 value.TotalSeconds}s"
+        else
+            $"%d{int64 value.TotalMilliseconds}ms"
+
+    /// Renders DownRemovalMargin: Zero emits off, anything else emits the
+    /// duration.
+    /// <param name="value">The removal margin.</param>
+    /// <returns>The HOCON value.</returns>
+    let downRemovalMarginHocon (value: TimeSpan) : string =
+        if value = TimeSpan.Zero then
+            "off"
+        else
+            formatHoconDuration value
+
+    /// Renders DownAllWhenUnstable: null emits on, Zero emits off, anything
+    /// else emits the duration.
+    /// <param name="value">The down-all setting, or null for on.</param>
+    /// <returns>The HOCON value.</returns>
+    let downAllWhenUnstableHocon (value: Nullable<TimeSpan>) : string =
+        if not value.HasValue then "on"
+        elif value.Value = TimeSpan.Zero then "off"
+        else formatHoconDuration value.Value
+
     /// Builds remoting+cluster HOCON from the cluster options. StaticSeeds
     /// lists SeedNodes as seed-nodes; Kubernetes lists none (SeedNodes is
     /// ignored) and runs as a singleton until issue 138. Both publish
@@ -82,6 +112,13 @@ module internal ClusterActorSystem =
     /// versioned envelope wiring (issue 130) rides along: the DTO
     /// serializer, its bindings for the actor, router, and entity protocol
     /// messages, and the global wire maximum from MaxWirePayloadBytes.
+    /// The keep-majority split-brain resolver block is bound from options:
+    /// StableAfter maps to split-brain-resolver.stable-after,
+    /// DownRemovalMargin (Zero means off) maps to down-removal-margin,
+    /// DownAllWhenUnstable (null means on, Zero means off) maps to
+    /// split-brain-resolver.down-all-when-unstable, and JoinTimeout maps
+    /// to seed-node-timeout. HostExitDeadline is a Legate-level StopAsync
+    /// cap and is never emitted as HOCON.
     /// <param name="options">The cluster options. Must not be null.</param>
     /// <param name="port">The remoting port, or 0 for an ephemeral port.</param>
     /// <returns>The cluster HOCON.</returns>
@@ -106,6 +143,10 @@ module internal ClusterActorSystem =
 
         let stamp = SessionSharding.versionStamp options.ShardHashVersion options.ShardCount
         let wire = WireSerialization.hoconFragment (max 1 options.MaxWirePayloadBytes)
+        let stableAfter = formatHoconDuration options.StableAfter
+        let removalMargin = downRemovalMarginHocon options.DownRemovalMargin
+        let downAll = downAllWhenUnstableHocon options.DownAllWhenUnstable
+        let joinTimeout = formatHoconDuration options.JoinTimeout
 
         $"""akka {{
   actor {{
@@ -121,6 +162,13 @@ module internal ClusterActorSystem =
     seed-nodes = [%s{seeds}]
     roles = [%s{roles}]
     app-version = "%s{stamp}"
+    seed-node-timeout = %s{joinTimeout}
+    down-removal-margin = %s{removalMargin}
+    split-brain-resolver {{
+      active-strategy = keep-majority
+      stable-after = %s{stableAfter}
+      down-all-when-unstable = %s{downAll}
+    }}
   }}
   coordinated-shutdown {{
     run-by-actor-system-terminate = on
@@ -281,6 +329,78 @@ module internal ClusterActorSystem =
             Linq.Expression.ToExpression(fun () -> new FunActor<obj, unit>(sessionEntityBehavior entityId spawnSession))
         )
 
+    /// The drain poll cadence: how often the stop path re-reads the
+    /// running-turn count while waiting. Short enough that a settled
+    /// drain returns promptly, long enough to avoid hot-polling the
+    /// store; the grace and deadline caps bound the total wait either
+    /// way.
+    let drainPollInterval = TimeSpan.FromMilliseconds 100.0
+
+    /// Waits for running turns to settle: polls the count until it reads
+    /// zero, the grace elapses, or the deadline measured from the stop
+    /// start elapses, whichever comes first. Cancellation abandons the
+    /// wait so shutdown proceeds. Store failures propagate to the
+    /// caller; only cancellation is absorbed here.
+    /// <param name="countRunning">Reads the running-turn count.</param>
+    /// <param name="grace">The running-turn wait bound.</param>
+    /// <param name="deadline">The total stop bound from the stop start.</param>
+    /// <param name="timeProvider">The clock waits and bounds run on.</param>
+    /// <param name="stopStartTimestamp">The stop-start timestamp.</param>
+    /// <param name="cancellationToken">Abandons the wait.</param>
+    /// <returns>The drain wait task.</returns>
+    let waitForDrainAsync
+        (countRunning: CancellationToken -> Task<int>)
+        (grace: TimeSpan)
+        (deadline: TimeSpan)
+        (timeProvider: TimeProvider)
+        (stopStartTimestamp: int64)
+        (cancellationToken: CancellationToken)
+        : Task =
+        ArgumentNullException.ThrowIfNull(countRunning)
+        ArgumentNullException.ThrowIfNull(timeProvider)
+
+        task {
+            let graceStart = timeProvider.GetTimestamp()
+            let mutable settled = false
+
+            while not settled do
+                let graceElapsed = timeProvider.GetElapsedTime graceStart
+                let totalElapsed = timeProvider.GetElapsedTime stopStartTimestamp
+
+                if totalElapsed >= deadline then
+                    settled <- true
+                elif graceElapsed >= grace then
+                    settled <- true
+                else
+                    let! running = countRunning cancellationToken
+
+                    if running <= 0 then
+                        settled <- true
+                    else
+                        let remainingGrace = grace - graceElapsed
+                        let remainingDeadline = deadline - totalElapsed
+
+                        let remaining =
+                            if remainingGrace < remainingDeadline then
+                                remainingGrace
+                            else
+                                remainingDeadline
+
+                        let wait =
+                            if remaining < drainPollInterval then
+                                remaining
+                            else
+                                drainPollInterval
+
+                        if wait <= TimeSpan.Zero then
+                            settled <- true
+                        else
+                            try
+                                do! Task.Delay(wait, timeProvider, cancellationToken)
+                            with :? OperationCanceledException ->
+                                settled <- true
+        }
+
     /// A per-session proxy: forwards everything into the region wrapped
     /// in the session envelope, preserving the sender so Ask round-trips
     /// through the entity and back to the asker.
@@ -303,8 +423,10 @@ module internal ClusterActorSystem =
 
 /// Singleton hosted service owning the clustered actor system. Starts
 /// only in StaticSeeds and Kubernetes cluster modes; Local mode
-/// resolves no system and no region. Stop bounds coordinated shutdown
-/// by <c>Cluster:ShutdownGraceSeconds</c>.
+/// resolves no system and no region. Stop fails readiness first through
+/// BeginDrain, waits for running turns up to
+/// <c>Cluster:ShutdownGraceSeconds</c>, then runs coordinated shutdown
+/// with the whole stop hard-capped by <c>Cluster:HostExitDeadline</c>.
 type internal ClusterActorSystemService(options: IOptions<LegateOptions>, timeProvider: TimeProvider) as this =
 
     do ArgumentNullException.ThrowIfNull(options)
@@ -316,6 +438,7 @@ type internal ClusterActorSystemService(options: IOptions<LegateOptions>, timePr
     let gate = obj ()
     let mutable proxies: Map<string, Task<IActorRef>> = Map.empty
     let mutable nextProxy = 0
+    let mutable draining = false
 
     /// The running actor system, or null when the host runs Local mode
     /// or has not started.
@@ -340,6 +463,20 @@ type internal ClusterActorSystemService(options: IOptions<LegateOptions>, timePr
     /// name it; hosts bind ephemeral ports until a stable-port knob
     /// lands. Must not be negative.
     member val RemotingPort: int = 0 with get, set
+
+    /// The session store polled for running turns during the drain wait,
+    /// or None when no store is wired (the drain wait then observes zero
+    /// running turns). The session client facade wires this alongside the
+    /// entity factory; tests set it directly. Set before StartAsync.
+    member val SessionStore: ISessionStore option = None with get, set
+
+    /// Marks the node as draining. Readiness flips Unhealthy the moment
+    /// this runs, before any wait starts, so the orchestrator stops
+    /// routing to the node while running turns settle. Idempotent.
+    member this.BeginDrain() : unit = lock gate (fun () -> draining <- true)
+
+    /// Whether BeginDrain has run. The readiness health check reads this.
+    member _.IsDraining: bool = lock gate (fun () -> draining)
 
     /// Spawns the session actor child for a newly hosted entity id.
     /// None keeps the legacy identity-only children; Some wires the
@@ -534,21 +671,57 @@ type internal ClusterActorSystemService(options: IOptions<LegateOptions>, timePr
 
         member _.StopAsync(cancellationToken: CancellationToken) =
             task {
+                // Fail readiness FIRST so the orchestrator stops routing
+                // before the running-turn wait starts.
+                this.BeginDrain()
+                let stopStart = timeProvider.GetTimestamp()
+
                 match systemOpt with
                 | None -> ()
                 | Some created ->
-                    let gracePeriod = options.Value.Cluster.ShutdownGraceSeconds
+                    let clusterOptions = options.Value.Cluster
+
+                    let countRunning =
+                        match this.SessionStore with
+                        | None -> fun (_: CancellationToken) -> Task.FromResult 0
+                        | Some store -> fun (ct: CancellationToken) -> store.CountRunningSessions(ct)
+
+                    try
+                        do!
+                            ClusterActorSystem.waitForDrainAsync
+                                countRunning
+                                clusterOptions.ShutdownGraceSeconds
+                                clusterOptions.HostExitDeadline
+                                timeProvider
+                                stopStart
+                                cancellationToken
+                    with :? OperationCanceledException ->
+                        ()
+
+                    let elapsed = timeProvider.GetElapsedTime stopStart
+                    let remainingDeadline = clusterOptions.HostExitDeadline - elapsed
+
+                    // The shutdown wait stays inside the remaining deadline
+                    // so the whole stop never exceeds HostExitDeadline; when
+                    // the drain already spent it, the wait bounds to zero and
+                    // termination proceeds in the background.
+                    let bound =
+                        if remainingDeadline <= TimeSpan.Zero then
+                            TimeSpan.Zero
+                        elif clusterOptions.ShutdownGraceSeconds < remainingDeadline then
+                            clusterOptions.ShutdownGraceSeconds
+                        else
+                            remainingDeadline
 
                     try
                         // Termination drives coordinated shutdown (the
                         // cluster HOCON keeps run-by-actor-system-terminate
-                        // on, which leaves the cluster first); the wait
-                        // bounds the drain by the configured grace. A null
+                        // on, which leaves the cluster first). A null
                         // from-phase runs every shutdown phase.
                         let shutdown =
                             CoordinatedShutdown.Get(created).Run(CoordinatedShutdown.ClrExitReason.Instance, null)
 
-                        let! _ = shutdown.WaitAsync(gracePeriod, cancellationToken)
+                        let! _ = shutdown.WaitAsync(bound, cancellationToken)
                         ()
                     with
                     | :? TimeoutException -> ()

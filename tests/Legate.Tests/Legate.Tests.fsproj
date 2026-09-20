@@ -57,6 +57,7 @@
     <Compile Include="ActorSystemColdStartTests.fs" />
     <Compile Include="ClusterShardingTests.fs" />
     <Compile Include="ClusterActorSystemTests.fs" />
+    <Compile Include="ClusterHealthTests.fs" />
     <Compile Include="SessionActorTests.fs" />
     <Compile Include="StopArbitrationTests.fs" />
     <Compile Include="ClaimHeartbeatTests.fs" />

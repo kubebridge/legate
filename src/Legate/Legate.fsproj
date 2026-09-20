@@ -61,6 +61,7 @@
     <Compile Include="LegateBuilder.fs" />
     <Compile Include="Agents/FileAgentStore.fs" />
     <Compile Include="ClusterActorSystem.fs" />
+    <Compile Include="ClusterHealth.fs" />
     <Compile Include="SessionClientFacade.fs" />
     <Compile Include="JournalArchiveOptions.fs" />
     <Compile Include="JournalArchiveWorker.fs" />
@@ -87,6 +88,7 @@
     <PackageReference Include="Microsoft.Extensions.Configuration.Abstractions" />
     <PackageReference Include="Microsoft.Extensions.Configuration.Binder" />
     <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" />
+    <PackageReference Include="Microsoft.Extensions.Diagnostics.HealthChecks" />
     <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" />
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
     <PackageReference Include="Microsoft.Extensions.Options" />
