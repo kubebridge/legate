@@ -2312,14 +2312,6 @@ module internal SessionActor =
         // re-prime, so later Compacts journal under the live token.
         let mutable currentCompact = props.Compact
 
-        // The last-seen agent definition the authority gate adopted: the
-        // session's agent id plus the store's (RowVersion, UpdatedAt) stamp.
-        // A version/stamp change is adopted for the next fresh turn, while
-        // the file store pins RowVersion to 0UL forever, so the pair is
-        // compared, never the version alone. A cell rather than a loop
-        // parameter, like pendingAgent below.
-        let mutable cachedAgent: (AgentId * uint64 * DateTimeOffset) option = None
-
         let failInterruptedTurn (entryOpt: InboxEntry option) : unit =
             let result =
                 {
@@ -2752,9 +2744,9 @@ module internal SessionActor =
                 ()
 
         /// Checks the per-turn execution authority for a fresh turn start:
-        /// re-reads the session's agent and adopts a (RowVersion, UpdatedAt)
-        /// stamp change into the actor cache. Missing, disabled, or
-        /// tenant-mismatched agents refuse without ever invoking the runner.
+        /// re-reads the session's agent from the store. Missing, disabled,
+        /// or tenant-mismatched agents refuse without ever invoking the
+        /// runner.
         /// A null agent catalog, a missing session row, or a store failure
         /// authorizes (the no-catalog and empty-shell precedents): the turn
         /// runs and the failure surfaces where it always has.
@@ -2779,9 +2771,7 @@ module internal SessionActor =
                                 AgentAuthorityFailure.TenantMismatch,
                                 sprintf "Agent %O belongs to another tenant." agentId
                             )
-                        | agent ->
-                            cachedAgent <- Some(agent.Id, agent.RowVersion, agent.UpdatedAt)
-                            None
+                        | _ -> None
                 with _ ->
                     None
 
