@@ -217,6 +217,52 @@ Every index traces to a store query:
 `cleanup_claims(session_id)` needs no secondary index: claim, complete, and
 defer are all point lookups by session.
 
+## Cluster
+
+`StaticSeeds` mode joins the named seed nodes and shards session entities
+by session id; `Kubernetes` mode runs as a singleton until the
+Akka.Management bootstrap lands. Every node stamps its shard version as
+the member app-version and fails closed (leaves first) on a peer stamp
+mismatch.
+
+### Split-brain resolution
+
+Bound from `Legate:Cluster`, keep-majority with explicit timings:
+
+| Option | Akka key | Default | Convention |
+|---|---|---|---|
+| `StableAfter` | `akka.cluster.split-brain-resolver.stable-after` | 20 s | positive duration |
+| `DownRemovalMargin` | `akka.cluster.down-removal-margin` | `off` (`TimeSpan.Zero`) | `Zero` emits `off`, positive emits the duration |
+| `DownAllWhenUnstable` | `akka.cluster.split-brain-resolver.down-all-when-unstable` | `on` (null) | null emits `on`, `Zero` emits `off`, positive emits the duration |
+| `JoinTimeout` | `akka.cluster.seed-node-timeout` | 5 s | positive duration |
+
+`HostExitDeadline` (default 60 s, positive) is a Legate-level total bound
+on the cluster hosted service's stop and is explicitly not an Akka key:
+it is never rendered into HOCON. Unknown HOCON keys are silently ignored
+by Akka, so emitting it would be a silent no-op while operators believe
+the deadline applies. Keep it above `ShutdownGraceSeconds` so the cap
+never truncates the drain wait; validation enforces positive only.
+
+### Readiness
+
+The `legate-cluster` health check (registered only when the host already
+uses health checks) reports whether a node may serve traffic. Local mode
+is always ready. The cluster modes are ready exactly when all of these
+hold: `BeginDrain` has not run, this member's status is Up, this member
+carries the session role, the cluster reports zero unreachable members,
+and the reachable set holds a strict majority of the known members.
+
+### Drain
+
+`BeginDrain` fails readiness first, then the stop path polls the shared
+truth (`ISessionStore.CountRunningSessions`, which works identically in
+Local and cluster modes) until no turns run, the grace
+(`Cluster:ShutdownGraceSeconds`) elapses, or the deadline
+(`Cluster:HostExitDeadline`) measured from the stop start elapses,
+whichever comes first. Coordinated shutdown (which leaves the cluster
+first) then runs with its wait bounded by the remaining deadline, so the
+whole stop never exceeds `HostExitDeadline`.
+
 ## Boundaries
 
 - Compile-time references point inward: every package references

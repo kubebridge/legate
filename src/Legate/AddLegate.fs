@@ -89,6 +89,7 @@ type LegateServiceCollectionExtensions =
         SessionArtifactRegistration.register services
         LocalActorSystemRegistration.register services
         ClusterActorSystemRegistration.register services
+        ClusterHealthRegistration.register services
         SessionClientRegistration.register services
         CompletionRedriverRegistration.register services
         JournalArchiveRegistration.register services

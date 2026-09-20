@@ -621,6 +621,42 @@ type ClusterOptions() =
     /// deserialising. Default 1 MiB. Must be at least 1.
     member val MaxWirePayloadBytes: int = 1048576 with get, set
 
+    /// How long the split-brain resolver waits for the cluster to stabilize
+    /// before downing unreachable nodes. Maps to
+    /// <c>akka.cluster.split-brain-resolver.stable-after</c>. Default 20 s;
+    /// must stay positive.
+    member val StableAfter: TimeSpan = TimeSpan.FromSeconds 20.0 with get, set
+
+    /// How long the cluster waits after downing before removing the downed
+    /// node. <see cref="F:System.TimeSpan.Zero" /> emits <c>off</c> (the
+    /// Akka default: never remove automatically); a positive value emits
+    /// the duration. Maps to <c>akka.cluster.down-removal-margin</c>.
+    /// Default <see cref="F:System.TimeSpan.Zero" />. Must not be negative.
+    member val DownRemovalMargin: TimeSpan = TimeSpan.Zero with get, set
+
+    /// What the split-brain resolver does when the cluster is unstable.
+    /// Null emits <c>on</c> (the Akka default: down all unreachable when
+    /// unstable); <see cref="F:System.TimeSpan.Zero" /> emits <c>off</c>;
+    /// a positive value emits the duration. Maps to
+    /// <c>akka.cluster.split-brain-resolver.down-all-when-unstable</c>.
+    /// Default null. When set, must not be negative.
+    member val DownAllWhenUnstable: Nullable<TimeSpan> = Nullable<TimeSpan>() with get, set
+
+    /// How long the node waits for seed nodes to answer before giving up
+    /// the join. Maps to <c>akka.cluster.seed-node-timeout</c>. Default
+    /// 5 s; must stay positive.
+    member val JoinTimeout: TimeSpan = TimeSpan.FromSeconds 5.0 with get, set
+
+    /// The Legate-enforced total bound on the cluster hosted service's
+    /// stop: leaving plus the running-turn drain runs inside
+    /// <see cref="P:Legate.ClusterOptions.ShutdownGraceSeconds" />, and the
+    /// whole stop is hard-capped by this deadline. This is a Legate-level
+    /// bound, never rendered into Akka HOCON. Default 60 s; must stay
+    /// positive and should exceed
+    /// <see cref="P:Legate.ClusterOptions.ShutdownGraceSeconds" /> so the
+    /// cap never truncates the drain wait.
+    member val HostExitDeadline: TimeSpan = TimeSpan.FromSeconds 60.0 with get, set
+
     /// Returns null when every knob is in range, otherwise a message for the
     /// first violation.
     /// <returns>The first violation's message, or null when the settings are valid.</returns>
@@ -629,6 +665,19 @@ type ClusterOptions() =
             "Mode has an unknown cluster mode."
         elif this.ShutdownGraceSeconds <= TimeSpan.Zero then
             "ShutdownGraceSeconds must be positive."
+        elif this.StableAfter <= TimeSpan.Zero then
+            "StableAfter must be positive."
+        elif this.DownRemovalMargin < TimeSpan.Zero then
+            "DownRemovalMargin must not be negative."
+        elif
+            this.DownAllWhenUnstable.HasValue
+            && this.DownAllWhenUnstable.Value < TimeSpan.Zero
+        then
+            "DownAllWhenUnstable must not be negative when set."
+        elif this.JoinTimeout <= TimeSpan.Zero then
+            "JoinTimeout must be positive."
+        elif this.HostExitDeadline <= TimeSpan.Zero then
+            "HostExitDeadline must be positive."
         elif isNull (box this.SeedNodes) then
             "SeedNodes must not be null."
         elif this.Mode = ClusterMode.StaticSeeds && this.SeedNodes.Count = 0 then

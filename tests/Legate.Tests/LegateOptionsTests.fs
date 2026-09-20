@@ -381,6 +381,65 @@ let ``Cluster Validate flags bad shard knobs roles and session role`` () =
     roleful.ShardHashVersion <- 2
     roleful.Validate() |> should equal null
 
+[<Fact>]
+let ``Cluster SBR defaults keep majority timings with a Legate-level exit cap`` () =
+    let options = ClusterOptions()
+    options.StableAfter |> should equal (TimeSpan.FromSeconds 20.0)
+    options.DownRemovalMargin |> should equal TimeSpan.Zero
+    options.DownAllWhenUnstable.HasValue |> should equal false
+    options.JoinTimeout |> should equal (TimeSpan.FromSeconds 5.0)
+    options.HostExitDeadline |> should equal (TimeSpan.FromSeconds 60.0)
+    options.Validate() |> should equal null
+
+[<Fact>]
+let ``Cluster Validate flags bad SBR timings`` () =
+    ClusterOptions(StableAfter = TimeSpan.Zero).Validate()
+    |> should equal "StableAfter must be positive."
+
+    ClusterOptions(DownRemovalMargin = TimeSpan.FromSeconds(-1.0)).Validate()
+    |> should equal "DownRemovalMargin must not be negative."
+
+    let negativeDownAll = ClusterOptions()
+    negativeDownAll.DownAllWhenUnstable <- Nullable(TimeSpan.FromSeconds(-1.0))
+
+    negativeDownAll.Validate()
+    |> should equal "DownAllWhenUnstable must not be negative when set."
+
+    ClusterOptions(JoinTimeout = TimeSpan.Zero).Validate()
+    |> should equal "JoinTimeout must be positive."
+
+    ClusterOptions(HostExitDeadline = TimeSpan.Zero).Validate()
+    |> should equal "HostExitDeadline must be positive."
+
+[<Fact>]
+let ``Cluster Validate accepts off and duration SBR conventions`` () =
+    let removalOff = ClusterOptions(DownRemovalMargin = TimeSpan.Zero)
+    removalOff.Validate() |> should equal null
+
+    let removalDuration = ClusterOptions(DownRemovalMargin = TimeSpan.FromSeconds 10.0)
+
+    removalDuration.Validate() |> should equal null
+
+    let downAllOff = ClusterOptions()
+    downAllOff.DownAllWhenUnstable <- Nullable TimeSpan.Zero
+    downAllOff.Validate() |> should equal null
+
+    let downAllDuration = ClusterOptions()
+    downAllDuration.DownAllWhenUnstable <- Nullable(TimeSpan.FromSeconds 5.0)
+    downAllDuration.Validate() |> should equal null
+
+[<Fact>]
+let ``Root Validate prefixes SBR violations with the cluster section`` () =
+    let options = LegateOptions()
+    options.Cluster.StableAfter <- TimeSpan.Zero
+    options.Validate() |> should equal "Cluster: StableAfter must be positive."
+
+    let deadline = LegateOptions()
+    deadline.Cluster.HostExitDeadline <- TimeSpan.Zero
+
+    deadline.Validate()
+    |> should equal "Cluster: HostExitDeadline must be positive."
+
 // ──────────────────────────────────────────────────────────────────────────
 // Pruning
 

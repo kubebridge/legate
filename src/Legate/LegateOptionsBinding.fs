@@ -35,6 +35,11 @@ module internal LegateOptionsBinding =
             "Completion:RedriveInterval"
             "Completion:ClaimLeaseDuration"
             "Cluster:ShutdownGraceSeconds"
+            "Cluster:StableAfter"
+            "Cluster:DownRemovalMargin"
+            "Cluster:DownAllWhenUnstable"
+            "Cluster:JoinTimeout"
+            "Cluster:HostExitDeadline"
             "Schedules:PollInterval"
         ]
 

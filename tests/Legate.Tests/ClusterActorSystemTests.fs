@@ -23,8 +23,10 @@ open Legate.Testing
 open Microsoft.Extensions.AI
 open Microsoft.Extensions.Configuration
 open Microsoft.Extensions.DependencyInjection
+open Microsoft.Extensions.Diagnostics.HealthChecks
 open Microsoft.Extensions.Hosting
 open Microsoft.Extensions.Options
+open Microsoft.Extensions.Time.Testing
 open Xunit
 
 // Cluster modes and sharding (issue 126): the HOCON builder, the version
@@ -108,6 +110,22 @@ let private stopQuietly (service: ClusterActorSystemService) : unit =
 /// Resolves one proxy and blocks for the map's reply.
 let private resolve (service: ClusterActorSystemService) (sessionId: string) =
     (service :> ISessionResolver).ResolveSessionAsync(sessionId, CancellationToken.None).GetAwaiter().GetResult()
+
+/// Builds a readiness check over a manually started service: the provider
+/// exposes the service as the hosted service the check resolves, and the
+/// options select the cluster mode the check evaluates.
+let private checkFor (provider: IServiceProvider) (configure: LegateOptions -> unit) : IHealthCheck =
+    let options = LegateOptions()
+    configure options
+
+    ClusterHealthCheck(OptionsWrapper<LegateOptions>(options) :> IOptions<LegateOptions>, provider) :> IHealthCheck
+
+/// Exposes one started service as the hosted service a readiness check
+/// resolves. The caller owns the provider.
+let private providerFor (service: ClusterActorSystemService) : ServiceProvider =
+    let services = ServiceCollection() :> IServiceCollection
+    services.AddSingleton<IHostedService>(service :> IHostedService) |> ignore
+    services.BuildServiceProvider()
 
 /// Builds a MemberUp for the stamp through the internal Member
 /// constructor: the constructor is internal to Akka, so the guard test
@@ -251,6 +269,198 @@ let ``HOCON lists no seeds for Kubernetes and honors the port`` () =
     |> should equal [ "session"; "api" ]
 
     config.GetString("akka.cluster.app-version") |> should equal "1.2.32"
+
+// ──────────────────────────────────────────────────────────────────────────
+// SBR HOCON (issue 127)
+
+[<Fact>]
+let ``HOCON emits the keep-majority SBR block from options`` () =
+    let options = ClusterOptions(Mode = ClusterMode.StaticSeeds)
+    options.SeedNodes.Add("127.0.0.1:5115") |> ignore
+    options.Roles.Add("session") |> ignore
+    options.StableAfter <- TimeSpan.FromSeconds 30.0
+    options.DownRemovalMargin <- TimeSpan.FromSeconds 10.0
+    options.DownAllWhenUnstable <- Nullable(TimeSpan.FromSeconds 5.0)
+    options.JoinTimeout <- TimeSpan.FromSeconds 7.0
+    options.HostExitDeadline <- TimeSpan.FromSeconds 90.0
+
+    let raw = ClusterActorSystem.buildClusterHocon options 0
+    let config = ConfigurationFactory.ParseString(raw)
+
+    config.GetString("akka.cluster.split-brain-resolver.active-strategy")
+    |> should equal "keep-majority"
+
+    config.GetString("akka.cluster.split-brain-resolver.stable-after")
+    |> should equal "30s"
+
+    config.GetString("akka.cluster.down-removal-margin") |> should equal "10s"
+
+    config.GetString("akka.cluster.split-brain-resolver.down-all-when-unstable")
+    |> should equal "5s"
+
+    config.GetString("akka.cluster.seed-node-timeout") |> should equal "7s"
+
+[<Fact>]
+let ``HOCON renders SBR defaults with on and off conventions`` () =
+    let options = ClusterOptions(Mode = ClusterMode.StaticSeeds)
+    options.SeedNodes.Add("127.0.0.1:5115") |> ignore
+    options.Roles.Add("session") |> ignore
+
+    let raw = ClusterActorSystem.buildClusterHocon options 0
+    let config = ConfigurationFactory.ParseString(raw)
+
+    config.GetString("akka.cluster.split-brain-resolver.active-strategy")
+    |> should equal "keep-majority"
+
+    config.GetString("akka.cluster.split-brain-resolver.stable-after")
+    |> should equal "20s"
+
+    config.GetString("akka.cluster.seed-node-timeout") |> should equal "5s"
+
+    // on and off are HOCON booleans, so they are asserted on the raw text.
+    raw.Contains("down-removal-margin = off") |> should equal true
+    raw.Contains("down-all-when-unstable = on") |> should equal true
+
+[<Fact>]
+let ``HOCON maps null and Zero down-all settings`` () =
+    let onOptions = ClusterOptions()
+    let onRaw = ClusterActorSystem.buildClusterHocon onOptions 0
+    onRaw.Contains("down-all-when-unstable = on") |> should equal true
+
+    let offOptions = ClusterOptions()
+    offOptions.DownAllWhenUnstable <- Nullable TimeSpan.Zero
+    let offRaw = ClusterActorSystem.buildClusterHocon offOptions 0
+    offRaw.Contains("down-all-when-unstable = off") |> should equal true
+
+    let durationOptions = ClusterOptions()
+    durationOptions.DownAllWhenUnstable <- Nullable(TimeSpan.FromSeconds 12.0)
+    let durationRaw = ClusterActorSystem.buildClusterHocon durationOptions 0
+    durationRaw.Contains("down-all-when-unstable = 12s") |> should equal true
+
+    let removalOff = ClusterActorSystem.buildClusterHocon (ClusterOptions()) 0
+    removalOff.Contains("down-removal-margin = off") |> should equal true
+
+    let removalOn = ClusterOptions(DownRemovalMargin = TimeSpan.FromSeconds 15.0)
+    let removalRaw = ClusterActorSystem.buildClusterHocon removalOn 0
+    removalRaw.Contains("down-removal-margin = 15s") |> should equal true
+
+[<Fact>]
+let ``HOCON never renders the Legate-level exit deadline`` () =
+    let options = ClusterOptions(Mode = ClusterMode.StaticSeeds)
+    options.SeedNodes.Add("127.0.0.1:5115") |> ignore
+    options.HostExitDeadline <- TimeSpan.FromSeconds 90.0
+
+    let raw = ClusterActorSystem.buildClusterHocon options 0
+
+    // Unknown HOCON keys are silently ignored by Akka, so a guessed
+    // host-exit key would be a silent no-op: assert it is never emitted.
+    raw.Contains("HostExitDeadline") |> should equal false
+    raw.ToLowerInvariant().Contains("host-exit") |> should equal false
+    raw.ToLowerInvariant().Contains("hostexit") |> should equal false
+
+// ──────────────────────────────────────────────────────────────────────────
+// Drain (issue 127)
+
+[<Fact>]
+let ``BeginDrain flips the readiness flag once`` () =
+    let service = ClusterActorSystemService(buildOptions ignore, TimeProvider.System)
+    service.IsDraining |> should equal false
+    service.BeginDrain()
+    service.IsDraining |> should equal true
+    service.BeginDrain()
+    service.IsDraining |> should equal true
+
+[<Fact>]
+let ``StopAsync fails readiness even with no system`` () : Task =
+    task {
+        let service = ClusterActorSystemService(buildOptions ignore, TimeProvider.System)
+        service.IsDraining |> should equal false
+        do! (service :> IHostedService).StopAsync(CancellationToken.None)
+        service.IsDraining |> should equal true
+    }
+
+[<Fact>]
+let ``Drain wait settles immediately when no turns run`` () =
+    let fake = FakeTimeProvider()
+    let start = fake.GetTimestamp()
+
+    let work =
+        ClusterActorSystem.waitForDrainAsync
+            (fun _ -> Task.FromResult 0)
+            (TimeSpan.FromSeconds 30.0)
+            (TimeSpan.FromSeconds 60.0)
+            fake
+            start
+            CancellationToken.None
+
+    work.Wait(TimeSpan.FromSeconds 10.0) |> should equal true
+
+[<Fact>]
+let ``Drain wait never exceeds the grace period`` () =
+    let fake = FakeTimeProvider()
+    let start = fake.GetTimestamp()
+
+    let work =
+        ClusterActorSystem.waitForDrainAsync
+            (fun _ -> Task.FromResult 1)
+            (TimeSpan.FromSeconds 30.0)
+            (TimeSpan.FromSeconds 60.0)
+            fake
+            start
+            CancellationToken.None
+
+    work.IsCompleted |> should equal false
+    fake.Advance(TimeSpan.FromSeconds 30.0)
+    work.Wait(TimeSpan.FromSeconds 10.0) |> should equal true
+
+[<Fact>]
+let ``Drain wait never exceeds the host exit deadline`` () =
+    let fake = FakeTimeProvider()
+    let start = fake.GetTimestamp()
+
+    // The grace is longer than the deadline: the deadline still caps the wait.
+    let work =
+        ClusterActorSystem.waitForDrainAsync
+            (fun _ -> Task.FromResult 1)
+            (TimeSpan.FromSeconds 60.0)
+            (TimeSpan.FromSeconds 10.0)
+            fake
+            start
+            CancellationToken.None
+
+    work.IsCompleted |> should equal false
+    fake.Advance(TimeSpan.FromSeconds 10.0)
+    work.Wait(TimeSpan.FromSeconds 10.0) |> should equal true
+
+[<Fact>]
+let ``Drain wait wakes early when turns settle`` () =
+    let mutable calls = 0
+
+    let count (_: CancellationToken) =
+        calls <- calls + 1
+        Task.FromResult(if calls < 3 then 1 else 0)
+
+    let fake = FakeTimeProvider()
+    let start = fake.GetTimestamp()
+
+    let work =
+        ClusterActorSystem.waitForDrainAsync
+            count
+            (TimeSpan.FromSeconds 30.0)
+            (TimeSpan.FromSeconds 60.0)
+            fake
+            start
+            CancellationToken.None
+
+    // Step the virtual clock poll by poll: each advance fires the next
+    // due timer, and the bounded wait yields for the loop's continuation
+    // to observe the settled count. Never Thread.Sleep.
+    for _ in 1..5 do
+        fake.Advance(TimeSpan.FromMilliseconds 100.0)
+        work.Wait(TimeSpan.FromMilliseconds 500.0) |> ignore
+
+    work.Wait(TimeSpan.FromSeconds 10.0) |> should equal true
+    (calls >= 3) |> should equal true
 
 // ──────────────────────────────────────────────────────────────────────────
 // Slow runtime (dedicated collection)
@@ -603,3 +813,160 @@ type ClusterRuntimeTests() =
             descriptor.ServiceType = typeof<IHostedService>
             && descriptor.ImplementationType = typeof<ClusterActorSystemService>)
         |> should equal true
+
+    [<Fact>]
+    member _.``Single-node Up is Healthy``() : Task =
+        task {
+            let port = freePort ()
+
+            let service =
+                startClusterOn port (fun root ->
+                    root.Cluster.Mode <- ClusterMode.StaticSeeds
+                    root.Cluster.SeedNodes.Add($"127.0.0.1:%d{port}") |> ignore
+                    root.Cluster.Roles.Add("session") |> ignore)
+
+            try
+                do! awaitUp (requireSystem service) (TimeSpan.FromSeconds(30.0))
+
+                use provider = providerFor service
+
+                let check =
+                    checkFor provider (fun root -> root.Cluster.Mode <- ClusterMode.StaticSeeds)
+
+                let! result =
+                    awaitWhat
+                        (check.CheckHealthAsync(HealthCheckContext(), CancellationToken.None))
+                        (TimeSpan.FromSeconds(30.0))
+                        "single-node readiness"
+
+                result.Status |> should equal HealthStatus.Healthy
+            finally
+                stopQuietly service
+        }
+
+    [<Fact>]
+    member _.``Two-node join is Healthy on both``() : Task =
+        task {
+            let portA = freePort ()
+            let portB = freePort ()
+
+            let nodeA =
+                startClusterOn portA (fun root ->
+                    root.Cluster.Mode <- ClusterMode.StaticSeeds
+                    root.Cluster.SeedNodes.Add($"127.0.0.1:%d{portA}") |> ignore
+                    root.Cluster.Roles.Add("session") |> ignore)
+
+            let nodeB =
+                startClusterOn portB (fun root ->
+                    root.Cluster.Mode <- ClusterMode.StaticSeeds
+                    root.Cluster.SeedNodes.Add($"127.0.0.1:%d{portA}") |> ignore
+                    root.Cluster.Roles.Add("session") |> ignore)
+
+            try
+                do! awaitUp (requireSystem nodeA) (TimeSpan.FromSeconds(30.0))
+                do! awaitUp (requireSystem nodeB) (TimeSpan.FromSeconds(30.0))
+
+                use providerA = providerFor nodeA
+                use providerB = providerFor nodeB
+
+                let checkA =
+                    checkFor providerA (fun root -> root.Cluster.Mode <- ClusterMode.StaticSeeds)
+
+                let checkB =
+                    checkFor providerB (fun root -> root.Cluster.Mode <- ClusterMode.StaticSeeds)
+
+                let! resultA =
+                    awaitWhat
+                        (checkA.CheckHealthAsync(HealthCheckContext(), CancellationToken.None))
+                        (TimeSpan.FromSeconds(30.0))
+                        "node A readiness after join"
+
+                let! resultB =
+                    awaitWhat
+                        (checkB.CheckHealthAsync(HealthCheckContext(), CancellationToken.None))
+                        (TimeSpan.FromSeconds(30.0))
+                        "node B readiness after join"
+
+                resultA.Status |> should equal HealthStatus.Healthy
+                resultB.Status |> should equal HealthStatus.Healthy
+            finally
+                stopQuietly nodeB
+                stopQuietly nodeA
+        }
+
+    [<Fact>]
+    member _.``Drain flips a live node Unhealthy``() : Task =
+        task {
+            let port = freePort ()
+
+            let service =
+                startClusterOn port (fun root ->
+                    root.Cluster.Mode <- ClusterMode.StaticSeeds
+                    root.Cluster.SeedNodes.Add($"127.0.0.1:%d{port}") |> ignore
+                    root.Cluster.Roles.Add("session") |> ignore)
+
+            try
+                do! awaitUp (requireSystem service) (TimeSpan.FromSeconds(30.0))
+
+                use provider = providerFor service
+
+                let check =
+                    checkFor provider (fun root -> root.Cluster.Mode <- ClusterMode.StaticSeeds)
+
+                let! before =
+                    awaitWhat
+                        (check.CheckHealthAsync(HealthCheckContext(), CancellationToken.None))
+                        (TimeSpan.FromSeconds(30.0))
+                        "readiness before drain"
+
+                before.Status |> should equal HealthStatus.Healthy
+
+                // The first drain level fails readiness before any wait
+                // starts: no restart, no gossip timing involved.
+                service.BeginDrain()
+
+                let! after =
+                    awaitWhat
+                        (check.CheckHealthAsync(HealthCheckContext(), CancellationToken.None))
+                        (TimeSpan.FromSeconds(30.0))
+                        "readiness after drain"
+
+                after.Status |> should equal HealthStatus.Unhealthy
+            finally
+                stopQuietly service
+        }
+
+    [<Fact>]
+    member _.``Drain then stop completes within the exit deadline``() : Task =
+        task {
+            let port = freePort ()
+
+            let service =
+                startClusterOn port (fun root ->
+                    root.Cluster.Mode <- ClusterMode.StaticSeeds
+                    root.Cluster.SeedNodes.Add($"127.0.0.1:%d{port}") |> ignore
+                    root.Cluster.Roles.Add("session") |> ignore
+                    root.Cluster.ShutdownGraceSeconds <- TimeSpan.FromSeconds 2.0
+                    root.Cluster.HostExitDeadline <- TimeSpan.FromSeconds 15.0)
+
+            try
+                do! awaitUp (requireSystem service) (TimeSpan.FromSeconds(30.0))
+
+                service.BeginDrain()
+                service.IsDraining |> should equal true
+
+                let stopwatch = Stopwatch.StartNew()
+
+                let stop =
+                    task {
+                        do! (service :> IHostedService).StopAsync(CancellationToken.None)
+                        return ()
+                    }
+
+                do! awaitWhat stop (TimeSpan.FromSeconds(15.0)) "drain then stop"
+
+                stopwatch.Stop()
+                (stopwatch.Elapsed < TimeSpan.FromSeconds 15.0) |> should equal true
+            finally
+                stopQuietly service
+        }
