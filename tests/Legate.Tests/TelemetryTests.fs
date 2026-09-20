@@ -158,6 +158,15 @@ let ``Instrument names carry the documented legate names`` () =
     Telemetry.QueueDepthName |> should equal "legate.session.queue.depth"
     Telemetry.LeaseRenewalsName |> should equal "legate.lease.renewals"
     Telemetry.DispatchLatencyName |> should equal "legate.dispatch.latency"
+
+    Telemetry.SerializationRejectedName
+    |> should equal "legate.serialization.rejected"
+
+    Telemetry.ReasonTag |> should equal "reason"
+    Telemetry.RejectionUnknownManifest |> should equal "unknownManifest"
+    Telemetry.RejectionNewerVersion |> should equal "newerVersion"
+    Telemetry.RejectionOversized |> should equal "oversized"
+    Telemetry.RejectionFailed |> should equal "failed"
     Telemetry.TurnActivityName |> should equal "Legate.Turn"
     Telemetry.ProviderActivityName |> should equal "Legate.ProviderCall"
     Telemetry.ToolActivityName |> should equal "Legate.ToolCall"
@@ -213,7 +222,8 @@ let ``MeterListener observes every counter and histogram with its tags`` () =
             Telemetry.addQueueDepth 1
             Telemetry.addQueueDepth -1
             Telemetry.recordLeaseRenewal Telemetry.LeaseContinued
-            Telemetry.recordDispatchLatency 7.5)
+            Telemetry.recordDispatchLatency 7.5
+            Telemetry.recordSerializationRejected Telemetry.RejectionUnknownManifest)
 
     shouldHold measurements Telemetry.TurnsStartedName []
     shouldHold measurements Telemetry.TurnsSettledName [ "status", "Completed" ]
@@ -248,6 +258,13 @@ let ``MeterListener observes every counter and histogram with its tags`` () =
 
     shouldHold measurements Telemetry.LeaseRenewalsName [ "outcome", Telemetry.LeaseContinued ]
     shouldHold measurements Telemetry.DispatchLatencyName []
+
+    shouldHold
+        measurements
+        Telemetry.SerializationRejectedName
+        [
+            "reason", Telemetry.RejectionUnknownManifest
+        ]
 
     let latency =
         measurements

@@ -615,6 +615,12 @@ type ClusterOptions() =
     /// stopping. Default 30 s; must stay positive.
     member val ShutdownGraceSeconds: TimeSpan = TimeSpan.FromSeconds 30.0 with get, set
 
+    /// The largest wire payload any node accepts in bytes, bounding every
+    /// versioned-envelope manifest on top of its per-case bound. Payloads
+    /// above this size (or above their case bound) are refused before
+    /// deserialising. Default 1 MiB. Must be at least 1.
+    member val MaxWirePayloadBytes: int = 1048576 with get, set
+
     /// Returns null when every knob is in range, otherwise a message for the
     /// first violation.
     /// <returns>The first violation's message, or null when the settings are valid.</returns>
@@ -631,6 +637,8 @@ type ClusterOptions() =
             "ShardCount must be at least 1."
         elif this.ShardHashVersion < 1 then
             "ShardHashVersion must be at least 1."
+        elif this.MaxWirePayloadBytes < 1 then
+            "MaxWirePayloadBytes must be at least 1."
         elif String.IsNullOrWhiteSpace this.SessionRole then
             "SessionRole must be a non-empty string."
         elif isNull (box this.Roles) then

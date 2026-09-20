@@ -78,7 +78,10 @@ module internal ClusterActorSystem =
     /// Builds remoting+cluster HOCON from the cluster options. StaticSeeds
     /// lists SeedNodes as seed-nodes; Kubernetes lists none (SeedNodes is
     /// ignored) and runs as a singleton until issue 138. Both publish
-    /// the version stamp as the member app-version and the node roles.
+    /// the version stamp as the member app-version and the node roles. The
+    /// versioned envelope wiring (issue 130) rides along: the DTO
+    /// serializer, its bindings for the actor, router, and entity protocol
+    /// messages, and the global wire maximum from MaxWirePayloadBytes.
     /// <param name="options">The cluster options. Must not be null.</param>
     /// <param name="port">The remoting port, or 0 for an ephemeral port.</param>
     /// <returns>The cluster HOCON.</returns>
@@ -102,6 +105,7 @@ module internal ClusterActorSystem =
                 |> String.concat ", "
 
         let stamp = SessionSharding.versionStamp options.ShardHashVersion options.ShardCount
+        let wire = WireSerialization.hoconFragment (max 1 options.MaxWirePayloadBytes)
 
         $"""akka {{
   actor {{
@@ -122,7 +126,8 @@ module internal ClusterActorSystem =
     run-by-actor-system-terminate = on
     run-by-clr-shutdown-hook = off
   }}
-}}"""
+}}
+{wire}"""
 
     /// Parses SeedNodes entries in host:port form into cluster addresses.
     /// <param name="options">The cluster options. Must not be null.</param>

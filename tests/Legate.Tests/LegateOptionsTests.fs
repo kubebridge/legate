@@ -304,6 +304,7 @@ let ``Cluster defaults run local with no seeds`` () =
     options.ShardCount |> should equal 128
     options.ShardHashVersion |> should equal 1
     options.ShutdownGraceSeconds |> should equal (TimeSpan.FromSeconds 30.0)
+    options.MaxWirePayloadBytes |> should equal 1048576
     options.Validate() |> should equal null
 
 [<Fact>]
@@ -352,6 +353,12 @@ let ``Cluster Validate flags bad shard knobs roles and session role`` () =
 
     ClusterOptions(ShardHashVersion = 0).Validate()
     |> should equal "ShardHashVersion must be at least 1."
+
+    ClusterOptions(MaxWirePayloadBytes = 0).Validate()
+    |> should equal "MaxWirePayloadBytes must be at least 1."
+
+    ClusterOptions(MaxWirePayloadBytes = -8).Validate()
+    |> should equal "MaxWirePayloadBytes must be at least 1."
 
     ClusterOptions(SessionRole = "  ").Validate()
     |> should equal "SessionRole must be a non-empty string."
