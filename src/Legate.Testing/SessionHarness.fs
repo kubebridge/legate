@@ -576,6 +576,7 @@ type SessionHarness
                         RunSuspendable = runner
                         ReprimeJournal = Some reprime
                         RefreshCompact = None
+                        AgentStore = null
                     }
 
                 let actor =

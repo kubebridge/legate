@@ -1356,6 +1356,7 @@ module internal SessionClientWiring =
                         clientOptions.LeaseDuration
                         runner
                         compactFor
+                        (provider.GetService<IAgentStore>())
                 )
 
             // The factory lands on the mode-active service only; the idle

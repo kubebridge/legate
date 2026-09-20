@@ -954,6 +954,7 @@ let private spawnWriterActor
             RunSuspendable = runner
             ReprimeJournal = None
             RefreshCompact = None
+            AgentStore = null
         }
 
     spawn system $"journal-{Guid.NewGuid():N}" (SessionActor.behaviorWithSuspend baseProps deps)

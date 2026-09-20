@@ -1132,6 +1132,7 @@ let private spawnSuspendable
             RunSuspendable = runner.Func
             ReprimeJournal = None
             RefreshCompact = None
+            AgentStore = null
         }
 
     spawn system $"suspend-{Guid.NewGuid():N}" (SessionActor.behaviorWithSuspend baseProps deps)
@@ -3391,6 +3392,7 @@ let private spawnSuspendableOver
             RunSuspendable = runner.Func
             ReprimeJournal = None
             RefreshCompact = None
+            AgentStore = null
         }
 
     spawn system $"crash-{Guid.NewGuid():N}" (SessionActor.behaviorWithSuspend baseProps deps)
@@ -3708,6 +3710,7 @@ let ``Kill mid-turn restarts exactly once with the journal prefix intact`` () =
                 RunSuspendable = runner.Func
                 ReprimeJournal = None
                 RefreshCompact = None
+                AgentStore = null
             }
 
         spawn system $"kill-{Guid.NewGuid():N}" (SessionActor.behaviorWithSuspend baseProps deps)
@@ -3903,6 +3906,7 @@ let private spawnReprimeable
             RunSuspendable = runner.Func
             ReprimeJournal = Some(reprimeFor store tenantId sessionId "owner-a")
             RefreshCompact = refresh
+            AgentStore = null
         }
 
     spawn system $"setagent-{Guid.NewGuid():N}" (SessionActor.behaviorWithSuspend baseProps deps)
