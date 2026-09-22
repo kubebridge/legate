@@ -170,7 +170,9 @@ module internal WireSerialization =
         options
 
     /// Every live type the envelope binds: the actor, router, and entity
-    /// protocol messages plus the session records that answer Asks. Raw DUs
+    /// protocol messages plus the session records that answer Asks, plus
+    /// the cross-node subscription request, its event batches, and the
+    /// journaled session events the owning entity streams back. Raw DUs
     /// bind here so Akka routes them to this serializer; the bytes on the
     /// wire are still always DTOs.
     let boundTypes: Type list =
@@ -184,6 +186,10 @@ module internal WireSerialization =
             typeof<SessionRouterMessage>
             typeof<SessionActor.SessionReplyReply>
             typeof<SessionActor.SessionSetAgentReply>
+            typeof<CrossNodeSubscriptions.CrossNodeSubscribeRequest>
+            typeof<CrossNodeSubscriptions.CrossNodeUnsubscribe>
+            typeof<CrossNodeSubscriptions.CrossNodeEventBatch>
+            typeof<SessionEvent>
         ]
 
     /// Renders one bound type as its HOCON binding key: FullName,

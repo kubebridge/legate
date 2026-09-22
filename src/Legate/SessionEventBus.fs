@@ -19,10 +19,13 @@ open Microsoft.Extensions.Logging
 // cluster semantics overkill for a process-local bus); cell derivation and
 // ReadTranscript here (owned by #50).
 
-/// How a live event subscription buffers: the per-session subscriber cap
-/// and the per-subscriber channel bound. Bound from configuration; mutable
-/// so hosts can set properties before registering. Defaults hold 512 live
-/// subscribers per session with 128 buffered events each.
+/// How a live event subscription buffers: the per-session subscriber cap,
+/// the per-subscriber channel bound, the owning-entity replay cache, and
+/// the per-event payload cap. Bound from configuration; mutable so hosts
+/// can set properties before registering. Defaults hold 512 live
+/// subscribers per session with 128 buffered events each, a 256-event
+/// replay cache, and a 1 MiB per-event cap (the global
+/// Cluster:MaxWirePayloadBytes caps every manifest on top of it).
 type SessionSubscriptionOptions() =
 
     /// The live subscribers one session holds. A new subscription past the
@@ -37,6 +40,19 @@ type SessionSubscriptionOptions() =
     /// stalling the publishing turn. Default 128.
     member val PerSubscriberBufferSize: int = 128 with get, set
 
+    /// How many recent journaled events the owning entity keeps in its
+    /// bounded replay cache for resuming cross-node subscribers. Older
+    /// cursors fall back to <see cref="M:Legate.ISessionEventStore.Replay*" />;
+    /// evicted entries redeliver from the store with duplicates allowed
+    /// and no gaps. Default 256.
+    member val ReplayCacheSize: int = 256 with get, set
+
+    /// The largest single session event the owning entity streams to a
+    /// remote subscriber, in bytes. Events above the bound refuse before
+    /// crossing; the global wire maximum caps every manifest on top of
+    /// it. Default 1048576.
+    member val MaxEventPayloadBytes: int = 1048576 with get, set
+
     /// Returns null when every knob is in range, otherwise a message for the
     /// first violation.
     /// <returns>The first violation's message, or null when the settings are valid.</returns>
@@ -45,6 +61,10 @@ type SessionSubscriptionOptions() =
             "MaxSubscribersPerSession must be at least 1."
         elif this.PerSubscriberBufferSize < 1 then
             "PerSubscriberBufferSize must be at least 1."
+        elif this.ReplayCacheSize < 1 then
+            "ReplayCacheSize must be at least 1."
+        elif this.MaxEventPayloadBytes < 1 then
+            "MaxEventPayloadBytes must be at least 1."
         else
             null
 

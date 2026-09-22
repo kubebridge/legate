@@ -138,6 +138,34 @@ type SessionsOptions() =
     /// is enabled. Bound from <c>Legate:Sessions:AutoTitleModel</c>.
     member val AutoTitleModel: string | null = null with get, set
 
+    /// The live subscribers one session holds on its owning entity in
+    /// cluster modes (and on the process-local bus in Local mode). A new
+    /// subscription past the cap rejects with the typed limit error
+    /// instead of evicting an existing one. Default 512. Bound from
+    /// <c>Legate:Sessions:MaxSubscribersPerSession</c>.
+    member val MaxSubscribersPerSession: int = 512 with get, set
+
+    /// The events one cross-node subscriber buffers before it is
+    /// considered slow. A subscriber past the bound disconnects with the
+    /// typed lagged error instead of stalling the owning turn. Default
+    /// 128. Bound from <c>Legate:Sessions:PerSubscriberBufferSize</c>.
+    member val PerSubscriberBufferSize: int = 128 with get, set
+
+    /// How many recent journaled events the owning entity keeps in its
+    /// bounded replay cache for resuming subscribers. Older cursors fall
+    /// back to <c>ISessionEventStore.Replay</c>; evicted cache entries
+    /// redeliver from the store with duplicates allowed and no gaps.
+    /// Default 256. Bound from
+    /// <c>Legate:Sessions:SubscriptionReplayCacheSize</c>.
+    member val SubscriptionReplayCacheSize: int = 256 with get, set
+
+    /// The largest single session event the owning entity streams to a
+    /// remote subscriber, in bytes. Events above the bound refuse before
+    /// crossing; the global <c>Cluster:MaxWirePayloadBytes</c> caps every
+    /// manifest on top of this per-event bound. Default 1 MiB. Bound from
+    /// <c>Legate:Sessions:SubscriptionMaxEventPayloadBytes</c>.
+    member val SubscriptionMaxEventPayloadBytes: int = 1048576 with get, set
+
     /// Returns null when every knob is in range, otherwise a message for the
     /// first violation.
     /// <returns>The first violation's message, or null when the settings are valid.</returns>
@@ -172,6 +200,14 @@ type SessionsOptions() =
                         "Expiry must be positive when set."
                     if titleModelInvalid then
                         "AutoTitleModel must be a valid model reference in provider/model form."
+                    if this.MaxSubscribersPerSession < 1 then
+                        "MaxSubscribersPerSession must be at least 1."
+                    if this.PerSubscriberBufferSize < 1 then
+                        "PerSubscriberBufferSize must be at least 1."
+                    if this.SubscriptionReplayCacheSize < 1 then
+                        "SubscriptionReplayCacheSize must be at least 1."
+                    if this.SubscriptionMaxEventPayloadBytes < 1 then
+                        "SubscriptionMaxEventPayloadBytes must be at least 1."
                 |]
 
             if violations.Length <> 0 then

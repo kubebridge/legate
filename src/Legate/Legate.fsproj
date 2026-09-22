@@ -23,6 +23,7 @@
     <Compile Include="SessionArtifactEnrichment.fs" />
     <Compile Include="Transcripts.fs" />
     <Compile Include="SessionEventBus.fs" />
+    <Compile Include="SubscriptionRegistry.fs" />
     <Compile Include="LlmStreaming.fs" />
     <Compile Include="StopArbitration.fs" />
     <Compile Include="WorkspaceLayout.fs" />

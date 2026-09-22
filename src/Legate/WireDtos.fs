@@ -364,6 +364,72 @@ module internal WireDtos =
         /// The state the session was in.
         member val State: SessionState = SessionState.Idle with get, set
 
+    // ────────────────── Subscription family: cross-node subscribe (issue 133) ──────────────────
+
+    /// Wire form of CrossNodeSubscriptions.CrossNodeSubscribeRequest: the
+    /// tenant, session, and exclusive cursor routed to the owning entity
+    /// through the session shard region. The caller resumes from its last
+    /// sequence on rebind; duplicates are acceptable, gaps are not.
+    type SubscribeDto() =
+
+        /// The tenant the session belongs to.
+        member val Tenant: string = Unchecked.defaultof<string> with get, set
+
+        /// The session to subscribe to.
+        member val SessionId: string = Unchecked.defaultof<string> with get, set
+
+        /// The exclusive cursor: events strictly greater than it stream back.
+        member val FromSequence: int64 = 0L with get, set
+
+        /// The subscriber token identifying this stream across re-polls
+        /// and rebinds.
+        member val SubscriberToken: string = Unchecked.defaultof<string> with get, set
+
+    /// Wire form of CrossNodeSubscriptions.CrossNodeUnsubscribe: the
+    /// tenant and session to detach from. Best-effort on dispose; a lost
+    /// unsubscribe only holds one subscriber slot until the entity
+    /// restarts.
+    type UnsubscribeDto() =
+
+        /// The tenant the session belongs to.
+        member val Tenant: string = Unchecked.defaultof<string> with get, set
+
+        /// The session to detach from.
+        member val SessionId: string = Unchecked.defaultof<string> with get, set
+
+        /// The subscriber token to detach.
+        member val SubscriberToken: string = Unchecked.defaultof<string> with get, set
+
+    /// Wire form of CrossNodeSubscriptions.CrossNodeEventBatch: one
+    /// entity-to-subscriber batch in sequence order with its resume
+    /// cursor. Bounded batches keep one Ask reply bounded; the consumer
+    /// follows NextCursor while EndOfStream is false.
+    type EventBatchDto() =
+
+        /// The session the events belong to.
+        member val SessionId: string = Unchecked.defaultof<string> with get, set
+
+        /// The events in sequence order; empty at end of stream.
+        member val Events: SessionEvent[] = [||] with get, set
+
+        /// The cursor to resume from.
+        member val NextCursor: int64 = 0L with get, set
+
+        /// True when the journal holds nothing more past the cursor now.
+        member val EndOfStream: bool = true with get, set
+
+    // ────────────────── Event family: session event stream (issue 133) ──────────────────
+
+    /// Wire form of one journaled SessionEvent streamed from the owning
+    /// entity to the subscribing node. The polymorphic SessionEvent
+    /// payload round-trips through its $type discriminator; the receiver
+    /// rebuilds the live event verbatim (sequences are store-stamped, so
+    /// no token or fence crosses).
+    type SessionEventDto() =
+
+        /// The journaled event.
+        member val Event: SessionEvent = Unchecked.defaultof<SessionEvent> with get, set
+
     // ────────────────── Translation ──────────────────
 
     /// Maps a live exception to its wire reason string: the message, or the
@@ -729,6 +795,45 @@ module internal WireDtos =
         elif message :? SessionRouterMessage then
             match message :?> SessionRouterMessage with
             | ResolveSession sessionId -> buildDto (fun (dto: ResolveSessionDto) -> dto.SessionId <- sessionId) :> obj
+        elif message :? CrossNodeSubscriptions.CrossNodeSubscribeRequest then
+            let request = message :?> CrossNodeSubscriptions.CrossNodeSubscribeRequest
+
+            buildDto (fun (dto: SubscribeDto) ->
+                dto.Tenant <- request.Tenant.ToString()
+                dto.SessionId <- request.SessionId.ToString()
+                dto.FromSequence <- request.FromSequence
+                dto.SubscriberToken <- request.SubscriberToken)
+            :> obj
+        elif message :? CrossNodeSubscriptions.CrossNodeUnsubscribe then
+            let request = message :?> CrossNodeSubscriptions.CrossNodeUnsubscribe
+
+            buildDto (fun (dto: UnsubscribeDto) ->
+                dto.Tenant <- request.Tenant.ToString()
+                dto.SessionId <- request.SessionId.ToString()
+                dto.SubscriberToken <- request.SubscriberToken)
+            :> obj
+        elif message :? CrossNodeSubscriptions.CrossNodeEventBatch then
+            let batch = message :?> CrossNodeSubscriptions.CrossNodeEventBatch
+
+            let events =
+                if isNull (box batch.Events) then
+                    [||]
+                else
+                    batch.Events |> Seq.filter (fun evt -> not (isNull (box evt))) |> Array.ofSeq
+
+            buildDto (fun (dto: EventBatchDto) ->
+                dto.SessionId <- batch.SessionId.ToString()
+                dto.Events <- events
+                dto.NextCursor <- batch.NextCursor
+                dto.EndOfStream <- batch.EndOfStream)
+            :> obj
+        elif message :? SessionEvent then
+            let evt = message :?> SessionEvent
+
+            if isNull (box evt) then
+                raise (ArgumentNullException(nameof message))
+
+            buildDto (fun (dto: SessionEventDto) -> dto.Event <- evt) :> obj
         else
             raise (
                 InvalidOperationException(
@@ -857,6 +962,78 @@ module internal WireDtos =
             SessionActor.SetAgentPending(requireSession (wire :?> SetAgentPendingDto).Session) :> obj
         elif wire :? SetAgentRejectedDto then
             SessionActor.SetAgentRejected((wire :?> SetAgentRejectedDto).State) :> obj
+        elif wire :? SubscribeDto then
+            let dto = wire :?> SubscribeDto
+
+            if String.IsNullOrWhiteSpace dto.Tenant then
+                raise (InvalidOperationException("The subscribe request carries no tenant."))
+
+            let mutable sessionId = Unchecked.defaultof<SessionId>
+
+            if not (SessionId.TryParse(dto.SessionId, &sessionId)) then
+                raise (InvalidOperationException("The subscribe request carries an invalid session id."))
+
+            if String.IsNullOrWhiteSpace dto.SubscriberToken then
+                raise (InvalidOperationException("The subscribe request carries no subscriber token."))
+
+            ({
+                Tenant = TenantId.Create(dto.Tenant)
+                SessionId = sessionId
+                FromSequence = dto.FromSequence
+                SubscriberToken = dto.SubscriberToken
+            }
+            : CrossNodeSubscriptions.CrossNodeSubscribeRequest)
+            :> obj
+        elif wire :? UnsubscribeDto then
+            let dto = wire :?> UnsubscribeDto
+
+            if String.IsNullOrWhiteSpace dto.Tenant then
+                raise (InvalidOperationException("The unsubscribe request carries no tenant."))
+
+            let mutable sessionId = Unchecked.defaultof<SessionId>
+
+            if not (SessionId.TryParse(dto.SessionId, &sessionId)) then
+                raise (InvalidOperationException("The unsubscribe request carries an invalid session id."))
+
+            if String.IsNullOrWhiteSpace dto.SubscriberToken then
+                raise (InvalidOperationException("The unsubscribe request carries no subscriber token."))
+
+            ({
+                Tenant = TenantId.Create(dto.Tenant)
+                SessionId = sessionId
+                SubscriberToken = dto.SubscriberToken
+            }
+            : CrossNodeSubscriptions.CrossNodeUnsubscribe)
+            :> obj
+        elif wire :? EventBatchDto then
+            let dto = wire :?> EventBatchDto
+
+            let mutable sessionId = Unchecked.defaultof<SessionId>
+
+            if not (SessionId.TryParse(dto.SessionId, &sessionId)) then
+                raise (InvalidOperationException("The event batch carries an invalid session id."))
+
+            let events =
+                if isNull (box dto.Events) then
+                    Array.Empty<SessionEvent>() :> IReadOnlyList<SessionEvent>
+                else
+                    dto.Events |> Array.filter (fun evt -> not (isNull (box evt))) :> IReadOnlyList<SessionEvent>
+
+            ({
+                SessionId = sessionId
+                Events = events
+                NextCursor = dto.NextCursor
+                EndOfStream = dto.EndOfStream
+            }
+            : CrossNodeSubscriptions.CrossNodeEventBatch)
+            :> obj
+        elif wire :? SessionEventDto then
+            let dto = wire :?> SessionEventDto
+
+            if isNull (box dto.Event) then
+                raise (InvalidOperationException("The session event envelope carries no event."))
+
+            dto.Event :> obj
         else
             raise (
                 InvalidOperationException(

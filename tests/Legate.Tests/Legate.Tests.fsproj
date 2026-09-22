@@ -133,6 +133,7 @@
     <Compile Include="AgentAuthorityTests.fs" />
     <Compile Include="WireSerializationTests.fs" />
     <Compile Include="WireSerializationGoldenTests.fs" />
+    <Compile Include="CrossNodeSubscriptionTests.fs" />
   </ItemGroup>
 
   <ItemGroup>

@@ -350,10 +350,14 @@ Small bound is 32,768 bytes (control DTOs); large bound is 1,048,576 bytes
 | `legate.entity.SuspendableInterruptPrompt.v1` | `WireDtos.SuspendableInterruptPromptDto` | 1 | large |
 | `legate.entity.SuspendableQueuePrompt.v1` | `WireDtos.SuspendableQueuePromptDto` | 1 | large |
 | `legate.entity.SuspendableSetAgent.v1` | `WireDtos.SuspendableSetAgentDto` | 1 | small |
+| `legate.subscription.Subscribe.v1` | `WireDtos.SubscribeDto` | 1 | small |
+| `legate.subscription.Unsubscribe.v1` | `WireDtos.UnsubscribeDto` | 1 | small |
+| `legate.subscription.EventBatch.v1` | `WireDtos.EventBatchDto` | 1 | large |
+| `legate.event.SessionEvent.v1` | `WireDtos.SessionEventDto` | 1 | large |
 
-Reserved (no DTO yet; refused as unknown manifests until their owning
-issue promotes them to table rows): `legate.subscription.Subscribe.v1`
-(issue 132), `legate.event.SessionEvent.v1` (issue 133).
+No reserved manifests remain: the subscription and event namespaces
+promoted to table rows in issue 133, so every `legate.subscription.*` /
+`legate.event.*` manifest names a registered wire case.
 
 ## Observability
 

@@ -2,6 +2,7 @@
 namespace Legate
 
 open System
+open System.Collections.Concurrent
 open System.Collections.Immutable
 open System.Runtime.ExceptionServices
 open System.Threading
@@ -273,27 +274,130 @@ module internal ClusterActorSystem =
 
         loop ()
 
+    /// The subscription dependencies one session entity serves remote
+    /// subscribers with: the journal batches fall back to, the bounds the
+    /// hub enforces, and the per-(tenant, session) hubs the service owns.
+    /// Hubs live on the service (not in actor state) so an entity restart
+    /// never drops subscriber slots or the replay cache.
+    type internal SubscriptionDeps =
+        {
+            /// The journal batches fall back to past the cache.
+            EventStore: ISessionEventStore
+            /// The subscriber, cache, and payload bounds.
+            Options: SessionSubscriptionOptions
+            /// The per-(tenant, session-id) hubs, keyed by tenant and the
+            /// entity id string (the session id text the resolver used).
+            Hubs: ConcurrentDictionary<TenantId * string, CrossNodeSubscriptions.SubscriptionHub>
+        }
+
     /// The shard entity: a thin delegator spawning one session child for
     /// its entity id and forwarding everything to it with the sender
     /// preserved. A bare string equal to the entity id is the wire-safe
     /// resolve marker (strings cross remoting without a custom
-    /// serializer): it answers the child to the sender. Every other
-    /// message is session traffic (the suspendable protocol the client
-    /// speaks, today and for future messages) and forwards to the
-    /// child, so the actor code stays shared with Local mode.
+    /// serializer): it answers the child to the sender. Cross-node
+    /// subscribe requests (issue 133) intercept here when subscription
+    /// dependencies are wired: the entity attaches the subscriber token
+    /// to its hub (the cap rejects with the typed limit error) and pipes
+    /// one bounded batch back to the asker without ever blocking the
+    /// actor thread; control-plane branches travel back as their typed
+    /// exceptions over Akka's native Ask failure channel while event data
+    /// travels exclusively under the versioned envelope. Unsubscribes
+    /// detach best-effort with no reply. Every other message is session
+    /// traffic (the suspendable protocol the client speaks, today and for
+    /// future messages) and forwards to the child, so the actor code stays
+    /// shared with Local mode.
     /// <param name="entityId">The session id this entity hosts.</param>
     /// <param name="spawnSession">Spawns the session child.</param>
+    /// <param name="subscriptionDeps">The subscription wiring, or None for the legacy pure-delegator entity.</param>
     /// <param name="mailbox">The entity mailbox.</param>
     /// <returns>The entity actor computation.</returns>
     let private sessionEntityBehavior
         (entityId: string)
         (spawnSession: string -> IActorContext -> string -> IActorRef)
+        (subscriptionDeps: SubscriptionDeps option)
         (mailbox: Actor<obj>)
         =
         let ensure (child: IActorRef option) : IActorRef =
             match child with
             | Some live -> live
             | None -> spawnSession entityId mailbox.Context "session"
+
+        let serveSubscribe (request: CrossNodeSubscriptions.CrossNodeSubscribeRequest) (sender: IActorRef) : unit =
+            match subscriptionDeps with
+            | None ->
+                sender.Tell(
+                    InvalidOperationException(
+                        "The Legate cluster actor system serves no cross-node subscriptions: the session client facade wires the subscription dependencies on start."
+                    )
+                    :> obj
+                )
+            | Some deps ->
+                ArgumentNullException.ThrowIfNull(deps.EventStore)
+                ArgumentNullException.ThrowIfNull(deps.Options)
+                ArgumentNullException.ThrowIfNull(deps.Hubs)
+
+                let hub =
+                    deps.Hubs.GetOrAdd(
+                        (request.Tenant, entityId),
+                        fun _ -> CrossNodeSubscriptions.SubscriptionHub(deps.Options)
+                    )
+
+                if not (hub.TryAttach(request.SubscriberToken)) then
+                    sender.Tell(
+                        SessionSubscriptionLimitExceededException(
+                            request.SessionId,
+                            deps.Options.MaxSubscribersPerSession,
+                            sprintf "The session holds %d live subscribers." deps.Options.MaxSubscribersPerSession
+                        )
+                        :> obj
+                    )
+                else
+                    let serve =
+                        CrossNodeSubscriptions.serveBatchAsync (
+                            deps.EventStore,
+                            hub,
+                            request.Tenant,
+                            request.SessionId,
+                            request.FromSequence,
+                            CrossNodeSubscriptions.MaxBatchEvents,
+                            deps.Options.MaxEventPayloadBytes,
+                            CancellationToken.None
+                        )
+
+                    serve.ContinueWith(fun (completed: Task<CrossNodeSubscriptions.CrossNodeBatchOutcome>) ->
+                        if completed.IsFaulted then
+                            let inner =
+                                match completed.Exception with
+                                | null -> Exception("The cross-node subscription failed.")
+                                | aggregate when aggregate.InnerExceptions.Count > 0 -> aggregate.InnerExceptions[0]
+                                | aggregate -> aggregate :> exn
+
+                            sender.Tell(inner :> obj)
+                        elif completed.IsCanceled then
+                            sender.Tell(OperationCanceledException() :> obj)
+                        else
+                            try
+                                CrossNodeSubscriptions.raiseForOutcome request.Tenant completed.Result
+
+                                match completed.Result with
+                                | CrossNodeSubscriptions.BatchPage batch -> sender.Tell(batch :> obj)
+                                | _ ->
+                                    sender.Tell(
+                                        InvalidOperationException("The cross-node subscription resolved with no page.")
+                                        :> obj
+                                    )
+                            with ex ->
+                                sender.Tell(ex :> obj))
+                    |> ignore
+
+        let serveUnsubscribe (request: CrossNodeSubscriptions.CrossNodeUnsubscribe) : unit =
+            match subscriptionDeps with
+            | None -> ()
+            | Some deps ->
+                if not (isNull (box deps.Hubs)) then
+                    match deps.Hubs.TryGetValue((request.Tenant, entityId)) with
+                    | true, hub -> hub.Detach(request.SubscriberToken)
+                    | false, _ -> ()
 
         let rec loop (child: IActorRef option) =
             actor {
@@ -304,6 +408,12 @@ module internal ClusterActorSystem =
                     let live = ensure child
                     mailbox.Sender() <! live
                     return! loop (Some live)
+                | :? CrossNodeSubscriptions.CrossNodeSubscribeRequest as subscribe ->
+                    serveSubscribe subscribe (mailbox.Sender())
+                    return! loop child
+                | :? CrossNodeSubscriptions.CrossNodeUnsubscribe as unsubscribe ->
+                    serveUnsubscribe unsubscribe
+                    return! loop child
                 | _ ->
                     let live = ensure child
                     live.Tell(message, mailbox.Sender())
@@ -326,7 +436,34 @@ module internal ClusterActorSystem =
             raise (ArgumentException("Entity id must be a non-empty string.", nameof entityId))
 
         Props.Create(
-            Linq.Expression.ToExpression(fun () -> new FunActor<obj, unit>(sessionEntityBehavior entityId spawnSession))
+            Linq.Expression.ToExpression(fun () ->
+                new FunActor<obj, unit>(sessionEntityBehavior entityId spawnSession None))
+        )
+
+    /// Lifts the subscription-wired entity behavior into Props: like
+    /// <see cref="M:Legate.ClusterActorSystem.entityProps" /> but the
+    /// entity serves cross-node subscribe requests from its hub with a
+    /// store fallback (issue 133).
+    /// <param name="entityId">The session id the entity hosts.</param>
+    /// <param name="spawnSession">Spawns the session child.</param>
+    /// <param name="subscriptionDeps">The subscription wiring. Must not be null.</param>
+    /// <returns>The entity Props.</returns>
+    let entityPropsWithSubscriptions
+        (entityId: string)
+        (spawnSession: string -> IActorContext -> string -> IActorRef)
+        (subscriptionDeps: SubscriptionDeps)
+        : Props =
+        ArgumentNullException.ThrowIfNull(spawnSession)
+        ArgumentNullException.ThrowIfNull(subscriptionDeps.EventStore)
+        ArgumentNullException.ThrowIfNull(subscriptionDeps.Options)
+        ArgumentNullException.ThrowIfNull(subscriptionDeps.Hubs)
+
+        if String.IsNullOrWhiteSpace entityId then
+            raise (ArgumentException("Entity id must be a non-empty string.", nameof entityId))
+
+        Props.Create(
+            Linq.Expression.ToExpression(fun () ->
+                new FunActor<obj, unit>(sessionEntityBehavior entityId spawnSession (Some subscriptionDeps)))
         )
 
     /// The drain poll cadence: how often the stop path re-reads the
@@ -469,6 +606,24 @@ type internal ClusterActorSystemService(options: IOptions<LegateOptions>, timePr
     /// running turns). The session client facade wires this alongside the
     /// entity factory; tests set it directly. Set before StartAsync.
     member val SessionStore: ISessionStore option = None with get, set
+
+    /// The journal cross-node subscription batches fall back to past the
+    /// entity replay cache, or None until the session client facade wires
+    /// it (entities then run the legacy pure-delegator behavior and serve
+    /// no subscriptions). The session client facade owns setting this
+    /// once it can supply the store. Set before StartAsync.
+    member val SubscriptionEventStore: ISessionEventStore option = None with get, set
+
+    /// The subscriber, cache, and payload bounds the session entities
+    /// enforce, or None until the session client facade wires them from
+    /// the host options. Set before StartAsync.
+    member val SubscriptionOptions: SessionSubscriptionOptions option = None with get, set
+
+    /// The per-(tenant, session-id) subscription hubs the session
+    /// entities attach remote subscribers to. Owned by the service (not
+    /// actor state) so entity restarts never drop slots or the cache.
+    member val SubscriptionHubs: ConcurrentDictionary<TenantId * string, CrossNodeSubscriptions.SubscriptionHub> =
+        ConcurrentDictionary<TenantId * string, CrossNodeSubscriptions.SubscriptionHub>() with get
 
     /// Marks the node as draining. Readiness flips Unhealthy the moment
     /// this runs, before any wait starts, so the orchestrator stops
@@ -631,7 +786,17 @@ type internal ClusterActorSystemService(options: IOptions<LegateOptions>, timePr
 
                         let entityPropsFactory =
                             System.Func<string, Props>(fun entityId ->
-                                ClusterActorSystem.entityProps entityId (spawnNow ()))
+                                match this.SubscriptionEventStore, this.SubscriptionOptions with
+                                | Some eventStore, Some subscriptionOptions ->
+                                    ClusterActorSystem.entityPropsWithSubscriptions
+                                        entityId
+                                        (spawnNow ())
+                                        {
+                                            EventStore = eventStore
+                                            Options = subscriptionOptions
+                                            Hubs = this.SubscriptionHubs
+                                        }
+                                | _ -> ClusterActorSystem.entityProps entityId (spawnNow ()))
 
                         let regionRef =
                             sharding.Start(SessionSharding.shardTypeName, entityPropsFactory, settings, extractor)
