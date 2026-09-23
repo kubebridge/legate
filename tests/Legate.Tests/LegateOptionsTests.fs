@@ -347,6 +347,47 @@ let ``Cluster Validate requires seeds in StaticSeeds but not in Kubernetes`` () 
     kubernetesSeeded.Validate() |> should equal null
 
 [<Fact>]
+let ``Cluster defaults bind ephemeral remoting on loopback`` () =
+    let options = ClusterOptions()
+    options.RemotingPort |> should equal 0
+    options.RemotingHostname |> should equal "127.0.0.1"
+    options.Validate() |> should equal null
+
+[<Fact>]
+let ``Cluster Validate flags bad remoting port and hostname`` () =
+    ClusterOptions(RemotingPort = -1).Validate()
+    |> should equal "RemotingPort must be between 0 and 65535."
+
+    ClusterOptions(RemotingPort = 65536).Validate()
+    |> should equal "RemotingPort must be between 0 and 65535."
+
+    ClusterOptions(RemotingHostname = "  ").Validate()
+    |> should equal "RemotingHostname must be a non-empty string."
+
+    let nullHost = ClusterOptions()
+    nullHost.RemotingHostname <- nullRef<string>
+
+    nullHost.Validate()
+    |> should equal "RemotingHostname must be a non-empty string."
+
+    let compose = ClusterOptions(RemotingPort = 4053, RemotingHostname = "0.0.0.0")
+    compose.Validate() |> should equal null
+
+[<Fact>]
+let ``Root Validate prefixes remoting violations with the cluster section`` () =
+    let port = LegateOptions()
+    port.Cluster.RemotingPort <- 70000
+
+    port.Validate()
+    |> should equal "Cluster: RemotingPort must be between 0 and 65535."
+
+    let host = LegateOptions()
+    host.Cluster.RemotingHostname <- "  "
+
+    host.Validate()
+    |> should equal "Cluster: RemotingHostname must be a non-empty string."
+
+[<Fact>]
 let ``Cluster Validate flags bad shard knobs roles and session role`` () =
     ClusterOptions(ShardCount = 0).Validate()
     |> should equal "ShardCount must be at least 1."

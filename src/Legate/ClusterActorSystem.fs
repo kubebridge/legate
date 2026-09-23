@@ -698,10 +698,13 @@ type internal ClusterActorSystemService
     /// measured on the injected clock; TimeSpan.Zero when never started.
     member _.LastColdStart: TimeSpan = lastColdStart
 
-    /// The remoting bind port, or 0 for an ephemeral port. Seeded tests
+    /// The remoting bind port override, or 0 to use the options-owned
+    /// <see cref="P:Legate.ClusterOptions.RemotingPort" />. Seeded tests
     /// set a free loopback port before StartAsync so seed entries can
-    /// name it; hosts bind ephemeral ports until a stable-port knob
-    /// lands. Must not be negative.
+    /// name it; hosts declare one stable port per node through
+    /// <c>Legate:Cluster:RemotingPort</c> (compose) and leave this seam
+    /// at 0. A non-zero seam wins over the options value. Must be
+    /// between 0 and 65535.
     member val RemotingPort: int = 0 with get, set
 
     /// The session store polled for running turns during the drain wait,
@@ -849,23 +852,33 @@ type internal ClusterActorSystemService
 
     interface IHostedService with
         member _.StartAsync(cancellationToken: CancellationToken) =
-            let remotingPort = this.RemotingPort
+            let seamPort = this.RemotingPort
             let spawnNow () = this.currentSpawn ()
 
             task {
                 match options.Value.Cluster.Mode with
                 | ClusterMode.StaticSeeds
                 | ClusterMode.Kubernetes as mode ->
-                    if remotingPort < 0 then
+                    let clusterOptions = options.Value.Cluster
+
+                    // The seam wins when set; otherwise the options-owned
+                    // Cluster:RemotingPort (compose declares one stable
+                    // port per node) supplies the bind port.
+                    let effectivePort =
+                        if seamPort <> 0 then
+                            seamPort
+                        else
+                            clusterOptions.RemotingPort
+
+                    if effectivePort < 0 || effectivePort > 65535 then
                         raise (
                             ArgumentOutOfRangeException(
                                 "RemotingPort",
-                                "The remoting port must be 0 (ephemeral) or a positive port."
+                                "The remoting port must be 0 (ephemeral) or between 1 and 65535."
                             )
                         )
 
                     let startTimestamp = timeProvider.GetTimestamp()
-                    let clusterOptions = options.Value.Cluster
 
                     let bootstrap =
                         match mode with
@@ -874,11 +887,17 @@ type internal ClusterActorSystemService
 
                     let hookPresent = not (isNull (box bootstrap))
 
-                    let remotingHostname =
+                    // Kubernetes with a hook must accept cross-pod
+                    // traffic, so it keeps binding all interfaces; every
+                    // other path binds the options-owned hostname
+                    // (loopback by default, 0.0.0.0 inside compose).
+                    let effectiveHostname =
                         if mode = ClusterMode.Kubernetes && hookPresent then
                             ClusterActorSystem.kubernetesRemotingHostname
-                        else
+                        elif String.IsNullOrWhiteSpace clusterOptions.RemotingHostname then
                             ClusterActorSystem.remotingHostname
+                        else
+                            clusterOptions.RemotingHostname.Trim()
 
                     // The hook fragment merges into the node configuration
                     // before the system is created: invalid hook options
@@ -893,7 +912,7 @@ type internal ClusterActorSystemService
 
                     let config =
                         ConfigurationFactory.ParseString(
-                            ClusterActorSystem.buildClusterHoconFor clusterOptions remotingPort remotingHostname
+                            ClusterActorSystem.buildClusterHoconFor clusterOptions effectivePort effectiveHostname
                             + "\n"
                             + fragment
                         )

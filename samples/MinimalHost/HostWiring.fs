@@ -5,7 +5,9 @@ open System
 open Giraffe
 open Legate
 open Legate.Cluster
+open Legate.Coordination
 open Legate.Llm.OpenAI
+open Legate.Storage
 open Legate.Storage.InMemory
 open Legate.Workspace.Process
 open Microsoft.Extensions.AI
@@ -29,6 +31,23 @@ let private hasKey (name: string) : bool =
 /// Whether any live provider key is present.
 let private hasLiveKey () : bool =
     hasKey "ANTHROPIC_API_KEY" || hasKey "OPENAI_API_KEY" || hasKey "GOOGLE_API_KEY"
+
+/// Whether the configuration carries a Postgres connection string: when
+/// set the host registers the Postgres stores, otherwise it keeps the
+/// offline InMemory default. Reads the bound configuration value (env
+/// Legate__Storage__Postgres__ConnectionString flows through here), so
+/// compose and appsettings both opt in without code changes.
+let private hasPostgres (configuration: IConfiguration) : bool =
+    not (String.IsNullOrWhiteSpace(configuration["Legate:Storage:Postgres:ConnectionString"]))
+
+/// Whether the configuration carries a Redis connection string: when set
+/// the host registers the Redis admission client, otherwise coordination
+/// stays local. Reads the bound value (env
+/// Legate__Llm__DistributedCoordination__ConnectionString flows through
+/// here); the Legate:Llm:DistributedCoordination switch itself arrives
+/// from configuration like every other knob.
+let private hasRedis (configuration: IConfiguration) : bool =
+    not (String.IsNullOrWhiteSpace(configuration["Legate:Llm:DistributedCoordination:ConnectionString"]))
 
 /// Resolves the live chat client: the provider named by
 /// LEGATE_MINIMALHOST_PROVIDER, else anthropic, openai, google in that
@@ -90,12 +109,16 @@ let private selectLiveClient (provider: IServiceProvider) : IChatClient =
         live.CreateChatClient(reference, null)
 
 /// Builds the container: InMemory session and event stores over one shared
-/// database, the process workspace, scripted-by-default providers, and the
-/// chat client the facade opts into suspendable children with. Binds the
-/// Legate configuration section (cluster mode, minimum members, and join
-/// timeout arrive from the environment) and registers the Kubernetes
-/// bootstrap hook with 3 required contact points; the hook stays idle
-/// unless Cluster:Mode selects Kubernetes.
+/// database by default, the process workspace, scripted-by-default
+/// providers, and the chat client the facade opts into suspendable
+/// children with. Binds the Legate configuration section (cluster mode,
+/// remoting port/hostname, minimum members, and join timeout arrive from
+/// the environment) and registers the Kubernetes bootstrap hook with 3
+/// required contact points; the hook stays idle unless Cluster:Mode
+/// selects Kubernetes. When the configuration carries a Postgres
+/// connection string the Postgres stores replace the InMemory ones, and
+/// when it carries a Redis connection string the Redis admission client
+/// registers; otherwise the host stays fully offline.
 /// <param name="services">The container to add Legate services to.</param>
 /// <param name="configuration">The application configuration providers bind from.</param>
 /// <param name="database">The shared in-memory database behind every store.</param>
@@ -108,6 +131,9 @@ let buildServices (services: IServiceCollection) (configuration: IConfiguration)
     // readiness check only when a HealthCheckService is already present,
     // so reversing this order would silently skip it.
     services.AddHealthChecks() |> ignore
+
+    let usePostgres = hasPostgres configuration
+    let useRedis = hasRedis configuration
 
     LegateServiceCollectionExtensions.AddLegate(
         services,
@@ -125,6 +151,12 @@ let buildServices (services: IServiceCollection) (configuration: IConfiguration)
             builder.Workspace.UseRuntime(ProcessWorkspaceRuntime(workspaceOptions, null, null))
             |> ignore
 
+            if usePostgres then
+                builder.UsePostgres(configuration) |> ignore
+
+            if useRedis then
+                builder.UseRedisCoordination(configuration) |> ignore
+
             if hasKey "ANTHROPIC_API_KEY" then
                 builder.Llm.AddAnthropic(configuration) |> ignore
 
@@ -137,8 +169,12 @@ let buildServices (services: IServiceCollection) (configuration: IConfiguration)
     )
     |> ignore
 
-    services.AddSingleton<ISessionEventStore>(InMemorySessionEventStore(database))
-    |> ignore
+    // The Postgres registration above replaces the session store; the
+    // event store is registered here, so it is only InMemory when Postgres
+    // did not already claim it.
+    if not usePostgres then
+        services.AddSingleton<ISessionEventStore>(InMemorySessionEventStore(database))
+        |> ignore
 
     // Giraffe needs its serializer in the container for the bindJson and
     // json handlers the routes use.

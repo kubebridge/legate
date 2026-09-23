@@ -613,17 +613,31 @@ type CompletionOptions() =
             Array.head violations
 
 /// Cluster settings: the deployment mode, the seed nodes StaticSeeds
-/// mode discovers through, this node's roles, the session sharding knobs,
-/// and how long the actor systems wait for graceful shutdown. Bound from
-/// the <c>Legate</c> configuration section; mutable so hosts can set
-/// properties before registering. Defaults run a single node with no seed
-/// nodes, no roles, 128 shards at hash version 1, and a 30 s shutdown
-/// grace.
+/// mode discovers through, this node's roles, the remoting bind port and
+/// hostname, the session sharding knobs, and how long the actor systems
+/// wait for graceful shutdown. Bound from the <c>Legate</c> configuration
+/// section; mutable so hosts can set properties before registering.
+/// Defaults run a single node with no seed nodes, no roles, an ephemeral
+/// remoting port on loopback, 128 shards at hash version 1, and a 30 s
+/// shutdown grace.
 type ClusterOptions() =
 
     /// How the runtime is deployed. Default
     /// <see cref="F:Legate.ClusterMode.Local" />.
     member val Mode: ClusterMode = ClusterMode.Local with get, set
+
+    /// The remoting TCP port this node binds, or 0 for an ephemeral port.
+    /// Compose declares one stable port per node (for example 4053) so
+    /// seed entries can name it; single-process hosts keep the ephemeral
+    /// default. Default 0. Must be between 0 and 65535. Bound from
+    /// <c>Legate:Cluster:RemotingPort</c>.
+    member val RemotingPort: int = 0 with get, set
+
+    /// The remoting bind hostname, for example 127.0.0.1 for loopback or
+    /// 0.0.0.0 for all interfaces inside containers. Default 127.0.0.1.
+    /// Must be a non-empty string. Bound from
+    /// <c>Legate:Cluster:RemotingHostname</c>.
+    member val RemotingHostname: string = "127.0.0.1" with get, set
 
     /// The seed nodes StaticSeeds mode discovers through, in host:port
     /// form. Empty means no seed nodes. Ignored in Kubernetes mode, where
@@ -730,6 +744,10 @@ type ClusterOptions() =
             "HostExitDeadline must be positive."
         elif this.MinimumMembers < 1 then
             "MinimumMembers must be at least 1."
+        elif this.RemotingPort < 0 || this.RemotingPort > 65535 then
+            "RemotingPort must be between 0 and 65535."
+        elif String.IsNullOrWhiteSpace this.RemotingHostname then
+            "RemotingHostname must be a non-empty string."
         elif isNull (box this.SeedNodes) then
             "SeedNodes must not be null."
         elif this.Mode = ClusterMode.StaticSeeds && this.SeedNodes.Count = 0 then

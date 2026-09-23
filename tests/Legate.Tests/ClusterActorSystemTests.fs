@@ -295,6 +295,35 @@ let ``HOCON binds all interfaces for Kubernetes with a bootstrap hook`` () =
 
     config.GetStringList("akka.cluster.seed-nodes") |> List.ofSeq |> should be Empty
 
+[<Fact>]
+let ``HOCON honors the options-owned remoting port and hostname`` () =
+    let options =
+        ClusterOptions(Mode = ClusterMode.StaticSeeds, RemotingPort = 4053, RemotingHostname = "0.0.0.0")
+
+    options.SeedNodes.Add("legate-1:4053") |> ignore
+    options.SeedNodes.Add("legate-2:4053") |> ignore
+    options.SeedNodes.Add("legate-3:4053") |> ignore
+    options.Roles.Add("session") |> ignore
+
+    let config =
+        ConfigurationFactory.ParseString(
+            ClusterActorSystem.buildClusterHoconFor options options.RemotingPort options.RemotingHostname
+        )
+
+    config.GetInt("akka.remote.dot-netty.tcp.port") |> should equal 4053
+
+    config.GetString("akka.remote.dot-netty.tcp.hostname") |> should equal "0.0.0.0"
+
+    config.GetStringList("akka.cluster.seed-nodes")
+    |> List.ofSeq
+    |> should
+        equal
+        [
+            "akka.tcp://legate@legate-1:4053"
+            "akka.tcp://legate@legate-2:4053"
+            "akka.tcp://legate@legate-3:4053"
+        ]
+
 // ──────────────────────────────────────────────────────────────────────────
 // SBR HOCON (issue 127)
 
@@ -698,6 +727,67 @@ type ClusterRuntimeTests() =
 
                 let other = resolve service "01ARZ3NDEKTSV4RRFFQ69G5FAW"
                 Assert.NotSame(first, other)
+            finally
+                stopQuietly service
+        }
+
+    [<Fact>]
+    member _.``Options-owned remoting port binds when the seam stays ephemeral``() : Task =
+        task {
+            let port = freePort ()
+
+            let service =
+                ClusterActorSystemService(
+                    buildOptions (fun root ->
+                        root.Cluster.Mode <- ClusterMode.StaticSeeds
+                        root.Cluster.SeedNodes.Add($"127.0.0.1:%d{port}") |> ignore
+                        root.Cluster.Roles.Add("session") |> ignore
+                        root.Cluster.RemotingPort <- port
+                        root.Cluster.RemotingHostname <- "127.0.0.1"),
+                    TimeProvider.System
+                )
+
+            // The seam stays 0, so the options-owned port supplies the bind.
+            service.RemotingPort |> should equal 0
+
+            try
+                do! (service :> IHostedService).StartAsync(CancellationToken.None)
+                do! awaitUp (requireSystem service) (TimeSpan.FromSeconds(30.0))
+
+                (requireSystem service).Settings.Config.GetInt("akka.remote.dot-netty.tcp.port")
+                |> should equal port
+
+                (requireSystem service).Settings.Config.GetString("akka.remote.dot-netty.tcp.hostname")
+                |> should equal "127.0.0.1"
+            finally
+                stopQuietly service
+        }
+
+    [<Fact>]
+    member _.``Seam port wins over the options-owned port``() : Task =
+        task {
+            let optionsPort = freePort ()
+            let seamPort = freePort ()
+
+            let service =
+                ClusterActorSystemService(
+                    buildOptions (fun root ->
+                        root.Cluster.Mode <- ClusterMode.StaticSeeds
+                        root.Cluster.SeedNodes.Add($"127.0.0.1:%d{seamPort}") |> ignore
+                        root.Cluster.Roles.Add("session") |> ignore
+                        root.Cluster.RemotingPort <- optionsPort
+                        root.Cluster.RemotingHostname <- "127.0.0.1"),
+                    TimeProvider.System
+                )
+
+            service.RemotingPort <- seamPort
+
+            try
+                do! (service :> IHostedService).StartAsync(CancellationToken.None)
+                do! awaitUp (requireSystem service) (TimeSpan.FromSeconds(30.0))
+
+                (requireSystem service).Settings.Config.GetInt("akka.remote.dot-netty.tcp.port")
+                |> should equal seamPort
             finally
                 stopQuietly service
         }

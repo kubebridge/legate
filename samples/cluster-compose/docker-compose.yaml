@@ -1,0 +1,171 @@
+# SPDX-License-Identifier: Apache-2.0
+# Sample-only three-node Legate cluster in StaticSeeds mode (issue 145).
+# No Legate.Cluster.Docker package: this is a harness plus an .fsx smoke,
+# not a runtime. Build from the repo root so MinimalHost project
+# references resolve; compose sets context to the repo root for the same
+# reason the MinimalHost Dockerfile builds from there.
+#
+#   LEGATE_MINIMALHOST_REPLY_DELAY_MS=10000 dotnet fsi samples/cluster-compose/smoke.crash-resume.fsx
+# The smoke owns the lifecycle (up --build, quorum wait, mid-turn kill,
+# survivor checks, teardown on success). Manual equivalent:
+#
+#   LEGATE_MINIMALHOST_REPLY_DELAY_MS=10000 docker compose up --build -d
+#   docker compose ps
+#   curl http://127.0.0.1:8081/healthz  # ok per node (8081, 8082, 8083)
+#   curl http://127.0.0.1:8081/ready    # 200 once the 3-member quorum is Up
+#   docker compose down -v
+#
+# Bootstrap order matters. A node whose seed list holds unreachable peers
+# stalls its self-join until the seed-node timeout, which races the
+# startup gate (both derive from JoinTimeout), so a simultaneous start
+# strands singletons: dotnet startup staggers Akka binds by tens of
+# seconds and first contact fails. legate-1 therefore bootstraps alone on
+# a self-only seed (MinimumMembers 1, instant self-join) and legate-2/3
+# start once legate-1 is /ready, so their first contact lands on a
+# listening seed; the followers still require the full quorum of 3.
+# Caveat: a restarted legate-1 rejoins only itself (self-only seed), so a
+# restarted bootstrap splits instead of merging; restart the stack to
+# re-form. A runtime-level seed retry belongs to the cluster epics.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: legate
+      POSTGRES_PASSWORD: legate
+      POSTGRES_DB: legate
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - legate-cluster
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U legate -d legate"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    networks:
+      - legate-cluster
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  legate-1:
+    build:
+      context: ../..
+      dockerfile: samples/MinimalHost/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8081:8080"
+    environment:
+      ASPNETCORE_URLS: http://+:8080
+      Legate__Cluster__Mode: StaticSeeds
+      Legate__Cluster__SeedNodes__0: legate-1:4053
+      Legate__Cluster__Roles__0: session
+      Legate__Cluster__RemotingPort: "4053"
+      Legate__Cluster__RemotingHostname: legate-1
+      Legate__Cluster__MinimumMembers: "1"
+      Legate__Cluster__JoinTimeout: 60s
+      Legate__Storage__Postgres__ConnectionString: Host=postgres;Port=5432;Database=legate;Username=legate;Password=legate
+      Legate__Llm__DistributedCoordination: "true"
+      Legate__Llm__DistributedCoordination__Mode: Redis
+      Legate__Llm__DistributedCoordination__ConnectionString: redis:6379
+      LEGATE_MINIMALHOST_REPLY_DELAY_MS: ${LEGATE_MINIMALHOST_REPLY_DELAY_MS:-0}
+    networks:
+      - legate-cluster
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8080/ready"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 90s
+
+  legate-2:
+    build:
+      context: ../..
+      dockerfile: samples/MinimalHost/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      legate-1:
+        condition: service_healthy
+    ports:
+      - "8082:8080"
+    environment:
+      ASPNETCORE_URLS: http://+:8080
+      Legate__Cluster__Mode: StaticSeeds
+      Legate__Cluster__SeedNodes__0: legate-1:4053
+      Legate__Cluster__SeedNodes__1: legate-2:4053
+      Legate__Cluster__SeedNodes__2: legate-3:4053
+      Legate__Cluster__Roles__0: session
+      Legate__Cluster__RemotingPort: "4053"
+      Legate__Cluster__RemotingHostname: legate-2
+      Legate__Cluster__MinimumMembers: "3"
+      Legate__Cluster__JoinTimeout: 60s
+      Legate__Storage__Postgres__ConnectionString: Host=postgres;Port=5432;Database=legate;Username=legate;Password=legate
+      Legate__Llm__DistributedCoordination: "true"
+      Legate__Llm__DistributedCoordination__Mode: Redis
+      Legate__Llm__DistributedCoordination__ConnectionString: redis:6379
+      LEGATE_MINIMALHOST_REPLY_DELAY_MS: ${LEGATE_MINIMALHOST_REPLY_DELAY_MS:-0}
+    networks:
+      - legate-cluster
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8080/ready"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 90s
+
+  legate-3:
+    build:
+      context: ../..
+      dockerfile: samples/MinimalHost/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      legate-1:
+        condition: service_healthy
+    ports:
+      - "8083:8080"
+    environment:
+      ASPNETCORE_URLS: http://+:8080
+      Legate__Cluster__Mode: StaticSeeds
+      Legate__Cluster__SeedNodes__0: legate-1:4053
+      Legate__Cluster__SeedNodes__1: legate-2:4053
+      Legate__Cluster__SeedNodes__2: legate-3:4053
+      Legate__Cluster__Roles__0: session
+      Legate__Cluster__RemotingPort: "4053"
+      Legate__Cluster__RemotingHostname: legate-3
+      Legate__Cluster__MinimumMembers: "3"
+      Legate__Cluster__JoinTimeout: 60s
+      Legate__Storage__Postgres__ConnectionString: Host=postgres;Port=5432;Database=legate;Username=legate;Password=legate
+      Legate__Llm__DistributedCoordination: "true"
+      Legate__Llm__DistributedCoordination__Mode: Redis
+      Legate__Llm__DistributedCoordination__ConnectionString: redis:6379
+      LEGATE_MINIMALHOST_REPLY_DELAY_MS: ${LEGATE_MINIMALHOST_REPLY_DELAY_MS:-0}
+    networks:
+      - legate-cluster
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8080/ready"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 90s
+
+networks:
+  legate-cluster:
+    driver: bridge
+
+volumes:
+  postgres-data:
