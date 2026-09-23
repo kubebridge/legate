@@ -440,6 +440,26 @@ let ``Root Validate prefixes SBR violations with the cluster section`` () =
     deadline.Validate()
     |> should equal "Cluster: HostExitDeadline must be positive."
 
+[<Fact>]
+let ``Cluster MinimumMembers defaults to the singleton quorum`` () =
+    let options = ClusterOptions()
+    options.MinimumMembers |> should equal 1
+    options.Validate() |> should equal null
+
+[<Fact>]
+let ``Cluster Validate flags too few minimum members`` () =
+    ClusterOptions(MinimumMembers = 0).Validate()
+    |> should equal "MinimumMembers must be at least 1."
+
+    ClusterOptions(MinimumMembers = -1).Validate()
+    |> should equal "MinimumMembers must be at least 1."
+
+[<Fact>]
+let ``Root Validate prefixes MinimumMembers violations with the cluster section`` () =
+    let options = LegateOptions()
+    options.Cluster.MinimumMembers <- 0
+    options.Validate() |> should equal "Cluster: MinimumMembers must be at least 1."
+
 // ──────────────────────────────────────────────────────────────────────────
 // Pruning
 

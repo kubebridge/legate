@@ -220,10 +220,13 @@ defer are all point lookups by session.
 ## Cluster
 
 `StaticSeeds` mode joins the named seed nodes and shards session entities
-by session id; `Kubernetes` mode runs as a singleton until the
-Akka.Management bootstrap lands. Every node stamps its shard version as
-the member app-version and fails closed (leaves first) on a peer stamp
-mismatch.
+by session id; `Kubernetes` mode bootstraps through the registered
+`IClusterBootstrap` hook (Akka.Management plus Kubernetes discovery, owned
+by `Legate.Cluster.Kubernetes`), or runs as a singleton when no hook is
+registered. `StartAsync` completes only once `Cluster:MinimumMembers`
+members are Up, bounded by `Cluster:JoinTimeout`. Every node stamps its
+shard version as the member app-version and fails closed (leaves first)
+on a peer stamp mismatch.
 
 ### Split-brain resolution
 

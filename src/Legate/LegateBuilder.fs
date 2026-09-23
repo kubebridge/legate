@@ -448,10 +448,47 @@ type PermissionsBuilder internal (services: IServiceCollection) as this =
         this
 
 // ──────────────────────────────────────────────────────────────────────────
+// Cluster
+
+/// Configures how a clustered Legate host forms its Akka cluster.
+/// Optional: without a bootstrap hook the Kubernetes start branch keeps
+/// today's singleton self-join, and StaticSeeds joins its seed nodes.
+/// The Kubernetes bootstrap package registers its hook through here.
+[<Sealed>]
+type ClusterBuilder internal (services: IServiceCollection) as this =
+    do ArgumentNullException.ThrowIfNull(services)
+
+    /// The container the builder registers into.
+    member _.Services: IServiceCollection = services
+
+    /// Registers the cluster bootstrap hook the Kubernetes start branch
+    /// consults, replacing any previous one. The hook supplies the
+    /// management plus discovery HOCON merged into the node configuration
+    /// and starts cluster formation against the running actor system.
+    /// <param name="hook">The bootstrap hook forming the cluster through discovery.</param>
+    /// <returns>This builder, for chaining.</returns>
+    member _.UseBootstrap(hook: IClusterBootstrap) : ClusterBuilder =
+        ArgumentNullException.ThrowIfNull(hook)
+
+        services.Replace(ServiceDescriptor.Singleton<IClusterBootstrap>(hook)) |> ignore
+
+        this
+
+    /// Registers a cluster bootstrap hook type for container construction,
+    /// replacing any previous one.
+    /// <typeparam name="T">The hook type to construct per container.</typeparam>
+    /// <returns>This builder, for chaining.</returns>
+    member _.UseBootstrap<'T when 'T :> IClusterBootstrap>() : ClusterBuilder =
+        services.Replace(ServiceDescriptor(typeof<IClusterBootstrap>, typeof<'T>, ServiceLifetime.Singleton))
+        |> ignore
+
+        this
+
+// ──────────────────────────────────────────────────────────────────────────
 // Root builder
 
 /// The Microsoft-style builder hosts configure inside
-/// <c>services.AddLegate(configure)</c>: seven sub-builders plus
+/// <c>services.AddLegate(configure)</c>: eight sub-builders plus
 /// <see cref="M:Legate.LegateBuilder.UseConfiguration(Microsoft.Extensions.Configuration.IConfigurationSection)" />.
 /// The local actor system registers through AddLegate (Local mode only)
 /// with the session client facade (SessionClient over the suspendable
@@ -468,6 +505,7 @@ type LegateBuilder internal (services: IServiceCollection) as this =
     let policies = PoliciesBuilder(services)
     let agents = AgentsBuilder(services)
     let permissions = PermissionsBuilder(services)
+    let cluster = ClusterBuilder(services)
 
     /// The container the builder registers into.
     member _.Services: IServiceCollection = services
@@ -492,6 +530,9 @@ type LegateBuilder internal (services: IServiceCollection) as this =
 
     /// Configures the permission policy gating tool calls.
     member _.Permissions: PermissionsBuilder = permissions
+
+    /// Configures how a clustered host forms its Akka cluster.
+    member _.Cluster: ClusterBuilder = cluster
 
     /// Binds the <c>Legate:Artifacts</c> configuration section onto
     /// <see cref="T:Legate.ArtifactOptions" /> with a snapshot copy, failing

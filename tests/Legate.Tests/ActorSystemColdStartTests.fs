@@ -4,6 +4,8 @@ module Legate.Tests.ActorSystemColdStartTests
 open System
 open System.Collections.Generic
 open System.Diagnostics
+open System.Net
+open System.Net.Sockets
 open System.Threading
 open FsUnit.Xunit
 open Legate
@@ -86,6 +88,21 @@ let private findActorService (provider: IServiceProvider) : LocalActorSystemServ
         match service with
         | :? LocalActorSystemService as actorService -> Some actorService
         | _ -> None)
+
+/// Picks the cluster actor system service out of the hosted services.
+let private findClusterService (provider: IServiceProvider) : ClusterActorSystemService =
+    provider.GetServices<IHostedService>()
+    |> Seq.pick (fun service ->
+        match service with
+        | :? ClusterActorSystemService as clustered -> Some clustered
+        | _ -> None)
+
+/// Allocates a free loopback port through the OS: closing the listener
+/// races in theory, but loopback ports recycle slowly enough for tests.
+let private freePort () : int =
+    use listener = new TcpListener(IPAddress.Loopback, 0)
+    listener.Start()
+    (listener.LocalEndpoint :?> IPEndPoint).Port
 
 // ──────────────────────────────────────────────────────────────────────────
 // Cold start
@@ -200,11 +217,16 @@ let ``Local mode starts the system through AddLegate`` () =
 
 [<Fact>]
 let ``StaticSeeds mode skips the local system through AddLegate`` () =
+    // Self-seed on a free loopback port: the singleton cluster forms, so
+    // the MinimumMembers startup gate passes and this test asserts what
+    // it owns (the local system stays down), never the join itself.
+    let port = freePort ()
+
     let section =
         buildSection
             [
                 "Legate:Cluster:Mode", "StaticSeeds"
-                "Legate:Cluster:SeedNodes:0", "127.0.0.1:5115"
+                "Legate:Cluster:SeedNodes:0", $"127.0.0.1:%d{port}"
             ]
 
     let services = ServiceCollection()
@@ -214,6 +236,9 @@ let ``StaticSeeds mode skips the local system through AddLegate`` () =
         builder.UseConfiguration(section) |> ignore)
 
     use provider = services.BuildServiceProvider()
+
+    let clustered = findClusterService provider
+    clustered.RemotingPort <- port
 
     try
         startHosted provider

@@ -32,8 +32,11 @@ type ClusterMode =
     | StaticSeeds = 1
 
     /// A sharded Akka.NET cluster bootstrapped through Akka.Management
-    /// Kubernetes discovery (issue 138). Until that bootstrap lands this
-    /// mode joins nothing and runs as a singleton: SeedNodes is ignored.
+    /// Kubernetes discovery (issue 138). The registered
+    /// <see cref="T:Legate.IClusterBootstrap" /> hook (if any) supplies the
+    /// management plus discovery HOCON and starts cluster formation;
+    /// without a hook the node joins itself and runs as a singleton.
+    /// SeedNodes is ignored in both cases.
     | Kubernetes = 2
 
 /// What a session does with the turn interrupted by a crash once the
@@ -623,8 +626,8 @@ type ClusterOptions() =
     member val Mode: ClusterMode = ClusterMode.Local with get, set
 
     /// The seed nodes StaticSeeds mode discovers through, in host:port
-    /// form. Empty means no seed nodes. Ignored in Kubernetes mode until
-    /// issue 138 ships the Akka.Management bootstrap.
+    /// form. Empty means no seed nodes. Ignored in Kubernetes mode, where
+    /// the <see cref="T:Legate.IClusterBootstrap" /> hook discovers peers.
     member val SeedNodes: List<string> = List<string>() with get, set
 
     /// This node's cluster roles, for example session or api. Empty means
@@ -693,6 +696,17 @@ type ClusterOptions() =
     /// cap never truncates the drain wait.
     member val HostExitDeadline: TimeSpan = TimeSpan.FromSeconds 60.0 with get, set
 
+    /// How many Up members the cluster start waits for before
+    /// <c>StartAsync</c> completes, so a node never serves traffic before
+    /// its quorum formed. This is a Legate-level startup gate, never
+    /// rendered into Akka HOCON: the wait is bounded by
+    /// <see cref="P:Legate.ClusterOptions.JoinTimeout" />, and an unmet
+    /// quorum fails startup with
+    /// <see cref="T:Legate.DeadlineExceededException" />. Default 1, which
+    /// completes as soon as this node is Up (today's singleton behavior).
+    /// Must be at least 1.
+    member val MinimumMembers: int = 1 with get, set
+
     /// Returns null when every knob is in range, otherwise a message for the
     /// first violation.
     /// <returns>The first violation's message, or null when the settings are valid.</returns>
@@ -714,6 +728,8 @@ type ClusterOptions() =
             "JoinTimeout must be positive."
         elif this.HostExitDeadline <= TimeSpan.Zero then
             "HostExitDeadline must be positive."
+        elif this.MinimumMembers < 1 then
+            "MinimumMembers must be at least 1."
         elif isNull (box this.SeedNodes) then
             "SeedNodes must not be null."
         elif this.Mode = ClusterMode.StaticSeeds && this.SeedNodes.Count = 0 then

@@ -270,6 +270,31 @@ let ``HOCON lists no seeds for Kubernetes and honors the port`` () =
 
     config.GetString("akka.cluster.app-version") |> should equal "1.2.32"
 
+[<Fact>]
+let ``HOCON keeps the loopback bind by default`` () =
+    let options = ClusterOptions(Mode = ClusterMode.StaticSeeds)
+    options.SeedNodes.Add("127.0.0.1:5115") |> ignore
+
+    let config =
+        ConfigurationFactory.ParseString(ClusterActorSystem.buildClusterHocon options 0)
+
+    config.GetString("akka.remote.dot-netty.tcp.hostname")
+    |> should equal "127.0.0.1"
+
+[<Fact>]
+let ``HOCON binds all interfaces for Kubernetes with a bootstrap hook`` () =
+    let options = ClusterOptions(Mode = ClusterMode.Kubernetes)
+    options.Roles.Add("session") |> ignore
+
+    let config =
+        ConfigurationFactory.ParseString(
+            ClusterActorSystem.buildClusterHoconFor options 0 ClusterActorSystem.kubernetesRemotingHostname
+        )
+
+    config.GetString("akka.remote.dot-netty.tcp.hostname") |> should equal "0.0.0.0"
+
+    config.GetStringList("akka.cluster.seed-nodes") |> List.ofSeq |> should be Empty
+
 // ──────────────────────────────────────────────────────────────────────────
 // SBR HOCON (issue 127)
 
@@ -463,7 +488,103 @@ let ``Drain wait wakes early when turns settle`` () =
     (calls >= 3) |> should equal true
 
 // ──────────────────────────────────────────────────────────────────────────
+// Startup quorum (issue 138)
+
+[<Fact>]
+let ``Member wait returns at once when the quorum is already Up`` () =
+    let fake = FakeTimeProvider()
+
+    let work =
+        ClusterActorSystem.waitForMembersAsync (fun () -> 3) 2 (TimeSpan.FromSeconds 5.0) fake CancellationToken.None
+
+    work.Wait(TimeSpan.FromSeconds 10.0) |> should equal true
+
+[<Fact>]
+let ``Member wait fails the start when JoinTimeout elapses without quorum`` () =
+    let fake = FakeTimeProvider()
+
+    let work =
+        ClusterActorSystem.waitForMembersAsync (fun () -> 1) 3 (TimeSpan.FromSeconds 5.0) fake CancellationToken.None
+
+    work.IsCompleted |> should equal false
+    fake.Advance(TimeSpan.FromSeconds 5.0)
+
+    let ex =
+        Assert.Throws<DeadlineExceededException>(fun () -> work.GetAwaiter().GetResult())
+
+    ex.OperationName |> should equal "ClusterStartup"
+
+[<Fact>]
+let ``Member wait wakes early once the quorum forms`` () =
+    let mutable calls = 0
+
+    let count () =
+        calls <- calls + 1
+        if calls < 3 then 1 else 3
+
+    let fake = FakeTimeProvider()
+
+    let work =
+        ClusterActorSystem.waitForMembersAsync count 3 (TimeSpan.FromSeconds 30.0) fake CancellationToken.None
+
+    // Step the virtual clock poll by poll: each advance fires the next
+    // due timer, and the bounded wait yields for the loop's continuation
+    // to observe the formed quorum. Never Thread.Sleep.
+    for _ in 1..5 do
+        fake.Advance(TimeSpan.FromMilliseconds 100.0)
+        work.Wait(TimeSpan.FromMilliseconds 500.0) |> ignore
+
+    work.Wait(TimeSpan.FromSeconds 10.0) |> should equal true
+    (calls >= 3) |> should equal true
+
+[<Fact>]
+let ``Member wait abandons the quorum when the host stops`` () =
+    use cts = new CancellationTokenSource()
+    cts.Cancel()
+
+    let fake = FakeTimeProvider()
+
+    let work =
+        ClusterActorSystem.waitForMembersAsync (fun () -> 0) 2 (TimeSpan.FromSeconds 30.0) fake cts.Token
+
+    try
+        work.GetAwaiter().GetResult()
+        raise (InvalidOperationException("The quorum wait should have observed cancellation."))
+    with :? OperationCanceledException ->
+        ()
+
+// ──────────────────────────────────────────────────────────────────────────
 // Slow runtime (dedicated collection)
+
+/// A bootstrap hook that records its calls and self-joins the running
+/// system, so the hook-present start path stays hermetic: no management
+/// endpoint, no discovery, no Kubernetes.
+type StubClusterBootstrap(fragment: string) =
+    let mutable hoconCalls = 0
+    let mutable startCalls = 0
+
+    interface IClusterBootstrap with
+        member _.BuildHocon() =
+            hoconCalls <- hoconCalls + 1
+            fragment
+
+        member _.StartAsync(system: obj, _cancellationToken: CancellationToken) =
+            task {
+                startCalls <- startCalls + 1
+
+                match system with
+                | :? ActorSystem as actorSystem ->
+                    let cluster = Cluster.Get(actorSystem)
+                    cluster.Join(cluster.SelfAddress)
+                | _ -> raise (ArgumentException("The bootstrap system must be the running actor system.", "system"))
+            }
+            :> Task
+
+    /// How many times the start rendered the hook fragment.
+    member _.HoconCalls = hoconCalls
+
+    /// How many times the start started bootstrap through the hook.
+    member _.StartCalls = startCalls
 
 [<Collection("LegateCluster")>]
 type ClusterRuntimeTests() =
@@ -600,6 +721,64 @@ type ClusterRuntimeTests() =
                 Assert.Same(first, second)
             finally
                 stopQuietly service
+        }
+
+    [<Fact>]
+    member _.``Kubernetes with a hook starts bootstrap through the hook``() : Task =
+        task {
+            let hook = StubClusterBootstrap("")
+            let services = ServiceCollection() :> IServiceCollection
+            services.AddSingleton<IClusterBootstrap>(hook :> IClusterBootstrap) |> ignore
+            use provider = services.BuildServiceProvider()
+
+            let service =
+                ClusterActorSystemService(
+                    buildOptions (fun root ->
+                        root.Cluster.Mode <- ClusterMode.Kubernetes
+                        root.Cluster.Roles.Add("session") |> ignore),
+                    TimeProvider.System,
+                    provider
+                )
+
+            service.RemotingPort <- 0
+
+            try
+                do! (service :> IHostedService).StartAsync(CancellationToken.None)
+                do! awaitUp (requireSystem service) (TimeSpan.FromSeconds(30.0))
+
+                hook.StartCalls |> should equal 1
+                (hook.HoconCalls >= 1) |> should equal true
+
+                (requireSystem service).Settings.Config.GetString("akka.remote.dot-netty.tcp.hostname")
+                |> should equal "0.0.0.0"
+
+                isNull (box service.Region) |> should equal false
+            finally
+                stopQuietly service
+        }
+
+    [<Fact>]
+    member _.``MinimumMembers above the singleton fails the start within JoinTimeout``() : Task =
+        task {
+            let service =
+                ClusterActorSystemService(
+                    buildOptions (fun root ->
+                        root.Cluster.Mode <- ClusterMode.Kubernetes
+                        root.Cluster.MinimumMembers <- 2
+                        root.Cluster.JoinTimeout <- TimeSpan.FromSeconds(2.0)),
+                    TimeProvider.System
+                )
+
+            service.RemotingPort <- 0
+
+            try
+                do! (service :> IHostedService).StartAsync(CancellationToken.None)
+
+                raise (InvalidOperationException("StartAsync should have failed the quorum gate."))
+            with :? DeadlineExceededException as ex ->
+                ex.OperationName |> should equal "ClusterStartup"
+
+            isNull (box service.System) |> should equal true
         }
 
     [<Fact>]

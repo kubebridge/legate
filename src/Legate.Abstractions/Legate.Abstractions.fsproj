@@ -12,6 +12,7 @@
     <Compile Include="Exceptions.fs" />
     <Compile Include="ArtifactOptions.fs" />
     <Compile Include="Seams.fs" />
+    <Compile Include="ClusterBootstrap.fs" />
     <Compile Include="Blobs.fs" />
     <Compile Include="Messages.fs" />
     <Compile Include="UntrustedContext.fs" />

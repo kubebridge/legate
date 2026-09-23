@@ -58,6 +58,8 @@
     <Compile Include="ClusterShardingTests.fs" />
     <Compile Include="ClusterActorSystemTests.fs" />
     <Compile Include="ClusterHealthTests.fs" />
+    <Compile Include="KubernetesOptionsTests.fs" />
+    <Compile Include="KubernetesHoconTests.fs" />
     <Compile Include="SessionActorTests.fs" />
     <Compile Include="StopArbitrationTests.fs" />
     <Compile Include="ClaimHeartbeatTests.fs" />
@@ -143,6 +145,7 @@
   <ItemGroup>
     <ProjectReference Include="../../src/Legate.Abstractions/Legate.Abstractions.fsproj" />
     <ProjectReference Include="../../src/Legate/Legate.fsproj" />
+    <ProjectReference Include="../../src/Legate.Cluster.Kubernetes/Legate.Cluster.Kubernetes.fsproj" />
     <ProjectReference Include="../../src/Legate.Storage.Migrations/Legate.Storage.Migrations.fsproj" />
     <ProjectReference Include="../../src/Legate.Llm.Google/Legate.Llm.Google.fsproj" />
     <ProjectReference Include="../../src/Legate.Llm.OpenAI/Legate.Llm.OpenAI.fsproj" />
