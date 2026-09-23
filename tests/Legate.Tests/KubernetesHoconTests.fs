@@ -29,6 +29,9 @@ let ``Fragment renders the documented management and discovery keys`` () =
 
     config.GetString("akka.discovery.method") |> should equal "kubernetes-api"
 
+    config.GetString("akka.discovery.kubernetes-api.class")
+    |> should equal "Akka.Discovery.KubernetesApiServiceDiscovery, Akka.Discovery.KubernetesApi"
+
     config.GetString("akka.discovery.kubernetes-api.pod-label-selector")
     |> should equal "app=legate"
 
