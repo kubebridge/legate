@@ -1157,6 +1157,64 @@ module internal ClusterSubscriptions =
             if batch.NextCursor > resumeCursor then
                 resumeCursor <- batch.NextCursor
 
+        let applyReplayPage (page: EventReplayPage) : unit =
+            let events =
+                if isNull (box page.Events) then
+                    Array.Empty<SessionEvent>()
+                else
+                    page.Events |> Seq.filter (fun evt -> not (isNull (box evt))) |> Array.ofSeq
+
+            for evt in events do
+                if evt.Sequence.HasValue && evt.Sequence.Value <= lastDelivered then
+                    ()
+                else
+                    let observed = CrossNodeSubscriptions.estimateEventBytes evt
+
+                    if observed > options.MaxEventPayloadBytes then
+                        raise (
+                            EventLimitExceededException(
+                                "perEventBytes",
+                                int64 options.MaxEventPayloadBytes,
+                                int64 observed,
+                                sprintf
+                                    "The event at sequence %d in session %O is %d bytes, above the cross-node bound."
+                                    (if evt.Sequence.HasValue then
+                                         evt.Sequence.Value
+                                     else
+                                         resumeCursor)
+                                    sessionId
+                                    observed
+                            )
+                        )
+
+                    queue.Enqueue(evt)
+
+                    if evt.Sequence.HasValue && evt.Sequence.Value > resumeCursor then
+                        resumeCursor <- evt.Sequence.Value
+
+            if page.NextCursor.HasValue && page.NextCursor.Value > resumeCursor then
+                resumeCursor <- page.NextCursor.Value
+
+        let throwForReplayOutcome (outcome: obj) : unit =
+            match outcome with
+            | :? EventReplayPage as page when not (isNull (box page)) -> applyReplayPage page
+            | :? EventReplayEndOfStream -> ()
+            | :? EventReplayUnknownSession as unknown when not (isNull (box unknown)) ->
+                raise (
+                    SessionNotFoundException(
+                        unknown.SessionId,
+                        sprintf "No session %O exists in tenant %O." unknown.SessionId tenant
+                    )
+                )
+            | :? EventReplayJournalExpired as expired when not (isNull (box expired)) ->
+                raise (
+                    SessionJournalExpiredException(
+                        expired.SessionId,
+                        sprintf "The journal for session %O is gone." expired.SessionId
+                    )
+                )
+            | _ -> raise (InvalidOperationException("The event store returned an unknown replay outcome."))
+
         let fallbackPageAsync (linkedCt: CancellationToken) : Task<unit> =
             task {
                 let! outcome =
@@ -1165,60 +1223,7 @@ module internal ClusterSubscriptions =
                 if isNull (box outcome) then
                     raise (InvalidOperationException("The event store returned null."))
                 else
-                    match outcome with
-                    | :? EventReplayPage as page when not (isNull (box page)) ->
-                        let events =
-                            if isNull (box page.Events) then
-                                Array.Empty<SessionEvent>()
-                            else
-                                page.Events |> Seq.filter (fun evt -> not (isNull (box evt))) |> Array.ofSeq
-
-                        for evt in events do
-                            if evt.Sequence.HasValue && evt.Sequence.Value <= lastDelivered then
-                                ()
-                            else
-                                let observed = CrossNodeSubscriptions.estimateEventBytes evt
-
-                                if observed > options.MaxEventPayloadBytes then
-                                    raise (
-                                        EventLimitExceededException(
-                                            "perEventBytes",
-                                            int64 options.MaxEventPayloadBytes,
-                                            int64 observed,
-                                            sprintf
-                                                "The event at sequence %d in session %O is %d bytes, above the cross-node bound."
-                                                (if evt.Sequence.HasValue then
-                                                     evt.Sequence.Value
-                                                 else
-                                                     resumeCursor)
-                                                sessionId
-                                                observed
-                                        )
-                                    )
-
-                                queue.Enqueue(evt)
-
-                                if evt.Sequence.HasValue && evt.Sequence.Value > resumeCursor then
-                                    resumeCursor <- evt.Sequence.Value
-
-                        if page.NextCursor.HasValue && page.NextCursor.Value > resumeCursor then
-                            resumeCursor <- page.NextCursor.Value
-                    | :? EventReplayEndOfStream -> ()
-                    | :? EventReplayUnknownSession as unknown when not (isNull (box unknown)) ->
-                        raise (
-                            SessionNotFoundException(
-                                unknown.SessionId,
-                                sprintf "No session %O exists in tenant %O." unknown.SessionId tenant
-                            )
-                        )
-                    | :? EventReplayJournalExpired as expired when not (isNull (box expired)) ->
-                        raise (
-                            SessionJournalExpiredException(
-                                expired.SessionId,
-                                sprintf "The journal for session %O is gone." expired.SessionId
-                            )
-                        )
-                    | _ -> raise (InvalidOperationException("The event store returned an unknown replay outcome."))
+                    throwForReplayOutcome outcome
             }
 
         member _.Current = current
