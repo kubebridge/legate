@@ -1,9 +1,122 @@
 // SPDX-License-Identifier: Apache-2.0
-namespace Legate.Coordination.Redis
+namespace Legate
 
 open System
 open System.Threading
 open System.Threading.Tasks
+
+// Distributed LLM admission seam. The options contract and the admission
+// interface live here (matching the ISessionStore/IToolSource precedent)
+// so the Legate runtime admits through the seam without referencing the
+// Redis package: Legate.Coordination.Redis implements this interface on
+// StackExchange.Redis. Settings bind from the
+// Legate:Llm:DistributedCoordination configuration section. Raw API keys
+// never enter identity keys, logs, or diagnostics.
+
+// ────────────────── Options ──────────────────────────────────────────
+
+/// <summary>
+/// How distributed LLM admission coordinates: local-only or through one
+/// shared Redis instance. Bound from configuration; unknown values fail
+/// binding.
+/// </summary>
+type DistributedCoordinationMode =
+
+    /// <summary>
+    /// No distributed coordination: the local coordinator admits in
+    /// process. The default.
+    /// </summary>
+    | Disabled = 0
+
+    /// <summary>
+    /// Admit through one shared Redis instance: processes sharing the
+    /// instance respect one combined concurrency limit.
+    /// </summary>
+    | Redis = 1
+
+/// <summary>
+/// Where distributed LLM admission lives and how it fails: the mode, the
+/// Redis connection, the key prefix isolating one deployment's keys, and
+/// the startup and failure switches. Bound from the
+/// <c>Legate:Llm:DistributedCoordination</c> configuration section.
+/// </summary>
+type DistributedCoordinationOptions() =
+
+    /// <summary>
+    /// The configuration section the client binds from:
+    /// <c>Legate:Llm:DistributedCoordination</c>.
+    /// </summary>
+    static member ConfigurationSectionPath = "Legate:Llm:DistributedCoordination"
+
+    /// <summary>
+    /// How admission coordinates. Defaults to
+    /// <see cref="F:Legate.DistributedCoordinationMode.Disabled" />:
+    /// a single node coordinates locally.
+    /// </summary>
+    member val Mode: DistributedCoordinationMode = DistributedCoordinationMode.Disabled with get, set
+
+    /// <summary>
+    /// The Redis connection string, for example
+    /// <c>127.0.0.1:6379</c>. Required when
+    /// <see cref="P:Legate.DistributedCoordinationOptions.Mode" />
+    /// is Redis; ignored otherwise. Never logged.
+    /// </summary>
+    member val ConnectionString: string = "" with get, set
+
+    /// <summary>
+    /// The key prefix isolating one deployment's admission keys, for
+    /// example <c>legate:llm</c>. Every script builds its keys as
+    /// <c>{prefix}:v1:...</c> so a rolling upgrade never mixes script
+    /// generations under one prefix. Must be non-empty.
+    /// </summary>
+    member val KeyPrefix: string = "legate:llm" with get, set
+
+    /// <summary>
+    /// Whether startup must prove Redis before reporting ready. Defaults
+    /// to true: the startup canary gates readiness. Kept here so the
+    /// canary and the client read one set of options.
+    /// </summary>
+    member val StartupRequired: bool = true with get, set
+
+    /// <summary>
+    /// Whether admission fails closed when Redis is unavailable. Defaults
+    /// to true: new work is rejected. When false the coordinator admits
+    /// locally under bounded emergency limits. Kept here so the fail
+    /// policy and the client read one set of options.
+    /// </summary>
+    member val FailClosed: bool = true with get, set
+
+    /// <summary>
+    /// Checks the options: the mode must be defined, the prefix
+    /// non-empty without whitespace or wildcards, and the connection
+    /// string non-empty when the mode is Redis.
+    /// </summary>
+    /// <returns>Null when the options are valid; otherwise the reason they are not.</returns>
+    member this.Validate() : string | null =
+        if
+            this.Mode <> DistributedCoordinationMode.Disabled
+            && this.Mode <> DistributedCoordinationMode.Redis
+        then
+            "DistributedCoordinationOptions.Mode must be Disabled or Redis."
+        elif String.IsNullOrWhiteSpace this.KeyPrefix then
+            "DistributedCoordinationOptions.KeyPrefix must be a non-empty key prefix."
+        elif
+            this.KeyPrefix.Contains(" ")
+            || this.KeyPrefix.Contains("*")
+            || this.KeyPrefix.Contains(":v1:")
+        then
+            "DistributedCoordinationOptions.KeyPrefix must not contain spaces, wildcards, or the :v1: generation tag."
+        elif isNull (box this.ConnectionString) then
+            "DistributedCoordinationOptions.ConnectionString must not be null: use the empty string when disabled."
+        elif
+            this.Mode = DistributedCoordinationMode.Redis
+            && String.IsNullOrWhiteSpace this.ConnectionString
+        then
+            "DistributedCoordinationOptions.ConnectionString must be non-empty when Mode is Redis."
+        else
+            null
+
+// ────────────────── Admission seam ───────────────────────────────────
 
 // Public contract for distributed LLM admission. The outcome is a sealed
 // class with an enum kind (no DU on the boundary), and every client method
@@ -44,7 +157,7 @@ type DistributedAdmissionOutcome private (kind: DistributedAdmissionDecision, qu
 
     /// <summary>
     /// The zero-based FIFO position while
-    /// <see cref="P:Legate.Coordination.Redis.DistributedAdmissionOutcome.Kind" />
+    /// <see cref="P:Legate.DistributedAdmissionOutcome.Kind" />
     /// is Queued; otherwise zero.
     /// </summary>
     member _.QueuePosition: int = queuePosition

@@ -5,6 +5,7 @@ open System
 open System.Threading
 open System.Threading.Tasks
 open FsUnit.Xunit
+open Legate
 open Legate.Coordination.Redis
 open StackExchange.Redis
 open Xunit

@@ -3,6 +3,7 @@ module Legate.Coordination.Redis.Tests.CompensationTests
 
 open System
 open FsUnit.Xunit
+open Legate
 open Legate.Coordination.Redis
 open Xunit
 
