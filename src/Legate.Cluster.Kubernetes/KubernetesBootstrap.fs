@@ -5,6 +5,7 @@ open System
 open System.Threading
 open System.Threading.Tasks
 open Akka.Actor
+open Akka.Discovery.KubernetesApi
 open Akka.Management.Cluster.Bootstrap
 open Akka.Management.Dsl
 open Legate
@@ -55,6 +56,10 @@ type internal KubernetesClusterBootstrap(options: IOptions<KubernetesOptions>) =
             task {
                 this.currentOptions () |> ignore
                 let! _ = AkkaManagement.Get(typed).Start()
+                // Touch the discovery extension first so its reference.conf
+                // fallback is injected; the explicit fragment keys override
+                // the injected defaults.
+                KubernetesDiscovery.Get(typed) |> ignore
                 do! ClusterBootstrap.Get(typed).Start()
                 cancellationToken.ThrowIfCancellationRequested()
             }
