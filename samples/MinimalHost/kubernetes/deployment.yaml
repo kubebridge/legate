@@ -1,0 +1,61 @@
+# Sample-only workload for the MinimalHost Kubernetes runbook.
+# Three symmetric replicas form one Akka cluster through the
+# Legate.Cluster.Kubernetes bootstrap: discovery finds pods labelled
+# app=legate and probes the port named management (8558). Cluster mode,
+# minimum members, and the join timeout arrive from the environment so
+# the image stays environment-driven; KubernetesOptions.Namespace stays
+# unset so discovery auto-detects legate-demo from the service account.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: legate-minimalhost
+  namespace: legate-demo
+  labels:
+    app: legate
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: legate
+  template:
+    metadata:
+      labels:
+        app: legate
+    spec:
+      serviceAccountName: legate-minimalhost
+      containers:
+        - name: minimalhost
+          image: legate-minimalhost:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: management
+              containerPort: 8558
+          env:
+            - name: ASPNETCORE_URLS
+              value: http://+:8080
+            - name: Legate__Cluster__Mode
+              value: Kubernetes
+            - name: Legate__Cluster__MinimumMembers
+              value: "3"
+            - name: Legate__Cluster__JoinTimeout
+              value: 60s
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: Legate__Cluster__Roles__0
+              value: session
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 10
