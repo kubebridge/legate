@@ -79,9 +79,9 @@ module internal ClusterActorSystem =
 
     /// The remoting bind hostname once a bootstrap hook is registered in
     /// Kubernetes mode: pods must accept cross-pod traffic, so the node
-    /// binds all interfaces. The advertised address still resolves
-    /// through Akka's default chain (remoting public-hostname, then host
-    /// DNS), which the pod manifests keep resolvable.
+    /// binds all interfaces. The advertised address comes from the hook
+    /// fragment's public-hostname (POD_IP), not host DNS: the core keeps
+    /// binding 0.0.0.0 while peers dial the pod IP.
     let kubernetesRemotingHostname = "0.0.0.0"
 
     /// Formats a positive TimeSpan as HOCON duration: whole seconds as

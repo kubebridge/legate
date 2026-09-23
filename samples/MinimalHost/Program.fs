@@ -4,7 +4,9 @@ module MinimalHost.Program
 open Legate
 open Legate.Storage.InMemory
 open Microsoft.AspNetCore.Builder
+open Microsoft.AspNetCore.Diagnostics.HealthChecks
 open Microsoft.Extensions.DependencyInjection
+open Microsoft.Extensions.Diagnostics.HealthChecks
 open MinimalHost.HostWiring
 open MinimalHost.Routes
 open Giraffe
@@ -26,6 +28,17 @@ let main (args: string[]) : int =
     // Resolve before running: the resolve triggers the session router
     // wiring, which must land before the actor system spawns its router.
     app.Services.GetRequiredService<SessionClient>() |> ignore
+
+    // Readiness on the app port, filtered to the legate-cluster check:
+    // the manifest probes this (not the Akka.Management port) for
+    // cluster membership. Middleware (not MapHealthChecks: the terminal
+    // Giraffe middleware handles every request itself, so an endpoint
+    // registered with MapHealthChecks never runs) before Giraffe;
+    // /healthz stays the static liveness probe.
+    let readyOptions =
+        HealthCheckOptions(Predicate = System.Func<_, _>(fun check -> check.Name = "legate-cluster"))
+
+    app.UseHealthChecks("/ready", readyOptions) |> ignore
 
     app.UseGiraffe(webApp) |> ignore
     app.Run()

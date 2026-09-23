@@ -4,6 +4,7 @@ module MinimalHost.HostWiring
 open System
 open Giraffe
 open Legate
+open Legate.Cluster
 open Legate.Llm.OpenAI
 open Legate.Storage.InMemory
 open Legate.Workspace.Process
@@ -90,7 +91,11 @@ let private selectLiveClient (provider: IServiceProvider) : IChatClient =
 
 /// Builds the container: InMemory session and event stores over one shared
 /// database, the process workspace, scripted-by-default providers, and the
-/// chat client the facade opts into suspendable children with.
+/// chat client the facade opts into suspendable children with. Binds the
+/// Legate configuration section (cluster mode, minimum members, and join
+/// timeout arrive from the environment) and registers the Kubernetes
+/// bootstrap hook with 3 required contact points; the hook stays idle
+/// unless Cluster:Mode selects Kubernetes.
 /// <param name="services">The container to add Legate services to.</param>
 /// <param name="configuration">The application configuration providers bind from.</param>
 /// <param name="database">The shared in-memory database behind every store.</param>
@@ -99,9 +104,19 @@ let buildServices (services: IServiceCollection) (configuration: IConfiguration)
     ArgumentNullException.ThrowIfNull(configuration)
     ArgumentNullException.ThrowIfNull(database)
 
+    // Health checks first: AddLegate registers the legate-cluster
+    // readiness check only when a HealthCheckService is already present,
+    // so reversing this order would silently skip it.
+    services.AddHealthChecks() |> ignore
+
     LegateServiceCollectionExtensions.AddLegate(
         services,
         Action<LegateBuilder>(fun builder ->
+            builder.UseConfiguration(configuration.GetSection("Legate")) |> ignore
+
+            builder.Cluster.UseKubernetes(Action<KubernetesOptions>(fun options -> options.RequiredContactPoints <- 3))
+            |> ignore
+
             builder.Storage.UseSessionStore(InMemorySessionStore(database)) |> ignore
 
             let workspaceOptions = ProcessWorkspaceRuntimeOptions()

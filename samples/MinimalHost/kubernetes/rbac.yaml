@@ -1,0 +1,38 @@
+# Sample-only RBAC for Akka.Discovery.KubernetesApi pod discovery.
+# Namespaced on purpose: the sample needs nothing outside legate-demo,
+# so a ClusterRole would be over-broad.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: legate-minimalhost
+  namespace: legate-demo
+  labels:
+    app: legate
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: legate-pod-discovery
+  namespace: legate-demo
+  labels:
+    app: legate
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: legate-pod-discovery
+  namespace: legate-demo
+  labels:
+    app: legate
+subjects:
+  - kind: ServiceAccount
+    name: legate-minimalhost
+    namespace: legate-demo
+roleRef:
+  kind: Role
+  name: legate-pod-discovery
+  apiGroup: rbac.authorization.k8s.io
