@@ -63,6 +63,7 @@
     <Compile Include="Agents/FileAgentStore.fs" />
     <Compile Include="ClusterActorSystem.fs" />
     <Compile Include="ClusterHealth.fs" />
+    <Compile Include="LlmCoordinationHealth.fs" />
     <Compile Include="SessionClientFacade.fs" />
     <Compile Include="JournalArchiveOptions.fs" />
     <Compile Include="JournalArchiveWorker.fs" />

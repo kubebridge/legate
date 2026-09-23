@@ -29,15 +29,19 @@ open Microsoft.Extensions.Logging
 // reservation with the provider-reported UsageSummary on success. Raw API
 // keys never enter identity keys, dictionaries, logs, or diagnostics; when
 // neither key source has a key the call fails fast with ProviderException
-// before anything queues. DistributedCoordination=true fails fast: there is
-// no distributed admission here. Everything time-shaped runs off the
+// before anything queues. When LlmOptions.DistributedCoordination is true
+// with Mode Redis and a registered admission client, the call admits
+// through the distributed seam first (the seam owns the combined
+// concurrency limit, FIFO queueing, and shared cooldown) while the local
+// RPM/TPM sliding windows still apply per process; the seam lease TTLs
+// derive from the turn deadline so no renewal runs on this path.
+// Everything time-shaped runs off the
 // injected TimeProvider (the deadline timer), ILlmDelay (rate, cooldown,
 // and backoff waits), and ILlmRandom (retry jitter) seams: no Task.Delay,
 // no DateTime.UtcNow, no Random. Rejected designs: a coordinator actor per
-// identity (heavier lifecycle for a few counters and queues), new exception
-// types (the existing AdmissionRejected, DeadlineExceeded, Provider, and
-// ProviderNotRegistered shapes already carry every failure), and
-// distributed admission (out of scope).
+// identity (heavier lifecycle for a few counters and queues) and new
+// exception types (the existing AdmissionRejected, DeadlineExceeded,
+// Provider, and ProviderNotRegistered shapes already carry every failure).
 module internal LlmCoordination =
 
     /// The credential scope shared by every tenant when the provider's
@@ -57,8 +61,56 @@ module internal LlmCoordination =
     [<Literal>]
     let ExecuteOperationName = "Execute"
 
+    /// The <see cref="T:Legate.AdmissionRejectedException" /> reason carried
+    /// when fail-closed rejects because the distributed seam is unavailable.
+    [<Literal>]
+    let DistributedUnavailableReason = "distributedUnavailable"
+
+    /// The emergency fail-open concurrency bound: one call per identity per
+    /// process, strictly below the normal default, so a Redis outage admits
+    /// progress without a stampede.
+    [<Literal>]
+    let EmergencyMaxConcurrency = 1
+
+    /// The emergency fail-open FIFO queue cap per identity per process.
+    [<Literal>]
+    let EmergencyMaxQueuedRequests = 16
+
     /// The sliding window RPM and TPM accounting covers: the last minute.
     let private rateWindow = TimeSpan.FromMinutes 1.0
+
+    /// The distributed-admit poll cadence while the seam reports Queued.
+    let private distributedPollInterval = TimeSpan.FromSeconds 1.0
+
+    /// Releases one owner's distributed lease, best-effort: a release
+    /// failure never fails the call. Callers resolve non-null arguments
+    /// first: the distributed path always holds a lease owner.
+    /// <param name="admission">The seam that holds the lease.</param>
+    /// <param name="identity">The coordination identity.</param>
+    /// <param name="ownerId">The owner releasing.</param>
+    let private releaseLeaseGuarded (admission: IDistributedLlmAdmission) (identity: string) (ownerId: string) : Task =
+        task {
+            try
+                let! _ = admission.ReleaseAsync(identity, ownerId, CancellationToken.None)
+                ()
+            with _ ->
+                ()
+        }
+
+    /// Starts a shared cooldown on the seam, best-effort: a propagation
+    /// failure never fails the retry. Skips non-positive pauses (the seam
+    /// requires a positive TTL).
+    /// <param name="admission">The seam owning the shared cooldown.</param>
+    /// <param name="identity">The coordination identity.</param>
+    /// <param name="pause">How long new work is refused.</param>
+    let private startCooldownGuarded (admission: IDistributedLlmAdmission) (identity: string) (pause: TimeSpan) : Task =
+        task {
+            if pause > TimeSpan.Zero then
+                try
+                    do! admission.StartCooldownAsync(identity, pause, CancellationToken.None)
+                with _ ->
+                    ()
+        }
 
     /// Reports whether an HTTP status is transient: 408, 429, or 5xx. Every
     /// other status, including the remaining 4xx, surfaces immediately.
@@ -187,6 +239,12 @@ module internal LlmCoordination =
         /// pulse or the given hint, whichever comes first.
         | AwaitTimed of TimeSpan
 
+    /// What one guarded distributed acquire produced: the seam outcome to
+    /// classify, or the fail-open fallback to emergency local admission.
+    type private DistributedAcquireStep =
+        | SeamOutcome of DistributedAdmissionOutcome
+        | SeamFellBack
+
     /// One TPM ledger entry: the admission instant plus the reserved token
     /// count, reconciled with the actual usage when the call settles.
     type TokenEntry =
@@ -276,30 +334,63 @@ module internal LlmCoordination =
             Log: ILogger
             /// The six-key scope every coordinator log line carries.
             LogScope: IReadOnlyList<KeyValuePair<string, obj>>
+            /// True on the distributed path: settle reconciles the local
+            /// token ledger without touching the concurrency gate and
+            /// releases the seam lease; HTTP 429s also propagate to the
+            /// seam cooldown. False on the local and emergency paths.
+            Distributed: bool
+            /// The seam the distributed path admits through, or null on the
+            /// local and emergency paths.
+            Admission: IDistributedLlmAdmission | null
+            /// The identity the call admitted under (local and distributed).
+            IdentityKey: string
+            /// The owner holding the distributed lease, or null on the
+            /// local and emergency paths.
+            OwnerId: string | null
         }
 
     /// Reconciles the reservation with the actual usage and releases the
-    /// concurrency slot, pulsing the waiters.
-    /// <param name="gate">The coordinator gate.</param>
-    /// <param name="state">The call's identity state.</param>
-    /// <param name="entry">The call's TPM ledger entry.</param>
+    /// concurrency slot, pulsing the waiters. On the distributed path the
+    /// gate is untouched (the seam owns concurrency) and the seam lease is
+    /// released best-effort instead.
+    /// <param name="context">The per-call parameters.</param>
     /// <param name="actualTokens">The input plus output tokens the provider reported.</param>
-    let private settleSuccess (gate: obj) (state: IdentityState) (entry: TokenEntry) (actualTokens: int64) : unit =
-        lock gate (fun () ->
-            entry.Tokens <- actualTokens
-            state.Active <- state.Active - 1
-            state.Signal.Signal())
+    let private settleSuccess<'T> (context: AttemptContext<'T>) (actualTokens: int64) : Task =
+        task {
+            lock context.Gate (fun () ->
+                context.Entry.Tokens <- actualTokens
+
+                if not context.Distributed then
+                    context.State.Active <- context.State.Active - 1
+                    context.State.Signal.Signal())
+
+            if context.Distributed then
+                match box context.Admission, box context.OwnerId with
+                | (:? IDistributedLlmAdmission as live), (:? string as owner) ->
+                    do! releaseLeaseGuarded live context.IdentityKey owner
+                | _ -> ()
+        }
 
     /// Releases the reservation and the concurrency slot without
-    /// reconciling (no usage was reported), pulsing the waiters.
-    /// <param name="gate">The coordinator gate.</param>
-    /// <param name="state">The call's identity state.</param>
-    /// <param name="entry">The call's TPM ledger entry.</param>
-    let private settleFailure (gate: obj) (state: IdentityState) (entry: TokenEntry) : unit =
-        lock gate (fun () ->
-            state.TokenLedger.Remove(entry) |> ignore
-            state.Active <- state.Active - 1
-            state.Signal.Signal())
+    /// reconciling (no usage was reported), pulsing the waiters. On the
+    /// distributed path the gate is untouched and the seam lease is
+    /// released best-effort instead.
+    /// <param name="context">The per-call parameters.</param>
+    let private settleFailure<'T> (context: AttemptContext<'T>) : Task =
+        task {
+            lock context.Gate (fun () ->
+                context.State.TokenLedger.Remove(context.Entry) |> ignore
+
+                if not context.Distributed then
+                    context.State.Active <- context.State.Active - 1
+                    context.State.Signal.Signal())
+
+            if context.Distributed then
+                match box context.Admission, box context.OwnerId with
+                | (:? IDistributedLlmAdmission as live), (:? string as owner) ->
+                    do! releaseLeaseGuarded live context.IdentityKey owner
+                | _ -> ()
+        }
 
     /// Authorises one tenant-provider-model call before the runtime
     /// resolves the provider: a deny throws
@@ -470,8 +561,15 @@ module internal LlmCoordination =
 
                     context.State.Signal.Signal())
 
+                // The distributed path shares the pause with peer
+                // processes; a propagation failure never fails the retry.
+                if context.Distributed then
+                    match box context.Admission with
+                    | :? IDistributedLlmAdmission as live -> do! startCooldownGuarded live context.IdentityKey pause
+                    | _ -> ()
+
             if attempt >= context.RetryCount then
-                settleFailure context.Gate context.State context.Entry
+                do! settleFailure context
                 return! Task.FromException<LlmCallOutcome<'T>>(mapped)
             else
                 let backoff = jitteredBackoff context.Random context.MinBackoff context.MaxBackoff
@@ -486,17 +584,17 @@ module internal LlmCoordination =
                 let wait = max backoff cooldownWait
 
                 if context.Clock.GetUtcNow() + wait >= context.Deadline then
-                    settleFailure context.Gate context.State context.Entry
+                    do! settleFailure context
                     return! Task.FromException<LlmCallOutcome<'T>>(context.DeadlineEx())
                 else
                     try
                         do! context.Delay.Delay(wait, context.LinkedToken)
                     with :? OperationCanceledException as waitCanceled ->
                         if context.IsDeadlineFired() then
-                            settleFailure context.Gate context.State context.Entry
+                            do! settleFailure context
                             raise (context.DeadlineEx())
                         else
-                            settleFailure context.Gate context.State context.Entry
+                            do! settleFailure context
                             ExceptionDispatchInfo.Capture(waitCanceled).Throw()
 
                     use _scope = LoggingScopes.beginScope context.Log context.LogScope
@@ -515,14 +613,14 @@ module internal LlmCoordination =
     let rec attemptLoop<'T> (context: AttemptContext<'T>) (attempt: int) : Task<LlmCallOutcome<'T>> =
         task {
             if context.Clock.GetUtcNow() >= context.Deadline then
-                settleFailure context.Gate context.State context.Entry
+                do! settleFailure context
                 raise (context.DeadlineEx())
 
             try
                 let! outcome = context.Invoke.Invoke(context.Client, context.LinkedToken)
 
                 if isNull (box outcome) then
-                    settleFailure context.Gate context.State context.Entry
+                    do! settleFailure context
 
                     return!
                         Task.FromException<LlmCallOutcome<'T>>(
@@ -537,11 +635,7 @@ module internal LlmCoordination =
                         else
                             outcome.Usage
 
-                    settleSuccess
-                        context.Gate
-                        context.State
-                        context.Entry
-                        (max 0L (usage.InputTokens + usage.OutputTokens))
+                    do! settleSuccess context (max 0L (usage.InputTokens + usage.OutputTokens))
 
                     return { Value = outcome.Value; Usage = usage }
             with
@@ -580,10 +674,10 @@ module internal LlmCoordination =
                         (wrapProviderError context.ProviderId (networkFailure :> exn))
             | :? OperationCanceledException as canceled ->
                 if context.IsDeadlineFired() then
-                    settleFailure context.Gate context.State context.Entry
+                    do! settleFailure context
                     return! Task.FromException<LlmCallOutcome<'T>>(context.DeadlineEx())
                 elif context.CallerToken.IsCancellationRequested then
-                    settleFailure context.Gate context.State context.Entry
+                    do! settleFailure context
                     return! Task.FromException<LlmCallOutcome<'T>>(canceled)
                 else
                     return!
@@ -593,13 +687,18 @@ module internal LlmCoordination =
                             attempt
                             (wrapProviderError context.ProviderId (canceled :> exn))
             | ex ->
-                settleFailure context.Gate context.State context.Entry
+                do! settleFailure context
                 return! Task.FromException<LlmCallOutcome<'T>>(ex)
         }
 
     /// Local per-identity coordinator: concurrency gate, RPM/TPM windows,
     /// capped FIFO queue, shared 429 cooldown, jittered transient retry,
-    /// and the turn deadline, all off the injected seams. One instance
+    /// and the turn deadline, all off the injected seams. When
+    /// <see cref="P:Legate.LlmOptions.DistributedCoordination" /> is true
+    /// with <see cref="P:Legate.DistributedCoordinationOptions.Mode" />
+    /// Redis and a registered admission client, calls admit through the
+    /// distributed seam first (fail-closed rejects, fail-open admits under
+    /// emergency limits). One instance
     /// serves every identity; state is keyed by providerId/scope and the
     /// instance is thread-safe. Construct directly (the session-actor
     /// wiring that owns the singleton arrives with the turn-loop
@@ -611,6 +710,8 @@ module internal LlmCoordination =
     /// <param name="delay">The injected wait seam: rate, cooldown, and backoff waits.</param>
     /// <param name="random">The injected jitter seam: retry backoff.</param>
     /// <param name="logger">The logger the coordinator reports admit/retry/reject points to, or null for no logging.</param>
+    /// <param name="admission">The distributed admission seam, or null for local-only coordination.</param>
+    /// <param name="distributedOptions">The distributed coordination options, or null for local-only coordination.</param>
     [<Sealed>]
     type LlmCoordinator
         (
@@ -620,7 +721,9 @@ module internal LlmCoordination =
             clock: TimeProvider,
             delay: ILlmDelay,
             random: ILlmRandom,
-            logger: ILogger | null
+            logger: ILogger | null,
+            admission: IDistributedLlmAdmission | null,
+            distributedOptions: DistributedCoordinationOptions | null
         ) =
 
         do
@@ -633,6 +736,8 @@ module internal LlmCoordination =
         let gate = obj ()
         let states = Dictionary<string, IdentityState>(StringComparer.Ordinal)
         let log = LoggingScopes.resolveLogger logger
+        let distributedSeam = admission
+        let distributedSettings = distributedOptions
 
         /// Builds the coordinator with no logger.
         /// <param name="options">The LLM section: coordination knobs, per-provider settings, and the distributed flag.</param>
@@ -650,7 +755,27 @@ module internal LlmCoordination =
                 delay: ILlmDelay,
                 random: ILlmRandom
             ) =
-            LlmCoordinator(options, registry, keyProvider, clock, delay, random, null)
+            LlmCoordinator(options, registry, keyProvider, clock, delay, random, null, null, null)
+
+        /// Builds the coordinator with a logger and local-only coordination.
+        /// <param name="options">The LLM section: coordination knobs, per-provider settings, and the distributed flag.</param>
+        /// <param name="registry">The registry the coordinator resolves providers through.</param>
+        /// <param name="keyProvider">The per-tenant key source, or null when the host keeps keys only in provider options.</param>
+        /// <param name="clock">The injected clock.</param>
+        /// <param name="delay">The injected wait seam.</param>
+        /// <param name="random">The injected jitter seam.</param>
+        /// <param name="logger">The logger the coordinator reports admit/retry/reject points to, or null for no logging.</param>
+        new
+            (
+                options: LlmOptions,
+                registry: ILlmProviderRegistry,
+                keyProvider: IApiKeyProvider | null,
+                clock: TimeProvider,
+                delay: ILlmDelay,
+                random: ILlmRandom,
+                logger: ILogger | null
+            ) =
+            LlmCoordinator(options, registry, keyProvider, clock, delay, random, logger, null, null)
 
         /// Runs one provider call under the reference's identity: authorises
         /// the tenant-provider-model through the policy first (a deny
@@ -663,7 +788,14 @@ module internal LlmCoordination =
         /// has a key, before anything queues), builds the chat client with
         /// the resolved key, admits the call through the concurrency gate,
         /// rate windows, and shared cooldown, then invokes with jittered
-        /// retry inside the turn deadline. Transient failures (408, 429,
+        /// retry inside the turn deadline. When distributed coordination is
+        /// on with Mode Redis and a registered admission client, the
+        /// concurrency gate, FIFO queueing, and shared cooldown come from
+        /// the seam (the local RPM/TPM windows still apply): Queued polls,
+        /// CooldownActive waits out the pause, fail-closed rejects without
+        /// contacting the provider, and fail-open admits locally under
+        /// emergency limits (concurrency 1, queue 16) with one metric point
+        /// per admitted call. Transient failures (408, 429,
         /// 5xx, network errors) retry up to
         /// <see cref="P:Legate.LlmCoordinationOptions.RetryCount" /> times;
         /// other 4xx surface immediately; every provider failure surfaces as
@@ -697,11 +829,11 @@ module internal LlmCoordination =
         /// <param name="attempt">The 1-based attempt the call runs under.</param>
         /// <returns>The value the provider call produced.</returns>
         /// <exception cref="T:System.ArgumentException">The coordination knobs do not validate.</exception>
-        /// <exception cref="T:System.InvalidOperationException">Distributed coordination is on, the provider returned null instead of a client or result, or the policy returned null or an unknown decision shape.</exception>
+        /// <exception cref="T:System.InvalidOperationException">Distributed coordination is on without Mode Redis and a registered client, the provider returned null instead of a client or result, or the policy returned null or an unknown decision shape.</exception>
         /// <exception cref="T:Legate.ModelDeniedException">The model policy denied the call.</exception>
         /// <exception cref="T:Legate.ProviderNotRegisteredException">No provider is registered under the reference's provider segment.</exception>
         /// <exception cref="T:Legate.ProviderException">Neither key source has a key, or the provider call failed.</exception>
-        /// <exception cref="T:Legate.AdmissionRejectedException">The FIFO queue is full.</exception>
+        /// <exception cref="T:Legate.AdmissionRejectedException">The FIFO queue is full, or the distributed seam is unavailable under FailClosed.</exception>
         /// <exception cref="T:Legate.DeadlineExceededException">The turn deadline fired.</exception>
         member _.ExecuteAsync<'T>
             (
@@ -728,12 +860,46 @@ module internal LlmCoordination =
                 | null -> ()
                 | violation -> raise (ArgumentException(violation, nameof options))
 
+                // ── Enabled rule: distributed admission is active when
+                // LlmOptions.DistributedCoordination is true with Mode Redis
+                // and a registered client. True with anything else fails
+                // fast naming the missing piece, never silently local;
+                // false always coordinates locally.
+                let mutable useDistributed = false
+                let mutable failClosed = true
+
                 if options.DistributedCoordination then
-                    raise (
-                        InvalidOperationException(
-                            "LlmOptions.DistributedCoordination is true, but this coordinator admits locally: distributed admission is out of scope."
+                    match box distributedSettings with
+                    | null ->
+                        raise (
+                            InvalidOperationException(
+                                "LlmOptions.DistributedCoordination is true, but no DistributedCoordinationOptions was supplied: pass the options the coordination package binds from Legate:Llm:DistributedCoordination."
+                            )
                         )
-                    )
+                    | :? DistributedCoordinationOptions as settings ->
+                        if settings.Mode <> DistributedCoordinationMode.Redis then
+                            raise (
+                                InvalidOperationException(
+                                    sprintf
+                                        "LlmOptions.DistributedCoordination is true, but DistributedCoordinationOptions.Mode is %O: set Mode to Redis or coordinate locally."
+                                        settings.Mode
+                                )
+                            )
+                        elif isNull (box distributedSeam) then
+                            raise (
+                                InvalidOperationException(
+                                    "LlmOptions.DistributedCoordination is true with Mode Redis, but no IDistributedLlmAdmission client was supplied: register the Redis coordination package."
+                                )
+                            )
+                        else
+                            useDistributed <- true
+                            failClosed <- settings.FailClosed
+                    | _ ->
+                        raise (
+                            InvalidOperationException(
+                                "LlmOptions.DistributedCoordination is true, but the distributed coordination options have an unknown shape."
+                            )
+                        )
 
                 if estimatedInputTokens < 0L then
                     raise (
@@ -829,6 +995,16 @@ module internal LlmCoordination =
 
                 let identityKey = providerId + "/" + scope
 
+                // The per-call lease owner: the turn plus the 1-based
+                // attempt (correlatable) plus a fresh guid (unique,
+                // secret-free). Retries hold the same lease under the same
+                // owner: no re-acquire between attempts.
+                let ownerId: string | null =
+                    if useDistributed then
+                        turnId.Value + "/attempt-" + string attempt + "/" + Guid.NewGuid().ToString("N")
+                    else
+                        null
+
                 let clientOptions = LlmProviderOptions()
                 clientOptions.ApiKey <- apiKey
                 let client = provider.CreateChatClient(reference, clientOptions)
@@ -875,13 +1051,13 @@ module internal LlmCoordination =
                         sprintf "The coordinated '%s' call exceeded its %d-second deadline." identityKey timeoutSeconds
                     )
 
-                let queueFullEx () =
+                let queueFullEx (capQueued: int) () =
                     AdmissionRejectedException(
                         QueueFullReason,
                         sprintf
                             "The '%s' coordinator queue is full (%d waiting); the request was rejected without contacting the provider."
                             identityKey
-                            maxQueued
+                            capQueued
                     )
 
                 // The queued waiter owned by this call, or null while the
@@ -905,8 +1081,10 @@ module internal LlmCoordination =
                 // Decides one admission step under the gate, enqueuing this
                 // call when it must wait and capturing the pulse to wait on.
                 // Only the queue head (or a new arrival on an empty queue)
-                // may admit, so waiters leave strictly in FIFO order.
-                let decide (now: DateTimeOffset) : AdmissionStep * Task =
+                // may admit, so waiters leave strictly in FIFO order. The
+                // caps are the coordination knobs on the local path and the
+                // emergency bounds on the fail-open path.
+                let decide (now: DateTimeOffset) (capConcurrency: int) (capQueued: int) : AdmissionStep * Task =
                     lock gate (fun () ->
                         let state =
                             if states.ContainsKey(identityKey) then
@@ -944,7 +1122,7 @@ module internal LlmCoordination =
                                 let spent = state.TokenLedger |> Seq.sumBy (fun entry -> entry.Tokens)
                                 spent + reservation <= int64 tpm.Value
 
-                        if mayAdmit && state.Active < maxConcurrency && cooldownOk && rpmOk && tpmOk then
+                        if mayAdmit && state.Active < capConcurrency && cooldownOk && rpmOk && tpmOk then
                             if enqueued then
                                 state.Waiters.Remove(waiter) |> ignore
 
@@ -958,7 +1136,7 @@ module internal LlmCoordination =
                             ticketEntry <- entry
                             state.Signal.Signal()
                             Admitted, Task.CompletedTask
-                        else if not enqueued && state.Waiters.Count >= maxQueued then
+                        else if not enqueued && state.Waiters.Count >= capQueued then
                             Rejected, Task.CompletedTask
                         else
                             if not enqueued then
@@ -1016,8 +1194,247 @@ module internal LlmCoordination =
                     use _scope = LoggingScopes.beginScope log callScope
                     log.LogInformation("{Message}", LoggingScopes.redactForLog message)
 
+                // Falls back to emergency local admission when the seam is
+                // unavailable in fail-open mode. Set by the distributed
+                // admit loop; the local loop below reads it for its caps.
+                let mutable emergencyLocal = false
+
+                // Re-validates the local RPM/TPM windows after the seam
+                // granted a lease (closing the check-then-act race while
+                // the seam still caps concurrency): records the reservation
+                // and captures the ticket on success, otherwise hands back
+                // the rate hint to wait on. The gate count, the waiters,
+                // and the local cooldown stay untouched on this path.
+                let checkDistributedRates (now: DateTimeOffset) : bool * TimeSpan =
+                    lock gate (fun () ->
+                        let state =
+                            if states.ContainsKey(identityKey) then
+                                states[identityKey]
+                            else
+                                let fresh = IdentityState()
+                                states[identityKey] <- fresh
+                                fresh
+
+                        let cutoff = now - rateWindow
+                        state.RequestTimes.RemoveAll(fun instant -> instant <= cutoff) |> ignore
+                        state.TokenLedger.RemoveAll(fun entry -> entry.Instant <= cutoff) |> ignore
+
+                        let rpmOk = state.RequestTimes.Count < rpm
+
+                        let tpmOk =
+                            if not tpm.HasValue then
+                                true
+                            elif state.TokenLedger.Count = 0 then
+                                // A reservation larger than the whole
+                                // budget admits immediately: waiting could
+                                // never free enough room.
+                                true
+                            else
+                                let spent = state.TokenLedger |> Seq.sumBy (fun entry -> entry.Tokens)
+                                spent + reservation <= int64 tpm.Value
+
+                        if rpmOk && tpmOk then
+                            state.RequestTimes.Add(now)
+
+                            let entry = { Instant = now; Tokens = reservation }
+
+                            state.TokenLedger.Add(entry)
+                            ticketState <- state
+                            ticketEntry <- entry
+                            true, TimeSpan.Zero
+                        else
+                            let mutable hint = TimeSpan.MaxValue
+
+                            if not rpmOk then
+                                let oldest = state.RequestTimes |> Seq.min
+                                hint <- min hint (oldest + rateWindow - now)
+
+                            if not tpmOk then
+                                let oldest = state.TokenLedger |> Seq.minBy (fun entry -> entry.Instant)
+                                hint <- min hint (oldest.Instant + rateWindow - now)
+
+                            false, hint)
+
+                // Admits through the distributed seam inside the turn
+                // deadline: Queued polls every second, CooldownActive waits
+                // out the shorter of the configured pause and the remaining
+                // deadline (the seam stays the cooldown authority: the local
+                // CooldownUntil is never written here), and an Acquired
+                // lease re-validates the local rate windows before it
+                // counts. Non-cancellation seam failures run the fail
+                // policy: fail-closed rejects, fail-open falls back to
+                // emergency local admission. Caller cancellation maps to
+                // the deadline or the abort, never to the fail policy.
+                // Retries hold the one lease under the one owner; every
+                // give-up path releases it best-effort. Returns true when
+                // the seam admitted the call.
+                let admitDistributed () : Task<bool> =
+                    task {
+                        // The enabled rule proved both non-null; resolve
+                        // once so every seam call below is null-clean.
+                        let seam, owner =
+                            match box distributedSeam, box ownerId with
+                            | (:? IDistributedLlmAdmission as live), (:? string as owned) -> live, owned
+                            | _ ->
+                                raise (
+                                    InvalidOperationException(
+                                        "LlmOptions.DistributedCoordination is true with Mode Redis, but no IDistributedLlmAdmission client was supplied: register the Redis coordination package."
+                                    )
+                                )
+
+                        // Waits out a distributed-admit pause off the delay
+                        // seam: a cancelled wait releases the lease
+                        // best-effort and maps to the deadline or the
+                        // caller's abort; a faulted wait releases and
+                        // rethrows the seam failure.
+                        let waitDistributed (hint: TimeSpan) : Task =
+                            task {
+                                try
+                                    do! delay.Delay(hint, linkedToken)
+                                with
+                                | :? OperationCanceledException ->
+                                    do! releaseLeaseGuarded seam identityKey owner
+
+                                    if isDeadlineFired () then
+                                        raise (deadlineEx ())
+                                    else
+                                        cancellationToken.ThrowIfCancellationRequested()
+                                        raise (OperationCanceledException(linkedToken))
+                                | ex ->
+                                    do! releaseLeaseGuarded seam identityKey owner
+                                    ExceptionDispatchInfo.Capture(ex).Throw()
+                            }
+
+                        let ttl = TimeSpan.FromSeconds(float timeoutSeconds)
+                        let mutable admitted = false
+                        let mutable fellBack = false
+
+                        while not admitted && not fellBack do
+                            try
+                                cancellationToken.ThrowIfCancellationRequested()
+                            with ex ->
+                                // A queued waiter entry belongs to this
+                                // owner: release it best-effort before the
+                                // abort surfaces.
+                                do! releaseLeaseGuarded seam identityKey owner
+                                ExceptionDispatchInfo.Capture(ex).Throw()
+
+                            let now = clock.GetUtcNow()
+
+                            if now >= deadline then
+                                do! releaseLeaseGuarded seam identityKey owner
+                                logCall "The coordinator deadline fired before distributed admission."
+                                raise (deadlineEx ())
+
+                            let! step =
+                                task {
+                                    try
+                                        let! acquired =
+                                            seam.AcquireAsync(identityKey, owner, maxConcurrency, ttl, ttl, linkedToken)
+
+                                        return SeamOutcome acquired
+                                    with
+                                    | :? OperationCanceledException as canceled ->
+                                        do! releaseLeaseGuarded seam identityKey owner
+
+                                        if isDeadlineFired () then
+                                            return! Task.FromException<DistributedAcquireStep>(deadlineEx ())
+                                        else
+                                            cancellationToken.ThrowIfCancellationRequested()
+                                            return! Task.FromException<DistributedAcquireStep>(canceled)
+                                    | _ ->
+                                        do! releaseLeaseGuarded seam identityKey owner
+
+                                        if failClosed then
+                                            logCall
+                                                "The coordinator rejected the call: the distributed seam is unavailable and FailClosed is set."
+
+                                            return!
+                                                Task.FromException<DistributedAcquireStep>(
+                                                    AdmissionRejectedException(
+                                                        DistributedUnavailableReason,
+                                                        sprintf
+                                                            "The '%s' distributed admission seam is unavailable and FailClosed rejects new work without contacting the provider."
+                                                            identityKey
+                                                    )
+                                                )
+                                        else
+                                            logCall
+                                                "The distributed seam is unavailable: the coordinator admits locally under emergency limits."
+
+                                            fellBack <- true
+                                            return SeamFellBack
+                                }
+
+                            match step with
+                            | SeamFellBack -> ()
+                            | SeamOutcome outcome ->
+                                match outcome.Kind with
+                                | DistributedAdmissionDecision.Acquired ->
+                                    let rated = clock.GetUtcNow()
+                                    let windowsOk, hint = checkDistributedRates rated
+
+                                    if windowsOk then
+                                        admitted <- true
+                                    else
+                                        do! releaseLeaseGuarded seam identityKey owner
+
+                                        if rated + hint >= deadline then
+                                            logCall
+                                                "The coordinator deadline fired while waiting on the local rate window."
+
+                                            raise (deadlineEx ())
+                                        else
+                                            do! waitDistributed hint
+                                | DistributedAdmissionDecision.Queued ->
+                                    if now + distributedPollInterval >= deadline then
+                                        do! releaseLeaseGuarded seam identityKey owner
+                                        logCall "The coordinator deadline fired while queued on the distributed seam."
+                                        raise (deadlineEx ())
+                                    else
+                                        do! waitDistributed distributedPollInterval
+                                | _ ->
+                                    // CooldownActive (or an unknown future
+                                    // decision): wait out the shorter of the
+                                    // configured pause and the remaining
+                                    // deadline, then re-acquire.
+                                    let remaining = deadline - clock.GetUtcNow()
+                                    let wait = min cooldown remaining
+
+                                    if remaining <= TimeSpan.Zero then
+                                        logCall "The coordinator deadline fired while the distributed seam cooled down."
+                                        raise (deadlineEx ())
+                                    elif wait > TimeSpan.Zero then
+                                        do! waitDistributed wait
+                                    else
+                                        ()
+
+                        emergencyLocal <- fellBack
+                        return admitted
+                    }
+
+                let mutable seamAdmitted = false
+
+                if useDistributed then
+                    let! admittedViaSeam = admitDistributed ()
+                    seamAdmitted <- admittedViaSeam
+
+                // The local loop caps: the coordination knobs, or the
+                // emergency bounds after a fail-open fallback.
+                let capConcurrency =
+                    if emergencyLocal then
+                        EmergencyMaxConcurrency
+                    else
+                        maxConcurrency
+
+                let capQueued =
+                    if emergencyLocal then
+                        EmergencyMaxQueuedRequests
+                    else
+                        maxQueued
+
                 try
-                    let mutable admitted = false
+                    let mutable admitted = seamAdmitted
 
                     while not admitted do
                         cancellationToken.ThrowIfCancellationRequested()
@@ -1028,14 +1445,14 @@ module internal LlmCoordination =
                             logCall "The coordinator deadline fired before admission."
                             raise (deadlineEx ())
 
-                        let step, signal = decide now
+                        let step, signal = decide now capConcurrency capQueued
 
                         match step with
                         | Admitted -> admitted <- true
                         | Rejected ->
                             removeWaiter ()
                             logCall "The coordinator rejected the call: the queue is full."
-                            raise (queueFullEx ())
+                            raise (queueFullEx capQueued ())
                         | AwaitSignal ->
                             try
                                 do! signal.WaitAsync(linkedToken)
@@ -1068,6 +1485,11 @@ module internal LlmCoordination =
                     if isNull (box ticketEntry) then
                         removeWaiter ()
 
+                // One metric point per call the emergency path admitted
+                // while the seam was unavailable in fail-open mode.
+                if emergencyLocal then
+                    Telemetry.recordFailOpenAdmission providerId
+
                 let context: AttemptContext<'T> =
                     {
                         Client = client
@@ -1090,6 +1512,14 @@ module internal LlmCoordination =
                         Entry = ticketEntry
                         Log = log
                         LogScope = callScope
+                        Distributed = useDistributed && not emergencyLocal
+                        Admission =
+                            (if useDistributed && not emergencyLocal then
+                                 distributedSeam
+                             else
+                                 null)
+                        IdentityKey = identityKey
+                        OwnerId = ownerId
                     }
 
                 logCall "The coordinator admitted the call."
@@ -1156,10 +1586,10 @@ module internal LlmCoordination =
         /// <param name="cancellationToken">Abandons the call: queued waits reject and in-flight work observes it.</param>
         /// <returns>The value the provider call produced.</returns>
         /// <exception cref="T:System.ArgumentException">The coordination knobs do not validate.</exception>
-        /// <exception cref="T:System.InvalidOperationException">Distributed coordination is on, or the provider returned null instead of a client or result.</exception>
+        /// <exception cref="T:System.InvalidOperationException">Distributed coordination is on without Mode Redis and a registered client, or the provider returned null instead of a client or result.</exception>
         /// <exception cref="T:Legate.ProviderNotRegisteredException">No provider is registered under the reference's provider segment.</exception>
         /// <exception cref="T:Legate.ProviderException">Neither key source has a key, or the provider call failed.</exception>
-        /// <exception cref="T:Legate.AdmissionRejectedException">The FIFO queue is full.</exception>
+        /// <exception cref="T:Legate.AdmissionRejectedException">The FIFO queue is full, or the distributed seam is unavailable under FailClosed.</exception>
         /// <exception cref="T:Legate.DeadlineExceededException">The turn deadline fired.</exception>
         member this.ExecuteAsync<'T>
             (

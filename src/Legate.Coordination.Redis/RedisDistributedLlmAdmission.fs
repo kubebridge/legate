@@ -4,6 +4,7 @@ namespace Legate.Coordination.Redis
 open System
 open System.Threading
 open System.Threading.Tasks
+open Legate
 open StackExchange.Redis
 
 // StackExchange.Redis client behind IDistributedLlmAdmission. Every mutation
@@ -49,7 +50,7 @@ module internal AdmissionParsing =
 /// StackExchange.Redis. Processes sharing the instance respect one
 /// combined concurrency limit with FIFO waiters, waiter TTL, and owner
 /// fencing. Sealed; hosts resolve it through
-/// <see cref="T:Legate.Coordination.Redis.IDistributedLlmAdmission" />.
+/// <see cref="T:Legate.IDistributedLlmAdmission" />.
 /// </summary>
 /// <param name="options">The validated coordination options. Must not be null.</param>
 /// <param name="getDatabase">The database factory. Must not be null.</param>

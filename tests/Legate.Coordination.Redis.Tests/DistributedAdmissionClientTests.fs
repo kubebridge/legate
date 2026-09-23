@@ -4,6 +4,7 @@ module Legate.Coordination.Redis.Tests.DistributedAdmissionClientTests
 open System
 open System.Threading
 open FsUnit.Xunit
+open Legate
 open Legate.Coordination.Redis
 open StackExchange.Redis
 open Xunit

@@ -12,7 +12,7 @@ namespace Legate.Coordination.Redis
 /// <summary>
 /// Key layout and Lua bodies for distributed admission. Internal: the
 /// client calls through these; hosts see only
-/// <see cref="T:Legate.Coordination.Redis.IDistributedLlmAdmission" />.
+/// <see cref="T:Legate.IDistributedLlmAdmission" />.
 /// </summary>
 module internal RedisScripts =
 

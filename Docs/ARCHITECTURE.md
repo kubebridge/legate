@@ -147,7 +147,7 @@ Legate.Storage.Migrations   shared FluentMigrator baseline both relational provi
 Legate.Storage.S3           IBlobStore, IAgentPackageStore
 Legate.Storage.FileSystem   IBlobStore, IAgentPackageStore on local disk
 Legate.Storage.InMemory     all stores in memory (tests, samples)
-Legate.Coordination.Redis   IDistributedLlmAdmission
+Legate.Coordination.Redis   IDistributedLlmAdmission on StackExchange.Redis (contract in Legate.Abstractions)
 Legate.Workspace.Docker     IWorkspaceRuntime over the docker CLI
 Legate.Workspace.HostDirectory  IWorkspaceRuntime bound to a host directory (CLI harness)
 Legate.Workspace.Process    IWorkspaceRuntime on a scratch directory, no sandbox
@@ -254,6 +254,17 @@ is always ready. The cluster modes are ready exactly when all of these
 hold: `BeginDrain` has not run, this member's status is Up, this member
 carries the session role, the cluster reports zero unreachable members,
 and the reachable set holds a strict majority of the known members.
+
+The `legate-llm-coordination` health check (registered the same way, with
+its startup canary always registered) reports whether distributed LLM
+admission may serve traffic. It is Healthy when distributed coordination
+is off, the mode is Disabled, or the canary is not required at startup;
+otherwise it reports the stored startup-canary outcome (a canary that has
+not run yet reads Unhealthy). The canary proves the admission scripts
+execute with a seam-level acquire and release on a reserved identity, not
+a socket ping; per-call admission failures never latch the check (they
+stay observable through `AdmissionRejectedException` and the
+`legate.provider.fail_open_admissions` counter).
 
 ### Drain
 

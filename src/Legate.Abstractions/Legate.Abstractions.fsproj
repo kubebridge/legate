@@ -20,6 +20,7 @@
     <Compile Include="Turns.fs" />
     <Compile Include="Llm.fs" />
     <Compile Include="ModelCatalog.fs" />
+    <Compile Include="DistributedAdmission.fs" />
     <Compile Include="LegateOptions.fs" />
     <Compile Include="Agents.fs" />
     <Compile Include="HostHooks.fs" />

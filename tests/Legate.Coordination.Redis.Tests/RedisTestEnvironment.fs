@@ -4,6 +4,7 @@ namespace Legate.Coordination.Redis.Tests
 open System
 open System.Runtime.InteropServices
 open System.Threading
+open Legate
 open Legate.Coordination.Redis
 open StackExchange.Redis
 open Testcontainers.Redis

@@ -8,9 +8,7 @@
   <!-- Compile order is explicit: register every new file here, in dependency order. -->
   <ItemGroup>
     <Compile Include="AssemblyInfo.fs" />
-    <Compile Include="DistributedCoordinationOptions.fs" />
     <Compile Include="RedisScripts.fs" />
-    <Compile Include="DistributedLlmAdmission.fs" />
     <Compile Include="Compensation.fs" />
     <Compile Include="RedisDistributedLlmAdmission.fs" />
     <Compile Include="Registration.fs" />

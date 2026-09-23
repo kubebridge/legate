@@ -3,6 +3,7 @@ module Legate.Coordination.Redis.Tests.DistributedCoordinationOptionsTests
 
 open System.Collections.Generic
 open FsUnit.Xunit
+open Legate
 open Legate.Coordination.Redis
 open Microsoft.Extensions.Configuration
 open Xunit

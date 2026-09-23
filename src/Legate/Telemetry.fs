@@ -22,7 +22,8 @@ open System.Diagnostics.Metrics
 //
 // Instrument names (the documented surface the mirror test asserts):
 // legate.turns.started, legate.turns.settled, legate.provider.calls,
-// legate.provider.latency, legate.tool.calls, legate.tool.latency,
+// legate.provider.latency, legate.provider.fail_open_admissions,
+// legate.tool.calls, legate.tool.latency,
 // legate.session.queue.depth, legate.lease.renewals, legate.dispatch.latency,
 // legate.serialization.rejected.
 // Span operations: Legate.Turn, Legate.ProviderCall, Legate.ToolCall.
@@ -63,6 +64,14 @@ module internal Telemetry =
     /// invoke phase with retries, by provider and model.
     [<Literal>]
     let ProviderLatencyName = "legate.provider.latency"
+
+    /// Counter: coordinated provider calls admitted locally while the
+    /// distributed seam was unavailable in fail-open mode, by provider.
+    /// One point per locally-admitted call, so fail-open volume stays
+    /// visible during a Redis outage. Provider tag only: names only, never
+    /// ids.
+    [<Literal>]
+    let FailOpenAdmissionsName = "legate.provider.fail_open_admissions"
 
     /// Counter: tool invocations that settled, by tool name and ok/error.
     /// Actual invocations only: control paths that never invoke (structured
@@ -251,6 +260,12 @@ module internal Telemetry =
             ProviderLatencyName,
             "ms",
             "Coordinated provider-call latency around the invoke phase."
+        )
+
+    let private failOpenAdmissionsCounter: Counter<int64> =
+        meter.CreateCounter<int64>(
+            FailOpenAdmissionsName,
+            description = "Coordinated provider calls admitted locally while the distributed seam was unavailable."
         )
 
     let private toolCallsCounter: Counter<int64> =
@@ -517,6 +532,17 @@ module internal Telemetry =
             tags.Add(ProviderTag, ((text provider) :> obj))
             tags.Add(ModelTag, ((text model) :> obj))
             providerLatencyHistogram.Record(max 0.0 milliseconds, &tags)
+        with _ ->
+            ()
+
+    /// Records one coordinated provider call admitted locally while the
+    /// distributed seam was unavailable in fail-open mode. Never throws.
+    /// <param name="provider">The provider id, or null for unknown.</param>
+    let recordFailOpenAdmission (provider: string | null) : unit =
+        try
+            let mutable tags = TagList()
+            tags.Add(ProviderTag, ((text provider) :> obj))
+            failOpenAdmissionsCounter.Add(1L, &tags)
         with _ ->
             ()
 

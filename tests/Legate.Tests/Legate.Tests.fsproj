@@ -58,6 +58,7 @@
     <Compile Include="ClusterShardingTests.fs" />
     <Compile Include="ClusterActorSystemTests.fs" />
     <Compile Include="ClusterHealthTests.fs" />
+    <Compile Include="LlmCoordinationHealthTests.fs" />
     <Compile Include="KubernetesOptionsTests.fs" />
     <Compile Include="KubernetesHoconTests.fs" />
     <Compile Include="SessionActorTests.fs" />
