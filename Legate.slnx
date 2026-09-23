@@ -17,6 +17,7 @@
     <Project Path="src/Legate.Workspace.Docker/Legate.Workspace.Docker.fsproj" />
     <Project Path="src/Legate.Coordination.Redis/Legate.Coordination.Redis.fsproj" />
     <Project Path="src/Legate.Mcp/Legate.Mcp.fsproj" />
+    <Project Path="src/Legate.Cluster.Kubernetes/Legate.Cluster.Kubernetes.fsproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/Legate.Tests/Legate.Tests.fsproj" />

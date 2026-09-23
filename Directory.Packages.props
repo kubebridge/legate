@@ -7,7 +7,9 @@
     <PackageVersion Include="Akka" Version="1.5.71" />
     <PackageVersion Include="Akka.Cluster" Version="1.5.71" />
     <PackageVersion Include="Akka.Cluster.Sharding" Version="1.5.71" />
+    <PackageVersion Include="Akka.Discovery.KubernetesApi" Version="1.5.70" />
     <PackageVersion Include="Akka.FSharp" Version="1.5.71" />
+    <PackageVersion Include="Akka.Management" Version="1.5.70" />
     <PackageVersion Include="Cronos" Version="0.13.0" />
     <PackageVersion Include="FluentMigrator" Version="8.0.1" />
     <PackageVersion Include="FluentMigrator.Runner" Version="8.0.1" />
@@ -33,6 +35,11 @@
     <PackageVersion Include="Microsoft.Extensions.Options" Version="10.0.3" />
     <PackageVersion Include="Npgsql" Version="10.0.3" />
     <PackageVersion Include="OpenAI" Version="2.10.0" />
+    <!-- Direct pin: Akka.Management resolves OpenTelemetry.Api 1.10.0
+         transitively, which NuGet audit flags (NU1902, warnings as errors).
+         The new Legate.Cluster.Kubernetes package references the patched
+         version directly; no source file touches OpenTelemetry types. -->
+    <PackageVersion Include="OpenTelemetry.Api" Version="1.19.1" />
     <PackageVersion Include="SixLabors.ImageSharp" Version="3.1.12" />
     <PackageVersion Include="StackExchange.Redis" Version="2.12.8" />
     <PackageVersion Include="Ulid" Version="1.4.1" />
