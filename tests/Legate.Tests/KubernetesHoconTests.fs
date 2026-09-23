@@ -86,6 +86,23 @@ let ``Fragment rejects invalid options before the cluster forms`` () =
     ex.Message.Contains("ManagementPort") |> should equal true
 
 [<Fact>]
+let ``Public-hostname line renders the pod IP override`` () =
+    let line = KubernetesHocon.buildPublicHostnameLine "10.0.0.7"
+
+    let config = ConfigurationFactory.ParseString(line)
+
+    config.GetString("akka.remote.dot-netty.tcp.public-hostname")
+    |> should equal "10.0.0.7"
+
+[<Fact>]
+let ``Public-hostname line is empty when the pod IP is blank`` () =
+    KubernetesHocon.buildPublicHostnameLine "   " |> should equal ""
+
+[<Fact>]
+let ``Public-hostname line is empty when the pod IP is unset`` () =
+    KubernetesHocon.buildPublicHostnameLine null |> should equal ""
+
+[<Fact>]
 let ``Fragment merges with the core cluster HOCON into one parseable config`` () =
     let clusterOptions = ClusterOptions(Mode = ClusterMode.Kubernetes)
     clusterOptions.Roles.Add("session") |> ignore
@@ -102,3 +119,20 @@ let ``Fragment merges with the core cluster HOCON into one parseable config`` ()
 
     config.GetString("akka.discovery.kubernetes-api.pod-label-selector")
     |> should equal "app=legate"
+
+[<Fact>]
+let ``Merged config binds all interfaces while advertising the pod IP`` () =
+    let clusterOptions = ClusterOptions(Mode = ClusterMode.Kubernetes)
+    clusterOptions.Roles.Add("session") |> ignore
+
+    let raw =
+        ClusterActorSystem.buildClusterHoconFor clusterOptions 0 ClusterActorSystem.kubernetesRemotingHostname
+        + "\n"
+        + KubernetesHocon.buildPublicHostnameLine "10.0.0.7"
+
+    let config = ConfigurationFactory.ParseString(raw)
+
+    config.GetString("akka.remote.dot-netty.tcp.hostname") |> should equal "0.0.0.0"
+
+    config.GetString("akka.remote.dot-netty.tcp.public-hostname")
+    |> should equal "10.0.0.7"

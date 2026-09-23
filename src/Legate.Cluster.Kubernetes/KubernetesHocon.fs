@@ -29,6 +29,19 @@ module internal KubernetesHocon =
         else
             value.Replace("\\", "\\\\").Replace("\"", "\\\"")
 
+    /// Renders the remoting public-hostname override from a pod IP: empty
+    /// when the value is null or blank so off-cluster configuration is
+    /// unchanged. The caller reads the POD_IP environment variable; tests
+    /// call this helper directly and never touch the environment.
+    /// <param name="podIp">The pod IP, or null when unset.</param>
+    /// <returns>The public-hostname HOCON block, or empty when unset.</returns>
+    let buildPublicHostnameLine (podIp: string | null) : string =
+        match Option.ofObj podIp with
+        | Some raw when not (String.IsNullOrWhiteSpace raw) ->
+            let ip = escape (raw.Trim())
+            $"akka.remote.dot-netty.tcp {{\n  public-hostname = \"%s{ip}\"\n}}\n"
+        | _ -> ""
+
     /// Renders the management plus discovery HOCON fragment for validated
     /// options. The namespace line is omitted when no namespace is set so
     /// discovery auto-detects it from the service account secret.
@@ -49,6 +62,13 @@ module internal KubernetesHocon =
             | Some ns when not (String.IsNullOrWhiteSpace ns) -> $"    pod-namespace = \"%s{escape (ns.Trim())}\"\n"
             | _ -> ""
 
+        // The pod IP arrives from the POD_IP environment variable (the
+        // manifest sets it from status.podIP): peers dial the advertised
+        // pod IP while the node keeps binding all interfaces. Blank or
+        // absent keeps today's behavior off-cluster.
+        let publicHostname =
+            buildPublicHostnameLine (Environment.GetEnvironmentVariable("POD_IP"))
+
         $"""akka.discovery {{
   method = %s{discoveryMethod}
   kubernetes-api {{
@@ -68,4 +88,5 @@ akka.management {{
       required-contact-point-nr = %d{options.RequiredContactPoints}
     }}
   }}
-}}"""
+}}
+%s{publicHostname}"""

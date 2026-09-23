@@ -99,6 +99,11 @@ let buildServices (services: IServiceCollection) (configuration: IConfiguration)
     ArgumentNullException.ThrowIfNull(configuration)
     ArgumentNullException.ThrowIfNull(database)
 
+    // Health checks first: AddLegate registers the legate-cluster
+    // readiness check only when a HealthCheckService is already present,
+    // so reversing this order would silently skip it.
+    services.AddHealthChecks() |> ignore
+
     LegateServiceCollectionExtensions.AddLegate(
         services,
         Action<LegateBuilder>(fun builder ->
