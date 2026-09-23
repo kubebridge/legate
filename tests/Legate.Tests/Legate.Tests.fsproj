@@ -61,6 +61,7 @@
     <Compile Include="LlmCoordinationHealthTests.fs" />
     <Compile Include="KubernetesOptionsTests.fs" />
     <Compile Include="KubernetesHoconTests.fs" />
+    <Compile Include="KubernetesBootstrapTests.fs" />
     <Compile Include="SessionActorTests.fs" />
     <Compile Include="StopArbitrationTests.fs" />
     <Compile Include="ClaimHeartbeatTests.fs" />
