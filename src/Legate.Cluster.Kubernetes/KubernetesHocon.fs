@@ -52,7 +52,7 @@ module internal KubernetesHocon =
         $"""akka.discovery {{
   method = %s{discoveryMethod}
   kubernetes-api {{
-    class = "Akka.Discovery.KubernetesApiServiceDiscovery, Akka.Discovery.KubernetesApi"
+    class = "Akka.Discovery.KubernetesApi.KubernetesApiServiceDiscovery, Akka.Discovery.KubernetesApi"
     pod-label-selector = "%s{selector}"
 %s{podNamespace}  }}
 }}
