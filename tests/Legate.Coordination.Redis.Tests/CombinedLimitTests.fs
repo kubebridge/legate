@@ -11,7 +11,7 @@ open Xunit
 [<Fact>]
 let ``Two clients sharing one instance respect one combined limit`` () : Task =
     task {
-        let options, first, second = RedisTestEnvironment.connectSharedPair ()
+        let _, first, second = RedisTestEnvironment.connectSharedPair ()
         let identity = RedisTestEnvironment.freshIdentity "combined"
         let leaseTtl = TimeSpan.FromMinutes 5.
         let waiterTtl = TimeSpan.FromMinutes 5.
@@ -38,7 +38,7 @@ let ``Two clients sharing one instance respect one combined limit`` () : Task =
 [<Fact>]
 let ``Cooldown refuses new work on both clients`` () : Task =
     task {
-        let options, first, second = RedisTestEnvironment.connectSharedPair ()
+        let _, first, second = RedisTestEnvironment.connectSharedPair ()
         let identity = RedisTestEnvironment.freshIdentity "cooldown"
         let leaseTtl = TimeSpan.FromMinutes 5.
         let waiterTtl = TimeSpan.FromMinutes 5.

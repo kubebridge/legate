@@ -52,11 +52,11 @@ let ``Expired waiters stop blocking the queue`` () : Task =
         db.SortedSetAdd(RedisKey.op_Implicit queueKey, RedisValue.op_Implicit "stale-waiter", 0.0)
         |> ignore
 
-        let! outcome = client.AcquireAsync(identity, "fresh-waiter", 1, leaseTtl, waiterTtl, CancellationToken.None)
+        let! _ = client.AcquireAsync(identity, "fresh-waiter", 1, leaseTtl, waiterTtl, CancellationToken.None)
 
         // With an empty active set the fresh waiter acquires outright; the
         // proof is that the stale entry no longer blocks the queue.
-        let remaining = db.SortedSetRange(RedisKey.op_Implicit queueKey)
+        let remaining = db.SortedSetRangeByRank(RedisKey.op_Implicit queueKey)
 
         let containsStale =
             remaining |> Array.exists (fun value -> value.ToString() = "stale-waiter")
