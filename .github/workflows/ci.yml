@@ -68,6 +68,40 @@ jobs:
           path: artifacts/*.nupkg
           if-no-files-found: error
 
+  # Three-node StaticSeeds harness for the cluster runtime and the wire
+  # format (issue 145): Postgres, Redis, and three MinimalHost replicas on
+  # legate-cluster, then the .fsx mid-turn-kill smoke. Required for changes
+  # under src/Legate/Cluster/** and the wire format; runs on every PR so
+  # the gate is the job itself, not a path filter. Self-hosted Linux only:
+  # it needs the Docker daemon the runner image already carries.
+  # SECURITY: same self-hosted scoping note as build (#144).
+  cluster-compose:
+    name: Cluster compose harness (linux)
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 30
+    env:
+      LEGATE_MINIMALHOST_REPLY_DELAY_MS: "10000"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      # The smoke owns the lifecycle (up --build, quorum wait, mid-turn
+      # kill, survivor checks, teardown on success); the reply delay keeps
+      # the turn running at kill time. The teardown step is a safety net:
+      # the smoke leaves the stack up when it fails for inspection.
+      - name: Run crash-resume smoke
+        run: dotnet fsi samples/cluster-compose/smoke.crash-resume.fsx
+
+      - name: Tear down harness
+        if: always()
+        working-directory: samples/cluster-compose
+        run: docker compose down -v
+
   # Every commit in a pull request must carry a Signed-off-by trailer (DCO).
   # Values from the event payload are bound under env and never interpolated
   # into the script body.
