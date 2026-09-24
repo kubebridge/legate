@@ -10,6 +10,7 @@
     <PackageVersion Include="Akka.Discovery.KubernetesApi" Version="1.5.70" />
     <PackageVersion Include="Akka.FSharp" Version="1.5.71" />
     <PackageVersion Include="Akka.Management" Version="1.5.70" />
+    <PackageVersion Include="Anthropic" Version="12.50.0" />
     <PackageVersion Include="Cronos" Version="0.13.0" />
     <PackageVersion Include="FluentMigrator" Version="8.0.1" />
     <PackageVersion Include="FluentMigrator.Runner" Version="8.0.1" />

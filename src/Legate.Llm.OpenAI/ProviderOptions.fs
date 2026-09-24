@@ -69,9 +69,11 @@ type OpenAICompatibleProviderOptions() =
             null
 
 /// The per-preset defaults one shared transport serves. Presets carry
-/// endpoint and model defaults only; there is no Anthropic-native SDK and no
-/// separate local-Ollama preset (the compatible preset covers any base URL,
-/// including a local Ollama endpoint).
+/// endpoint and model defaults only; the Anthropic preset serves the
+/// OpenAI-compatible endpoint shape (the native provider lives in
+/// <c>Legate.Llm.Anthropic</c>) and there is no separate local-Ollama preset
+/// (the compatible preset covers any base URL, including a local Ollama
+/// endpoint).
 module internal Presets =
 
     /// One preset's endpoint and model defaults plus its capability flag.
@@ -99,7 +101,8 @@ module internal Presets =
 
     /// The Anthropic preset: the Anthropic OpenAI-compatible v1 endpoint
     /// serving claude-sonnet by default. Compatible-shape payloads only;
-    /// there is no Anthropic-native SDK in this package.
+    /// the native provider lives in <c>Legate.Llm.Anthropic</c> and registers
+    /// through <c>AddAnthropic</c>.
     let Anthropic =
         {
             Id = "anthropic"
