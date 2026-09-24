@@ -95,6 +95,25 @@ Target.create "Pack" (fun _ ->
         ]
         rootPath)
 
+// Builds the DocFX documentation site from Docs/docfx.json into Docs/_site.
+// Builds the solution in Release first so the DLL+XML metadata sources
+// exist, then runs docfx (both through the pinned local tools, so this
+// target starts with a tool restore like Restore does).
+Target.create "Docs" (fun _ ->
+    run dotnet [ "tool"; "restore" ] rootPath
+
+    run
+        dotnet
+        [
+            "build"
+            solution
+            "--configuration"
+            "Release"
+        ]
+        rootPath
+
+    run dotnet [ "docfx"; "Docs/docfx.json" ] rootPath)
+
 open Fake.Core.TargetOperators
 
 "Clean" ==> "Restore" ==> "Build" ==> "Test"

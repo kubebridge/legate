@@ -68,3 +68,53 @@ jobs:
         with:
           name: nuget-packages
           path: artifacts/*.nupkg
+
+  docs:
+    name: Build and deploy docs
+    # Deploys the DocFX site to GitHub Pages on version tags. Requires a
+    # maintainer to enable Pages on the repository first (source: GitHub
+    # Actions); until then this job fails at the deploy step while the
+    # build and artifact steps still verify the site.
+    # Same org self-hosted Linux runner as ci.yml; see the SECURITY note
+    # there before this repository goes public (#144).
+    runs-on: [self-hosted, linux, x64]
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      # The tag is externally influenced: validate it before use and bind
+      # it under env rather than interpolating into the script (same
+      # semver check as the publish job).
+      - name: Validate version tag
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$TAG_NAME" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::Tag '$TAG_NAME' is not a semantic version tag (vX.Y.Z or vX.Y.Z-suffix)."
+            exit 1
+          fi
+
+      - name: Build docs site
+        run: dotnet fsi build.fsx -- -t Docs
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: Docs/_site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
