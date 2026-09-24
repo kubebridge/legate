@@ -5,7 +5,7 @@ open System
 open System.Runtime.CompilerServices
 open Microsoft.Extensions.Configuration
 
-// Registration over LegateBuilder.Llm: AddOpenAI, AddAnthropic,
+// Registration over LegateBuilder.Llm: AddOpenAI, AddAnthropicCompatible,
 // AddOllamaCloud, and AddOpenAICompatible(name, baseUrl). Each preset binds
 // its Legate:Llm:Providers:<Name> section over the preset defaults
 // (endpoint, default model, timeout, reasoning flag), applies the optional
@@ -82,25 +82,32 @@ type OpenAILlmBuilderExtensions =
         ArgumentNullException.ThrowIfNull(configure)
         Registration.addPreset (builder, configuration, Presets.OpenAI, configure)
 
-    /// Registers the Anthropic preset (<c>anthropic</c>, the Anthropic
-    /// OpenAI-compatible v1 endpoint, <c>claude-sonnet</c>) bound from
-    /// <c>Legate:Llm:Providers:anthropic</c>. Compatible-shape payloads
-    /// only; there is no Anthropic-native SDK in this package.
+    /// Registers the Anthropic compatible preset (<c>anthropic</c>, the
+    /// Anthropic OpenAI-compatible v1 endpoint, <c>claude-sonnet</c>)
+    /// bound from <c>Legate:Llm:Providers:anthropic</c>. Compatible-shape
+    /// payloads only; the native provider lives in
+    /// <c>Legate.Llm.Anthropic</c> (<c>builder.Llm.AddAnthropic(...)</c>).
+    /// Do not register both under <c>anthropic</c>: the last registration
+    /// wins.
     /// <param name="builder">The LLM builder receiving the provider.</param>
     /// <param name="configuration">The application configuration root.</param>
     /// <returns>The same builder, for chaining.</returns>
     [<Extension>]
-    static member AddAnthropic(builder: Legate.LlmBuilder, configuration: IConfiguration) : Legate.LlmBuilder =
+    static member AddAnthropicCompatible
+        (builder: Legate.LlmBuilder, configuration: IConfiguration)
+        : Legate.LlmBuilder =
         Registration.addPreset (builder, configuration, Presets.Anthropic, null)
 
-    /// Registers the Anthropic preset bound from
+    /// Registers the Anthropic compatible preset bound from
     /// <c>Legate:Llm:Providers:anthropic</c>, adjusted by the callback.
+    /// Compatible-shape payloads only; for the native provider see
+    /// <c>Legate.Llm.Anthropic</c>.
     /// <param name="builder">The LLM builder receiving the provider.</param>
     /// <param name="configuration">The application configuration root.</param>
     /// <param name="configure">Adjusts the bound options before registration.</param>
     /// <returns>The same builder, for chaining.</returns>
     [<Extension>]
-    static member AddAnthropic
+    static member AddAnthropicCompatible
         (builder: Legate.LlmBuilder, configuration: IConfiguration, configure: Action<OpenAICompatibleProviderOptions>)
         : Legate.LlmBuilder =
         ArgumentNullException.ThrowIfNull(configure)

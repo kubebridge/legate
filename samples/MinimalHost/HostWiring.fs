@@ -158,7 +158,7 @@ let buildServices (services: IServiceCollection) (configuration: IConfiguration)
                 builder.UseRedisCoordination(configuration) |> ignore
 
             if hasKey "ANTHROPIC_API_KEY" then
-                builder.Llm.AddAnthropic(configuration) |> ignore
+                builder.Llm.AddAnthropicCompatible(configuration) |> ignore
 
             if hasKey "OPENAI_API_KEY" then
                 builder.Llm.AddOpenAI(configuration) |> ignore

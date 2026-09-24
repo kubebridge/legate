@@ -3,6 +3,7 @@
     <Project Path="src/Legate.Abstractions/Legate.Abstractions.fsproj" />
     <Project Path="src/Legate/Legate.fsproj" />
     <Project Path="src/Legate.Llm.Google/Legate.Llm.Google.fsproj" />
+    <Project Path="src/Legate.Llm.Anthropic/Legate.Llm.Anthropic.fsproj" />
     <Project Path="src/Legate.Llm.OpenAI/Legate.Llm.OpenAI.fsproj" />
     <Project Path="src/Legate.Storage.InMemory/Legate.Storage.InMemory.fsproj" />
     <Project Path="src/Legate.Storage.FileSystem/Legate.Storage.FileSystem.fsproj" />
@@ -21,6 +22,7 @@
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/Legate.Tests/Legate.Tests.fsproj" />
+    <Project Path="tests/Legate.Llm.Anthropic.Tests/Legate.Llm.Anthropic.Tests.fsproj" />
     <Project Path="tests/Legate.Workspace.Docker.Tests/Legate.Workspace.Docker.Tests.fsproj" />
     <Project Path="tests/Legate.Storage.Postgres.Tests/Legate.Storage.Postgres.Tests.fsproj" />
     <Project Path="tests/Legate.Storage.S3.Tests/Legate.Storage.S3.Tests.fsproj" />
