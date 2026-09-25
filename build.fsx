@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #r "nuget:Fake.Core.Target, 5.23"
 #r "nuget:Fake.IO.FileSystem, 5.23"
 
@@ -50,6 +51,54 @@ Target.create "Format" (fun _ -> runFantomas [])
 // Helpers.createProcess pipes through CreateProcess.ensureExitCode, so drift
 // fails the target without extra handling.
 Target.create "CheckFormat" (fun _ -> runFantomas [ "--check" ])
+
+// The single source of truth for the Apache 2.0 SPDX header scope. CI calls
+// this target rather than restating the paths, so adding a tree here is the
+// only edit a new scope needs.
+let headerRoots = [ "src"; "tests"; "samples"; ".build" ]
+
+let headerExtensions = Set.ofList [ ".fs"; ".fsi"; ".fsx" ]
+
+let generatedDirs = Set.ofList [ "obj"; "bin"; ".git" ]
+
+let isGeneratedPath (path: string) =
+    path.Split(
+        [|
+            System.IO.Path.DirectorySeparatorChar
+            System.IO.Path.AltDirectorySeparatorChar
+        |]
+    )
+    |> Array.exists generatedDirs.Contains
+
+let headerCandidates () =
+    let fromRoot root =
+        System.IO.Directory.EnumerateFiles(root, "*", System.IO.SearchOption.AllDirectories)
+        |> Seq.filter (fun f -> headerExtensions.Contains(System.IO.Path.GetExtension f))
+        |> Seq.filter (isGeneratedPath >> not)
+        |> Seq.toList
+
+    let roots =
+        headerRoots
+        |> List.choose (fun rel ->
+            let full = Path.combine rootPath rel
+            if System.IO.Directory.Exists full then Some full else None)
+
+    Path.combine rootPath "build.fsx" :: List.collect fromRoot roots
+
+let filesMissingSpdxHeader () =
+    headerCandidates ()
+    |> List.filter (fun file ->
+        System.IO.File.ReadAllText file
+        |> fun text -> text.Contains "SPDX-License-Identifier: Apache-2.0" |> not)
+    |> List.sort
+
+// Fails the build when any F# source file lacks the Apache 2.0 SPDX header.
+Target.create "CheckHeaders" (fun _ ->
+    match filesMissingSpdxHeader () with
+    | [] -> printfn "All source files carry the SPDX header."
+    | missing ->
+        missing |> List.iter (printfn "Missing SPDX header: %s")
+        failwithf "%d file(s) missing the SPDX-License-Identifier: Apache-2.0 header." missing.Length)
 
 // Smoke-runs both samples on scripted transports (no keys, no network):
 // Headless proves one prompt, its exit code, and its signed webhook, and

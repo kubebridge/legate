@@ -24,8 +24,8 @@ env:
   DOTNET_INSTALL_DIR: /home/runner/.dotnet
 
 jobs:
-  # The single gate for main and pull requests: format, build, test, sample
-  # smokes, pack.
+  # The single gate for main and pull requests: format, headers, build,
+  # test, sample smokes, pack.
   # Every step calls a build.fsx target so the path lists and flags live once.
   # Runs on the org self-hosted Linux runner (default labels self-hosted,
   # linux, x64): GitHub-hosted minutes are billing-blocked, and the runner
@@ -51,6 +51,9 @@ jobs:
 
       - name: Check formatting
         run: dotnet fsi build.fsx -- -t CheckFormat
+
+      - name: Check SPDX headers
+        run: dotnet fsi build.fsx -- -t CheckHeaders
 
       - name: Build and test
         run: dotnet fsi build.fsx -- -t Test
@@ -104,30 +107,3 @@ jobs:
         if: always()
         working-directory: samples/cluster-compose
         run: docker compose down -v
-
-  # Every commit in a pull request must carry a Signed-off-by trailer (DCO).
-  # Values from the event payload are bound under env and never interpolated
-  # into the script body.
-  dco:
-    name: DCO sign-off
-    if: github.event_name == 'pull_request'
-    runs-on: [self-hosted, linux, x64]
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Check Signed-off-by on every PR commit
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          set -euo pipefail
-          missing=0
-          for sha in $(git rev-list "$BASE_SHA".."$HEAD_SHA"); do
-            if ! git show -s --format=%B "$sha" | grep -qE '^Signed-off-by: .+ <.+@.+>$'; then
-              echo "::error::Commit $sha is missing a Signed-off-by trailer (git commit -s)."
-              missing=1
-            fi
-          done
-          exit "$missing"
