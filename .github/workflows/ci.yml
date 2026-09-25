@@ -30,12 +30,14 @@ jobs:
   # Runs on the org self-hosted Linux runner (default labels self-hosted,
   # linux, x64): GitHub-hosted minutes are billing-blocked, and the runner
   # image already carries the .NET SDKs plus a Docker daemon for Testcontainers.
-  # SECURITY: before this repository goes public (#144), re-scope these jobs so
-  # untrusted fork PRs never execute on self-hosted infrastructure.
   # Windows leg parked: windows-latest cannot start while billing is broken.
   # Restore the matrix entry when billing is fixed.
   build:
     name: Build and test (linux)
+    # Self-hosted scoping (#144): untrusted fork PRs never execute on
+    # self-hosted infrastructure. Pushes, workflow_dispatch, and same-repo
+    # PRs run unchanged.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v4
@@ -77,12 +79,14 @@ jobs:
   # Three-node StaticSeeds harness for the cluster runtime and the wire
   # format (issue 145): Postgres, Redis, and three MinimalHost replicas on
   # legate-cluster, then the .fsx mid-turn-kill smoke. Required for changes
-  # under src/Legate/Cluster/** and the wire format; runs on every PR so
-  # the gate is the job itself, not a path filter. Self-hosted Linux only:
-  # it needs the Docker daemon the runner image already carries.
-  # SECURITY: same self-hosted scoping note as build (#144).
+  # under src/Legate/Cluster/** and the wire format; runs on every same-repo
+  # PR so the gate is the job itself, not a path filter. Self-hosted Linux
+  # only: it needs the Docker daemon the runner image already carries.
   cluster-compose:
     name: Cluster compose harness (linux)
+    # Self-hosted scoping (#144): untrusted fork PRs never execute on
+    # self-hosted infrastructure (same guard as build).
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, linux, x64]
     timeout-minutes: 30
     env:

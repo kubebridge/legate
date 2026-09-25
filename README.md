@@ -1,5 +1,8 @@
 # Legate
 
+[![CI](https://github.com/kubebridge/legate/actions/workflows/ci.yml/badge.svg)](https://github.com/kubebridge/legate/actions/workflows/ci.yml)
+[![NuGet](https://img.shields.io/nuget/v/Legate.svg)](https://www.nuget.org/packages/Legate)
+
 > A durable Akka.NET runtime for tool-using AI agents.
 
 Legate is an **agent harness** for .NET. You register it in a host (ASP.NET
@@ -25,8 +28,10 @@ permissions) sits behind an interface with a default implementation.
 
 ## Status
 
-Pre-release. The public API described in `Docs/ARCHITECTURE.md` is being
-built; nothing is published to NuGet yet.
+First public release: `Legate` `0.1.0` is published to
+[nuget.org](https://www.nuget.org/packages/Legate). The API described in
+`Docs/ARCHITECTURE.md` is still being built out; expect breaking changes
+between `0.x` releases.
 
 ## Building
 

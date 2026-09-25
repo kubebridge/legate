@@ -148,10 +148,9 @@ they exist, the `samples/` hosts run locally (`dotnet run --project samples/<Nam
 Default QA target: the test suite.
 
 Releases: pushing a tag `vX.Y.Z[-suffix]` runs `.github/workflows/release.yml`,
-which tests, packs with that version, and publishes to GitHub Packages
-(`https://nuget.pkg.github.com/kubebridge/index.json`). Switch the source
-and API key to nuget.org for the first public release. The release workflow
-has not yet been exercised by a real tag.
+which tests, packs with that version, and publishes to nuget.org
+(`https://api.nuget.org/v3/index.json`) with the `NUGET_API_KEY` secret.
+The release workflow has not yet been exercised by a real tag.
 
 ## Branch Map
 
