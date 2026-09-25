@@ -336,6 +336,34 @@ let ``Prompt with Inject folds into the running turn`` () : Task =
             entered.Dispose()
     }
 
+/// Asserts the pre-empted turn settled Aborted for the interrupt.
+/// Pure so the resumable test stays a straight-line await plus a return.
+let private checkPreemptedOutcome (outcome: TurnOutcome | null) =
+    match outcome with
+    | :? TurnAborted as aborted ->
+        aborted.Cause |> should equal StopCause.ExplicitAbort
+        aborted.Reason |> should equal SessionActor.InterruptReason
+    | _ -> failwith "Expected the pre-empted turn to settle Aborted."
+
+/// Asserts the aborted turn carries the explicit-abort stop cause.
+/// Pure so the resumable test stays a straight-line await plus a return.
+let private checkAbortedOutcome (outcome: TurnOutcome | null) =
+    match outcome with
+    | :? TurnAborted as outcome ->
+        outcome.Cause |> should equal StopCause.ExplicitAbort
+        outcome.Reason |> should equal "test-abort"
+    | _ -> failwith "Expected the aborted turn to carry the stop cause."
+
+/// Asserts the fork carried the source metadata and options over. Pure
+/// so the resumable test stays a straight-line await plus a return.
+let private checkForkedMetadata (options: SessionOptions) (sourceId: SessionId) =
+    match Option.ofObj options.Metadata with
+    | None -> failwith "Expected the fork to carry metadata."
+    | Some forkedMetadata ->
+        options.MaxIterations |> should equal 7
+        forkedMetadata["ForkedFrom"] |> should equal (sourceId.ToString())
+        forkedMetadata["lane"] |> should equal "evening"
+
 [<Fact>]
 let ``Prompt with Interrupt pre-empts and drains first`` () : Task =
     task {
@@ -397,11 +425,7 @@ let ``Prompt with Interrupt pre-empts and drains first`` () : Task =
                         let! first = awaitWhat waiter.Task "the pre-empted turn to settle"
                         first.Status |> should equal TurnStatus.Aborted
 
-                        match first.Outcome with
-                        | :? TurnAborted as aborted ->
-                            aborted.Cause |> should equal StopCause.ExplicitAbort
-                            aborted.Reason |> should equal SessionActor.InterruptReason
-                        | _ -> failwith "Expected the pre-empted turn to settle Aborted."
+                        checkPreemptedOutcome first.Outcome
 
                         let! second = awaitWhat secondWaiter.Task "the interrupt turn to settle"
                         second.Status |> should equal TurnStatus.Completed
@@ -635,11 +659,7 @@ let ``Abort while Running settles Aborted with zero loser effects`` () : Task =
                         let! aborted = awaitWhat waiter.Task "the aborted turn to settle"
                         aborted.Status |> should equal TurnStatus.Aborted
 
-                        match aborted.Outcome with
-                        | :? TurnAborted as outcome ->
-                            outcome.Cause |> should equal StopCause.ExplicitAbort
-                            outcome.Reason |> should equal "test-abort"
-                        | _ -> failwith "Expected the aborted turn to carry the stop cause."
+                        checkAbortedOutcome aborted.Outcome
 
                         // The settle already won: the loser's late report
                         // takes zero further effects.
@@ -1579,12 +1599,7 @@ let ``Fork copies the prefix and references the source`` () : Task =
                     forked.State |> should equal SessionState.Idle
                     forked.CurrentTurnId.HasValue |> should equal false
 
-                    match Option.ofObj forked.Options.Metadata with
-                    | None -> failwith "Expected the fork to carry metadata."
-                    | Some forkedMetadata ->
-                        forked.Options.MaxIterations |> should equal 7
-                        forkedMetadata["ForkedFrom"] |> should equal (created.Id.ToString())
-                        forkedMetadata["lane"] |> should equal "evening"
+                    checkForkedMetadata forked.Options created.Id
 
                     let! forkedEvents = readAllEvents client forked.Id
                     forkedEvents.Length |> should equal sourceEvents.Length
