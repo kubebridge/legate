@@ -100,6 +100,31 @@ module internal ClaimHeartbeat =
         /// injected observer).
         | StopCancelled
 
+    /// Decides one renewal outcome: renewed and held continue, expiring
+    /// renews now, lost and missing stop with lease loss, and an observed
+    /// cancellation stops with cancellation even when the lease is live.
+    /// Pure over the renewal outcome so the resumable step stays a
+    /// straight-line await plus a return.
+    /// <param name="state">The renewal outcome. Must not be null.</param>
+    /// <param name="cancelled">Whether a host cancel was observed mid-renewal.</param>
+    /// <returns>What the renewal decided.</returns>
+    let private decide (state: TurnLeaseState) (cancelled: bool) : ClaimHeartbeatDecision =
+        if isNull (box state) then
+            raise (InvalidOperationException("The claim renewal returned null instead of a lease state."))
+        else
+            match state with
+            | :? TurnLeaseRenewed as renewed -> if cancelled then StopCancelled else Continue renewed.Claim
+            | :? TurnLeaseHeld as held -> if cancelled then StopCancelled else Continue held.Claim
+            | :? TurnLeaseExpiring as expiring -> if cancelled then StopCancelled else RenewNow expiring.Claim
+            | :? TurnLeaseLost -> StopLeaseLost
+            | :? TurnLeaseMissing -> StopLeaseLost
+            | unknown ->
+                raise (
+                    InvalidOperationException(
+                        $"The claim renewal returned an unknown lease state: %s{unknown.GetType().FullName}."
+                    )
+                )
+
     /// Renews once and branches every renewal outcome: renewed and held
     /// continue, expiring renews now, lost and missing stop with lease
     /// loss, and an observed cancellation stops with cancellation even
@@ -133,34 +158,7 @@ module internal ClaimHeartbeat =
             // mid-renewal stops the turn even when the renew landed.
             let cancelled = isCancellationRequested ()
 
-            if isNull (box state) then
-                return raise (InvalidOperationException("The claim renewal returned null instead of a lease state."))
-            else
-                match state with
-                | :? TurnLeaseRenewed as renewed ->
-                    if cancelled then
-                        return StopCancelled
-                    else
-                        return Continue renewed.Claim
-                | :? TurnLeaseHeld as held ->
-                    if cancelled then
-                        return StopCancelled
-                    else
-                        return Continue held.Claim
-                | :? TurnLeaseExpiring as expiring ->
-                    if cancelled then
-                        return StopCancelled
-                    else
-                        return RenewNow expiring.Claim
-                | :? TurnLeaseLost -> return StopLeaseLost
-                | :? TurnLeaseMissing -> return StopLeaseLost
-                | unknown ->
-                    return
-                        raise (
-                            InvalidOperationException(
-                                $"The claim renewal returned an unknown lease state: %s{unknown.GetType().FullName}."
-                            )
-                        )
+            return decide state cancelled
         }
 
     /// The heartbeat's live view of one claim: the loop observes every step
