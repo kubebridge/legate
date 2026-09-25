@@ -1,15 +1,14 @@
 name: Release
 
-# Publishes NuGet packages when a version tag is pushed. Previews go to GitHub
-# Packages while the repository is private; switch NUGET_SOURCE and the API key
-# to nuget.org for the first public release.
+# Publishes NuGet packages to nuget.org when a version tag is pushed. Requires
+# the NUGET_API_KEY secret. The docs job requires Pages enabled (source:
+# GitHub Actions) before the first tagged release.
 on:
   push:
     tags: ["v*"]
 
 permissions:
   contents: read
-  packages: write
 
 env:
   DOTNET_NOLOGO: "1"
@@ -20,8 +19,10 @@ env:
 jobs:
   publish:
     name: Pack and publish
-    # Same org self-hosted Linux runner as ci.yml; see the SECURITY note there
-    # before this repository goes public (#144).
+    # Same org self-hosted Linux runner as ci.yml. Tags are pushable by
+    # writers only, and the fork-PR guard below keeps untrusted PRs off
+    # self-hosted infrastructure.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v4
@@ -54,10 +55,10 @@ jobs:
       - name: Pack
         run: dotnet pack Legate.slnx --configuration Release --output artifacts -p:Version="$PACKAGE_VERSION"
 
-      - name: Publish to GitHub Packages
+      - name: Publish to nuget.org
         env:
-          NUGET_SOURCE: https://nuget.pkg.github.com/kubebridge/index.json
-          NUGET_API_KEY: ${{ secrets.GITHUB_TOKEN }}
+          NUGET_SOURCE: https://api.nuget.org/v3/index.json
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
         run: |
           set -euo pipefail
           for package in artifacts/*.nupkg; do
@@ -75,8 +76,9 @@ jobs:
     # maintainer to enable Pages on the repository first (source: GitHub
     # Actions); until then this job fails at the deploy step while the
     # build and artifact steps still verify the site.
-    # Same org self-hosted Linux runner as ci.yml; see the SECURITY note
-    # there before this repository goes public (#144).
+    # Same org self-hosted Linux runner as ci.yml, with the same fork-PR
+    # guard as the publish job.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, linux, x64]
     permissions:
       contents: read
