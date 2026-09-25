@@ -119,6 +119,39 @@ module internal ScheduleEvaluator =
 
         sweep lookbackWindows
 
+    /// Whether one agent's schedule can fire this pass: present,
+    /// enabled, and backed by a parsable cron plus a known time zone.
+    /// Pure so the resumable sweep stays an if chain.
+    /// <param name="schedule">The agent schedule, or null when unscheduled.</param>
+    /// <returns>True when the schedule is present, enabled, and valid.</returns>
+    let private isSweepable (schedule: AgentSchedule | null) : bool =
+        match schedule with
+        | null -> false
+        | s ->
+            if not s.Enabled then
+                false
+            elif not (AgentScheduleRules.TryValidateCron s.Cron) then
+                false
+            elif not (AgentScheduleRules.TryValidateTimeZone s.TimeZone) then
+                false
+            else
+                true
+
+    /// Narrows a sweepable schedule to non-null. Call only after
+    /// isSweepable; pure so the resumable sweep stays an if chain.
+    /// <param name="schedule">The agent schedule, known sweepable.</param>
+    /// <returns>The schedule as non-null.</returns>
+    let private asSweepable (schedule: AgentSchedule | null) : AgentSchedule =
+        match schedule with
+        | null -> raise (InvalidOperationException("The agent schedule is null."))
+        | s -> s
+
+    /// Whether a consume outcome won the occurrence.
+    /// Pure so the resumable sweep stays an if chain.
+    /// <param name="outcome">The consume outcome.</param>
+    /// <returns>True when the occurrence was consumed by this instance.</returns>
+    let private isConsumeWin (outcome: ScheduleOccurrenceOutcome) : bool = outcome :? ScheduleOccurrenceConsumed
+
     /// Sweeps one agent: consumes every due occurrence in the winning
     /// window and fires the latest on a consume win. Older missed
     /// occurrences are consumed without firing; an already-consumed latest
@@ -149,56 +182,54 @@ module internal ScheduleEvaluator =
             cancellationToken.ThrowIfCancellationRequested()
 
             try
-                match agent.Schedule with
-                | null -> return 0
-                | schedule when not schedule.Enabled -> return 0
-                | schedule ->
-                    if not (AgentScheduleRules.TryValidateCron schedule.Cron) then
-                        return 0
-                    elif not (AgentScheduleRules.TryValidateTimeZone schedule.TimeZone) then
+                let schedule = agent.Schedule
+
+                if not (isSweepable schedule) then
+                    return 0
+                else
+                    let sweepable = asSweepable schedule
+                    let zone = AgentScheduleRules.ResolveTimeZone sweepable.TimeZone
+                    let expression = CronExpression.Parse(sweepable.Cron, CronFormat.Standard)
+                    let now = clock.GetUtcNow()
+                    let due = dueOccurrences expression zone now
+
+                    if List.isEmpty due then
                         return 0
                     else
-                        let zone = AgentScheduleRules.ResolveTimeZone schedule.TimeZone
-                        let expression = CronExpression.Parse(schedule.Cron, CronFormat.Standard)
-                        let now = clock.GetUtcNow()
+                        let latest = due |> List.max
+                        let latestUtc = latest.ToUniversalTime()
 
-                        match dueOccurrences expression zone now with
-                        | [] -> return 0
-                        | due ->
-                            let latest = due |> List.max
-                            let latestUtc = latest.ToUniversalTime()
+                        for occurrence in due do
+                            if occurrence < latest then
+                                let key = occurrenceKey agent.Id sweepable.Cron (occurrence.ToUniversalTime())
 
-                            for occurrence in due do
-                                if occurrence < latest then
-                                    let key = occurrenceKey agent.Id schedule.Cron (occurrence.ToUniversalTime())
+                                let! _ =
+                                    agentStore.TryConsumeScheduleOccurrence(
+                                        tenant,
+                                        agent.Id,
+                                        key,
+                                        occurrence.ToUniversalTime(),
+                                        cancellationToken
+                                    )
 
-                                    let! _ =
-                                        agentStore.TryConsumeScheduleOccurrence(
-                                            tenant,
-                                            agent.Id,
-                                            key,
-                                            occurrence.ToUniversalTime(),
-                                            cancellationToken
-                                        )
+                                ()
 
-                                    ()
+                        let latestKey = occurrenceKey agent.Id sweepable.Cron latestUtc
 
-                            let latestKey = occurrenceKey agent.Id schedule.Cron latestUtc
+                        let! outcome =
+                            agentStore.TryConsumeScheduleOccurrence(
+                                tenant,
+                                agent.Id,
+                                latestKey,
+                                latestUtc,
+                                cancellationToken
+                            )
 
-                            let! outcome =
-                                agentStore.TryConsumeScheduleOccurrence(
-                                    tenant,
-                                    agent.Id,
-                                    latestKey,
-                                    latestUtc,
-                                    cancellationToken
-                                )
-
-                            match outcome with
-                            | :? ScheduleOccurrenceConsumed ->
-                                do! fireAsync agent schedule latestUtc cancellationToken
-                                return 1
-                            | _ -> return 0
+                        if isConsumeWin outcome then
+                            do! fireAsync agent sweepable latestUtc cancellationToken
+                            return 1
+                        else
+                            return 0
             with
             | :? OperationCanceledException as cancelled -> return raise cancelled
             | _ -> return 0

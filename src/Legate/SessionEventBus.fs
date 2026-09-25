@@ -322,6 +322,37 @@ type SessionEventBus
 
     let isDisposed () = Volatile.Read(&disposed) = 1
 
+    /// Maps one replay outcome to its read result: pages yield their
+    /// events, end of stream yields empty, and control branches raise
+    /// their typed exceptions. Pure so the resumable read stays a
+    /// straight-line await plus a return.
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="outcome">The replay outcome. Must not be null.</param>
+    /// <returns>The journaled events, in sequence order; empty at end of stream.</returns>
+    let mapReplayOutcome (tenant: TenantId) (outcome: EventReplayOutcome) : IReadOnlyList<SessionEvent> =
+        match outcome with
+        | :? EventReplayPage as page when not (isNull (box page)) ->
+            if isNull (box page.Events) then
+                Array.Empty<SessionEvent>() :> IReadOnlyList<SessionEvent>
+            else
+                page.Events
+        | :? EventReplayEndOfStream -> Array.Empty<SessionEvent>() :> IReadOnlyList<SessionEvent>
+        | :? EventReplayUnknownSession as unknown when not (isNull (box unknown)) ->
+            raise (
+                SessionNotFoundException(
+                    unknown.SessionId,
+                    sprintf "No session %O exists in tenant %O." unknown.SessionId tenant
+                )
+            )
+        | :? EventReplayJournalExpired as expired when not (isNull (box expired)) ->
+            raise (
+                SessionJournalExpiredException(
+                    expired.SessionId,
+                    sprintf "The journal for session %O is gone." expired.SessionId
+                )
+            )
+        | _ -> raise (InvalidOperationException("The event store returned an unknown replay outcome."))
+
     let publishToHub (tenant: TenantId) (sessionId: SessionId) (stamped: IReadOnlyList<SessionEvent>) =
         match hubs.TryGetValue((tenant, sessionId)) with
         | false, _ -> ()
@@ -432,30 +463,7 @@ type SessionEventBus
             if isNull (box outcome) then
                 return raise (InvalidOperationException("The event store returned null."))
             else
-                match outcome with
-                | :? EventReplayPage as page when not (isNull (box page)) ->
-                    if isNull (box page.Events) then
-                        return Array.Empty<SessionEvent>() :> IReadOnlyList<SessionEvent>
-                    else
-                        return page.Events
-                | :? EventReplayEndOfStream -> return Array.Empty<SessionEvent>() :> IReadOnlyList<SessionEvent>
-                | :? EventReplayUnknownSession as unknown when not (isNull (box unknown)) ->
-                    return
-                        raise (
-                            SessionNotFoundException(
-                                unknown.SessionId,
-                                sprintf "No session %O exists in tenant %O." unknown.SessionId tenant
-                            )
-                        )
-                | :? EventReplayJournalExpired as expired when not (isNull (box expired)) ->
-                    return
-                        raise (
-                            SessionJournalExpiredException(
-                                expired.SessionId,
-                                sprintf "The journal for session %O is gone." expired.SessionId
-                            )
-                        )
-                | _ -> return raise (InvalidOperationException("The event store returned an unknown replay outcome."))
+                return mapReplayOutcome tenant outcome
         }
 
     /// Subscribes to the session's events from the cursor: replays the
