@@ -133,9 +133,35 @@ module DockerIntegrationTests =
             do! workspace.DisposeAsync()
         }
 
-    // See #245: the docker-exec round-trip live test lived here; removed
-    // because the self-hosted runner's DinD bind-mount mismatch fails
-    // container-side reads environmentally. Restore is tracked there.
+    [<Fact>]
+    let ``Exec round-trips through docker exec with environment`` () =
+        task {
+            DockerTestDaemon.ensureReady ()
+
+            let root = DockerTestHelpers.freshRoot ()
+            let runtime = DockerWorkspaceRuntime(optionsForIntegration root, null, null)
+            let session = DockerTestHelpers.sessionFor ()
+
+            use! workspace = (runtime :> IWorkspaceRuntime).Bind(session, null, CancellationToken.None)
+
+            let fileName = "exec-roundtrip.txt"
+            let fileContent = "legate-exec-mount-probe"
+            let envName = "LEGATE_EXEC_PROBE"
+            let envValue = "probe-value"
+
+            do! workspace.WriteFile(fileName, Encoding.UTF8.GetBytes fileContent, CancellationToken.None)
+
+            let env = readOnlyDict [ envName, envValue ]
+
+            let! outcome = workspace.Exec($"cat {fileName} && echo ${envName}", Nullable(), env, CancellationToken.None)
+
+            Assert.Equal(0, outcome.ExitCode)
+            Assert.Contains(fileContent, outcome.StandardOutput)
+            Assert.Contains(envValue, outcome.StandardOutput)
+            Assert.False(outcome.TimedOut)
+
+            do! workspace.DisposeAsync()
+        }
 
     [<Fact>]
     let ``Readiness probes the daemon`` () =
