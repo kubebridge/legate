@@ -54,8 +54,9 @@ start-to-first-token budget. Akka stays for single-node on these numbers.
 
 ## Contributing
 
-See `CONTRIBUTING.md`. Contributions are accepted under the DCO; sign your
-commits with `git commit -s`.
+See `CONTRIBUTING.md`. Contributions are accepted under the Individual
+Contributor License Agreement (`CLA.md`); accept it once on your first pull
+request.
 
 ## License
 

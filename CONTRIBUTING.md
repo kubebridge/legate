@@ -4,19 +4,24 @@ Thanks for considering a contribution. This document covers the mechanics;
 the design and conventions live in `Docs/ARCHITECTURE.md` and
 `Docs/agents/code-rules.md`.
 
-## Developer Certificate of Origin
+## Contributor License Agreement
 
-Contributions are accepted under the [Developer Certificate of Origin](https://developercertificate.org/)
-(DCO) rather than a CLA. Every commit must carry a `Signed-off-by` trailer
-that matches the commit author:
+Contributions are accepted under the Individual Contributor License Agreement
+(`CLA.md`) rather than a sign-off trailer. The CLA grants KubeBridge an
+Apache-2.0-consistent copyright and patent license for your contributions so
+Legate can stay open-source under the Apache License 2.0.
+
+Accept it once by posting the following statement on your first pull request:
 
 ```
-git commit -s -m "add session store contract"
+I have read the Legate Individual Contributor License Agreement (`CLA.md`)
+and I agree to its terms for this and all future contributions I make to
+Legate.
 ```
 
-By signing off you certify that you wrote the change or otherwise have the
-right to submit it under the Apache 2.0 license. CI rejects pull requests
-whose commits are missing the trailer.
+Maintainers verify the statement before merging; it then covers all of your
+future contributions unless you withdraw in writing. No `Signed-off-by`
+trailer is required on commits.
 
 ## Workflow
 
