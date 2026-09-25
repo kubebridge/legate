@@ -342,6 +342,16 @@ let ``StartupRequired false stays Healthy without touching the seam`` () : Task 
         result.Status |> should equal HealthStatus.Healthy
     }
 
+/// Asserts the canary recorded the missing-client failure naming the
+/// admission seam. Pure so the resumable test stays a straight-line
+/// await plus a return.
+let private checkMissingClientOutcome (outcome: HealthCheckResult option) =
+    match outcome with
+    | None -> failwith "expected the canary to record an outcome"
+    | Some recorded ->
+        recorded.Status |> should equal HealthStatus.Unhealthy
+        recorded |> describes "IDistributedLlmAdmission" |> should equal true
+
 [<Fact>]
 let ``Missing client records failure naming the client`` () : Task =
     task {
@@ -352,11 +362,7 @@ let ``Missing client records failure naming the client`` () : Task =
 
         do! (canary :> IHostedService).StartAsync(CancellationToken.None)
 
-        match canary.Outcome with
-        | None -> failwith "expected the canary to record an outcome"
-        | Some outcome ->
-            outcome.Status |> should equal HealthStatus.Unhealthy
-            outcome |> describes "IDistributedLlmAdmission" |> should equal true
+        checkMissingClientOutcome canary.Outcome
 
         let! result = checkHealth options provider
         result.Status |> should equal HealthStatus.Unhealthy

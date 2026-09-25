@@ -1207,6 +1207,19 @@ let ``ClaimNextTurn returns the missing lease state on an empty session`` () =
     }
     |> (fun t -> t.Wait())
 
+/// Asserts the claimed turn names session-actor-1 at attempt 1 with a
+/// live token and expiry. Pure so the resumable test stays a
+/// straight-line await plus a return.
+let private checkClaimedLease (lease: TurnLeaseState) =
+    match lease with
+    | :? TurnLeaseRenewed as held ->
+        held.Claim.Owner |> should equal "session-actor-1"
+        held.Claim.Attempt |> should equal 1
+        held.Claim.Token |> should not' (equal null)
+        held.Claim.ExpiresAt |> should not' (equal null)
+        ()
+    | _ -> failwith "unreachable: the lease was a renewal"
+
 [<Fact>]
 let ``ClaimNextTurn claims a pending user-message turn under a lease`` () =
     let store = FakeSessionStore() :> ISessionStore
@@ -1228,14 +1241,7 @@ let ``ClaimNextTurn claims a pending user-message turn under a lease`` () =
 
         (lease :? TurnLeaseRenewed) |> should equal true
 
-        match lease with
-        | :? TurnLeaseRenewed as held ->
-            held.Claim.Owner |> should equal "session-actor-1"
-            held.Claim.Attempt |> should equal 1
-            held.Claim.Token |> should not' (equal null)
-            held.Claim.ExpiresAt |> should not' (equal null)
-            ()
-        | _ -> failwith "unreachable: the lease was a renewal"
+        checkClaimedLease lease
     }
     |> (fun t -> t.Wait())
 

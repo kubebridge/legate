@@ -297,6 +297,86 @@ let ``Hub replay cache evicts oldest first past the bound`` () =
     |> Seq.toList
     |> should equal [ 5L ]
 
+/// Asserts the first serve streamed both events from the store and
+/// warmed the hub cache. Pure so the resumable test stays a
+/// straight-line await plus a return.
+let private checkFirstBatch
+    (hub: CrossNodeSubscriptions.SubscriptionHub)
+    (outcome: CrossNodeSubscriptions.CrossNodeBatchOutcome)
+    =
+    match outcome with
+    | CrossNodeSubscriptions.BatchPage batch ->
+        batch.Events.Count |> should equal 2
+        batch.NextCursor |> should equal 2L
+        batch.EndOfStream |> should equal true
+        hub.CacheCount |> should equal 2
+    | CrossNodeSubscriptions.BatchUnknownSession _ -> failwith "expected a page, not unknown session"
+    | CrossNodeSubscriptions.BatchJournalExpired _ -> failwith "expected a page, not an expired journal"
+    | CrossNodeSubscriptions.BatchSubscriberCapped _ -> failwith "expected a page, not a cap"
+    | CrossNodeSubscriptions.BatchEventOversized _ -> failwith "expected a page, not an oversized event"
+
+/// Asserts the second serve replayed both events from the hub cache.
+/// Pure so the resumable test stays a straight-line await plus a return.
+let private checkCachedBatch (cached: CrossNodeSubscriptions.CrossNodeBatchOutcome) =
+    match cached with
+    | CrossNodeSubscriptions.BatchPage batch ->
+        batch.Events
+        |> Seq.map (fun evt -> evt.Sequence.Value)
+        |> Seq.toList
+        |> should equal [ 1L; 2L ]
+    | CrossNodeSubscriptions.BatchUnknownSession _ -> failwith "expected a cached page"
+    | CrossNodeSubscriptions.BatchJournalExpired _ -> failwith "expected a cached page"
+    | CrossNodeSubscriptions.BatchSubscriberCapped _ -> failwith "expected a cached page"
+    | CrossNodeSubscriptions.BatchEventOversized _ -> failwith "expected a cached page"
+
+/// Asserts the serve refused the oversized event before crossing. Pure
+/// so the resumable test stays a straight-line await plus a return.
+let private checkOversizedRefusal (sessionId: SessionId) (outcome: CrossNodeSubscriptions.CrossNodeBatchOutcome) =
+    match outcome with
+    | CrossNodeSubscriptions.BatchEventOversized(oversizedId, _, limit, observed) ->
+        oversizedId |> should equal sessionId
+        limit |> should equal 1
+        (observed > 1) |> should equal true
+    | CrossNodeSubscriptions.BatchPage _ -> failwith "expected an oversized refusal"
+    | CrossNodeSubscriptions.BatchUnknownSession _ -> failwith "expected an oversized refusal"
+    | CrossNodeSubscriptions.BatchJournalExpired _ -> failwith "expected an oversized refusal"
+    | CrossNodeSubscriptions.BatchSubscriberCapped _ -> failwith "expected an oversized refusal"
+
+/// Asserts the entity answered the subscribe with the two-event batch.
+/// Pure so the resumable test stays a straight-line await plus a return.
+let private checkEntityBatchReply (reply: obj) =
+    match reply with
+    | :? CrossNodeSubscriptions.CrossNodeEventBatch as batch ->
+        batch.Events
+        |> Seq.map (fun evt -> evt.Sequence.Value)
+        |> Seq.toList
+        |> should equal [ 1L; 2L ]
+
+        batch.NextCursor |> should equal 2L
+    | :? Exception as error -> failwith $"expected a batch but the entity answered {error.GetType().Name}"
+    | _ -> failwith "expected a batch reply"
+
+/// Polls the hub until the unsubscribe detaches or the bound lapses.
+/// A straight-line loop task so the entity test keeps only awaits and
+/// calls in its own resumable body.
+let private waitForDetachAsync
+    (hubs: ConcurrentDictionary<TenantId * string, CrossNodeSubscriptions.SubscriptionHub>)
+    (tenant: TenantId)
+    (sessionId: SessionId)
+    : Task<bool> =
+    task {
+        let mutable detached = false
+
+        for _ in 1..50 do
+            if hubs[(tenant, sessionId.ToString())].SubscriberCount = 0 then
+                detached <- true
+
+            if not detached then
+                do! Task.Delay(20)
+
+        return detached
+    }
+
 [<Fact>]
 let ``Serve batch prefers the cache and falls back to the store`` () =
     task {
@@ -330,16 +410,7 @@ let ``Serve batch prefers the cache and falls back to the store`` () =
                 CancellationToken.None
             )
 
-        match outcome with
-        | CrossNodeSubscriptions.BatchPage batch ->
-            batch.Events.Count |> should equal 2
-            batch.NextCursor |> should equal 2L
-            batch.EndOfStream |> should equal true
-            hub.CacheCount |> should equal 2
-        | CrossNodeSubscriptions.BatchUnknownSession _ -> failwith "expected a page, not unknown session"
-        | CrossNodeSubscriptions.BatchJournalExpired _ -> failwith "expected a page, not an expired journal"
-        | CrossNodeSubscriptions.BatchSubscriberCapped _ -> failwith "expected a page, not a cap"
-        | CrossNodeSubscriptions.BatchEventOversized _ -> failwith "expected a page, not an oversized event"
+        checkFirstBatch hub outcome
 
         let! cached =
             CrossNodeSubscriptions.serveBatchAsync (
@@ -353,16 +424,7 @@ let ``Serve batch prefers the cache and falls back to the store`` () =
                 CancellationToken.None
             )
 
-        match cached with
-        | CrossNodeSubscriptions.BatchPage batch ->
-            batch.Events
-            |> Seq.map (fun evt -> evt.Sequence.Value)
-            |> Seq.toList
-            |> should equal [ 1L; 2L ]
-        | CrossNodeSubscriptions.BatchUnknownSession _ -> failwith "expected a cached page"
-        | CrossNodeSubscriptions.BatchJournalExpired _ -> failwith "expected a cached page"
-        | CrossNodeSubscriptions.BatchSubscriberCapped _ -> failwith "expected a cached page"
-        | CrossNodeSubscriptions.BatchEventOversized _ -> failwith "expected a cached page"
+        checkCachedBatch cached
     }
 
 [<Fact>]
@@ -441,15 +503,7 @@ let ``Serve batch refuses oversized events before crossing`` () =
         let! outcome =
             CrossNodeSubscriptions.serveBatchAsync (events, hub, tenant, sessionId, 0L, 100, 1, CancellationToken.None)
 
-        match outcome with
-        | CrossNodeSubscriptions.BatchEventOversized(oversizedId, _, limit, observed) ->
-            oversizedId |> should equal sessionId
-            limit |> should equal 1
-            (observed > 1) |> should equal true
-        | CrossNodeSubscriptions.BatchPage _ -> failwith "expected an oversized refusal"
-        | CrossNodeSubscriptions.BatchUnknownSession _ -> failwith "expected an oversized refusal"
-        | CrossNodeSubscriptions.BatchJournalExpired _ -> failwith "expected an oversized refusal"
-        | CrossNodeSubscriptions.BatchSubscriberCapped _ -> failwith "expected an oversized refusal"
+        checkOversizedRefusal sessionId outcome
     }
 
 [<Fact>]
@@ -632,16 +686,7 @@ let ``Entity serves subscribe batches and detaches on unsubscribe`` () =
 
             let! reply = askEntity entity (request :> obj)
 
-            match reply with
-            | :? CrossNodeSubscriptions.CrossNodeEventBatch as batch ->
-                batch.Events
-                |> Seq.map (fun evt -> evt.Sequence.Value)
-                |> Seq.toList
-                |> should equal [ 1L; 2L ]
-
-                batch.NextCursor |> should equal 2L
-            | :? Exception as error -> failwith $"expected a batch but the entity answered {error.GetType().Name}"
-            | _ -> failwith "expected a batch reply"
+            checkEntityBatchReply reply
 
             hubs[(tenant, sessionId.ToString())].SubscriberCount |> should equal 1
 
@@ -658,15 +703,7 @@ let ``Entity serves subscribe batches and detaches on unsubscribe`` () =
 
             entity.Tell(unsubscribe :> obj)
 
-            let mutable detached = false
-
-            for _ in 1..50 do
-                if hubs[(tenant, sessionId.ToString())].SubscriberCount = 0 then
-                    detached <- true
-
-                if not detached then
-                    do! Task.Delay(20)
-
+            let! detached = waitForDetachAsync hubs tenant sessionId
             detached |> should equal true
         finally
             system.Terminate().GetAwaiter().GetResult() |> ignore
