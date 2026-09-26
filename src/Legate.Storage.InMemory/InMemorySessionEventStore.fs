@@ -318,6 +318,16 @@ type InMemorySessionEventStore(database: InMemoryDatabase) =
                                         source.Companions
                                     )
                                     :> SessionEvent
+                                | :? AgentInvalidEvent as source ->
+                                    AgentInvalidEvent(
+                                        sessionId,
+                                        turnId,
+                                        sequence,
+                                        timestamp,
+                                        source.AgentName,
+                                        source.Reason
+                                    )
+                                    :> SessionEvent
                                 | :? AgentSwitchedEvent as source ->
                                     AgentSwitchedEvent(
                                         sessionId,

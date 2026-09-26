@@ -597,3 +597,42 @@ type SessionEventStoreConformance
                 | _ -> failwith "expected the replay page"
             | _ -> failwith "expected the appended outcome"
         }
+
+    [<Fact>]
+    member this.``AgentInvalidEvent stamps and replays``() =
+        task {
+            let! sessionId, claim = this.ClaimedSession()
+
+            let invalid =
+                AgentInvalidEvent(
+                    sessionId,
+                    claim.TurnId,
+                    Nullable(),
+                    DateTimeOffset.MinValue,
+                    "deploy-agent",
+                    "the agent file has no description"
+                )
+                :> SessionEvent
+
+            let! outcome = eventStore.Append(tenant, sessionId, claim.Token, [ invalid ], CancellationToken.None)
+
+            match outcome with
+            | :? EventAppended as appended ->
+                Assert.Equal(1, appended.Events.Count)
+                Assert.Equal(1L, appended.Events[0].Sequence.Value)
+
+                let! replayed = eventStore.Replay(tenant, sessionId, 0L, 10, CancellationToken.None)
+
+                match replayed with
+                | :? EventReplayPage as page ->
+                    Assert.Equal(1, page.Events.Count)
+
+                    match page.Events[0] with
+                    | :? AgentInvalidEvent as roundTripped ->
+                        Assert.Equal(1L, roundTripped.Sequence.Value)
+                        Assert.Equal("deploy-agent", roundTripped.AgentName)
+                        Assert.Equal("the agent file has no description", roundTripped.Reason)
+                    | _ -> failwith "expected the agent invalid event"
+                | _ -> failwith "expected the replay page"
+            | _ -> failwith "expected the appended outcome"
+        }
