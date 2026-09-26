@@ -6,22 +6,66 @@ the design and conventions live in `Docs/ARCHITECTURE.md` and
 
 ## Contributor License Agreement
 
-Contributions are accepted under the Individual Contributor License Agreement
-(`CLA.md`) rather than a sign-off trailer. The CLA grants KubeBridge an
-Apache-2.0-consistent copyright and patent license for your contributions so
-Legate can stay open-source under the Apache License 2.0.
+**The revised agreement in `CLA.md` is a draft and is not open for signing.**
+The Steward is KUBEBRIDGE TECHNOLOGIES INC., incorporated in British Columbia,
+Canada. Legal review must be completed before a final version is published
+and activated. This draft does not cancel earlier agreements or convert earlier
+signatures into acceptance of revised terms.
+No `Signed-off-by` trailer is required on commits.
 
-Accept it once by posting the following statement on your first pull request:
+The proposed policy preserves contributor ownership and documents copyright
+and patent permissions for Apache-2.0 distribution. It grants no additional
+relicensing permission beyond Apache-2.0. Read the actual final agreement
+before accepting it; this summary is not a substitute for its terms.
 
+### Signing after activation
+
+Use the configured CLA Assistant link on your pull request only after checking
+that it displays the approved **Legate Individual Contributor License
+Agreement**, the correct legal Steward, and the final version. If the page
+instead names SAP as the recipient of the contribution rights, or otherwise
+differs from the approved agreement, stop and notify the maintainers on the
+pull request. The service provider's branding is distinct from the agreement's
+named parties.
+
+As a maintainer-verified fallback, post this statement with both placeholders
+replaced by the published final version and its immutable reference:
+
+```text
+I have read the Legate Individual Contributor License Agreement, version
+<final-version>, at <immutable-agreement-URL>, and agree to its terms for
+the Contribution in this pull request and my subsequent Contributions
+covered by that agreement.
 ```
-I have read the Legate Individual Contributor License Agreement (`CLA.md`)
-and I agree to its terms for this and all future contributions I make to
-Legate.
-```
 
-Maintainers verify the statement before merging; it then covers all of your
-future contributions unless you withdraw in writing. No `Signed-off-by`
-trailer is required on commits.
+Maintainers record the contributor's identity, acceptance date, pull request,
+agreement version, and immutable text reference. A substantive revision
+requires fresh acceptance. Withdrawal from coverage of future Contributions
+does not revoke licenses already granted.
+
+### Maintainer activation and CLA Assistant configuration
+
+1. Confirm the Steward identification in `CLA.md`, obtain legal review, and
+   replace the draft designation with an approved final version.
+2. Publish the approved text at an immutable Git commit URL. Put the same
+   agreement text in a maintainer-controlled GitHub Gist for the hosted
+   CLA Assistant service, and record its Gist revision alongside the repository
+   version. Adding `CLA.md` to the repository alone does not configure the
+   hosted service.
+3. In CLA Assistant, inspect the effective repository and organization
+   configuration for `kubebridge/legate` and link the approved Gist. Verify
+   the document shown through the actual pull-request signing link, including
+   its parties and version, before asking anyone to accept it.
+4. Preserve existing acceptance records and the exact documents they refer to.
+   Do not import signatures against a different agreement as acceptance of the
+   new one. Obtain fresh acceptance and verify the resulting pull-request check;
+   do not assume changing a Gist automatically resolves every existing PR.
+5. For signatures against an unintended agreement, retain the relevant text,
+   version, and PR reference, and contact the service operator to clarify or
+   correct the record. Changing configuration or deleting a record does not
+   itself rescind a legal agreement.
+6. Once the approved agreement and signing flow are verified, update this draft
+   status notice and the README to describe the active policy.
 
 ## Workflow
 
