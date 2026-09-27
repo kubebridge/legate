@@ -1234,3 +1234,214 @@ let ``Subscriber on node A observes a session owned by node B`` () =
             stopQuietly serviceB
             stopQuietly serviceA
     }
+
+/// Asserts the resumed stream is contiguous from the first observed
+/// cursor: a sorted scan where each next sequence is either a duplicate
+/// redelivery (at or below the last delivered) or exactly the next
+/// gap-free value. Duplicates are allowed (at-least-once); gaps fail.
+/// Pure so the restart test keeps only awaits and calls in its own
+/// resumable body.
+let private assertGapFree (received: IReadOnlyList<SessionEvent>) =
+    let ordered =
+        received
+        |> Seq.choose (fun evt ->
+            if evt.Sequence.HasValue then
+                Some evt.Sequence.Value
+            else
+                None)
+        |> Seq.sort
+        |> Seq.toList
+
+    match ordered with
+    | [] -> failwith "expected events across the restart, got none"
+    | first :: rest ->
+        let mutable prev = first
+
+        for next in rest do
+            if next <= prev then
+                ()
+            elif next = prev + 1L then
+                prev <- next
+            else
+                failwith $"gap in the resumed stream: jumped from {prev} to {next}"
+
+/// A subscriber on node A resumes gap-free across a real session-node
+/// restart: node B is terminated mid-subscription via stopQuietly, a fresh
+/// node restarts on the same port/roles against the same shared store, and
+/// the live router enumerator continues from its cursor with no sequence
+/// gaps (duplicates allowed). The shared InMemorySessionEventStore stands
+/// in for the durable journal: the What is resume-from-cursor over a
+/// surviving journal, not journal durability itself.
+[<Fact>]
+let ``Subscriber resumes gap-free across a real session-node restart`` () =
+    task {
+        let _, sessions, events = makeStores ()
+        let tenant = tenantOf "two-node-restart"
+        let options = defaultOptions ()
+        let portA = freePort ()
+
+        let serviceA = startNode portA [ $"127.0.0.1:{portA}" ] [ "api" ] events options
+
+        do! awaitUp serviceA.System (TimeSpan.FromSeconds 30.0) "node A to come Up"
+
+        let portB = freePort ()
+
+        let mutable serviceB =
+            startNode portB [ $"127.0.0.1:{portA}" ] [ "session" ] events options
+
+        try
+            do! awaitUp serviceB.System (TimeSpan.FromSeconds 30.0) "node B to join"
+
+            let resolverA = serviceA :> ISessionResolver
+            let! sessionId, claim = makeSession sessions tenant (SessionId.New())
+
+            // The resolver fronts the entity with a node-local proxy, so
+            // the owner check asks the proxy with the wire-safe string
+            // marker: the entity answers its child, whose address proves
+            // the session lives on node B.
+            use warmCts = new CancellationTokenSource(TimeSpan.FromSeconds 60.0)
+            let! proxy = resolverA.ResolveSessionAsync(sessionId.ToString(), warmCts.Token)
+            let! child = proxy.Ask<IActorRef>(sessionId.ToString(), warmCts.Token)
+
+            if child.Path.Address.Port.GetValueOrDefault(0) <> portB then
+                failwith $"Expected the session child on port {portB} but resolved {child.Path} (node A port {portA})."
+
+            let router = ClusterSubscriptions.ClusterSubscribeRouter(resolverA, events, options)
+
+            let! _ =
+                appendViaWriter
+                    events
+                    tenant
+                    sessionId
+                    claim.Token
+                    ([
+                        delta sessionId claim.TurnId "restart-pre-one"
+                        delta sessionId claim.TurnId "restart-pre-two"
+                    ]
+                    :> IReadOnlyList<_>)
+
+            // The live enumerator stays open across the kill: the prefix is
+            // driven before the restart, the tail after it, so the resume
+            // must come from its cursor over the surviving shared store.
+            let stream =
+                (router :> ISubscribeRouter).Subscribe(tenant, sessionId, 0L, CancellationToken.None)
+
+            use enumerator = stream.GetAsyncEnumerator(CancellationToken.None)
+            let received = ResizeArray<SessionEvent>()
+
+            let takeOne (what: string) =
+                task {
+                    try
+                        let! has =
+                            enumerator
+                                .MoveNextAsync()
+                                .AsTask()
+                                .WaitAsync(TimeSpan.FromSeconds 60.0, CancellationToken.None)
+
+                        if not has then
+                            failwith $"The test timed out waiting for {what}."
+                        else
+                            received.Add(enumerator.Current)
+                    with :? TimeoutException ->
+                        failwith $"The test timed out waiting for {what}."
+                }
+
+            do! takeOne "the pre-restart prefix"
+            do! takeOne "the pre-restart prefix"
+
+            received
+            |> Seq.map (fun evt -> evt.Sequence.Value)
+            |> Seq.toList
+            |> should equal [ 1L; 2L ]
+
+            // Terminate the owning node mid-subscription, journal the tail
+            // to the surviving shared store, then restart the same
+            // port/roles against it. The restarted node loses its hub
+            // cache by design, so the resume must hit the store fallback.
+            stopQuietly serviceB
+            do! Task.Delay(TimeSpan.FromSeconds 1.0)
+
+            let! _ =
+                appendViaWriter
+                    events
+                    tenant
+                    sessionId
+                    claim.Token
+                    ([
+                        delta sessionId claim.TurnId "restart-post-three"
+                        closed sessionId claim.TurnId
+                    ]
+                    :> IReadOnlyList<_>)
+
+            serviceB <- startNode portB [ $"127.0.0.1:{portA}" ] [ "session" ] events options
+            do! awaitUp serviceB.System (TimeSpan.FromSeconds 30.0) "node B to rejoin"
+
+            let mutable tailDone = false
+
+            while not tailDone do
+                do! takeOne "the post-restart tail"
+
+                if enumerator.Current :? SessionClosedEvent then
+                    tailDone <- true
+
+            assertGapFree received
+
+            received
+            |> Seq.map (fun evt -> evt.Sequence.Value)
+            |> Seq.distinct
+            |> Seq.sort
+            |> Seq.toList
+            |> should equal [ 1L; 2L; 3L; 4L ]
+
+            // Error outcomes still surface through the same router path in
+            // the restarted topology.
+            let unknown = SessionId.New()
+
+            try
+                let! _ =
+                    collectBounded
+                        ((router :> ISubscribeRouter).Subscribe(tenant, unknown, 0L, CancellationToken.None))
+                        (TimeSpan.FromSeconds 30.0)
+
+                failwith "expected SessionNotFoundException after the restart"
+            with :? SessionNotFoundException as ex ->
+                ex.SessionId |> should equal unknown
+
+            let! expiredId, expiredClaim = makeSession sessions tenant (SessionId.New())
+
+            let! _ =
+                appendViaWriter
+                    events
+                    tenant
+                    expiredId
+                    expiredClaim.Token
+                    ([
+                        delta expiredId expiredClaim.TurnId "restart-expired"
+                    ]
+                    :> IReadOnlyList<_>)
+
+            let! granted =
+                events.TryClaimCleanup(
+                    tenant,
+                    expiredId,
+                    "restart-worker",
+                    TimeSpan.FromMinutes 5.,
+                    CancellationToken.None
+                )
+
+            let lease = (granted :?> EventCleanupClaimed).Claim
+            let! _ = events.CompleteCleanup(tenant, expiredId, lease.Token, null, CancellationToken.None)
+
+            try
+                let! _ =
+                    collectBounded
+                        ((router :> ISubscribeRouter).Subscribe(tenant, expiredId, 0L, CancellationToken.None))
+                        (TimeSpan.FromSeconds 30.0)
+
+                failwith "expected SessionJournalExpiredException after the restart"
+            with :? SessionJournalExpiredException as ex ->
+                ex.SessionId |> should equal expiredId
+        finally
+            stopQuietly serviceB
+            stopQuietly serviceA
+    }
