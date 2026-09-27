@@ -7,7 +7,10 @@
 #
 #   LEGATE_MINIMALHOST_REPLY_DELAY_MS=10000 dotnet fsi samples/cluster-compose/smoke.crash-resume.fsx
 # The smoke owns the lifecycle (up --build, quorum wait, mid-turn kill,
-# survivor checks, teardown on success). Manual equivalent:
+# survivor checks, teardown on success). The smoke agent id defaults to
+# the stable literal the host and the smoke share; export
+# LEGATE_SMOKE_AGENT_ID only to override it (the default reaches every
+# node, so all three serve the same identity). Manual equivalent:
 #
 #   LEGATE_MINIMALHOST_REPLY_DELAY_MS=10000 docker compose up --build -d
 #   docker compose ps
@@ -78,6 +81,7 @@ services:
       Legate__Llm__DistributedCoordination__Mode: Redis
       Legate__Llm__DistributedCoordination__ConnectionString: redis:6379
       LEGATE_MINIMALHOST_REPLY_DELAY_MS: ${LEGATE_MINIMALHOST_REPLY_DELAY_MS:-0}
+      LEGATE_SMOKE_AGENT_ID: ${LEGATE_SMOKE_AGENT_ID:-01ARZ3NDEKTSV4RRFFQ69G5FAV}
     networks:
       - legate-cluster
     healthcheck:
@@ -116,6 +120,7 @@ services:
       Legate__Llm__DistributedCoordination__Mode: Redis
       Legate__Llm__DistributedCoordination__ConnectionString: redis:6379
       LEGATE_MINIMALHOST_REPLY_DELAY_MS: ${LEGATE_MINIMALHOST_REPLY_DELAY_MS:-0}
+      LEGATE_SMOKE_AGENT_ID: ${LEGATE_SMOKE_AGENT_ID:-01ARZ3NDEKTSV4RRFFQ69G5FAV}
     networks:
       - legate-cluster
     healthcheck:
@@ -154,6 +159,7 @@ services:
       Legate__Llm__DistributedCoordination__Mode: Redis
       Legate__Llm__DistributedCoordination__ConnectionString: redis:6379
       LEGATE_MINIMALHOST_REPLY_DELAY_MS: ${LEGATE_MINIMALHOST_REPLY_DELAY_MS:-0}
+      LEGATE_SMOKE_AGENT_ID: ${LEGATE_SMOKE_AGENT_ID:-01ARZ3NDEKTSV4RRFFQ69G5FAV}
     networks:
       - legate-cluster
     healthcheck:

@@ -108,6 +108,30 @@ let private selectLiveClient (provider: IServiceProvider) : IChatClient =
 
         live.CreateChatClient(reference, null)
 
+// ──────────────────────────────────────────────────────────────────────────
+// Smoke agent (cluster-compose crash-resume harness, issue 271)
+
+// The stable cross-node id of the code-defined smoke agent: every node
+// registers the same id, so a session opened with it resolves on any
+// survivor after the kill. The cluster-compose smoke hardcodes the same
+// literal; keep the two in sync.
+let private smokeAgentIdDefault = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+
+/// Resolves the smoke agent id: LEGATE_SMOKE_AGENT_ID when it parses as
+/// an agent id, else the fixed default. An unparsable override falls back
+/// instead of failing startup so a typo never strands every node.
+let private smokeAgentId () : AgentId =
+    match Environment.GetEnvironmentVariable("LEGATE_SMOKE_AGENT_ID") with
+    | null -> AgentId.Parse(smokeAgentIdDefault)
+    | raw when String.IsNullOrWhiteSpace(raw) -> AgentId.Parse(smokeAgentIdDefault)
+    | raw ->
+        let mutable parsed = Unchecked.defaultof<AgentId>
+
+        if AgentId.TryParse(raw.Trim(), &parsed) then
+            parsed
+        else
+            AgentId.Parse(smokeAgentIdDefault)
+
 /// Builds the container: InMemory session and event stores over one shared
 /// database by default, the process workspace, scripted-by-default
 /// providers, and the chat client the facade opts into suspendable
@@ -165,7 +189,26 @@ let buildServices (services: IServiceCollection) (configuration: IConfiguration)
 
             if hasKey "GOOGLE_API_KEY" then
                 Legate.Llm.GoogleServiceCollectionExtensions.AddGoogle(builder.Services, configuration)
-                |> ignore)
+                |> ignore
+
+            // The crash-resume smoke agent: a code-defined entry with the
+            // stable id above, the scripted model (the echo transport serves
+            // every call, holding the reply past the kill via
+            // LEGATE_MINIMALHOST_REPLY_DELAY_MS), and an empty tool
+            // selection. The harness registers no tool sources, so empty
+            // means no tools and no side-effect surface to dedup.
+            builder.Agents.Add(
+                "smoke",
+                Func<Agent, Agent>(fun template ->
+                    { template with
+                        Id = smokeAgentId ()
+                        Description = "Stable smoke agent for the cluster-compose crash-resume harness."
+                        Model = ModelReference.Parse("scripted/scripted")
+                        SystemPrompt = "You are the cluster-compose crash-resume smoke agent. Answer briefly."
+                        ToolSelection = ToolSelection()
+                    })
+            )
+            |> ignore)
     )
     |> ignore
 
