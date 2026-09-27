@@ -138,6 +138,7 @@
     <Compile Include="WireSerializationTests.fs" />
     <Compile Include="WireSerializationGoldenTests.fs" />
     <Compile Include="CrossNodeSubscriptionTests.fs" />
+    <Compile Include="TurnInCallMarkerTests.fs" />
   </ItemGroup>
 
   <ItemGroup>

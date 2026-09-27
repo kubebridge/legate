@@ -148,7 +148,7 @@ module internal SessionPermissions =
                 with _ ->
                     ()
 
-        fun entry _attempt allowed cursor reply seed runnerToken ->
+        fun entry _attempt allowed cursor reply seed runnerToken onTurnStarted ->
             let tools, loopOptions = resolveInputs entry
 
             // Fail fast outside the task computation: a null tool set or
@@ -204,7 +204,11 @@ module internal SessionPermissions =
                                 client
                                 history
                                 tools
-                                loopOptions
+                                // Fresh runs mark at the first provider-call
+                                // entry through the behavior-supplied hook.
+                                { loopOptions with
+                                    OnTurnStarted = onTurnStarted
+                                }
                                 loopDelay
                                 runnerToken
                                 (fun () -> true)
@@ -238,7 +242,11 @@ module internal SessionPermissions =
                                 client
                                 live.HistorySnapshot
                                 tools
-                                loopOptions
+                                // Resumes already marked before they
+                                // suspended: never mark on resume.
+                                { loopOptions with
+                                    OnTurnStarted = None
+                                }
                                 loopDelay
                                 runnerToken
                                 (fun () -> true)
@@ -252,7 +260,11 @@ module internal SessionPermissions =
                                 client
                                 live.HistorySnapshot
                                 tools
-                                loopOptions
+                                // Resumes already marked before they
+                                // suspended: never mark on resume.
+                                { loopOptions with
+                                    OnTurnStarted = None
+                                }
                                 loopDelay
                                 runnerToken
                                 (fun () -> true)
@@ -269,7 +281,11 @@ module internal SessionPermissions =
                                 client
                                 history
                                 tools
-                                loopOptions
+                                // Retries are fresh runs under a new turn id:
+                                // mark at the first provider-call entry.
+                                { loopOptions with
+                                    OnTurnStarted = onTurnStarted
+                                }
                                 loopDelay
                                 runnerToken
                                 (fun () -> true)

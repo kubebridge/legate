@@ -1075,16 +1075,8 @@ type private ScriptSuspendRunner(first: TurnLoop.TurnLoopCompletion, second: Tur
     member _.Attempts = attempts :> IReadOnlyList<int>
 
     /// The runner as the suspendable delegate.
-    member _.Func
-        : (InboxEntry
-              -> int
-              -> HashSet<string>
-              -> TurnLoop.TurnLoopSuspension option
-              -> Reply option
-              -> IList<ChatMessage> option
-              -> CancellationToken
-              -> Task<TurnLoop.TurnLoopCompletion>) =
-        fun _ attempt _ cursor reply _ _ ->
+    member _.Func: SessionActor.SuspendableRunner =
+        fun _ attempt _ cursor reply _ _ _ ->
             attempts.Add(attempt)
             cursors.Add(cursor)
             replies.Add(reply)
@@ -3410,16 +3402,8 @@ type private GatedSuspendRunner(second: TurnLoop.TurnLoopCompletion) =
 
     member _.Release() = gate.TrySetResult(second) |> ignore
 
-    member _.Func
-        : (InboxEntry
-              -> int
-              -> HashSet<string>
-              -> TurnLoop.TurnLoopSuspension option
-              -> Reply option
-              -> IList<ChatMessage> option
-              -> CancellationToken
-              -> Task<TurnLoop.TurnLoopCompletion>) =
-        fun _ attempt _ _ _ _ _ ->
+    member _.Func: SessionActor.SuspendableRunner =
+        fun _ attempt _ _ _ _ _ _ ->
             attempts.Add(attempt)
             calls <- calls + 1
 

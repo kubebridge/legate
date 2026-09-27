@@ -455,7 +455,9 @@ type SessionHarness
                     ResizeArray<InboxEntry>() :> IReadOnlyList<InboxEntry>
 
                 let runner: SessionActor.SuspendableRunner =
-                    fun entry _attempt allowed cursor reply seed runnerToken ->
+                    // The harness journals through its own fenced observer,
+                    // never the in-call marker: no marker hook on any path.
+                    fun entry _attempt allowed cursor reply seed runnerToken _ ->
                         task {
                             match cursor, reply with
                             | None, None ->

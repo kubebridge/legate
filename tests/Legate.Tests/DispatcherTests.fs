@@ -190,7 +190,7 @@ type private ScriptSuspendRunner(completions: TurnLoop.TurnLoopCompletion list) 
 
     /// The runner as the suspendable delegate.
     member _.Func: SessionActor.SuspendableRunner =
-        fun entry _ _ _ _ _ _ ->
+        fun entry _ _ _ _ _ _ _ ->
             lock gate (fun () ->
                 calls <- calls + 1
                 entries.Add(entry))
@@ -221,7 +221,7 @@ type private GatedSuspendRunner(completion: TurnLoop.TurnLoopCompletion) =
 
     /// The runner as the suspendable delegate.
     member _.Func: SessionActor.SuspendableRunner =
-        fun entry _ _ _ _ _ _ ->
+        fun entry _ _ _ _ _ _ _ ->
             lock gate (fun () ->
                 calls <- calls + 1
                 entries.Add(entry))

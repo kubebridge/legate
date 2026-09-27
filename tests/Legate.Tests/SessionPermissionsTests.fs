@@ -713,7 +713,7 @@ let ``Crash seed carries the resumption note into the runner history input`` () 
         :> IList<ChatMessage>
 
     let fresh =
-        runner entry 1 (HashSet<string>()) None None (Some seed) CancellationToken.None
+        runner entry 1 (HashSet<string>()) None None (Some seed) CancellationToken.None None
         |> fun task -> task.GetAwaiter().GetResult()
 
     fresh.Result.AssistantText |> should equal "done"
@@ -732,6 +732,7 @@ let ``Crash seed carries the resumption note into the runner history input`` () 
             (Some(PermissionDecision("req-1", PermissionDecisionKind.AllowOnce) :> Reply))
             (Some seed)
             CancellationToken.None
+            None
         |> fun task -> task.GetAwaiter().GetResult()
 
     rebuild.Result.AssistantText |> should equal "done"
@@ -765,7 +766,7 @@ let ``spawnSuspendFactory rejects invalid wiring`` () =
     let _, journal = createStores TimeProvider.System
 
     let runner: SessionActor.SuspendableRunner =
-        fun _ _ _ _ _ _ _ -> Task.FromResult(Unchecked.defaultof<TurnLoop.TurnLoopCompletion>)
+        fun _ _ _ _ _ _ _ _ -> Task.FromResult(Unchecked.defaultof<TurnLoop.TurnLoopCompletion>)
 
     let store = InMemorySessionStore(InMemoryDatabase()) :> ISessionStore
 
