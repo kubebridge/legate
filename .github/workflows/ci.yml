@@ -48,6 +48,16 @@ jobs:
         with:
           global-json-file: global.json
 
+      - name: Log in to Quay.io
+        # MinIO left Docker Hub in 2025 and quay.io returns 401 for
+        # anonymous pulls, which breaks the S3 Testcontainers suites.
+        # Credentials live in QUAY_USERNAME/QUAY_TOKEN secrets; bound via
+        # env, never interpolated into the run script.
+        env:
+          QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
+          QUAY_TOKEN: ${{ secrets.QUAY_TOKEN }}
+        run: echo "$QUAY_TOKEN" | docker login quay.io -u "$QUAY_USERNAME" --password-stdin
+
       - name: Restore
         run: dotnet fsi build.fsx -- -t Restore
 
