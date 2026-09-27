@@ -58,6 +58,12 @@ jobs:
           QUAY_TOKEN: ${{ secrets.QUAY_TOKEN }}
         run: echo "$QUAY_TOKEN" | docker login quay.io -u "$QUAY_USERNAME" --password-stdin
 
+      - name: Probe MinIO mirror pull
+        # Decisive probe: if the CLI pull works but Testcontainers still
+        # 401s, auth is not reaching the test client; if this fails too,
+        # the mirror repo, tag, or robot grant is at fault.
+        run: docker pull quay.io/odytrice/minio:RELEASE.2025-04-22T22-12-26Z
+
       - name: Restore
         run: dotnet fsi build.fsx -- -t Restore
 
