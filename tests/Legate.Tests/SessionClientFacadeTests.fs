@@ -503,7 +503,7 @@ let ``Reply resumes a suspended turn and Subscribe streams the lifecycle`` () : 
                 task {
                     let! created = openSession client
                     let waiter = settleWaiter created.Id
-                    let stream = collectStream client created.Id 0L 1
+                    let stream = collectStream client created.Id 0L 2
 
                     let prompt =
                         SessionClientOperations.PromptAsync(
@@ -711,7 +711,7 @@ let ``Abort while WaitingForInput is a no-op and Reply still resumes`` () : Task
                         )
 
                     let! _ = awaitWhat prompt "the prompt to land"
-                    let! events = awaitWhat (collectStream client created.Id 0L 1) "the suspension"
+                    let! events = awaitWhat (collectStream client created.Id 0L 2) "the suspension"
 
                     let asked =
                         events
@@ -1029,7 +1029,7 @@ let ``ReadEvents pages by cursor and limit`` () : Task =
                             CancellationToken.None
                         )
 
-                    let! events = awaitWhat (collectStream client created.Id 0L 1) "the suspension"
+                    let! events = awaitWhat (collectStream client created.Id 0L 2) "the suspension"
 
                     let asked =
                         events
@@ -1519,9 +1519,9 @@ let ``SetAgent while Running defers to the quiescent boundary without stealing``
 let ``Fork copies the prefix and references the source`` () : Task =
     task {
         // The source turn suspends on the Ask verdict and resumes: the
-        // suspendable flow journals suspend and resolve events only, so the
-        // suspend/resume cycle is what makes the prefix non-empty (a bare
-        // text turn journals nothing).
+        // suspendable flow journals the in-call marker first, then the
+        // suspend and resolve events, so the marker plus the suspend/resume
+        // cycle is what makes the prefix non-empty.
         let invocations = ref []
 
         let services =
@@ -1554,7 +1554,7 @@ let ``Fork copies the prefix and references the source`` () : Task =
                         SessionClientOperations.OpenSessionAsync(client, agent, options, CancellationToken.None)
 
                     let waiter = settleWaiter created.Id
-                    let stream = collectStream client created.Id 0L 1
+                    let stream = collectStream client created.Id 0L 2
 
                     let! _ =
                         SessionClientOperations.PromptAsync(
@@ -1657,7 +1657,7 @@ let ``Fork clamps beyond-tail and allows closed and empty prefixes`` () : Task =
                 task {
                     let! created = openSession client
                     let waiter = settleWaiter created.Id
-                    let stream = collectStream client created.Id 0L 1
+                    let stream = collectStream client created.Id 0L 2
 
                     let! _ =
                         SessionClientOperations.PromptAsync(

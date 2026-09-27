@@ -1801,7 +1801,10 @@ module internal SessionActor =
     /// The crash seed carries the in-memory rehydrated history (with the
     /// resumption note) on crash-resume activation and is None elsewhere:
     /// a seeded run leads its runner history input with the seed instead
-    /// of the entry-derived message. Tests inject scripted runners; the
+    /// of the entry-derived message. The in-call marker hook (issue 284)
+    /// rides last: Some journals the fenced TurnStartedEvent at the first
+    /// provider-call entry, None journals nothing (resumes already marked
+    /// before they suspended). Tests inject scripted runners; the
     /// TurnLoop-backed runner wires
     /// TurnLoop.runSuspendableAsync plus the resume continuations.
     type SuspendableRunner =
@@ -1812,6 +1815,7 @@ module internal SessionActor =
             -> Reply option
             -> IList<ChatMessage> option
             -> CancellationToken
+            -> TurnLoop.TurnStartedHook option
             -> Task<TurnLoop.TurnLoopCompletion>
 
     /// What a suspendable session actor is built from: the base actor
@@ -2582,6 +2586,45 @@ module internal SessionActor =
             )
             |> ignore
 
+        /// Journals the in-call marker for one turn entering its first
+        /// provider call (issue 284): a TurnStartedEvent under the given
+        /// journal token through the fenced writer. The caller snapshots
+        /// the live token at turn start and passes the snapshot, so a
+        /// takeover between snapshot and append still fences out: the store
+        /// rejects the stale token. Appended proceeds to the provider call;
+        /// a stale-token rejection raises TurnLeaseLostException so the
+        /// takeover loser stops before the provider call with zero effects;
+        /// a failed write (a persistent store fault past the bounded
+        /// retries) returns silently and the turn proceeds unmarked:
+        /// best-effort observability, since completion journals nothing and
+        /// stays valid without the marker.
+        /// <param name="eventStore">The journal the marker appends to.</param>
+        /// <param name="tenant">The tenant the session belongs to.</param>
+        /// <param name="sessionId">The session whose journal appends.</param>
+        /// <param name="token">The journal token snapshot fencing the write.</param>
+        /// <param name="turnId">The turn entering its first provider call.</param>
+        /// <param name="cancellationToken">Abandons the append.</param>
+        let journalTurnStartedAsync
+            (eventStore: ISessionEventStore)
+            (tenant: TenantId)
+            (sessionId: SessionId)
+            (token: string)
+            (turnId: TurnId)
+            (cancellationToken: CancellationToken)
+            : Task<unit> =
+            task {
+                let marker =
+                    TurnStartedEvent(sessionId, turnId, Unchecked.defaultof<Nullable<int64>>, DateTimeOffset.UtcNow)
+                    :> SessionEvent
+
+                let batch = ResizeArray<SessionEvent>([| marker |]) :> IReadOnlyList<SessionEvent>
+
+                match! JournalWriter.appendWithTokenAsync eventStore tenant sessionId token batch cancellationToken with
+                | JournalWriter.JournalAppended _ -> ()
+                | JournalWriter.JournalRejected _ -> return raise (TurnLoop.TurnLeaseLostException())
+                | JournalWriter.JournalFailed _ -> ()
+            }
+
         let journalSuspend (suspension: TurnLoop.TurnLoopSuspension) : JournalWriter.JournalWriteResult =
             let turnId = TurnId.New()
             let stamp = DateTimeOffset.UtcNow
@@ -2819,10 +2862,27 @@ module internal SessionActor =
             (allowed: HashSet<string>)
             (seed: IList<ChatMessage> option)
             : unit =
+            // Snapshot the live journal token for the turn's in-call
+            // marker (issue 284): the marker presents this snapshot, so a
+            // takeover between snapshot and append still fences out (the
+            // store rejects the stale token and the loser stops before the
+            // provider call with zero effects).
+            let markerToken = journalToken
+
+            let onTurnStarted: TurnLoop.TurnStartedHook option =
+                Some(fun turnId cancellationToken ->
+                    journalTurnStartedAsync
+                        suspend.EventStore
+                        props.Tenant
+                        props.SessionId
+                        markerToken
+                        turnId
+                        cancellationToken)
+
             let runTask =
                 try
                     let started =
-                        suspend.RunSuspendable entry attempt allowed None None seed CancellationToken.None
+                        suspend.RunSuspendable entry attempt allowed None None seed CancellationToken.None onTurnStarted
 
                     if isNull (box started) then
                         Task.FromException<TurnLoop.TurnLoopCompletion>(
@@ -2872,6 +2932,9 @@ module internal SessionActor =
                             (Some reply)
                             None
                             CancellationToken.None
+                            // A resumed turn already marked before it
+                            // suspended: no marker on resume.
+                            None
 
                     if isNull (box started) then
                         Task.FromException<TurnLoop.TurnLoopCompletion>(
