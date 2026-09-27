@@ -37,9 +37,10 @@ module S3TestEnvironment =
     let mutable private skipped: string option = None
 
     /// The pinned server image the suites run against. Recent enough to
-    /// evaluate conditional writes. MinIO left Docker Hub in 2025, so the
-    /// pin lives on Quay.
-    let MinioImage = "quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z"
+    /// evaluate conditional writes. MinIO left Docker Hub in 2025, so CI
+    /// pulls an org-owned Docker Hub mirror (same upstream digest tag)
+    /// that needs no registry authentication.
+    let MinioImage = "odytrice/minio:RELEASE.2025-04-22T22-12-26Z"
 
     /// The test credentials minted into every container.
     let AccessKey = "legate-test-key"
