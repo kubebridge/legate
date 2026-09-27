@@ -32,8 +32,11 @@ type ClusterMode =
     | StaticSeeds = 1
 
     /// A sharded Akka.NET cluster bootstrapped through Akka.Management
-    /// Kubernetes discovery (issue 138). Until that bootstrap lands this
-    /// mode joins nothing and runs as a singleton: SeedNodes is ignored.
+    /// Kubernetes discovery (issue 138). The registered
+    /// <see cref="T:Legate.IClusterBootstrap" /> hook (if any) supplies the
+    /// management plus discovery HOCON and starts cluster formation;
+    /// without a hook the node joins itself and runs as a singleton.
+    /// SeedNodes is ignored in both cases.
     | Kubernetes = 2
 
 /// What a session does with the turn interrupted by a crash once the
@@ -138,6 +141,34 @@ type SessionsOptions() =
     /// is enabled. Bound from <c>Legate:Sessions:AutoTitleModel</c>.
     member val AutoTitleModel: string | null = null with get, set
 
+    /// The live subscribers one session holds on its owning entity in
+    /// cluster modes (and on the process-local bus in Local mode). A new
+    /// subscription past the cap rejects with the typed limit error
+    /// instead of evicting an existing one. Default 512. Bound from
+    /// <c>Legate:Sessions:MaxSubscribersPerSession</c>.
+    member val MaxSubscribersPerSession: int = 512 with get, set
+
+    /// The events one cross-node subscriber buffers before it is
+    /// considered slow. A subscriber past the bound disconnects with the
+    /// typed lagged error instead of stalling the owning turn. Default
+    /// 128. Bound from <c>Legate:Sessions:PerSubscriberBufferSize</c>.
+    member val PerSubscriberBufferSize: int = 128 with get, set
+
+    /// How many recent journaled events the owning entity keeps in its
+    /// bounded replay cache for resuming subscribers. Older cursors fall
+    /// back to <c>ISessionEventStore.Replay</c>; evicted cache entries
+    /// redeliver from the store with duplicates allowed and no gaps.
+    /// Default 256. Bound from
+    /// <c>Legate:Sessions:SubscriptionReplayCacheSize</c>.
+    member val SubscriptionReplayCacheSize: int = 256 with get, set
+
+    /// The largest single session event the owning entity streams to a
+    /// remote subscriber, in bytes. Events above the bound refuse before
+    /// crossing; the global <c>Cluster:MaxWirePayloadBytes</c> caps every
+    /// manifest on top of this per-event bound. Default 1 MiB. Bound from
+    /// <c>Legate:Sessions:SubscriptionMaxEventPayloadBytes</c>.
+    member val SubscriptionMaxEventPayloadBytes: int = 1048576 with get, set
+
     /// Returns null when every knob is in range, otherwise a message for the
     /// first violation.
     /// <returns>The first violation's message, or null when the settings are valid.</returns>
@@ -172,6 +203,14 @@ type SessionsOptions() =
                         "Expiry must be positive when set."
                     if titleModelInvalid then
                         "AutoTitleModel must be a valid model reference in provider/model form."
+                    if this.MaxSubscribersPerSession < 1 then
+                        "MaxSubscribersPerSession must be at least 1."
+                    if this.PerSubscriberBufferSize < 1 then
+                        "PerSubscriberBufferSize must be at least 1."
+                    if this.SubscriptionReplayCacheSize < 1 then
+                        "SubscriptionReplayCacheSize must be at least 1."
+                    if this.SubscriptionMaxEventPayloadBytes < 1 then
+                        "SubscriptionMaxEventPayloadBytes must be at least 1."
                 |]
 
             if violations.Length <> 0 then
@@ -574,21 +613,35 @@ type CompletionOptions() =
             Array.head violations
 
 /// Cluster settings: the deployment mode, the seed nodes StaticSeeds
-/// mode discovers through, this node's roles, the session sharding knobs,
-/// and how long the actor systems wait for graceful shutdown. Bound from
-/// the <c>Legate</c> configuration section; mutable so hosts can set
-/// properties before registering. Defaults run a single node with no seed
-/// nodes, no roles, 128 shards at hash version 1, and a 30 s shutdown
-/// grace.
+/// mode discovers through, this node's roles, the remoting bind port and
+/// hostname, the session sharding knobs, and how long the actor systems
+/// wait for graceful shutdown. Bound from the <c>Legate</c> configuration
+/// section; mutable so hosts can set properties before registering.
+/// Defaults run a single node with no seed nodes, no roles, an ephemeral
+/// remoting port on loopback, 128 shards at hash version 1, and a 30 s
+/// shutdown grace.
 type ClusterOptions() =
 
     /// How the runtime is deployed. Default
     /// <see cref="F:Legate.ClusterMode.Local" />.
     member val Mode: ClusterMode = ClusterMode.Local with get, set
 
+    /// The remoting TCP port this node binds, or 0 for an ephemeral port.
+    /// Compose declares one stable port per node (for example 4053) so
+    /// seed entries can name it; single-process hosts keep the ephemeral
+    /// default. Default 0. Must be between 0 and 65535. Bound from
+    /// <c>Legate:Cluster:RemotingPort</c>.
+    member val RemotingPort: int = 0 with get, set
+
+    /// The remoting bind hostname, for example 127.0.0.1 for loopback or
+    /// 0.0.0.0 for all interfaces inside containers. Default 127.0.0.1.
+    /// Must be a non-empty string. Bound from
+    /// <c>Legate:Cluster:RemotingHostname</c>.
+    member val RemotingHostname: string = "127.0.0.1" with get, set
+
     /// The seed nodes StaticSeeds mode discovers through, in host:port
-    /// form. Empty means no seed nodes. Ignored in Kubernetes mode until
-    /// issue 138 ships the Akka.Management bootstrap.
+    /// form. Empty means no seed nodes. Ignored in Kubernetes mode, where
+    /// the <see cref="T:Legate.IClusterBootstrap" /> hook discovers peers.
     member val SeedNodes: List<string> = List<string>() with get, set
 
     /// This node's cluster roles, for example session or api. Empty means
@@ -657,6 +710,17 @@ type ClusterOptions() =
     /// cap never truncates the drain wait.
     member val HostExitDeadline: TimeSpan = TimeSpan.FromSeconds 60.0 with get, set
 
+    /// How many Up members the cluster start waits for before
+    /// <c>StartAsync</c> completes, so a node never serves traffic before
+    /// its quorum formed. This is a Legate-level startup gate, never
+    /// rendered into Akka HOCON: the wait is bounded by
+    /// <see cref="P:Legate.ClusterOptions.JoinTimeout" />, and an unmet
+    /// quorum fails startup with
+    /// <see cref="T:Legate.DeadlineExceededException" />. Default 1, which
+    /// completes as soon as this node is Up (today's singleton behavior).
+    /// Must be at least 1.
+    member val MinimumMembers: int = 1 with get, set
+
     /// Returns null when every knob is in range, otherwise a message for the
     /// first violation.
     /// <returns>The first violation's message, or null when the settings are valid.</returns>
@@ -678,6 +742,12 @@ type ClusterOptions() =
             "JoinTimeout must be positive."
         elif this.HostExitDeadline <= TimeSpan.Zero then
             "HostExitDeadline must be positive."
+        elif this.MinimumMembers < 1 then
+            "MinimumMembers must be at least 1."
+        elif this.RemotingPort < 0 || this.RemotingPort > 65535 then
+            "RemotingPort must be between 0 and 65535."
+        elif String.IsNullOrWhiteSpace this.RemotingHostname then
+            "RemotingHostname must be a non-empty string."
         elif isNull (box this.SeedNodes) then
             "SeedNodes must not be null."
         elif this.Mode = ClusterMode.StaticSeeds && this.SeedNodes.Count = 0 then

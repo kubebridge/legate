@@ -25,15 +25,15 @@ module internal WireManifests =
     [<Literal>]
     let EntityFamily = "entity"
 
-    /// Manifest family: reserved for the subscription protocol (issue 132).
-    /// No DTO is registered yet; the reservation pins the namespace so 132
-    /// registers entries without touching the envelope.
+    /// Manifest family: the cross-node subscription protocol (issue 133).
+    /// Subscribe routes through the session shard region; EventBatch
+    /// streams bounded pages back to the subscribing node.
     [<Literal>]
     let SubscriptionFamily = "subscription"
 
-    /// Manifest family: reserved for the session event protocol (issue
-    /// 133). No DTO is registered yet; the reservation pins the namespace
-    /// so 133 registers entries without touching the envelope.
+    /// Manifest family: the session event stream (issue 133). Single
+    /// journaled events stream from the owning entity to the subscribing
+    /// node; batches cross as subscription EventBatch pages.
     [<Literal>]
     let EventFamily = "event"
 
@@ -57,8 +57,7 @@ module internal WireManifests =
     /// version, and its per-case byte bound.
     type WireCase =
         {
-            /// actor, router, or entity. Subscription and event families
-            /// stay reserved with no rows yet.
+            /// actor, router, entity, subscription, or event.
             Family: string
             /// The wire-case name, matching its DTO's message name.
             Name: string
@@ -141,17 +140,17 @@ module internal WireManifests =
             row EntityFamily "SuspendableInterruptPrompt" typeof<WireDtos.SuspendableInterruptPromptDto> LargeWireBytes
             row EntityFamily "SuspendableQueuePrompt" typeof<WireDtos.SuspendableQueuePromptDto> LargeWireBytes
             row EntityFamily "SuspendableSetAgent" typeof<WireDtos.SuspendableSetAgentDto> SmallWireBytes
+            row SubscriptionFamily "Subscribe" typeof<WireDtos.SubscribeDto> SmallWireBytes
+            row SubscriptionFamily "Unsubscribe" typeof<WireDtos.UnsubscribeDto> SmallWireBytes
+            row SubscriptionFamily "EventBatch" typeof<WireDtos.EventBatchDto> LargeWireBytes
+            row EventFamily "SessionEvent" typeof<WireDtos.SessionEventDto> LargeWireBytes
         ]
 
-    /// Manifests reserved for the subscription protocol (issue 132) and the
-    /// session event protocol (issue 133). Reservations only: no DTO is
-    /// registered, so the envelope refuses them as unknown manifests until
-    /// their owning issue promotes them to table rows.
-    let reservedManifests: string list =
-        [
-            $"legate.%s{SubscriptionFamily}.Subscribe.v1"
-            $"legate.%s{EventFamily}.SessionEvent.v1"
-        ]
+    /// Manifests reserved for future wire cases. The subscription and event
+    /// namespaces promoted to table rows in issue 133, so no reservations
+    /// remain; the list stays so the envelope still has a named place for
+    /// the next family to reserve.
+    let reservedManifests: string list = []
 
     /// Finds the wire case a manifest names, ignoring its version.
     /// <param name="family">The manifest family.</param>

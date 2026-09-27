@@ -272,6 +272,23 @@ let ``Store operations are tenant-scoped`` () =
     }
     |> (fun t -> t.Wait())
 
+/// Asserts the absent upsert inserted the agent at version 1. Pure so
+/// the resumable test stays a straight-line await plus a return.
+let private checkInsertedAsUpdated (outcome: AgentUpdateOutcome) =
+    match outcome with
+    | :? AgentUpdated as updated ->
+        updated.Agent.RowVersion |> should equal 1UL
+        updated.Agent.UpdatedAt |> should equal laterStamp
+        updated.Agent.Tenant |> should equal tenant
+    | _ -> failwith "expected AgentUpdated"
+
+/// Asserts the inserted agent reads back at version 1. Pure so the
+/// resumable test stays a straight-line await plus a return.
+let private checkInsertedRead (read: Agent | null) =
+    match read with
+    | null -> failwith "the inserted agent was not found"
+    | found -> found.RowVersion |> should equal 1UL
+
 [<Fact>]
 let ``UpdateIfUnchanged inserts when absent with expected version 0`` () =
     let store = FakeAgentStore() :> IAgentStore
@@ -280,20 +297,23 @@ let ``UpdateIfUnchanged inserts when absent with expected version 0`` () =
     task {
         let! outcome = store.UpdateIfUnchanged(tenant, agent, 0UL, CancellationToken.None)
 
-        match outcome with
-        | :? AgentUpdated as updated ->
-            updated.Agent.RowVersion |> should equal 1UL
-            updated.Agent.UpdatedAt |> should equal laterStamp
-            updated.Agent.Tenant |> should equal tenant
-        | _ -> failwith "expected AgentUpdated"
+        checkInsertedAsUpdated outcome
 
         let! read = store.GetAgent(tenant, agent.Id, CancellationToken.None)
 
-        match read with
-        | null -> failwith "the inserted agent was not found"
-        | found -> found.RowVersion |> should equal 1UL
+        checkInsertedRead read
     }
     |> (fun t -> t.Wait())
+
+/// Asserts the matching update renamed the agent at version 2. Pure so
+/// the resumable test stays a straight-line await plus a return.
+let private checkIncremented (second: AgentUpdateOutcome) =
+    match second with
+    | :? AgentUpdated as updated ->
+        updated.Agent.Name |> should equal "checkout-v2"
+        updated.Agent.RowVersion |> should equal 2UL
+        updated.Agent.UpdatedAt |> should equal laterStamp
+    | _ -> failwith "expected AgentUpdated"
 
 [<Fact>]
 let ``UpdateIfUnchanged increments the version on a matching update`` () =
@@ -307,14 +327,20 @@ let ``UpdateIfUnchanged increments the version on a matching update`` () =
         let renamed = { inserted with Name = "checkout-v2" }
         let! second = store.UpdateIfUnchanged(tenant, renamed, inserted.RowVersion, CancellationToken.None)
 
-        match second with
-        | :? AgentUpdated as updated ->
-            updated.Agent.Name |> should equal "checkout-v2"
-            updated.Agent.RowVersion |> should equal 2UL
-            updated.Agent.UpdatedAt |> should equal laterStamp
-        | _ -> failwith "expected AgentUpdated"
+        checkIncremented second
     }
     |> (fun t -> t.Wait())
+
+/// Asserts the stale edit lost to the concurrent edit and carries the
+/// current row. Pure so the resumable test stays a straight-line await
+/// plus a return.
+let private checkConflict (expectedVersion: uint64) (outcome: AgentUpdateOutcome) =
+    match outcome with
+    | :? AgentUpdateConflict as conflict ->
+        let current = conflict.Agent |> Option.ofObj
+        current.Value.Name |> should equal "concurrent-edit"
+        current.Value.RowVersion |> should equal expectedVersion
+    | _ -> failwith "expected AgentUpdateConflict"
 
 [<Fact>]
 let ``UpdateIfUnchanged returns the conflict branch with the current row`` () =
@@ -336,16 +362,32 @@ let ``UpdateIfUnchanged returns the conflict branch with the current row`` () =
 
         let! outcome = store.UpdateIfUnchanged(tenant, staleEdit, inserted.RowVersion, CancellationToken.None)
 
-        match outcome with
-        | :? AgentUpdateConflict as conflict ->
-            let current = conflict.Agent |> Option.ofObj
-            current.Value.Name |> should equal "concurrent-edit"
-
-            let expectedVersion = inserted.RowVersion + 1UL
-            current.Value.RowVersion |> should equal expectedVersion
-        | _ -> failwith "expected AgentUpdateConflict"
+        let expectedVersion = inserted.RowVersion + 1UL
+        checkConflict expectedVersion outcome
     }
     |> (fun t -> t.Wait())
+
+/// Runs one store call and captures any exception instead of raising, so
+/// the test's resumable body stays a straight-line await plus a return.
+/// The call is deferred so synchronous throws are captured too.
+let private captureCall (call: unit -> Task) : Task<exn option> =
+    task {
+        try
+            do! call ()
+            return None
+        with ex ->
+            return Some ex
+    }
+
+/// Asserts the captured outcome is the typed missing-agent failure.
+/// Pure so the resumable test stays a straight-line await plus a return.
+let private checkAgentNotFound (agentId: AgentId) (captured: exn option) =
+    match captured with
+    | Some(:? AgentNotFoundException as exn) ->
+        exn.AgentId |> should equal agentId
+        exn.Message |> should equal "Agent not found."
+    | Some unexpected -> failwith $"expected AgentNotFoundException but got {unexpected.GetType().Name}"
+    | None -> failwith "expected AgentNotFoundException"
 
 [<Fact>]
 let ``UpdateIfUnchanged throws AgentNotFoundException for a missing row with a nonzero expected version`` () =
@@ -353,12 +395,10 @@ let ``UpdateIfUnchanged throws AgentNotFoundException for a missing row with a n
     let agent = { sampleAgent () with RowVersion = 4UL }
 
     task {
-        try
-            let! _ = store.UpdateIfUnchanged(tenant, agent, 4UL, CancellationToken.None)
-            failwith "expected AgentNotFoundException"
-        with :? AgentNotFoundException as exn ->
-            exn.AgentId |> should equal agent.Id
-            exn.Message |> should equal "Agent not found."
+        let! captured =
+            captureCall (fun () -> store.UpdateIfUnchanged(tenant, agent, 4UL, CancellationToken.None) :> Task)
+
+        checkAgentNotFound agent.Id captured
     }
     |> (fun t -> t.Wait())
 
@@ -538,6 +578,31 @@ let ``UpsertCustomTool rejects an invalid tool name`` () =
     }
     |> (fun t -> t.Wait())
 
+/// Asserts the captured custom-tool outcome is the typed missing-agent
+/// failure. Pure so the resumable test stays a straight-line await plus a
+/// return.
+let private checkCustomToolAgentNotFound (agentId: AgentId) (captured: exn option) =
+    match captured with
+    | Some(:? AgentNotFoundException as exn) ->
+        exn.AgentId |> should equal agentId
+        exn.Message |> should equal "Agent not found."
+    | Some unexpected -> failwith $"expected AgentNotFoundException but got {unexpected.GetType().Name}"
+    | None -> failwith "expected AgentNotFoundException"
+
+/// Asserts the captured outcome is the typed read-only refusal for the
+/// given operation, checking the message when one is expected. Pure so
+/// the resumable test stays a straight-line await plus a return.
+let private checkReadOnlyRefusal (operation: string) (message: string option) (captured: exn option) =
+    match captured with
+    | Some(:? ReadOnlyAgentStoreException as exn) ->
+        exn.Operation |> should equal operation
+
+        match message with
+        | Some expected -> exn.Message |> should equal expected
+        | None -> ()
+    | Some unexpected -> failwith $"expected ReadOnlyAgentStoreException but got {unexpected.GetType().Name}"
+    | None -> failwith "expected ReadOnlyAgentStoreException"
+
 [<Fact>]
 let ``UpsertCustomTool throws AgentNotFoundException when the agent is missing`` () =
     let store = FakeAgentStore() :> IAgentCustomToolStore
@@ -545,12 +610,11 @@ let ``UpsertCustomTool throws AgentNotFoundException when the agent is missing``
     let agentId = agent.Id
 
     task {
-        try
-            let! _ = store.UpsertCustomTool(tenant, agentId, sampleCustomTool agentId, CancellationToken.None)
-            failwith "expected AgentNotFoundException"
-        with :? AgentNotFoundException as exn ->
-            exn.AgentId |> should equal agentId
-            exn.Message |> should equal "Agent not found."
+        let! captured =
+            captureCall (fun () ->
+                store.UpsertCustomTool(tenant, agentId, sampleCustomTool agentId, CancellationToken.None) :> Task)
+
+        checkCustomToolAgentNotFound agentId captured
     }
     |> (fun t -> t.Wait())
 
@@ -714,21 +778,18 @@ let ``A read-only IAgentStore serves reads and throws the typed exception on wri
         let! listed = store.ListAgents(tenant, CancellationToken.None)
         listed.Count |> should equal 0
 
-        try
-            let! _ = store.UpdateIfUnchanged(tenant, sampleAgent (), 0UL, CancellationToken.None)
-            failwith "expected ReadOnlyAgentStoreException"
-        with :? ReadOnlyAgentStoreException as exn ->
-            exn.Operation |> should equal "UpdateIfUnchanged"
-            exn.Message |> should equal "The agent store is read-only."
+        let! updateOutcome =
+            captureCall (fun () -> store.UpdateIfUnchanged(tenant, sampleAgent (), 0UL, CancellationToken.None) :> Task)
 
-        try
-            let! _ = store.DeleteAgent(tenant, AgentId.New(), CancellationToken.None)
-            failwith "expected ReadOnlyAgentStoreException"
-        with :? ReadOnlyAgentStoreException as exn ->
-            exn.Operation |> should equal "DeleteAgent"
+        checkReadOnlyRefusal "UpdateIfUnchanged" (Some "The agent store is read-only.") updateOutcome
 
-        try
-            let! _ =
+        let! deleteOutcome =
+            captureCall (fun () -> store.DeleteAgent(tenant, AgentId.New(), CancellationToken.None) :> Task)
+
+        checkReadOnlyRefusal "DeleteAgent" None deleteOutcome
+
+        let! consumeOutcome =
+            captureCall (fun () ->
                 store.TryConsumeScheduleOccurrence(
                     tenant,
                     AgentId.New(),
@@ -736,10 +797,9 @@ let ``A read-only IAgentStore serves reads and throws the typed exception on wri
                     DateTimeOffset.UtcNow,
                     CancellationToken.None
                 )
+                :> Task)
 
-            failwith "expected ReadOnlyAgentStoreException"
-        with :? ReadOnlyAgentStoreException as exn ->
-            exn.Operation |> should equal "TryConsumeScheduleOccurrence"
+        checkReadOnlyRefusal "TryConsumeScheduleOccurrence" None consumeOutcome
     }
     |> (fun t -> t.Wait())
 
@@ -754,19 +814,17 @@ let ``A read-only IAgentCustomToolStore serves reads and throws the typed except
         let! absent = store.GetCustomTool(tenant, AgentId.New(), "lookup_order", CancellationToken.None)
         absent |> should equal null
 
-        try
-            let! _ =
+        let! upsertOutcome =
+            captureCall (fun () ->
                 store.UpsertCustomTool(tenant, AgentId.New(), sampleCustomTool (AgentId.New()), CancellationToken.None)
+                :> Task)
 
-            failwith "expected ReadOnlyAgentStoreException"
-        with :? ReadOnlyAgentStoreException as exn ->
-            exn.Operation |> should equal "UpsertCustomTool"
-            exn.Message |> should equal "The custom tool store is read-only."
+        checkReadOnlyRefusal "UpsertCustomTool" (Some "The custom tool store is read-only.") upsertOutcome
 
-        try
-            let! _ = store.DeleteCustomTool(tenant, AgentId.New(), "lookup_order", CancellationToken.None)
-            failwith "expected ReadOnlyAgentStoreException"
-        with :? ReadOnlyAgentStoreException as exn ->
-            exn.Operation |> should equal "DeleteCustomTool"
+        let! deleteOutcome =
+            captureCall (fun () ->
+                store.DeleteCustomTool(tenant, AgentId.New(), "lookup_order", CancellationToken.None) :> Task)
+
+        checkReadOnlyRefusal "DeleteCustomTool" None deleteOutcome
     }
     |> (fun t -> t.Wait())

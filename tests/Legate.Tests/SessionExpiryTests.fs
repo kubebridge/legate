@@ -272,17 +272,47 @@ let private startValidation (provider: IServiceProvider) : Task =
         do! validation.StartAsync(CancellationToken.None)
     }
 
+/// Runs one startup validation and captures any exception instead of
+/// raising, so the test's resumable body stays a straight-line await plus
+/// a return. The call is deferred so synchronous throws are captured too.
+let private captureCall (call: unit -> Task) : Task<exn option> =
+    task {
+        try
+            do! call ()
+            return None
+        with ex ->
+            return Some ex
+    }
+
+/// Asserts the captured outcome is the expiry-without-a-blob-store
+/// refusal. Pure so the resumable test stays a straight-line await plus
+/// a return.
+let private checkMissingBlobStore (captured: exn option) =
+    match captured with
+    | Some(:? InvalidOperationException as failed) ->
+        failed.Message.Contains("Sessions:Expiry") |> should equal true
+        failed.Message.Contains("durable blob store") |> should equal true
+    | Some unexpected -> failwith $"expected InvalidOperationException but got {unexpected.GetType().Name}"
+    | None -> failwith "Startup should have failed without a blob store."
+
+/// Asserts the captured outcome is the expiry-with-InMemory refusal.
+/// Pure so the resumable test stays a straight-line await plus a return.
+let private checkInMemoryBlobStore (captured: exn option) =
+    match captured with
+    | Some(:? InvalidOperationException as failed) ->
+        failed.Message.Contains("Sessions:Expiry") |> should equal true
+        failed.Message.Contains("InMemory") |> should equal true
+    | Some unexpected -> failwith $"expected InvalidOperationException but got {unexpected.GetType().Name}"
+    | None -> failwith "Startup should have failed with the InMemory blob store."
+
 [<Fact>]
 let ``Startup fails with a single message on expiry without a blob store`` () =
     task {
         use provider = buildValidationProvider null (Nullable(TimeSpan.FromMinutes 30.0))
 
-        try
-            do! startValidation provider
-            Assert.Fail("Startup should have failed without a blob store.")
-        with :? InvalidOperationException as failed ->
-            failed.Message.Contains("Sessions:Expiry") |> should equal true
-            failed.Message.Contains("durable blob store") |> should equal true
+        let! captured = captureCall (fun () -> startValidation provider)
+
+        checkMissingBlobStore captured
     }
 
 [<Fact>]
@@ -297,12 +327,9 @@ let ``Startup fails on expiry with the InMemory blob store`` () =
 
         use provider = durable
 
-        try
-            do! startValidation provider
-            Assert.Fail("Startup should have failed with the InMemory blob store.")
-        with :? InvalidOperationException as failed ->
-            failed.Message.Contains("Sessions:Expiry") |> should equal true
-            failed.Message.Contains("InMemory") |> should equal true
+        let! captured = captureCall (fun () -> startValidation provider)
+
+        checkInMemoryBlobStore captured
     }
 
 [<Fact>]

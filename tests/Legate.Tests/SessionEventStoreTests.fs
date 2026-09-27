@@ -733,6 +733,79 @@ let ``Append on an unknown session throws the control-plane exception`` () =
     }
     |> (fun t -> t.Wait())
 
+/// Runs one event-store call and captures any exception instead of
+/// raising, so the test's resumable body stays a straight-line await plus
+/// a return. The call is deferred so synchronous throws are captured too.
+let private captureCall (call: unit -> Task) : Task<exn option> =
+    task {
+        try
+            do! call ()
+            return None
+        with ex ->
+            return Some ex
+    }
+
+/// Asserts the first replay page holds ev-1 and ev-2 with cursor 2.
+/// Pure so the resumable test stays a straight-line await plus a return.
+let private checkFirstReplayPage (page: EventReplayOutcome) =
+    match page with
+    | :? EventReplayPage as p ->
+        p.Events.Count |> should equal 2
+        p.Events[0].Sequence.Value |> should equal 1L
+        p.Events[1].Sequence.Value |> should equal 2L
+        (p.Events[0] :?> TextDeltaEvent).Text |> should equal "ev-1"
+        p.NextCursor |> should equal (Nullable 2L)
+    | _ -> failwith "unreachable"
+
+/// Asserts the continuation page holds ev-3 and ev-4 with cursor 4.
+/// Pure so the resumable test stays a straight-line await plus a return.
+let private checkSecondReplayPage (second: EventReplayOutcome) =
+    match second with
+    | :? EventReplayPage as p ->
+        p.Events.Count |> should equal 2
+        p.Events[0].Sequence.Value |> should equal 3L
+        p.NextCursor |> should equal (Nullable 4L)
+    | _ -> failwith "expected a second page"
+
+/// Asserts the captured outcome is the per-event breach over the 600
+/// characters of text. Pure so the resumable test stays a straight-line
+/// await plus a return.
+let private checkOversizedEvent (captured: exn option) =
+    match captured with
+    | Some(:? EventLimitExceededException as exn) ->
+        // Observed is the persisted JSON size of the event, which is
+        // the text plus the envelope fields, so it is larger than the
+        // 600-character text and the breach is by that measure.
+        exn.LimitKind |> should equal "perEventBytes"
+        exn.Limit |> should equal 500L
+        exn.Observed |> should equal 766L
+        (exn.Observed > 600L) |> should equal true
+        exn.Message.Contains("per-event byte limit") |> should equal true
+    | Some unexpected -> failwith $"expected EventLimitExceededException but got {unexpected.GetType().Name}"
+    | None -> failwith "expected EventLimitExceededException"
+
+/// Asserts the captured outcome is the batch-size breach. Pure so the
+/// resumable test stays a straight-line await plus a return.
+let private checkOversizedBatch (captured: exn option) =
+    match captured with
+    | Some(:? EventLimitExceededException as exn) ->
+        exn.LimitKind |> should equal "batchSize"
+        exn.Limit |> should equal 3L
+        exn.Observed |> should equal 4L
+    | Some unexpected -> failwith $"expected EventLimitExceededException but got {unexpected.GetType().Name}"
+    | None -> failwith "expected EventLimitExceededException"
+
+/// Asserts the captured outcome is the per-session count breach. Pure
+/// so the resumable test stays a straight-line await plus a return.
+let private checkCountOverflow (captured: exn option) =
+    match captured with
+    | Some(:? EventLimitExceededException as exn) ->
+        exn.LimitKind |> should equal "perSessionCount"
+        exn.Limit |> should equal 5L
+        exn.Observed |> should equal 6L
+    | Some unexpected -> failwith $"expected EventLimitExceededException but got {unexpected.GetType().Name}"
+    | None -> failwith "expected EventLimitExceededException"
+
 [<Fact>]
 let ``Replay pages in sequence order and honours the limit`` () =
     let _, sessionId, store = fresh ()
@@ -752,24 +825,12 @@ let ``Replay pages in sequence order and honours the limit`` () =
 
         (page :? EventReplayPage) |> should equal true
 
-        match page with
-        | :? EventReplayPage as p ->
-            p.Events.Count |> should equal 2
-            p.Events[0].Sequence.Value |> should equal 1L
-            p.Events[1].Sequence.Value |> should equal 2L
-            (p.Events[0] :?> TextDeltaEvent).Text |> should equal "ev-1"
-            p.NextCursor |> should equal (Nullable 2L)
-        | _ -> failwith "unreachable"
+        checkFirstReplayPage page
 
         // Continuation from the cursor returns the rest.
         let! second = store.Replay(tenant, sessionId, 2L, 2, CancellationToken.None)
 
-        match second with
-        | :? EventReplayPage as p ->
-            p.Events.Count |> should equal 2
-            p.Events[0].Sequence.Value |> should equal 3L
-            p.NextCursor |> should equal (Nullable 4L)
-        | _ -> failwith "expected a second page"
+        checkSecondReplayPage second
 
         // Past the last event: end of stream, distinct from a page.
         let! tail = store.Replay(tenant, sessionId, 4L, 2, CancellationToken.None)
@@ -953,8 +1014,8 @@ let ``An oversized event throws EventLimitExceededException with populated prope
     let huge = String('x', 600)
 
     task {
-        try
-            let! _ =
+        let! captured =
+            captureCall (fun () ->
                 store.Append(
                     tenant,
                     sessionId,
@@ -962,17 +1023,9 @@ let ``An oversized event throws EventLimitExceededException with populated prope
                     ([ inFlight sessionId huge ] :> IReadOnlyList<SessionEvent>),
                     CancellationToken.None
                 )
+                :> Task)
 
-            failwith "expected EventLimitExceededException"
-        with :? EventLimitExceededException as exn ->
-            // Observed is the persisted JSON size of the event, which is
-            // the text plus the envelope fields, so it is larger than the
-            // 600-character text and the breach is by that measure.
-            exn.LimitKind |> should equal "perEventBytes"
-            exn.Limit |> should equal 500L
-            exn.Observed |> should equal 766L
-            (exn.Observed > 600L) |> should equal true
-            exn.Message.Contains("per-event byte limit") |> should equal true
+        checkOversizedEvent captured
 
         fake.MaxSequence(sessionId) |> should equal 0L
     }
@@ -986,13 +1039,10 @@ let ``An oversized batch throws with the batch-size kind and no write`` () =
         [ 1..4 ] |> List.map (fun n -> inFlight sessionId $"ev-{n}") :> IReadOnlyList<SessionEvent>
 
     task {
-        try
-            let! _ = store.Append(tenant, sessionId, "token-1", events, CancellationToken.None)
-            failwith "expected EventLimitExceededException"
-        with :? EventLimitExceededException as exn ->
-            exn.LimitKind |> should equal "batchSize"
-            exn.Limit |> should equal 3L
-            exn.Observed |> should equal 4L
+        let! captured =
+            captureCall (fun () -> store.Append(tenant, sessionId, "token-1", events, CancellationToken.None) :> Task)
+
+        checkOversizedBatch captured
 
         fake.MaxSequence(sessionId) |> should equal 0L
     }
@@ -1018,8 +1068,8 @@ let ``Exceeding the per-session count throws and leaves no partial batch`` () =
 
         fake.MaxSequence(sessionId) |> should equal 5L
 
-        try
-            let! _ =
+        let! captured =
+            captureCall (fun () ->
                 store.Append(
                     tenant,
                     sessionId,
@@ -1027,12 +1077,9 @@ let ``Exceeding the per-session count throws and leaves no partial batch`` () =
                     ([ inFlight sessionId "overflow" ] :> IReadOnlyList<SessionEvent>),
                     CancellationToken.None
                 )
+                :> Task)
 
-            failwith "expected EventLimitExceededException"
-        with :? EventLimitExceededException as exn ->
-            exn.LimitKind |> should equal "perSessionCount"
-            exn.Limit |> should equal 5L
-            exn.Observed |> should equal 6L
+        checkCountOverflow captured
 
         fake.MaxSequence(sessionId) |> should equal 5L
     }

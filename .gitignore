@@ -74,3 +74,8 @@ appsettings.user.*
 
 # Agent tooling node modules
 .opencode/node_modules/
+
+# DocFX site output and generated API YAML (Docs/api/index.md stays tracked)
+Docs/_site/
+Docs/api/*.yml
+Docs/api/.manifest

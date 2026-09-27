@@ -10,7 +10,7 @@ open Microsoft.Extensions.Configuration
 open Microsoft.Extensions.DependencyInjection
 open Xunit
 
-// Registration coverage for every preset: AddOpenAI, AddAnthropic,
+// Registration coverage for every preset: AddOpenAI, AddAnthropicCompatible,
 // AddOllamaCloud, and AddOpenAICompatible bind Legate:Llm:Providers:<Name>
 // and register one provider instance. Scripted transports only; the canned
 // key never leaves the test.
@@ -89,7 +89,7 @@ let ``AddOpenAI honours the configure callback`` () =
     provider.DefaultModel |> should equal "gpt-4o"
 
 [<Fact>]
-let ``AddAnthropic registers the Anthropic preset`` () =
+let ``AddAnthropicCompatible registers the Anthropic preset`` () =
     let config =
         buildConfig
             [
@@ -97,7 +97,7 @@ let ``AddAnthropic registers the Anthropic preset`` () =
             ]
 
     let provider =
-        registerSingle (fun builder -> builder.Llm.AddAnthropic(config) |> ignore)
+        registerSingle (fun builder -> builder.Llm.AddAnthropicCompatible(config) |> ignore)
 
     provider.Id |> should equal "anthropic"
     provider.DefaultModel |> should equal "claude-sonnet"
@@ -200,7 +200,7 @@ let ``Registration chains on the same builder`` () =
     let services = ServiceCollection()
     let builder = LegateBuilder(services)
 
-    let chained = builder.Llm.AddOpenAI(config).AddAnthropic(config)
+    let chained = builder.Llm.AddOpenAI(config).AddAnthropicCompatible(config)
 
     Object.ReferenceEquals(chained, builder.Llm) |> should equal true
 

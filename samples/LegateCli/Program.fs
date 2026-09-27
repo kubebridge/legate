@@ -193,7 +193,7 @@ let private buildServices
                 |> ignore
             else
                 match start.Provider.ToLowerInvariant() with
-                | "anthropic" -> builder.Llm.AddAnthropic(configuration) |> ignore
+                | "anthropic" -> builder.Llm.AddAnthropicCompatible(configuration) |> ignore
                 | "openai" -> builder.Llm.AddOpenAI(configuration) |> ignore
                 | "google" ->
                     Legate.Llm.GoogleServiceCollectionExtensions.AddGoogle(builder.Services, configuration)

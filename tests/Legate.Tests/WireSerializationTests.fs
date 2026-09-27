@@ -91,9 +91,11 @@ let private liveCursor () : TurnLoop.TurnLoopSuspension =
         Nested = None
     }
 
-/// Builds every live actor-protocol message: all nine SessionActorMessage
-/// cases, all thirteen SuspendableActorMessage cases, every reply case, the
-/// snapshot, a stored session, and the router message.
+/// Builds every live wire message: all nine SessionActorMessage cases,
+/// all thirteen SuspendableActorMessage cases, every reply case, the
+/// snapshot, a stored session, the router message, and the four
+/// cross-node subscription cases (issue 133: the subscribe request, the
+/// unsubscribe, one event batch, and one journaled session event).
 let private everyLiveMessage () : obj list =
     let entry = textEntry "wire probe" 7L
     let session = storedSession ()
@@ -104,6 +106,38 @@ let private everyLiveMessage () : obj list =
         ReplyMismatchException(session.Id, "req-9", "No pending request 'req-9'.")
 
     let allowed = HashSet<string>([| "probe-tool" |])
+
+    let subscribeRequest: CrossNodeSubscriptions.CrossNodeSubscribeRequest =
+        {
+            Tenant = TenantId.Default
+            SessionId = session.Id
+            FromSequence = 0L
+            SubscriberToken = "wire-subscriber"
+        }
+
+    let unsubscribeRequest: CrossNodeSubscriptions.CrossNodeUnsubscribe =
+        {
+            Tenant = TenantId.Default
+            SessionId = session.Id
+            SubscriberToken = "wire-subscriber"
+        }
+
+    let eventBatch: CrossNodeSubscriptions.CrossNodeEventBatch =
+        {
+            SessionId = session.Id
+            Events =
+                [|
+                    TextDeltaEvent(session.Id, TurnId.New(), Nullable<int64>(7L), DateTimeOffset.UtcNow, "wire event")
+                    :> SessionEvent
+                |]
+                :> IReadOnlyList<SessionEvent>
+            NextCursor = 7L
+            EndOfStream = true
+        }
+
+    let journaledEvent: SessionEvent =
+        TextDeltaEvent(session.Id, TurnId.New(), Nullable<int64>(7L), DateTimeOffset.UtcNow, "wire event")
+        :> SessionEvent
 
     let finished =
         SessionActor.SuspendableFinished(entry, settledCompletion (), 1, allowed)
@@ -166,6 +200,10 @@ let private everyLiveMessage () : obj list =
         :> obj
         session :> obj
         SessionRouterMessage.ResolveSession(session.Id.ToString()) :> obj
+        subscribeRequest :> obj
+        unsubscribeRequest :> obj
+        eventBatch :> obj
+        journaledEvent :> obj
     ]
 
 /// Runs emit under a MeterListener scoped to the serialization rejected
@@ -241,7 +279,7 @@ let private toWireBytes (serializer: WireSerializer) (message: obj) : byte[] * s
 let ``Manifest table carries one unique legate manifest per wire case at v1`` () =
     let manifests = WireManifests.cases |> List.map WireManifests.manifestOf
 
-    manifests.Length |> should equal 37
+    manifests.Length |> should equal 41
     manifests |> List.distinct |> List.length |> should equal manifests.Length
 
     for wireCase in WireManifests.cases do
@@ -256,20 +294,8 @@ let ``Manifest table carries one unique legate manifest per wire case at v1`` ()
     dtoTypes |> List.distinct |> List.length |> should equal dtoTypes.Length
 
 [<Fact>]
-let ``Reserved manifests pin the subscription and event namespaces`` () =
-    WireManifests.reservedManifests
-    |> should
-        equal
-        [
-            "legate.subscription.Subscribe.v1"
-            "legate.event.SessionEvent.v1"
-        ]
-
-    for manifest in WireManifests.reservedManifests do
-        (WireManifests.tryParseManifest manifest).IsSome |> should equal true
-
-        let family, _, _ = WireManifests.tryParseManifest manifest |> Option.get
-        WireManifests.tryFindCase family (manifest.Split('.')[2]) |> should equal None
+let ``No manifests stay reserved after the subscription promotion`` () =
+    WireManifests.reservedManifests |> should be Empty
 
 [<Fact>]
 let ``Manifest parsing accepts the shape and refuses anything else`` () =
@@ -292,7 +318,7 @@ let ``Manifest parsing accepts the shape and refuses anything else`` () =
 [<Fact>]
 let ``Every protocol case maps to a DTO with a manifest`` () =
     let messages = everyLiveMessage ()
-    messages.Length |> should equal 38
+    messages.Length |> should equal 42
 
     for message in messages do
         let dto = WireDtos.toWire message
@@ -305,9 +331,9 @@ let ``Every protocol case maps to a DTO with a manifest`` () =
     let dtos = messages |> List.map WireDtos.toWire
     let types = dtos |> List.map (fun dto -> dto.GetType())
 
-    // 38 live messages over 37 DTOs: the settled and the suspended
+    // 42 live messages over 41 DTOs: the settled and the suspended
     // SuspendableFinished share one wire case.
-    types |> List.distinct |> List.length |> should equal 37
+    types |> List.distinct |> List.length |> should equal 41
 
 [<Fact>]
 let ``Prompt DTO round-trips its payload and drops its token`` () =
@@ -664,7 +690,7 @@ let ``HOCON fragment binds every protocol type to the wire serializer`` () =
         let key = $"{boundType.FullName}, {boundType.Assembly.GetName().Name}"
         fragment.Contains(key, StringComparison.Ordinal) |> should equal true
 
-    WireSerialization.boundTypes.Length |> should equal 9
+    WireSerialization.boundTypes.Length |> should equal 13
 
 [<Fact>]
 let ``Cluster HOCON carries the wire maximum from options`` () =

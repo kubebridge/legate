@@ -283,6 +283,50 @@ let ``Subscribe handoff under concurrent append loses and duplicates nothing`` (
         sequences |> should equal [ 1L; 2L; 3L; 4L; 5L; 6L ]
     }
 
+/// Runs one bus call and captures any exception instead of raising, so
+/// the test's resumable body stays a straight-line await plus a return.
+/// The call is deferred so synchronous throws are captured too.
+let private captureCall (call: unit -> Task) : Task<exn option> =
+    task {
+        try
+            do! call ()
+            return None
+        with ex ->
+            return Some ex
+    }
+
+/// Asserts the captured outcome is the typed slow-subscriber lag naming
+/// the session. Pure so the resumable test stays a straight-line await
+/// plus a return.
+let private checkLagged (sessionId: SessionId) (captured: exn option) =
+    match captured with
+    | Some(:? SessionSubscriptionLaggedException as ex) ->
+        ex.SessionId |> should equal sessionId
+        ex.Reason |> should equal "slowSubscriber"
+    | Some unexpected -> failwith $"expected SessionSubscriptionLaggedException but got {unexpected.GetType().Name}"
+    | None -> failwith "expected SessionSubscriptionLaggedException"
+
+/// Attempts a third subscription synchronously and captures any refusal
+/// instead of raising. Synchronous, so the resumable test keeps only
+/// straight-line awaits around it.
+let private tryThirdSubscribe (bus: SessionEventBus) (tenant: TenantId) (sessionId: SessionId) : exn option =
+    try
+        bus.Subscribe(tenant, sessionId, 0L, CancellationToken.None) |> ignore
+        None
+    with ex ->
+        Some ex
+
+/// Asserts the captured outcome is the typed subscriber-cap refusal.
+/// Pure so the resumable test stays a straight-line await plus a return.
+let private checkCapRefusal (sessionId: SessionId) (captured: exn option) =
+    match captured with
+    | Some(:? SessionSubscriptionLimitExceededException as ex) ->
+        ex.SessionId |> should equal sessionId
+        ex.Limit |> should equal 2
+    | Some unexpected ->
+        failwith $"expected SessionSubscriptionLimitExceededException but got {unexpected.GetType().Name}"
+    | None -> failwith "expected SessionSubscriptionLimitExceededException"
+
 [<Fact>]
 let ``Slow subscriber disconnects with the typed lagged error instead of stalling`` () =
     task {
@@ -308,12 +352,9 @@ let ``Slow subscriber disconnects with the typed lagged error instead of stallin
 
         publishTen ()
 
-        try
-            let! _ = collectAll stream
-            failwith "expected SessionSubscriptionLaggedException"
-        with :? SessionSubscriptionLaggedException as ex ->
-            ex.SessionId |> should equal sessionId
-            ex.Reason |> should equal "slowSubscriber"
+        let! captured = captureCall (fun () -> collectAll stream :> Task)
+
+        checkLagged sessionId captured
     }
 
 [<Fact>]
@@ -333,12 +374,8 @@ let ``Subscriber cap rejects past the limit`` () =
         let second = bus.Subscribe(tenant, sessionId, 0L, CancellationToken.None)
         let secondEnumerator = second.GetAsyncEnumerator(CancellationToken.None)
 
-        try
-            bus.Subscribe(tenant, sessionId, 0L, CancellationToken.None) |> ignore
-            failwith "expected SessionSubscriptionLimitExceededException"
-        with :? SessionSubscriptionLimitExceededException as ex ->
-            ex.SessionId |> should equal sessionId
-            ex.Limit |> should equal 2
+        let captured = tryThirdSubscribe bus tenant sessionId
+        checkCapRefusal sessionId captured
 
         do! secondEnumerator.DisposeAsync().AsTask()
         do! firstEnumerator.DisposeAsync().AsTask()

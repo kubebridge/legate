@@ -12,6 +12,7 @@
     <Compile Include="Exceptions.fs" />
     <Compile Include="ArtifactOptions.fs" />
     <Compile Include="Seams.fs" />
+    <Compile Include="ClusterBootstrap.fs" />
     <Compile Include="Blobs.fs" />
     <Compile Include="Messages.fs" />
     <Compile Include="UntrustedContext.fs" />
@@ -19,6 +20,7 @@
     <Compile Include="Turns.fs" />
     <Compile Include="Llm.fs" />
     <Compile Include="ModelCatalog.fs" />
+    <Compile Include="DistributedAdmission.fs" />
     <Compile Include="LegateOptions.fs" />
     <Compile Include="Agents.fs" />
     <Compile Include="HostHooks.fs" />

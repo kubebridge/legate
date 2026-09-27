@@ -108,8 +108,7 @@ dotnet test Legate.slnx                 # plain test run
   provider (SQLite locally; Postgres via Testcontainers in CI) before opening
   or merging a PR.
 - **Commit message convention**: single line, lowercase, imperative mood,
-  under 72 characters (`add session store contract`). Every commit carries a
-  `Signed-off-by` trailer (`git commit -s`); CI rejects PRs without it (DCO).
+  under 72 characters (`add session store contract`).
 
 ## Project Board
 
@@ -149,10 +148,9 @@ they exist, the `samples/` hosts run locally (`dotnet run --project samples/<Nam
 Default QA target: the test suite.
 
 Releases: pushing a tag `vX.Y.Z[-suffix]` runs `.github/workflows/release.yml`,
-which tests, packs with that version, and publishes to GitHub Packages
-(`https://nuget.pkg.github.com/kubebridge/index.json`). Switch the source
-and API key to nuget.org for the first public release. The release workflow
-has not yet been exercised by a real tag.
+which tests, packs with that version, and publishes to nuget.org
+(`https://api.nuget.org/v3/index.json`) with the `NUGET_API_KEY` secret.
+The release workflow has not yet been exercised by a real tag.
 
 ## Branch Map
 
@@ -162,8 +160,7 @@ has not yet been exercised by a real tag.
 | `v*` tags | releases | `.github/workflows/release.yml` |
 
 - `ci.yml` is the gate for pull requests and `main`: `Restore`,
-  `CheckFormat`, `Test`, and `Pack` via `build.fsx` on Ubuntu and Windows,
-  plus a `dco` job that fails a PR when any commit lacks `Signed-off-by`.
+  `CheckFormat`, `CheckHeaders`, `Test`, and `Pack` via `build.fsx` on Ubuntu and Windows.
 - Merging to `main` deploys nothing. Reviewer auto-merge is safe whenever CI
   is green; releases are an explicit tag push.
 - Never implement or commit directly on `main` or the user's active working

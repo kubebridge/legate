@@ -1,0 +1,18 @@
+# Sample-only entry point for humans and curl: plain ClusterIP on the
+# app port. Pod discovery does not use DNS (it queries the Kubernetes
+# API), so this Service stays out of the cluster-formation path.
+apiVersion: v1
+kind: Service
+metadata:
+  name: legate-minimalhost
+  namespace: legate-demo
+  labels:
+    app: legate
+spec:
+  type: ClusterIP
+  selector:
+    app: legate
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

@@ -3,6 +3,7 @@ module Legate.Tests.LlmCoordinatorTests
 
 open System
 open System.Collections.Generic
+open System.Diagnostics.Metrics
 open System.Net.Http
 open System.Threading
 open System.Threading.Tasks
@@ -2009,3 +2010,760 @@ let ``Coordinator admit logs carry all six scopes and never carry keys`` () =
             entry.Scopes |> List.exists (fun (name, _) -> name = key) |> should equal true
 
         entry.Text.Contains("sk-static-coordinator-key") |> should equal false
+
+// ───────────────────────────────────────────────────────────────────────────
+// Distributed admission (issue 136)
+
+/// One scripted acquire step: an outcome to return, or a failure to raise.
+type private ScriptedAcquire =
+    | AcquireOutcome of DistributedAdmissionOutcome
+    | AcquireThrow of exn
+
+/// A scripted IDistributedLlmAdmission: dequeues scripted acquire outcomes
+/// in call order and records every acquire, release, and cooldown for
+/// assertions. Renew and complete report false (fenced or missing).
+type private FakeAdmission(script: ResizeArray<ScriptedAcquire>) =
+    let gate = obj ()
+    let acquireCalls = ResizeArray<string * string * int * TimeSpan * TimeSpan>()
+    let releases = ResizeArray<string * string>()
+    let cooldowns = ResizeArray<string * TimeSpan>()
+
+    /// The acquire calls seen, oldest first: identity, owner, max
+    /// concurrency, lease TTL, waiter TTL.
+    member _.AcquireCalls = lock gate (fun () -> acquireCalls |> List.ofSeq)
+
+    /// The releases seen, oldest first: identity and owner.
+    member _.Releases = lock gate (fun () -> releases |> List.ofSeq)
+
+    /// The cooldown propagations seen, oldest first: identity and pause.
+    member _.Cooldowns = lock gate (fun () -> cooldowns |> List.ofSeq)
+
+    interface IDistributedLlmAdmission with
+        member _.AcquireAsync(identity, ownerId, maxConcurrency, leaseTtl, waiterTtl, _) =
+            lock gate (fun () -> acquireCalls.Add((identity, ownerId, maxConcurrency, leaseTtl, waiterTtl)))
+
+            let step =
+                lock gate (fun () ->
+                    if script.Count = 0 then
+                        failwith "The acquire script ran out of scripted outcomes."
+
+                    let head = script[0]
+                    script.RemoveAt(0)
+                    head)
+
+            match step with
+            | AcquireOutcome outcome -> Task.FromResult(outcome)
+            | AcquireThrow failure -> Task.FromException<DistributedAdmissionOutcome>(failure)
+
+        member _.RenewAsync(_, _, _, _) = Task.FromResult(false)
+
+        member _.ReleaseAsync(identity, ownerId, _) =
+            lock gate (fun () -> releases.Add((identity, ownerId)))
+            Task.FromResult(true)
+
+        member _.CompleteAsync(_, _, _) = Task.FromResult(false)
+
+        member _.StartCooldownAsync(identity, cooldown, _) =
+            lock gate (fun () -> cooldowns.Add((identity, cooldown)))
+            Task.CompletedTask
+
+/// Builds distributed coordination options: Redis mode on the loopback
+/// connection with the given fail policy.
+let private makeDistOptions (failClosed: bool) : DistributedCoordinationOptions =
+    let dist = DistributedCoordinationOptions()
+    dist.Mode <- DistributedCoordinationMode.Redis
+    dist.ConnectionString <- "127.0.0.1:6379"
+    dist.FailClosed <- failClosed
+    dist
+
+/// Builds a coordinator wired to the fake seam.
+let private makeDistributedCoordinator
+    (options: LlmOptions)
+    (registry: ILlmProviderRegistry)
+    (clock: TimeProvider)
+    (delay: ILlmDelay)
+    (random: ILlmRandom)
+    (admission: IDistributedLlmAdmission | null)
+    (distOptions: DistributedCoordinationOptions | null)
+    : LlmCoordination.LlmCoordinator =
+    LlmCoordination.LlmCoordinator(
+        options,
+        registry,
+        TableKeyProvider(Map.empty) :> IApiKeyProvider,
+        clock,
+        delay,
+        random,
+        null,
+        admission,
+        distOptions
+    )
+
+/// Runs one call under a known session, turn, and attempt: the owner id
+/// the coordinator derives stays assertable.
+let private executeKnownTurn
+    (coordinator: LlmCoordination.LlmCoordinator)
+    (tenant: TenantId)
+    (invoke: Func<IChatClient, CancellationToken, Task<StringOutcome>>)
+    (sessionId: SessionId)
+    (turnId: TurnId)
+    (attempt: int)
+    : Task<string> =
+    coordinator.ExecuteAsync(
+        ModelReference.Parse("acme/fast"),
+        tenant,
+        10L,
+        invoke,
+        CancellationToken.None,
+        null,
+        null,
+        sessionId,
+        turnId,
+        attempt
+    )
+
+/// An ILlmDelay that advances the fake clock by the requested wait instead
+/// of parking on it: deadline-bound distributed waits stay deterministic
+/// without interleaving advances from the fact.
+type private AdvancingDelay(clock: FakeTimeProvider, recorded: ResizeArray<TimeSpan>) =
+    interface ILlmDelay with
+        member _.Delay(requested, cancellationToken) =
+            recorded.Add(requested)
+            cancellationToken.ThrowIfCancellationRequested()
+            clock.Advance(requested)
+            Task.CompletedTask
+
+/// An ILlmDelay that cancels the caller's source on the first wait: the
+/// fact proves caller cancellation maps to cancel, never to fail policy.
+type private CancelOnFirstDelay(owner: CancellationTokenSource) =
+    interface ILlmDelay with
+        member _.Delay(_, _) =
+            owner.Cancel()
+            Task.CompletedTask
+
+/// Counts legate.provider.fail_open_admissions points for the provider
+/// observed while emit runs.
+let private countFailOpenAdmissions (provider: string) (emit: unit -> unit) : int64 =
+    let gate = obj ()
+    let mutable total = 0L
+    use listener = new MeterListener()
+
+    listener.InstrumentPublished <-
+        Action<Instrument, MeterListener>(fun instrument _ ->
+            if instrument.Name = Telemetry.FailOpenAdmissionsName then
+                listener.EnableMeasurementEvents(instrument, null) |> ignore)
+
+    listener.SetMeasurementEventCallback<int64>(fun instrument measurement tags _ ->
+        if instrument.Name = Telemetry.FailOpenAdmissionsName then
+            let mutable matched = false
+
+            for index in 0 .. tags.Length - 1 do
+                if tags[index].Key = Telemetry.ProviderTag && string tags[index].Value = provider then
+                    matched <- true
+
+            if matched then
+                lock gate (fun () -> total <- total + measurement))
+
+    listener.Start()
+    emit ()
+    lock gate (fun () -> total)
+
+[<Fact>]
+let ``Distributed admit invokes under one lease and releases on settle`` () =
+    let provider = StubProvider("acme", "fast")
+    let registry = makeRegistry [ provider :> ILlmProvider ]
+    let options = makeOptions ignore [ "acme", "sk-static" ] true
+    let dist = makeDistOptions true
+    let clock = FakeTimeProvider()
+    let delay = RecordingDelay()
+    let tracker = ParallelTracker()
+
+    let admission =
+        FakeAdmission(
+            ResizeArray(
+                [
+                    AcquireOutcome(DistributedAdmissionOutcome.Acquired())
+                ]
+            )
+        )
+
+    let coordinator =
+        makeDistributedCoordinator
+            options
+            registry
+            clock
+            (delay :> ILlmDelay)
+            (SeededRandom(1) :> ILlmRandom)
+            admission
+            dist
+
+    let sessionId = SessionId.New()
+    let turnId = TurnId.New()
+
+    let value =
+        executeKnownTurn coordinator tenantA (instantInvoke tracker (usageOf 1L 1L) "ok") sessionId turnId 1
+        |> fun task -> task.GetAwaiter().GetResult()
+
+    value |> should equal "ok"
+
+    let calls = admission.AcquireCalls
+    calls.Length |> should equal 1
+    let identity, owner, cap, leaseTtl, waiterTtl = calls[0]
+    identity |> should equal "acme/static"
+    owner.StartsWith(turnId.Value + "/attempt-1/") |> should equal true
+    owner.Split('/').Length |> should equal 3
+    cap |> should equal 4
+    leaseTtl |> should equal (TimeSpan.FromSeconds 120.0)
+    waiterTtl |> should equal (TimeSpan.FromSeconds 120.0)
+
+    admission.Releases |> should equal [ (identity, owner) ]
+    admission.Cooldowns |> should be Empty
+
+[<Fact>]
+let ``Distributed flag with Disabled mode or no client fails fast`` () =
+    let provider = StubProvider("acme", "fast")
+    let registry = makeRegistry [ provider :> ILlmProvider ]
+    let clock = FakeTimeProvider()
+    let tracker = ParallelTracker()
+
+    // Mode Disabled with a client: names the mode, never the seam.
+    let disabled = makeDistOptions true
+    disabled.Mode <- DistributedCoordinationMode.Disabled
+
+    let modeMismatch =
+        makeDistributedCoordinator
+            (makeOptions ignore [ "acme", "sk-static" ] true)
+            registry
+            clock
+            (NeverDelay() :> ILlmDelay)
+            (SeededRandom(1) :> ILlmRandom)
+            (FakeAdmission(ResizeArray()) :> IDistributedLlmAdmission)
+            disabled
+
+    let modeCaught =
+        try
+            execute modeMismatch "acme/fast" tenantA 10L (instantInvoke tracker (usageOf 1L 1L) "unreached")
+            |> fun task -> task.GetAwaiter().GetResult() |> ignore
+
+            None
+        with :? InvalidOperationException as failure ->
+            Some failure
+
+    modeCaught.IsSome |> should equal true
+
+    modeCaught.Value.Message.Contains("DistributedCoordination")
+    |> should equal true
+
+    provider.Builds |> should equal 0
+
+    // Mode Redis with no client: names the missing client.
+    let missingClient =
+        makeDistributedCoordinator
+            (makeOptions ignore [ "acme", "sk-static" ] true)
+            registry
+            clock
+            (NeverDelay() :> ILlmDelay)
+            (SeededRandom(1) :> ILlmRandom)
+            null
+            (makeDistOptions true)
+
+    let missingCaught =
+        try
+            execute missingClient "acme/fast" tenantA 10L (instantInvoke tracker (usageOf 1L 1L) "unreached")
+            |> fun task -> task.GetAwaiter().GetResult() |> ignore
+
+            None
+        with :? InvalidOperationException as failure ->
+            Some failure
+
+    missingCaught.IsSome |> should equal true
+
+    missingCaught.Value.Message.Contains("IDistributedLlmAdmission")
+    |> should equal true
+
+    provider.Builds |> should equal 0
+
+[<Fact>]
+let ``Fail-closed rejects without contacting the provider`` () =
+    let provider = StubProvider("acme", "fast")
+    let registry = makeRegistry [ provider :> ILlmProvider ]
+    let options = makeOptions ignore [ "acme", "sk-static" ] true
+    let dist = makeDistOptions true
+    let clock = FakeTimeProvider()
+    let delay = RecordingDelay()
+
+    let admission =
+        FakeAdmission(
+            ResizeArray(
+                [
+                    AcquireThrow(InvalidOperationException("redis down"))
+                ]
+            )
+        )
+
+    let coordinator =
+        makeDistributedCoordinator
+            options
+            registry
+            clock
+            (delay :> ILlmDelay)
+            (SeededRandom(1) :> ILlmRandom)
+            admission
+            dist
+
+    let attempts = ResizeArray<int>()
+
+    let plan =
+        ResizeArray<PlannedOutcome>(
+            [
+                SucceedWith(usageOf 1L 1L, "unreached")
+            ]
+        )
+
+    let caught =
+        try
+            executeKnownTurn coordinator tenantA (runPlan plan attempts) (SessionId.New()) (TurnId.New()) 1
+            |> fun task -> task.GetAwaiter().GetResult() |> ignore
+
+            None
+        with :? AdmissionRejectedException as rejected ->
+            Some rejected
+
+    caught.IsSome |> should equal true
+    caught.Value.Reason |> should equal LlmCoordination.DistributedUnavailableReason
+    // The invoke lambda never ran: the provider was never contacted.
+    attempts |> List.ofSeq |> should be Empty
+    // The give-up path still released the (possibly landed) lease.
+    admission.AcquireCalls.Length |> should equal 1
+    admission.Releases.Length |> should equal 1
+
+[<Fact>]
+let ``Fail-open admits one concurrent call with a queue of sixteen and records the metric`` () =
+    let provider = StubProvider("acme", "fast")
+    let registry = makeRegistry [ provider :> ILlmProvider ]
+    let options = makeOptions ignore [ "acme", "sk-static" ] true
+    let dist = makeDistOptions false
+    let clock = FakeTimeProvider()
+    let tracker = ParallelTracker()
+
+    // Every acquire fails: every call takes the emergency path.
+    let admission =
+        FakeAdmission(
+            ResizeArray(
+                [
+                    for _ in 1..32 -> AcquireThrow(InvalidOperationException("redis down"))
+                ]
+            )
+        )
+
+    let coordinator =
+        makeDistributedCoordinator
+            options
+            registry
+            clock
+            (NeverDelay() :> ILlmDelay)
+            (SeededRandom(1) :> ILlmRandom)
+            admission
+            dist
+
+    let gate = new TaskCompletionSource<StringOutcome>()
+
+    let admitted =
+        countFailOpenAdmissions "acme" (fun () ->
+            let holder = execute coordinator "acme/fast" tenantA 10L (gatedInvoke tracker gate)
+
+            let waiters =
+                [
+                    for _ in 1..16 ->
+                        execute coordinator "acme/fast" tenantA 10L (instantInvoke tracker (usageOf 1L 1L) "w")
+                ]
+
+            // One emergency slot held, sixteen queued: none settled.
+            waiters |> List.forall (fun task -> not task.IsCompleted) |> should equal true
+
+            // The seventeenth waiter overflows the emergency queue cap.
+            let rejected =
+                try
+                    execute coordinator "acme/fast" tenantA 10L (instantInvoke tracker (usageOf 1L 1L) "unreached")
+                    |> fun task -> task.GetAwaiter().GetResult() |> ignore
+
+                    None
+                with :? AdmissionRejectedException as failure ->
+                    Some failure
+
+            rejected.IsSome |> should equal true
+            rejected.Value.Reason |> should equal LlmCoordination.QueueFullReason
+            rejected.Value.Message.Contains("16") |> should equal true
+
+            gate.SetResult(outcomeOf "held" 1L 1L)
+            holder.GetAwaiter().GetResult() |> should equal "held"
+
+            for waiter in waiters do
+                waiter.GetAwaiter().GetResult() |> should equal "w")
+
+    // One point per locally-admitted call: the holder plus sixteen
+    // waiters. The rejected seventeenth records nothing.
+    admitted |> should equal 17L
+
+[<Fact>]
+let ``Queued polls within the deadline then admits`` () =
+    let provider = StubProvider("acme", "fast")
+    let registry = makeRegistry [ provider :> ILlmProvider ]
+    let options = makeOptions ignore [ "acme", "sk-static" ] true
+    let dist = makeDistOptions true
+    let clock = FakeTimeProvider()
+    let recorded = ResizeArray<TimeSpan>()
+    let tracker = ParallelTracker()
+
+    let admission =
+        FakeAdmission(
+            ResizeArray(
+                [
+                    AcquireOutcome(DistributedAdmissionOutcome.Queued(0))
+                    AcquireOutcome(DistributedAdmissionOutcome.Acquired())
+                ]
+            )
+        )
+
+    let coordinator =
+        makeDistributedCoordinator
+            options
+            registry
+            clock
+            (AdvancingDelay(clock, recorded) :> ILlmDelay)
+            (SeededRandom(1) :> ILlmRandom)
+            admission
+            dist
+
+    let value =
+        execute coordinator "acme/fast" tenantA 10L (instantInvoke tracker (usageOf 1L 1L) "ok")
+        |> fun task -> task.GetAwaiter().GetResult()
+
+    value |> should equal "ok"
+    recorded |> List.ofSeq |> should equal [ TimeSpan.FromSeconds 1.0 ]
+    admission.AcquireCalls.Length |> should equal 2
+    // Retries hold the one lease under the one owner.
+    let _, firstOwner, _, _, _ = admission.AcquireCalls[0]
+    let _, secondOwner, _, _, _ = admission.AcquireCalls[1]
+    secondOwner |> should equal firstOwner
+    // Settle released the lease once.
+    admission.Releases |> should equal [ ("acme/static", firstOwner) ]
+
+[<Fact>]
+let ``Queued past the deadline raises DeadlineExceeded`` () =
+    let provider = StubProvider("acme", "fast")
+    let registry = makeRegistry [ provider :> ILlmProvider ]
+
+    let options =
+        makeOptions (fun coordination -> coordination.RequestTimeoutSeconds <- 3) [ "acme", "sk-static" ] true
+
+    let dist = makeDistOptions true
+    let clock = FakeTimeProvider()
+    let recorded = ResizeArray<TimeSpan>()
+    let tracker = ParallelTracker()
+
+    let admission =
+        FakeAdmission(
+            ResizeArray(
+                [
+                    for _ in 1..10 -> AcquireOutcome(DistributedAdmissionOutcome.Queued(0))
+                ]
+            )
+        )
+
+    let coordinator =
+        makeDistributedCoordinator
+            options
+            registry
+            clock
+            (AdvancingDelay(clock, recorded) :> ILlmDelay)
+            (SeededRandom(1) :> ILlmRandom)
+            admission
+            dist
+
+    (fun () ->
+        execute coordinator "acme/fast" tenantA 10L (instantInvoke tracker (usageOf 1L 1L) "unreached")
+        |> fun task -> task.GetAwaiter().GetResult() |> ignore)
+    |> should throw typeof<DeadlineExceededException>
+
+    recorded
+    |> List.ofSeq
+    |> should
+        equal
+        [
+            TimeSpan.FromSeconds 1.0
+            TimeSpan.FromSeconds 1.0
+        ]
+
+    admission.AcquireCalls.Length |> should equal 3
+    // The give-up path released the queued waiter entry.
+    admission.Releases.Length |> should equal 1
+
+[<Fact>]
+let ``CooldownActive waits the pause then admits without touching the local cooldown`` () =
+    let provider = StubProvider("acme", "fast")
+    let registry = makeRegistry [ provider :> ILlmProvider ]
+    let options = makeOptions ignore [ "acme", "sk-static" ] true
+    let dist = makeDistOptions true
+    let clock = FakeTimeProvider()
+    let recorded = ResizeArray<TimeSpan>()
+    let tracker = ParallelTracker()
+
+    let admission =
+        FakeAdmission(
+            ResizeArray(
+                [
+                    AcquireOutcome(DistributedAdmissionOutcome.CooldownActive())
+                    AcquireOutcome(DistributedAdmissionOutcome.Acquired())
+                ]
+            )
+        )
+
+    let coordinator =
+        makeDistributedCoordinator
+            options
+            registry
+            clock
+            (AdvancingDelay(clock, recorded) :> ILlmDelay)
+            (SeededRandom(1) :> ILlmRandom)
+            admission
+            dist
+
+    let value =
+        execute coordinator "acme/fast" tenantA 10L (instantInvoke tracker (usageOf 1L 1L) "ok")
+        |> fun task -> task.GetAwaiter().GetResult()
+
+    value |> should equal "ok"
+    // The shorter of RateLimitCooldown (30 s) and the remaining deadline.
+    recorded |> List.ofSeq |> should equal [ TimeSpan.FromSeconds 30.0 ]
+    admission.AcquireCalls.Length |> should equal 2
+    // No lease was ever held, so settle released exactly once; nothing
+    // propagated a cooldown the seam never reported.
+    admission.Releases.Length |> should equal 1
+    admission.Cooldowns |> should be Empty
+
+[<Fact>]
+let ``CooldownActive past the deadline raises DeadlineExceeded`` () =
+    let provider = StubProvider("acme", "fast")
+    let registry = makeRegistry [ provider :> ILlmProvider ]
+
+    let options =
+        makeOptions (fun coordination -> coordination.RequestTimeoutSeconds <- 5) [ "acme", "sk-static" ] true
+
+    let dist = makeDistOptions true
+    let clock = FakeTimeProvider()
+    let recorded = ResizeArray<TimeSpan>()
+    let tracker = ParallelTracker()
+
+    let admission =
+        FakeAdmission(
+            ResizeArray(
+                [
+                    for _ in 1..3 -> AcquireOutcome(DistributedAdmissionOutcome.CooldownActive())
+                ]
+            )
+        )
+
+    let coordinator =
+        makeDistributedCoordinator
+            options
+            registry
+            clock
+            (AdvancingDelay(clock, recorded) :> ILlmDelay)
+            (SeededRandom(1) :> ILlmRandom)
+            admission
+            dist
+
+    (fun () ->
+        execute coordinator "acme/fast" tenantA 10L (instantInvoke tracker (usageOf 1L 1L) "unreached")
+        |> fun task -> task.GetAwaiter().GetResult() |> ignore)
+    |> should throw typeof<DeadlineExceededException>
+
+    // min(RateLimitCooldown 30 s, remaining 5 s).
+    recorded |> List.ofSeq |> should equal [ TimeSpan.FromSeconds 5.0 ]
+    admission.AcquireCalls.Length |> should equal 1
+    // No lease was ever held, but the deadline give-up still releases
+    // best-effort: every give-up path releases.
+    admission.Releases.Length |> should equal 1
+
+[<Fact>]
+let ``Post-acquire rate trip releases the lease and waits`` () =
+    let provider = StubProvider("acme", "fast")
+    let registry = makeRegistry [ provider :> ILlmProvider ]
+
+    let options =
+        makeOptions (fun coordination -> coordination.RequestsPerMinute <- 1) [ "acme", "sk-static" ] true
+
+    let dist = makeDistOptions true
+    let clock = FakeTimeProvider()
+    let recorded = ResizeArray<TimeSpan>()
+    let tracker = ParallelTracker()
+
+    let admission =
+        FakeAdmission(
+            ResizeArray(
+                [
+                    AcquireOutcome(DistributedAdmissionOutcome.Acquired())
+                    AcquireOutcome(DistributedAdmissionOutcome.Acquired())
+                    AcquireOutcome(DistributedAdmissionOutcome.Acquired())
+                ]
+            )
+        )
+
+    let coordinator =
+        makeDistributedCoordinator
+            options
+            registry
+            clock
+            (AdvancingDelay(clock, recorded) :> ILlmDelay)
+            (SeededRandom(1) :> ILlmRandom)
+            admission
+            dist
+
+    let first =
+        execute coordinator "acme/fast" tenantA 10L (instantInvoke tracker (usageOf 1L 1L) "one")
+        |> fun task -> task.GetAwaiter().GetResult()
+
+    first |> should equal "one"
+
+    // The first call filled the per-process RPM window, so the second
+    // call trips the post-acquire check, releases, waits out the window,
+    // and re-acquires under the same owner.
+    let second =
+        execute coordinator "acme/fast" tenantA 10L (instantInvoke tracker (usageOf 1L 1L) "two")
+        |> fun task -> task.GetAwaiter().GetResult()
+
+    second |> should equal "two"
+    recorded |> List.ofSeq |> should equal [ TimeSpan.FromMinutes 1.0 ]
+    admission.AcquireCalls.Length |> should equal 3
+
+    let _, firstOwner, _, _, _ = admission.AcquireCalls[0]
+    let _, secondOwner, _, _, _ = admission.AcquireCalls[1]
+    let _, thirdOwner, _, _, _ = admission.AcquireCalls[2]
+    secondOwner |> should equal thirdOwner
+    (secondOwner = firstOwner) |> should equal false
+
+    admission.Releases
+    |> should
+        equal
+        [
+            ("acme/static", firstOwner)
+            ("acme/static", secondOwner)
+            ("acme/static", secondOwner)
+        ]
+
+[<Fact>]
+let ``HTTP 429 propagates the same pause to the seam`` () =
+    let provider = StubProvider("acme", "fast")
+    let registry = makeRegistry [ provider :> ILlmProvider ]
+
+    let options =
+        makeOptions (fun coordination -> coordination.RequestTimeoutSeconds <- 600) [ "acme", "sk-static" ] true
+
+    let dist = makeDistOptions true
+    let clock = FakeTimeProvider()
+    let recorded = ResizeArray<TimeSpan>()
+
+    let admission =
+        FakeAdmission(
+            ResizeArray(
+                [
+                    AcquireOutcome(DistributedAdmissionOutcome.Acquired())
+                ]
+            )
+        )
+
+    let coordinator =
+        makeDistributedCoordinator
+            options
+            registry
+            clock
+            (AdvancingDelay(clock, recorded) :> ILlmDelay)
+            (SeededRandom(1) :> ILlmRandom)
+            admission
+            dist
+
+    let plan =
+        ResizeArray<PlannedOutcome>(
+            [
+                FailWith(providerFailureWithRetryAfter 429 (TimeSpan.FromSeconds 120.0))
+                SucceedWith(usageOf 1L 1L, "ok")
+            ]
+        )
+
+    let attempts = ResizeArray<int>()
+
+    let value =
+        execute coordinator "acme/fast" tenantA 10L (runPlan plan attempts)
+        |> fun task -> task.GetAwaiter().GetResult()
+
+    value |> should equal "ok"
+    attempts |> List.ofSeq |> should equal [ 1; 2 ]
+    // The retry-after outlasts the configured pause: local and seam share
+    // the same 120-second pause.
+    admission.Cooldowns
+    |> should
+        equal
+        [
+            ("acme/static", TimeSpan.FromSeconds 120.0)
+        ]
+
+    recorded |> List.ofSeq |> should equal [ TimeSpan.FromSeconds 120.0 ]
+
+[<Fact>]
+let ``Caller cancel during a distributed wait maps to cancel, never to fail policy`` () =
+    let provider = StubProvider("acme", "fast")
+    let registry = makeRegistry [ provider :> ILlmProvider ]
+    let options = makeOptions ignore [ "acme", "sk-static" ] true
+    let dist = makeDistOptions true
+    let clock = FakeTimeProvider()
+    let tracker = ParallelTracker()
+    use caller = new CancellationTokenSource()
+
+    let admission =
+        FakeAdmission(
+            ResizeArray(
+                [
+                    for _ in 1..5 -> AcquireOutcome(DistributedAdmissionOutcome.Queued(0))
+                ]
+            )
+        )
+
+    let coordinator =
+        makeDistributedCoordinator
+            options
+            registry
+            clock
+            (CancelOnFirstDelay(caller) :> ILlmDelay)
+            (SeededRandom(1) :> ILlmRandom)
+            admission
+            dist
+
+    let mutable sawAdmissionRejected = false
+    let mutable sawDeadline = false
+
+    let caught =
+        try
+            executeWithToken
+                coordinator
+                "acme/fast"
+                tenantA
+                10L
+                (instantInvoke tracker (usageOf 1L 1L) "unreached")
+                caller.Token
+            |> fun task -> task.GetAwaiter().GetResult() |> ignore
+
+            None
+        with
+        | :? AdmissionRejectedException ->
+            sawAdmissionRejected <- true
+            None
+        | :? DeadlineExceededException ->
+            sawDeadline <- true
+            None
+        | :? OperationCanceledException as canceled -> Some canceled
+
+    sawAdmissionRejected |> should equal false
+    sawDeadline |> should equal false
+    caught.IsSome |> should equal true
+    // The cancelled wait released its queued waiter entry.
+    admission.Releases.Length |> should equal 1

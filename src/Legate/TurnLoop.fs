@@ -66,6 +66,16 @@ module internal TurnLoop =
     /// Compaction.createHook; None on TurnLoopOptions disables compaction.
     type CompactionHook = IList<ChatMessage> -> int64 -> int64 -> CancellationToken -> Task<int64 * int64>
 
+    /// Provider-call-entry hook (issue 284): invoked once before the first
+    /// provider call of a fresh turn run, carrying the turn id and the
+    /// iteration's linked token. The session actor journals the fenced
+    /// TurnStartedEvent here, so subscribers observe an executing turn
+    /// in-call; None on TurnLoopOptions journals nothing. A hook failure
+    /// propagates: a fenced-out loser raises TurnLeaseLostException instead
+    /// of calling the model. Nested sub-agent turns fire it under their own
+    /// turn id; resume and post-nested continuations never refire it.
+    type TurnStartedHook = TurnId -> CancellationToken -> Task<unit>
+
     /// What one settled tool invocation looked like: the name the model
     /// called it by, the call id the result answers, the appended result
     /// text, and the failure when the invocation raised instead of
@@ -132,6 +142,10 @@ module internal TurnLoop =
             AskUser: AskUserOptions option
             /// The settled-invocation observer, or None to observe nothing.
             OnToolCall: (ToolCallObservation -> Task<unit>) option
+            /// The provider-call-entry hook (issue 284), or None to journal
+            /// nothing. Fires once before the first provider call of a fresh
+            /// run; continuations never refire it (see runSuspendableAsync).
+            OnTurnStarted: TurnStartedHook option
             /// The task-tool nested runner, or None when the turn offers no
             /// task tool.
             TaskNested: TaskNestedRun option
@@ -163,6 +177,7 @@ module internal TurnLoop =
                 Compaction = None
                 AskUser = None
                 OnToolCall = None
+                OnTurnStarted = None
                 TaskNested = None
                 StructuredOutcome = false
                 Logger = null
@@ -1816,7 +1831,10 @@ module internal TurnLoop =
                                 client
                                 history
                                 tools
-                                options
+                                // The turn already marked at its first
+                                // provider call: the continuation runs
+                                // stripped, so it never double-marks.
+                                { options with OnTurnStarted = None }
                                 delay
                                 resumeToken
                                 isLeaseValid
@@ -2216,6 +2234,18 @@ module internal TurnLoop =
                         | None -> Task.FromResult((inputTokens, outputTokens))
 
                     try
+                        // In-call marker (issue 284): once, before the first
+                        // provider call of a fresh run. Inside the try so a
+                        // deadline firing mid-append settles as the timeout
+                        // like an in-flight provider call; external
+                        // cancellation still propagates. Continuations never
+                        // reach here with the hook set (they run stripped),
+                        // so a turn marks exactly once per fresh run.
+                        if iterations = 0 then
+                            match options.OnTurnStarted with
+                            | Some hook -> do! hook turnId linkedToken
+                            | None -> ()
+
                         let! response =
                             LlmStreaming.streamResponseAsync client history chatOptions linkedToken ignore ignore
 
@@ -2313,6 +2343,11 @@ module internal TurnLoop =
 
         if not (Enum.IsDefined(typeof<PermissionDecisionKind>, decision)) then
             raise (ArgumentOutOfRangeException(nameof decision, "Unknown permission decision."))
+
+        // A resumed turn already marked before it suspended: the
+        // continuation runs stripped, so it never double-marks (and never
+        // marks under the continuation's default turn ids).
+        let options = { options with OnTurnStarted = None }
 
         let allowed =
             if isNull (box allowedForSession) then
@@ -2435,6 +2470,11 @@ module internal TurnLoop =
 
         if suspension.Kind <> QuestionSuspension then
             raise (ArgumentException("The suspension is not a question suspension.", nameof suspension))
+
+        // A resumed turn already marked before it suspended: the
+        // continuation runs stripped, so it never double-marks (and never
+        // marks under the continuation's default turn ids).
+        let options = { options with OnTurnStarted = None }
 
         let text = if isNull answer then "" else answer
 

@@ -75,8 +75,59 @@ type internal ClusterHealthCheck(options: IOptions<LegateOptions>, provider: ISe
     do ArgumentNullException.ThrowIfNull(options)
     do ArgumentNullException.ThrowIfNull(provider)
 
+    /// Finds the cluster actor-system service. Pure so the resumable
+    /// check stays a flat mode match.
+    /// <returns>Some service when registered; otherwise None.</returns>
+    member private _.FindClusteredService() : ClusterActorSystemService option =
+        provider.GetServices<IHostedService>()
+        |> Seq.tryPick (fun service ->
+            match service with
+            | :? ClusterActorSystemService as typed -> Some typed
+            | _ -> None)
+
+    /// Evaluates the StaticSeeds/Kubernetes branch over the live cluster
+    /// view. Pure over the resolved service so the resumable check
+    /// delegates with a single return.
+    /// <param name="mode">The cluster mode the branch runs in.</param>
+    /// <param name="clusterOptions">The cluster options the snapshot reads.</param>
+    /// <returns>The readiness result.</returns>
+    member private this.CheckClustered(mode: ClusterMode, clusterOptions: ClusterOptions) : HealthCheckResult =
+        match this.FindClusteredService() with
+        | None -> HealthCheckResult.Unhealthy("The cluster actor system is not registered: AddLegate registers it.")
+        | Some clustered ->
+            match clustered.System with
+            | null -> HealthCheckResult.Unhealthy($"The cluster actor system is not running in %O{mode} mode.")
+            | system ->
+                let cluster: Akka.Cluster.Cluster = Cluster.Get(system)
+                let self: Akka.Cluster.Member = cluster.SelfMember
+                let state: Akka.Cluster.ClusterEvent.CurrentClusterState = cluster.State
+
+                if isNull (box self) then
+                    HealthCheckResult.Unhealthy("The cluster reports no self member.")
+                elif isNull (box state) then
+                    HealthCheckResult.Unhealthy("The cluster reports no current state.")
+                else
+                    let selfUp = self.Status = MemberStatus.Up
+                    let hasRole = self.Roles.Contains(clusterOptions.SessionRole)
+                    let total = state.Members.Count
+                    let unreachable = state.Unreachable.Count
+                    let reachable = total - unreachable
+
+                    ClusterHealth.evaluateSnapshot clustered.IsDraining selfUp hasRole reachable total unreachable
+
+    /// Evaluates the StaticSeeds/Kubernetes branch as a task. Trivially
+    /// resumable (straight-line return) so the readiness check delegates
+    /// with a single return!.
+    /// <param name="mode">The cluster mode the branch runs in.</param>
+    /// <param name="clusterOptions">The cluster options the snapshot reads.</param>
+    /// <returns>The readiness result.</returns>
+    member private this.CheckClusteredAsync
+        (mode: ClusterMode, clusterOptions: ClusterOptions)
+        : Task<HealthCheckResult> =
+        task { return this.CheckClustered(mode, clusterOptions) }
+
     interface IHealthCheck with
-        member _.CheckHealthAsync(context: HealthCheckContext, _cancellationToken: CancellationToken) =
+        member this.CheckHealthAsync(context: HealthCheckContext, _cancellationToken: CancellationToken) =
             task {
                 ArgumentNullException.ThrowIfNull(context)
                 let clusterOptions = options.Value.Cluster
@@ -84,52 +135,7 @@ type internal ClusterHealthCheck(options: IOptions<LegateOptions>, provider: ISe
                 match clusterOptions.Mode with
                 | ClusterMode.Local -> return HealthCheckResult.Healthy("Local mode runs no cluster: always ready.")
                 | ClusterMode.StaticSeeds
-                | ClusterMode.Kubernetes as mode ->
-                    let service =
-                        provider.GetServices<IHostedService>()
-                        |> Seq.tryPick (fun service ->
-                            match service with
-                            | :? ClusterActorSystemService as typed -> Some typed
-                            | _ -> None)
-
-                    match service with
-                    | None ->
-                        return
-                            HealthCheckResult.Unhealthy(
-                                "The cluster actor system is not registered: AddLegate registers it."
-                            )
-                    | Some clustered ->
-                        match box clustered.System with
-                        | null ->
-                            return
-                                HealthCheckResult.Unhealthy(
-                                    $"The cluster actor system is not running in %O{mode} mode."
-                                )
-                        | :? Akka.Actor.ActorSystem as system ->
-                            let cluster: Akka.Cluster.Cluster = Cluster.Get(system)
-                            let self: Akka.Cluster.Member = cluster.SelfMember
-                            let state: Akka.Cluster.ClusterEvent.CurrentClusterState = cluster.State
-
-                            if isNull (box self) then
-                                return HealthCheckResult.Unhealthy("The cluster reports no self member.")
-                            elif isNull (box state) then
-                                return HealthCheckResult.Unhealthy("The cluster reports no current state.")
-                            else
-                                let selfUp = self.Status = MemberStatus.Up
-                                let hasRole = self.Roles.Contains(clusterOptions.SessionRole)
-                                let total = state.Members.Count
-                                let unreachable = state.Unreachable.Count
-                                let reachable = total - unreachable
-
-                                return
-                                    ClusterHealth.evaluateSnapshot
-                                        clustered.IsDraining
-                                        selfUp
-                                        hasRole
-                                        reachable
-                                        total
-                                        unreachable
-                        | _ -> return HealthCheckResult.Unhealthy("The cluster actor system is not running.")
+                | ClusterMode.Kubernetes as mode -> return! this.CheckClusteredAsync(mode, clusterOptions)
                 | _ ->
                     return
                         HealthCheckResult.Unhealthy(

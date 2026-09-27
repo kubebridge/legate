@@ -347,6 +347,47 @@ let ``Cluster Validate requires seeds in StaticSeeds but not in Kubernetes`` () 
     kubernetesSeeded.Validate() |> should equal null
 
 [<Fact>]
+let ``Cluster defaults bind ephemeral remoting on loopback`` () =
+    let options = ClusterOptions()
+    options.RemotingPort |> should equal 0
+    options.RemotingHostname |> should equal "127.0.0.1"
+    options.Validate() |> should equal null
+
+[<Fact>]
+let ``Cluster Validate flags bad remoting port and hostname`` () =
+    ClusterOptions(RemotingPort = -1).Validate()
+    |> should equal "RemotingPort must be between 0 and 65535."
+
+    ClusterOptions(RemotingPort = 65536).Validate()
+    |> should equal "RemotingPort must be between 0 and 65535."
+
+    ClusterOptions(RemotingHostname = "  ").Validate()
+    |> should equal "RemotingHostname must be a non-empty string."
+
+    let nullHost = ClusterOptions()
+    nullHost.RemotingHostname <- nullRef<string>
+
+    nullHost.Validate()
+    |> should equal "RemotingHostname must be a non-empty string."
+
+    let compose = ClusterOptions(RemotingPort = 4053, RemotingHostname = "0.0.0.0")
+    compose.Validate() |> should equal null
+
+[<Fact>]
+let ``Root Validate prefixes remoting violations with the cluster section`` () =
+    let port = LegateOptions()
+    port.Cluster.RemotingPort <- 70000
+
+    port.Validate()
+    |> should equal "Cluster: RemotingPort must be between 0 and 65535."
+
+    let host = LegateOptions()
+    host.Cluster.RemotingHostname <- "  "
+
+    host.Validate()
+    |> should equal "Cluster: RemotingHostname must be a non-empty string."
+
+[<Fact>]
 let ``Cluster Validate flags bad shard knobs roles and session role`` () =
     ClusterOptions(ShardCount = 0).Validate()
     |> should equal "ShardCount must be at least 1."
@@ -439,6 +480,26 @@ let ``Root Validate prefixes SBR violations with the cluster section`` () =
 
     deadline.Validate()
     |> should equal "Cluster: HostExitDeadline must be positive."
+
+[<Fact>]
+let ``Cluster MinimumMembers defaults to the singleton quorum`` () =
+    let options = ClusterOptions()
+    options.MinimumMembers |> should equal 1
+    options.Validate() |> should equal null
+
+[<Fact>]
+let ``Cluster Validate flags too few minimum members`` () =
+    ClusterOptions(MinimumMembers = 0).Validate()
+    |> should equal "MinimumMembers must be at least 1."
+
+    ClusterOptions(MinimumMembers = -1).Validate()
+    |> should equal "MinimumMembers must be at least 1."
+
+[<Fact>]
+let ``Root Validate prefixes MinimumMembers violations with the cluster section`` () =
+    let options = LegateOptions()
+    options.Cluster.MinimumMembers <- 0
+    options.Validate() |> should equal "Cluster: MinimumMembers must be at least 1."
 
 // ──────────────────────────────────────────────────────────────────────────
 // Pruning

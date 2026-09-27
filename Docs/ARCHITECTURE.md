@@ -147,7 +147,7 @@ Legate.Storage.Migrations   shared FluentMigrator baseline both relational provi
 Legate.Storage.S3           IBlobStore, IAgentPackageStore
 Legate.Storage.FileSystem   IBlobStore, IAgentPackageStore on local disk
 Legate.Storage.InMemory     all stores in memory (tests, samples)
-Legate.Coordination.Redis   IDistributedLlmAdmission
+Legate.Coordination.Redis   IDistributedLlmAdmission on StackExchange.Redis (contract in Legate.Abstractions)
 Legate.Workspace.Docker     IWorkspaceRuntime over the docker CLI
 Legate.Workspace.HostDirectory  IWorkspaceRuntime bound to a host directory (CLI harness)
 Legate.Workspace.Process    IWorkspaceRuntime on a scratch directory, no sandbox
@@ -220,10 +220,13 @@ defer are all point lookups by session.
 ## Cluster
 
 `StaticSeeds` mode joins the named seed nodes and shards session entities
-by session id; `Kubernetes` mode runs as a singleton until the
-Akka.Management bootstrap lands. Every node stamps its shard version as
-the member app-version and fails closed (leaves first) on a peer stamp
-mismatch.
+by session id; `Kubernetes` mode bootstraps through the registered
+`IClusterBootstrap` hook (Akka.Management plus Kubernetes discovery, owned
+by `Legate.Cluster.Kubernetes`), or runs as a singleton when no hook is
+registered. `StartAsync` completes only once `Cluster:MinimumMembers`
+members are Up, bounded by `Cluster:JoinTimeout`. Every node stamps its
+shard version as the member app-version and fails closed (leaves first)
+on a peer stamp mismatch.
 
 ### Split-brain resolution
 
@@ -251,6 +254,17 @@ is always ready. The cluster modes are ready exactly when all of these
 hold: `BeginDrain` has not run, this member's status is Up, this member
 carries the session role, the cluster reports zero unreachable members,
 and the reachable set holds a strict majority of the known members.
+
+The `legate-llm-coordination` health check (registered the same way, with
+its startup canary always registered) reports whether distributed LLM
+admission may serve traffic. It is Healthy when distributed coordination
+is off, the mode is Disabled, or the canary is not required at startup;
+otherwise it reports the stored startup-canary outcome (a canary that has
+not run yet reads Unhealthy). The canary proves the admission scripts
+execute with a seam-level acquire and release on a reserved identity, not
+a socket ping; per-call admission failures never latch the check (they
+stay observable through `AdmissionRejectedException` and the
+`legate.provider.fail_open_admissions` counter).
 
 ### Drain
 
@@ -350,10 +364,14 @@ Small bound is 32,768 bytes (control DTOs); large bound is 1,048,576 bytes
 | `legate.entity.SuspendableInterruptPrompt.v1` | `WireDtos.SuspendableInterruptPromptDto` | 1 | large |
 | `legate.entity.SuspendableQueuePrompt.v1` | `WireDtos.SuspendableQueuePromptDto` | 1 | large |
 | `legate.entity.SuspendableSetAgent.v1` | `WireDtos.SuspendableSetAgentDto` | 1 | small |
+| `legate.subscription.Subscribe.v1` | `WireDtos.SubscribeDto` | 1 | small |
+| `legate.subscription.Unsubscribe.v1` | `WireDtos.UnsubscribeDto` | 1 | small |
+| `legate.subscription.EventBatch.v1` | `WireDtos.EventBatchDto` | 1 | large |
+| `legate.event.SessionEvent.v1` | `WireDtos.SessionEventDto` | 1 | large |
 
-Reserved (no DTO yet; refused as unknown manifests until their owning
-issue promotes them to table rows): `legate.subscription.Subscribe.v1`
-(issue 132), `legate.event.SessionEvent.v1` (issue 133).
+No reserved manifests remain: the subscription and event namespaces
+promoted to table rows in issue 133, so every `legate.subscription.*` /
+`legate.event.*` manifest names a registered wire case.
 
 ## Observability
 

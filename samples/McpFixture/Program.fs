@@ -163,48 +163,46 @@ let private handleCallTool (id: JsonElement) (paramsOf: JsonElement) : Task =
     }
 
 let private handle (root: JsonElement) : Task =
-    task {
-        let hasId =
-            match tryGet root "id" with
-            | Some id when id.ValueKind <> JsonValueKind.Null -> Some id
-            | _ -> None
+    let hasId =
+        match tryGet root "id" with
+        | Some id when id.ValueKind <> JsonValueKind.Null -> Some id
+        | _ -> None
 
-        let method =
-            match tryGet root "method" with
-            | Some name -> textValue name
-            | None -> null
+    let method =
+        match tryGet root "method" with
+        | Some name -> textValue name
+        | None -> null
 
-        if String.IsNullOrWhiteSpace method then
+    if String.IsNullOrWhiteSpace method then
+        match hasId with
+        | Some id -> fail id -32600 "Missing method."
+        | None -> Task.CompletedTask
+    else
+        let paramsOf = objectOrEmpty root "params"
+
+        match method with
+        | "initialize" ->
             match hasId with
-            | Some id -> return! fail id -32600 "Missing method."
-            | None -> return ()
-        else
-            let paramsOf = objectOrEmpty root "params"
-
-            match method with
-            | "initialize" ->
-                match hasId with
-                | Some id -> return! handleInitialize id paramsOf
-                | None -> return ()
-            | "tools/list" ->
-                match hasId with
-                | Some id -> return! handleListTools id
-                | None -> return ()
-            | "tools/call" ->
-                match hasId with
-                | Some id -> return! handleCallTool id paramsOf
-                | None -> return ()
-            | "ping" ->
-                match hasId with
-                | Some id -> return! respond id (JsonObject())
-                | None -> return ()
-            | _ ->
-                // Unknown notifications are ignored; unknown requests fail
-                // with MethodNotFound so the client degrades explicitly.
-                match hasId with
-                | Some id -> return! fail id -32601 $"Method not found: {method}."
-                | None -> return ()
-    }
+            | Some id -> handleInitialize id paramsOf
+            | None -> Task.CompletedTask
+        | "tools/list" ->
+            match hasId with
+            | Some id -> handleListTools id
+            | None -> Task.CompletedTask
+        | "tools/call" ->
+            match hasId with
+            | Some id -> handleCallTool id paramsOf
+            | None -> Task.CompletedTask
+        | "ping" ->
+            match hasId with
+            | Some id -> respond id (JsonObject())
+            | None -> Task.CompletedTask
+        | _ ->
+            // Unknown notifications are ignored; unknown requests fail
+            // with MethodNotFound so the client degrades explicitly.
+            match hasId with
+            | Some id -> fail id -32601 $"Method not found: {method}."
+            | None -> Task.CompletedTask
 
 /// Reads one frame: LSP Content-Length framing when the line opens with
 /// it, else the line itself. Returns None at end of stream.

@@ -153,6 +153,10 @@ let ``Instrument names carry the documented legate names`` () =
     Telemetry.TurnsSettledName |> should equal "legate.turns.settled"
     Telemetry.ProviderCallsName |> should equal "legate.provider.calls"
     Telemetry.ProviderLatencyName |> should equal "legate.provider.latency"
+
+    Telemetry.FailOpenAdmissionsName
+    |> should equal "legate.provider.fail_open_admissions"
+
     Telemetry.ToolCallsName |> should equal "legate.tool.calls"
     Telemetry.ToolLatencyName |> should equal "legate.tool.latency"
     Telemetry.QueueDepthName |> should equal "legate.session.queue.depth"
@@ -217,6 +221,7 @@ let ``MeterListener observes every counter and histogram with its tags`` () =
             Telemetry.recordTurnSettled "Completed"
             Telemetry.recordProviderCall "probe-provider" "probe-model" Telemetry.StatusOk
             Telemetry.recordProviderLatency 12.5 "probe-provider" "probe-model"
+            Telemetry.recordFailOpenAdmission "probe-provider"
             Telemetry.recordToolCall "probe-tool" Telemetry.StatusOk
             Telemetry.recordToolLatency 3.25 "probe-tool"
             Telemetry.addQueueDepth 1
@@ -244,6 +249,8 @@ let ``MeterListener observes every counter and histogram with its tags`` () =
             "provider", "probe-provider"
             "model", "probe-model"
         ]
+
+    shouldHold measurements Telemetry.FailOpenAdmissionsName [ "provider", "probe-provider" ]
 
     shouldHold
         measurements

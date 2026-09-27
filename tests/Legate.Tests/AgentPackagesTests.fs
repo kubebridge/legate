@@ -601,6 +601,22 @@ let ``GetPackageInfo returns null when nothing was ever uploaded`` () =
     }
     |> (fun t -> t.Wait())
 
+/// Asserts the fetched info reflects the just-published manual upload:
+/// instructions, the deploy skill, the reviewer sub-agent, and the active
+/// version. Pure so the resumable test stays a straight-line await plus a
+/// return.
+let private checkPublishedInfo (info: AgentPackageInfo | null) =
+    match info with
+    | null -> failwith "the uploaded package was not found"
+    | found ->
+        found.Instructions |> should equal "instructions"
+        found.Skills.Count |> should equal 1
+        found.Skills[0] |> should equal "deploy"
+        found.SubAgents.Count |> should equal 1
+        found.SubAgents[0] |> should equal "reviewer"
+        found.Source |> should equal "manual-zip"
+        found.ActiveVersion |> should equal "1.0.0"
+
 [<Fact>]
 let ``UploadPackage publishes the version and makes it active`` () =
     let store = FakePackageStore() :> IAgentPackageStore
@@ -621,16 +637,7 @@ let ``UploadPackage publishes the version and makes it active`` () =
 
         let! info = store.GetPackageInfo(tenant, agent, CancellationToken.None)
 
-        match info with
-        | null -> failwith "the uploaded package was not found"
-        | found ->
-            found.Instructions |> should equal "instructions"
-            found.Skills.Count |> should equal 1
-            found.Skills[0] |> should equal "deploy"
-            found.SubAgents.Count |> should equal 1
-            found.SubAgents[0] |> should equal "reviewer"
-            found.Source |> should equal "manual-zip"
-            found.ActiveVersion |> should equal "1.0.0"
+        checkPublishedInfo info
     }
     |> (fun t -> t.Wait())
 
@@ -659,6 +666,28 @@ let ``UploadPackage rejects duplicate normalised paths and leaves no partial ver
         info |> should equal null
     }
     |> (fun t -> t.Wait())
+
+/// Asserts the replaced entry reads back the second upload's text,
+/// taking ownership of the stream. Pure (synchronous) so the resumable
+/// test stays a straight-line await plus a return.
+let private checkReplacedEntry (read: Stream | null) =
+    match read with
+    | null -> failwith "the replaced entry was not found"
+    | stream ->
+        use stream = stream
+        use reader = new StreamReader(stream)
+        reader.ReadToEnd() |> should equal "second"
+
+/// Asserts the info still points at the replaced version's contents and
+/// source. Pure so the resumable test stays a straight-line await plus a
+/// return.
+let private checkReplacedInfo (info: AgentPackageInfo | null) =
+    match info with
+    | null -> failwith "the package was not found"
+    | found ->
+        found.Instructions |> should equal "second"
+        found.Source |> should equal "github-sync"
+        found.ActiveVersion |> should equal "1.0.0"
 
 [<Fact>]
 let ``Re-uploading an existing version replaces contents and stays active`` () =
@@ -690,21 +719,11 @@ let ``Re-uploading an existing version replaces contents and stays active`` () =
 
         let! read = store.ReadFile(tenant, agent, "1.0.0", "AGENTS.md", CancellationToken.None)
 
-        match read with
-        | null -> failwith "the replaced entry was not found"
-        | stream ->
-            use stream = stream
-            use reader = new StreamReader(stream)
-            reader.ReadToEnd() |> should equal "second"
+        checkReplacedEntry read
 
         let! info = store.GetPackageInfo(tenant, agent, CancellationToken.None)
 
-        match info with
-        | null -> failwith "the package was not found"
-        | found ->
-            found.Instructions |> should equal "second"
-            found.Source |> should equal "github-sync"
-            found.ActiveVersion |> should equal "1.0.0"
+        checkReplacedInfo info
     }
     |> (fun t -> t.Wait())
 
@@ -964,6 +983,26 @@ let ``Store operations are tenant-scoped and agent-scoped`` () =
 // ───────────────────────────────────────────────────────────────────────────
 // IAgentPackageLeaseService
 
+/// Asserts the first acquire granted worker-a the lease. Pure so the
+/// resumable test stays a straight-line await plus a return.
+let private checkFirstGrant (first: PackageLeaseState) =
+    match first with
+    | :? PackageLeaseAcquired as acquired ->
+        acquired.Lease.Owner |> should equal "worker-a"
+        acquired.Lease.AgentId |> should equal agent
+        acquired.Lease.Tenant |> should equal tenant
+        isNull (box acquired.Lease.Token) |> should equal false
+    | _ -> failwith "expected PackageLeaseAcquired"
+
+/// Asserts the second acquire reports the lease as held. Pure so the
+/// resumable test stays a straight-line await plus a return.
+let private checkHeldUnavailable (second: PackageLeaseState) =
+    match second with
+    | :? PackageLeaseUnavailable as unavailable ->
+        unavailable.Reason |> should equal "leaseHeld"
+        unavailable.AgentId |> should equal agent
+    | _ -> failwith "expected PackageLeaseUnavailable"
+
 [<Fact>]
 let ``Acquire grants when unheld and reports leaseHeld when held`` () =
     let service = FakeLeaseService() :> IAgentPackageLeaseService
@@ -971,21 +1010,11 @@ let ``Acquire grants when unheld and reports leaseHeld when held`` () =
     task {
         let! first = service.Acquire(tenant, agent, "worker-a", TimeSpan.FromMinutes 5., CancellationToken.None)
 
-        match first with
-        | :? PackageLeaseAcquired as acquired ->
-            acquired.Lease.Owner |> should equal "worker-a"
-            acquired.Lease.AgentId |> should equal agent
-            acquired.Lease.Tenant |> should equal tenant
-            isNull (box acquired.Lease.Token) |> should equal false
-        | _ -> failwith "expected PackageLeaseAcquired"
+        checkFirstGrant first
 
         let! second = service.Acquire(tenant, agent, "worker-b", TimeSpan.FromMinutes 5., CancellationToken.None)
 
-        match second with
-        | :? PackageLeaseUnavailable as unavailable ->
-            unavailable.Reason |> should equal "leaseHeld"
-            unavailable.AgentId |> should equal agent
-        | _ -> failwith "expected PackageLeaseUnavailable"
+        checkHeldUnavailable second
     }
     |> (fun t -> t.Wait())
 
@@ -1009,6 +1038,22 @@ let ``Acquire is tenant-scoped`` () =
     }
     |> (fun t -> t.Wait())
 
+/// Asserts the renewal issued a fresh token with a later expiry. Pure so
+/// the resumable test stays a straight-line await plus a return.
+let private checkRenewedFresh (lease: AgentPackageLease) (renewed: PackageLeaseRenewal) =
+    match renewed with
+    | :? PackageLeaseRenewed as ok ->
+        ok.Lease.Token |> should not' (equal lease.Token)
+        ok.Lease.ExpiresAt |> should be (greaterThan DateTimeOffset.UtcNow)
+    | _ -> failwith "expected PackageLeaseRenewed"
+
+/// Asserts renewing the stale token reports the lease as lost. Pure so the
+/// resumable test stays a straight-line await plus a return.
+let private checkRenewedStale (lost: PackageLeaseRenewal) =
+    match lost with
+    | :? PackageLeaseLost as failure -> failure.Reason |> should equal "staleToken"
+    | _ -> failwith "expected PackageLeaseLost"
+
 [<Fact>]
 let ``Renew returns a fresh lease or the lost branch`` () =
     let service = FakeLeaseService() :> IAgentPackageLeaseService
@@ -1019,18 +1064,12 @@ let ``Renew returns a fresh lease or the lost branch`` () =
 
         let! renewed = service.Renew(lease, TimeSpan.FromMinutes 5., CancellationToken.None)
 
-        match renewed with
-        | :? PackageLeaseRenewed as ok ->
-            ok.Lease.Token |> should not' (equal lease.Token)
-            ok.Lease.ExpiresAt |> should be (greaterThan DateTimeOffset.UtcNow)
-        | _ -> failwith "expected PackageLeaseRenewed"
+        checkRenewedFresh lease renewed
 
         // The old token is stale after a renewal: the renewal is lost.
         let! lost = service.Renew(lease, TimeSpan.FromMinutes 5., CancellationToken.None)
 
-        match lost with
-        | :? PackageLeaseLost as failure -> failure.Reason |> should equal "staleToken"
-        | _ -> failwith "expected PackageLeaseLost"
+        checkRenewedStale lost
     }
     |> (fun t -> t.Wait())
 
@@ -1163,6 +1202,29 @@ let ``WithLease releases the lease when the work fails`` () =
     }
     |> (fun t -> t.Wait())
 
+/// Runs one package-service call and captures any exception instead of
+/// raising, so the test's resumable body stays a straight-line await plus
+/// a return. The call is deferred so synchronous throws are captured too.
+let private captureCall (call: unit -> Task) : Task<exn option> =
+    task {
+        try
+            do! call ()
+            return None
+        with ex ->
+            return Some ex
+    }
+
+/// Asserts the captured outcome is the acquire refusal naming worker-a.
+/// Pure so the resumable test stays a straight-line await plus a return.
+let private checkLeaseDenied (captured: exn option) =
+    match captured with
+    | Some(:? PackageLeaseException as exn) ->
+        exn.Operation |> should equal "acquire"
+        exn.AgentId |> should equal agent
+        exn.Owner |> should equal "worker-a"
+    | Some unexpected -> failwith $"expected PackageLeaseException but got {unexpected.GetType().Name}"
+    | None -> failwith "expected PackageLeaseException"
+
 [<Fact>]
 let ``WithLease throws PackageLeaseException when the acquire fails`` () =
     let leased = FakeLeaseService() :> IAgentPackageLeaseService
@@ -1171,8 +1233,8 @@ let ``WithLease throws PackageLeaseException when the acquire fails`` () =
         // Hold the lease from another owner.
         let! _ = leased.Acquire(tenant, agent, "holder", TimeSpan.FromMinutes 5., CancellationToken.None)
 
-        try
-            let! _ =
+        let! captured =
+            captureCall (fun () ->
                 leased.WithLease(
                     tenant,
                     agent,
@@ -1182,11 +1244,8 @@ let ``WithLease throws PackageLeaseException when the acquire fails`` () =
                     (fun (_: CancellationToken) -> Task.FromResult 1),
                     CancellationToken.None
                 )
+                :> Task)
 
-            failwith "expected PackageLeaseException"
-        with :? PackageLeaseException as exn ->
-            exn.Operation |> should equal "acquire"
-            exn.AgentId |> should equal agent
-            exn.Owner |> should equal "worker-a"
+        checkLeaseDenied captured
     }
     |> (fun t -> t.Wait())

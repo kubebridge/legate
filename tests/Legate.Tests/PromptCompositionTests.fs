@@ -440,6 +440,26 @@ module PromptCompositionTests =
     // ───────────────────────────────────────────────────────────────────
     // Turn wiring: the composed runner leads with the system message
 
+    /// Asserts the history led with the resolved system prompt. Pure so
+    /// the resumable test stays a straight-line await plus a return.
+    let private checkSystemLedHistory (seen: ChatMessage list) =
+        match seen with
+        | [ system; user ] ->
+            system.Role |> should equal ChatRole.System
+            messageText system |> should equal "composed system"
+            user.Role |> should equal ChatRole.User
+            messageText user |> should equal "hello"
+        | seen -> failwith (sprintf "expected a system message plus the user message, saw %d messages" seen.Length)
+
+    /// Asserts the history kept the user-only shape. Pure so the
+    /// resumable test stays a straight-line await plus a return.
+    let private checkUserOnlyHistory (seen: ChatMessage list) =
+        match seen with
+        | [ user ] ->
+            user.Role |> should equal ChatRole.User
+            messageText user |> should equal "hello"
+        | seen -> failwith (sprintf "expected only the user message, saw %d messages" seen.Length)
+
     [<Fact>]
     let ``Composed runner leads history with the resolved system prompt`` () =
         task {
@@ -457,13 +477,7 @@ module PromptCompositionTests =
 
             result.Status |> should equal TurnStatus.Completed
 
-            match client.Seen with
-            | [ system; user ] ->
-                system.Role |> should equal ChatRole.System
-                messageText system |> should equal "composed system"
-                user.Role |> should equal ChatRole.User
-                messageText user |> should equal "hello"
-            | seen -> failwith (sprintf "expected a system message plus the user message, saw %d messages" seen.Length)
+            checkSystemLedHistory client.Seen
         }
 
     [<Fact>]
@@ -483,11 +497,7 @@ module PromptCompositionTests =
 
             result.Status |> should equal TurnStatus.Completed
 
-            match client.Seen with
-            | [ user ] ->
-                user.Role |> should equal ChatRole.User
-                messageText user |> should equal "hello"
-            | seen -> failwith (sprintf "expected only the user message, saw %d messages" seen.Length)
+            checkUserOnlyHistory client.Seen
         }
 
     [<Fact>]

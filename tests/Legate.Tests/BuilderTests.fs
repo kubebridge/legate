@@ -7,6 +7,7 @@ open System.Threading
 open System.Threading.Tasks
 open FsUnit.Xunit
 open Legate
+open Legate.Cluster
 open Legate.Storage.InMemory
 open Microsoft.Extensions.AI
 open Microsoft.Extensions.Configuration
@@ -401,3 +402,71 @@ let ``C# Action style registers through the same builder`` () =
     options.Sessions.Capacity |> should equal 8
 
     startHosted provider
+
+// ──────────────────────────────────────────────────────────────────────────
+// Cluster bootstrap (issue 138)
+
+/// A bootstrap hook that contributes no HOCON and starts nothing: the
+/// builder tests only assert registration, never cluster formation.
+type StubClusterBootstrap() =
+
+    interface IClusterBootstrap with
+        member _.BuildHocon() = ""
+        member _.StartAsync(_system: obj, _cancellationToken: CancellationToken) = Task.CompletedTask
+
+[<Fact>]
+let ``Cluster UseBootstrap registers the hook instance`` () =
+    let hook = StubClusterBootstrap()
+    let services = ServiceCollection()
+
+    addLegateFSharp services (fun builder -> builder.Cluster.UseBootstrap(hook :> IClusterBootstrap) |> ignore)
+
+    use provider = services.BuildServiceProvider()
+    provider.GetService<IClusterBootstrap>() |> should equal hook
+
+    // No hook by default: Kubernetes keeps the singleton self-join.
+    let plain = ServiceCollection()
+    addLegateFSharp plain (fun _ -> ())
+    use plainProvider = plain.BuildServiceProvider()
+
+    isNull (box (plainProvider.GetService<IClusterBootstrap>()))
+    |> should equal true
+
+[<Fact>]
+let ``Cluster UseBootstrap generic registers the hook type`` () =
+    let services = ServiceCollection()
+
+    addLegateFSharp services (fun builder -> builder.Cluster.UseBootstrap<StubClusterBootstrap>() |> ignore)
+
+    use provider = services.BuildServiceProvider()
+
+    provider.GetService<IClusterBootstrap>() :? StubClusterBootstrap
+    |> should equal true
+
+[<Fact>]
+let ``Cluster UseKubernetes registers the bootstrap hook with shaped options`` () =
+    let services = ServiceCollection()
+
+    addLegateFSharp services (fun builder ->
+        builder.Cluster.UseKubernetes(Action<KubernetesOptions>(fun options -> options.RequiredContactPoints <- 3))
+        |> ignore)
+
+    use provider = services.BuildServiceProvider()
+
+    provider.GetService<IClusterBootstrap>() |> should not' (be null)
+
+    let options = provider.GetRequiredService<IOptions<KubernetesOptions>>().Value
+    options.RequiredContactPoints |> should equal 3
+    options.Validate() |> should equal null
+
+[<Fact>]
+let ``Cluster UseKubernetes fails fast on invalid options`` () =
+    let services = ServiceCollection()
+
+    let register () =
+        addLegateFSharp services (fun builder ->
+            builder.Cluster.UseKubernetes(Action<KubernetesOptions>(fun options -> options.ManagementPort <- 0))
+            |> ignore)
+
+    let ex = Assert.Throws<InvalidOperationException>(register)
+    ex.Message.Contains("ManagementPort") |> should equal true

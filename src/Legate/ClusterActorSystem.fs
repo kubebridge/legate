@@ -2,6 +2,7 @@
 namespace Legate
 
 open System
+open System.Collections.Concurrent
 open System.Collections.Immutable
 open System.Runtime.ExceptionServices
 open System.Threading
@@ -19,17 +20,18 @@ open Microsoft.Extensions.Options
 
 // Clustered actor systems for StaticSeeds and Kubernetes modes. A
 // singleton hosted service creates one Akka.NET ActorSystem with
-// remoting+cluster HOCON, joins (seed nodes, or itself as a
-// singleton until issue 138 ships the Akka.Management bootstrap),
-// starts one session shard region restricted to the session role, and
-// resolves sessions through per-id proxies that forward into the
-// region preserving the sender, so Ask round-trips to the entity and
-// back. Entities are thin delegators spawning the same SessionActor
-// through the facade-wired factory, so the actor code is shared with
-// Local mode. A version guard fails closed on a peer stamp mismatch.
-// Local mode is untouched: this service starts nothing there.
-// Kubernetes joins nothing until issue 138: SeedNodes is ignored and
-// the node runs as a singleton until the bootstrap lands.
+// remoting+cluster HOCON, joins (seed nodes, itself as a singleton when
+// no bootstrap hook is registered, or through the registered
+// IClusterBootstrap hook), starts one session shard region restricted to
+// the session role, and resolves sessions through per-id proxies that
+// forward into the region preserving the sender, so Ask round-trips to
+// the entity and back. Entities are thin delegators spawning the same
+// SessionActor through the facade-wired factory, so the actor code is
+// shared with Local mode. A version guard fails closed on a peer stamp
+// mismatch. Local mode is untouched: this service starts nothing there.
+// Kubernetes without a hook ignores SeedNodes and runs as a singleton;
+// with a hook the node binds all interfaces and bootstraps through
+// Akka.Management plus Kubernetes discovery.
 
 // ──────────────────────────────────────────────────────────────────────────
 // Guard protocol
@@ -75,6 +77,13 @@ module internal ClusterActorSystem =
     /// arrive with the production bootstrap work.
     let remotingHostname = "127.0.0.1"
 
+    /// The remoting bind hostname once a bootstrap hook is registered in
+    /// Kubernetes mode: pods must accept cross-pod traffic, so the node
+    /// binds all interfaces. The advertised address comes from the hook
+    /// fragment's public-hostname (POD_IP), not host DNS: the core keeps
+    /// binding 0.0.0.0 while peers dial the pod IP.
+    let kubernetesRemotingHostname = "0.0.0.0"
+
     /// Formats a positive TimeSpan as HOCON duration: whole seconds as
     /// Ns, anything smaller as Nms. Validation keeps SBR knobs in range;
     /// this only renders what Validate already accepted.
@@ -107,23 +116,29 @@ module internal ClusterActorSystem =
 
     /// Builds remoting+cluster HOCON from the cluster options. StaticSeeds
     /// lists SeedNodes as seed-nodes; Kubernetes lists none (SeedNodes is
-    /// ignored) and runs as a singleton until issue 138. Both publish
-    /// the version stamp as the member app-version and the node roles. The
-    /// versioned envelope wiring (issue 130) rides along: the DTO
-    /// serializer, its bindings for the actor, router, and entity protocol
-    /// messages, and the global wire maximum from MaxWirePayloadBytes.
+    /// ignored: peers come from the bootstrap hook's discovery fragment).
+    /// Both publish the version stamp as the member app-version and the
+    /// node roles. The versioned envelope wiring (issue 130) rides along:
+    /// the DTO serializer, its bindings for the actor, router, and entity
+    /// protocol messages, and the global wire maximum from
+    /// MaxWirePayloadBytes.
     /// The keep-majority split-brain resolver block is bound from options:
     /// StableAfter maps to split-brain-resolver.stable-after,
     /// DownRemovalMargin (Zero means off) maps to down-removal-margin,
     /// DownAllWhenUnstable (null means on, Zero means off) maps to
     /// split-brain-resolver.down-all-when-unstable, and JoinTimeout maps
     /// to seed-node-timeout. HostExitDeadline is a Legate-level StopAsync
-    /// cap and is never emitted as HOCON.
+    /// cap and is never emitted as HOCON, and neither is MinimumMembers
+    /// (the Legate-level startup gate, enforced in code).
     /// <param name="options">The cluster options. Must not be null.</param>
     /// <param name="port">The remoting port, or 0 for an ephemeral port.</param>
+    /// <param name="hostname">The remoting bind hostname.</param>
     /// <returns>The cluster HOCON.</returns>
-    let buildClusterHocon (options: ClusterOptions) (port: int) : string =
+    let buildClusterHoconFor (options: ClusterOptions) (port: int) (hostname: string) : string =
         ArgumentNullException.ThrowIfNull(options)
+
+        if String.IsNullOrWhiteSpace hostname then
+            raise (ArgumentException("The remoting hostname must be a non-empty string.", nameof hostname))
 
         let seeds =
             match options.Mode with
@@ -155,7 +170,7 @@ module internal ClusterActorSystem =
   loglevel = "WARNING"
   stdout-loglevel = "WARNING"
   remote.dot-netty.tcp {{
-    hostname = "%s{remotingHostname}"
+    hostname = "%s{hostname}"
     port = %d{port}
   }}
   cluster {{
@@ -176,6 +191,17 @@ module internal ClusterActorSystem =
   }}
 }}
 {wire}"""
+
+    /// Builds remoting+cluster HOCON from the cluster options over the
+    /// default loopback bind hostname: the hermetic path for tests and
+    /// containerless hosts. Kubernetes with a registered bootstrap hook
+    /// binds all interfaces through
+    /// <see cref="M:Legate.ClusterActorSystem.buildClusterHoconFor" />.
+    /// <param name="options">The cluster options. Must not be null.</param>
+    /// <param name="port">The remoting port, or 0 for an ephemeral port.</param>
+    /// <returns>The cluster HOCON.</returns>
+    let buildClusterHocon (options: ClusterOptions) (port: int) : string =
+        buildClusterHoconFor options port remotingHostname
 
     /// Parses SeedNodes entries in host:port form into cluster addresses.
     /// <param name="options">The cluster options. Must not be null.</param>
@@ -273,27 +299,130 @@ module internal ClusterActorSystem =
 
         loop ()
 
+    /// The subscription dependencies one session entity serves remote
+    /// subscribers with: the journal batches fall back to, the bounds the
+    /// hub enforces, and the per-(tenant, session) hubs the service owns.
+    /// Hubs live on the service (not in actor state) so an entity restart
+    /// never drops subscriber slots or the replay cache.
+    type internal SubscriptionDeps =
+        {
+            /// The journal batches fall back to past the cache.
+            EventStore: ISessionEventStore
+            /// The subscriber, cache, and payload bounds.
+            Options: SessionSubscriptionOptions
+            /// The per-(tenant, session-id) hubs, keyed by tenant and the
+            /// entity id string (the session id text the resolver used).
+            Hubs: ConcurrentDictionary<TenantId * string, CrossNodeSubscriptions.SubscriptionHub>
+        }
+
     /// The shard entity: a thin delegator spawning one session child for
     /// its entity id and forwarding everything to it with the sender
     /// preserved. A bare string equal to the entity id is the wire-safe
     /// resolve marker (strings cross remoting without a custom
-    /// serializer): it answers the child to the sender. Every other
-    /// message is session traffic (the suspendable protocol the client
-    /// speaks, today and for future messages) and forwards to the
-    /// child, so the actor code stays shared with Local mode.
+    /// serializer): it answers the child to the sender. Cross-node
+    /// subscribe requests (issue 133) intercept here when subscription
+    /// dependencies are wired: the entity attaches the subscriber token
+    /// to its hub (the cap rejects with the typed limit error) and pipes
+    /// one bounded batch back to the asker without ever blocking the
+    /// actor thread; control-plane branches travel back as their typed
+    /// exceptions over Akka's native Ask failure channel while event data
+    /// travels exclusively under the versioned envelope. Unsubscribes
+    /// detach best-effort with no reply. Every other message is session
+    /// traffic (the suspendable protocol the client speaks, today and for
+    /// future messages) and forwards to the child, so the actor code stays
+    /// shared with Local mode.
     /// <param name="entityId">The session id this entity hosts.</param>
     /// <param name="spawnSession">Spawns the session child.</param>
+    /// <param name="subscriptionDeps">The subscription wiring, or None for the legacy pure-delegator entity.</param>
     /// <param name="mailbox">The entity mailbox.</param>
     /// <returns>The entity actor computation.</returns>
     let private sessionEntityBehavior
         (entityId: string)
         (spawnSession: string -> IActorContext -> string -> IActorRef)
+        (subscriptionDeps: SubscriptionDeps option)
         (mailbox: Actor<obj>)
         =
         let ensure (child: IActorRef option) : IActorRef =
             match child with
             | Some live -> live
             | None -> spawnSession entityId mailbox.Context "session"
+
+        let serveSubscribe (request: CrossNodeSubscriptions.CrossNodeSubscribeRequest) (sender: IActorRef) : unit =
+            match subscriptionDeps with
+            | None ->
+                sender.Tell(
+                    InvalidOperationException(
+                        "The Legate cluster actor system serves no cross-node subscriptions: the session client facade wires the subscription dependencies on start."
+                    )
+                    :> obj
+                )
+            | Some deps ->
+                ArgumentNullException.ThrowIfNull(deps.EventStore)
+                ArgumentNullException.ThrowIfNull(deps.Options)
+                ArgumentNullException.ThrowIfNull(deps.Hubs)
+
+                let hub =
+                    deps.Hubs.GetOrAdd(
+                        (request.Tenant, entityId),
+                        fun _ -> CrossNodeSubscriptions.SubscriptionHub(deps.Options)
+                    )
+
+                if not (hub.TryAttach(request.SubscriberToken)) then
+                    sender.Tell(
+                        SessionSubscriptionLimitExceededException(
+                            request.SessionId,
+                            deps.Options.MaxSubscribersPerSession,
+                            sprintf "The session holds %d live subscribers." deps.Options.MaxSubscribersPerSession
+                        )
+                        :> obj
+                    )
+                else
+                    let serve =
+                        CrossNodeSubscriptions.serveBatchAsync (
+                            deps.EventStore,
+                            hub,
+                            request.Tenant,
+                            request.SessionId,
+                            request.FromSequence,
+                            CrossNodeSubscriptions.MaxBatchEvents,
+                            deps.Options.MaxEventPayloadBytes,
+                            CancellationToken.None
+                        )
+
+                    serve.ContinueWith(fun (completed: Task<CrossNodeSubscriptions.CrossNodeBatchOutcome>) ->
+                        if completed.IsFaulted then
+                            let inner =
+                                match completed.Exception with
+                                | null -> Exception("The cross-node subscription failed.")
+                                | aggregate when aggregate.InnerExceptions.Count > 0 -> aggregate.InnerExceptions[0]
+                                | aggregate -> aggregate :> exn
+
+                            sender.Tell(inner :> obj)
+                        elif completed.IsCanceled then
+                            sender.Tell(OperationCanceledException() :> obj)
+                        else
+                            try
+                                CrossNodeSubscriptions.raiseForOutcome request.Tenant completed.Result
+
+                                match completed.Result with
+                                | CrossNodeSubscriptions.BatchPage batch -> sender.Tell(batch :> obj)
+                                | _ ->
+                                    sender.Tell(
+                                        InvalidOperationException("The cross-node subscription resolved with no page.")
+                                        :> obj
+                                    )
+                            with ex ->
+                                sender.Tell(ex :> obj))
+                    |> ignore
+
+        let serveUnsubscribe (request: CrossNodeSubscriptions.CrossNodeUnsubscribe) : unit =
+            match subscriptionDeps with
+            | None -> ()
+            | Some deps ->
+                if not (isNull (box deps.Hubs)) then
+                    match deps.Hubs.TryGetValue((request.Tenant, entityId)) with
+                    | true, hub -> hub.Detach(request.SubscriberToken)
+                    | false, _ -> ()
 
         let rec loop (child: IActorRef option) =
             actor {
@@ -304,6 +433,12 @@ module internal ClusterActorSystem =
                     let live = ensure child
                     mailbox.Sender() <! live
                     return! loop (Some live)
+                | :? CrossNodeSubscriptions.CrossNodeSubscribeRequest as subscribe ->
+                    serveSubscribe subscribe (mailbox.Sender())
+                    return! loop child
+                | :? CrossNodeSubscriptions.CrossNodeUnsubscribe as unsubscribe ->
+                    serveUnsubscribe unsubscribe
+                    return! loop child
                 | _ ->
                     let live = ensure child
                     live.Tell(message, mailbox.Sender())
@@ -326,7 +461,34 @@ module internal ClusterActorSystem =
             raise (ArgumentException("Entity id must be a non-empty string.", nameof entityId))
 
         Props.Create(
-            Linq.Expression.ToExpression(fun () -> new FunActor<obj, unit>(sessionEntityBehavior entityId spawnSession))
+            Linq.Expression.ToExpression(fun () ->
+                new FunActor<obj, unit>(sessionEntityBehavior entityId spawnSession None))
+        )
+
+    /// Lifts the subscription-wired entity behavior into Props: like
+    /// <see cref="M:Legate.ClusterActorSystem.entityProps" /> but the
+    /// entity serves cross-node subscribe requests from its hub with a
+    /// store fallback (issue 133).
+    /// <param name="entityId">The session id the entity hosts.</param>
+    /// <param name="spawnSession">Spawns the session child.</param>
+    /// <param name="subscriptionDeps">The subscription wiring. Must not be null.</param>
+    /// <returns>The entity Props.</returns>
+    let entityPropsWithSubscriptions
+        (entityId: string)
+        (spawnSession: string -> IActorContext -> string -> IActorRef)
+        (subscriptionDeps: SubscriptionDeps)
+        : Props =
+        ArgumentNullException.ThrowIfNull(spawnSession)
+        ArgumentNullException.ThrowIfNull(subscriptionDeps.EventStore)
+        ArgumentNullException.ThrowIfNull(subscriptionDeps.Options)
+        ArgumentNullException.ThrowIfNull(subscriptionDeps.Hubs)
+
+        if String.IsNullOrWhiteSpace entityId then
+            raise (ArgumentException("Entity id must be a non-empty string.", nameof entityId))
+
+        Props.Create(
+            Linq.Expression.ToExpression(fun () ->
+                new FunActor<obj, unit>(sessionEntityBehavior entityId spawnSession (Some subscriptionDeps)))
         )
 
     /// The drain poll cadence: how often the stop path re-reads the
@@ -401,6 +563,75 @@ module internal ClusterActorSystem =
                                 settled <- true
         }
 
+    /// The startup quorum poll cadence: how often the start path re-reads
+    /// the Up-member count while waiting for MinimumMembers. Short enough
+    /// that a formed quorum returns promptly, long enough to avoid
+    /// hot-polling the cluster state; JoinTimeout bounds the total wait
+    /// either way.
+    let startupPollInterval = TimeSpan.FromMilliseconds 100.0
+
+    /// Waits for the cluster quorum: returns once at least
+    /// <paramref name="minimumMembers" /> members are Up, or throws
+    /// <see cref="T:Legate.DeadlineExceededException" /> when
+    /// <paramref name="bound" /> elapses first, so a node never serves
+    /// traffic before its quorum formed and never hangs startup either.
+    /// Cancellation abandons the wait and propagates, so host shutdown
+    /// proceeds; count failures propagate to the caller.
+    /// <param name="countUp">Reads the current Up-member count.</param>
+    /// <param name="minimumMembers">The Up members StartAsync waits for.</param>
+    /// <param name="bound">The total quorum wait bound.</param>
+    /// <param name="timeProvider">The clock waits and bounds run on.</param>
+    /// <param name="cancellationToken">Abandons the wait.</param>
+    /// <returns>The quorum wait task.</returns>
+    let waitForMembersAsync
+        (countUp: unit -> int)
+        (minimumMembers: int)
+        (bound: TimeSpan)
+        (timeProvider: TimeProvider)
+        (cancellationToken: CancellationToken)
+        : Task =
+        ArgumentNullException.ThrowIfNull(countUp)
+        ArgumentNullException.ThrowIfNull(timeProvider)
+
+        task {
+            let startTimestamp = timeProvider.GetTimestamp()
+            let mutable quorate = false
+
+            while not quorate do
+                let elapsed = timeProvider.GetElapsedTime startTimestamp
+
+                if elapsed >= bound then
+                    raise (
+                        DeadlineExceededException(
+                            "ClusterStartup",
+                            $"The cluster start timed out waiting for %d{minimumMembers} Up members within %O{bound}."
+                        )
+                    )
+
+                let up = countUp ()
+
+                if up >= minimumMembers then
+                    quorate <- true
+                else
+                    let remaining = bound - elapsed
+
+                    let wait =
+                        if remaining < startupPollInterval then
+                            remaining
+                        else
+                            startupPollInterval
+
+                    if wait <= TimeSpan.Zero then
+                        raise (
+                            DeadlineExceededException(
+                                "ClusterStartup",
+                                $"The cluster start timed out waiting for %d{minimumMembers} Up members within %O{bound}."
+                            )
+                        )
+                    else
+                        do! Task.Delay(wait, timeProvider, cancellationToken)
+        }
+
     /// A per-session proxy: forwards everything into the region wrapped
     /// in the session envelope, preserving the sender so Ask round-trips
     /// through the entity and back to the asker.
@@ -427,7 +658,8 @@ module internal ClusterActorSystem =
 /// BeginDrain, waits for running turns up to
 /// <c>Cluster:ShutdownGraceSeconds</c>, then runs coordinated shutdown
 /// with the whole stop hard-capped by <c>Cluster:HostExitDeadline</c>.
-type internal ClusterActorSystemService(options: IOptions<LegateOptions>, timeProvider: TimeProvider) as this =
+type internal ClusterActorSystemService
+    (options: IOptions<LegateOptions>, timeProvider: TimeProvider, provider: IServiceProvider | null) as this =
 
     do ArgumentNullException.ThrowIfNull(options)
     do ArgumentNullException.ThrowIfNull(timeProvider)
@@ -439,6 +671,14 @@ type internal ClusterActorSystemService(options: IOptions<LegateOptions>, timePr
     let mutable proxies: Map<string, Task<IActorRef>> = Map.empty
     let mutable nextProxy = 0
     let mutable draining = false
+
+    /// Initialises the service without a container: no bootstrap hook
+    /// ever resolves, so Kubernetes mode keeps today's singleton
+    /// self-join. Tests and containerless hosts use this overload.
+    /// <param name="options">The Legate options.</param>
+    /// <param name="timeProvider">The clock starts and waits run on.</param>
+    new(options: IOptions<LegateOptions>, timeProvider: TimeProvider) =
+        ClusterActorSystemService(options, timeProvider, null)
 
     /// The running actor system, or null when the host runs Local mode
     /// or has not started.
@@ -458,10 +698,13 @@ type internal ClusterActorSystemService(options: IOptions<LegateOptions>, timePr
     /// measured on the injected clock; TimeSpan.Zero when never started.
     member _.LastColdStart: TimeSpan = lastColdStart
 
-    /// The remoting bind port, or 0 for an ephemeral port. Seeded tests
+    /// The remoting bind port override, or 0 to use the options-owned
+    /// <see cref="P:Legate.ClusterOptions.RemotingPort" />. Seeded tests
     /// set a free loopback port before StartAsync so seed entries can
-    /// name it; hosts bind ephemeral ports until a stable-port knob
-    /// lands. Must not be negative.
+    /// name it; hosts declare one stable port per node through
+    /// <c>Legate:Cluster:RemotingPort</c> (compose) and leave this seam
+    /// at 0. A non-zero seam wins over the options value. Must be
+    /// between 0 and 65535.
     member val RemotingPort: int = 0 with get, set
 
     /// The session store polled for running turns during the drain wait,
@@ -469,6 +712,24 @@ type internal ClusterActorSystemService(options: IOptions<LegateOptions>, timePr
     /// running turns). The session client facade wires this alongside the
     /// entity factory; tests set it directly. Set before StartAsync.
     member val SessionStore: ISessionStore option = None with get, set
+
+    /// The journal cross-node subscription batches fall back to past the
+    /// entity replay cache, or None until the session client facade wires
+    /// it (entities then run the legacy pure-delegator behavior and serve
+    /// no subscriptions). The session client facade owns setting this
+    /// once it can supply the store. Set before StartAsync.
+    member val SubscriptionEventStore: ISessionEventStore option = None with get, set
+
+    /// The subscriber, cache, and payload bounds the session entities
+    /// enforce, or None until the session client facade wires them from
+    /// the host options. Set before StartAsync.
+    member val SubscriptionOptions: SessionSubscriptionOptions option = None with get, set
+
+    /// The per-(tenant, session-id) subscription hubs the session
+    /// entities attach remote subscribers to. Owned by the service (not
+    /// actor state) so entity restarts never drop slots or the cache.
+    member val SubscriptionHubs: ConcurrentDictionary<TenantId * string, CrossNodeSubscriptions.SubscriptionHub> =
+        ConcurrentDictionary<TenantId * string, CrossNodeSubscriptions.SubscriptionHub>() with get
 
     /// Marks the node as draining. Readiness flips Unhealthy the moment
     /// this runs, before any wait starts, so the orchestrator stops
@@ -494,6 +755,20 @@ type internal ClusterActorSystemService(options: IOptions<LegateOptions>, timePr
         match this.SessionEntityFactory with
         | Some factory -> factory
         | None -> LocalActorSystem.identitySpawn
+
+    /// Resolves the registered cluster bootstrap hook, or null when the
+    /// host registered none (or this service was built without a
+    /// container): the Kubernetes start branch self-joins as a singleton
+    /// in that case.
+    /// <returns>The bootstrap hook, or null when none is registered.</returns>
+    member private _.resolveBootstrap() : IClusterBootstrap | null =
+        match box provider with
+        | null -> null
+        | :? IServiceProvider as container ->
+            match container.GetServices<IClusterBootstrap>() |> Seq.tryHead with
+            | Some hook -> hook
+            | None -> null
+        | _ -> null
 
     /// Resolves the session proxy for a session id: the same id returns
     /// the same proxy, distinct ids return distinct proxies. The first
@@ -576,31 +851,70 @@ type internal ClusterActorSystemService(options: IOptions<LegateOptions>, timePr
             this.resolveInner sessionId cancellationToken
 
     interface IHostedService with
-        member _.StartAsync(_cancellationToken: CancellationToken) =
-            let remotingPort = this.RemotingPort
+        member _.StartAsync(cancellationToken: CancellationToken) =
+            let seamPort = this.RemotingPort
             let spawnNow () = this.currentSpawn ()
 
             task {
                 match options.Value.Cluster.Mode with
                 | ClusterMode.StaticSeeds
                 | ClusterMode.Kubernetes as mode ->
-                    if remotingPort < 0 then
+                    let clusterOptions = options.Value.Cluster
+
+                    // The seam wins when set; otherwise the options-owned
+                    // Cluster:RemotingPort (compose declares one stable
+                    // port per node) supplies the bind port.
+                    let effectivePort =
+                        if seamPort <> 0 then
+                            seamPort
+                        else
+                            clusterOptions.RemotingPort
+
+                    if effectivePort < 0 || effectivePort > 65535 then
                         raise (
                             ArgumentOutOfRangeException(
                                 "RemotingPort",
-                                "The remoting port must be 0 (ephemeral) or a positive port."
+                                "The remoting port must be 0 (ephemeral) or between 1 and 65535."
                             )
                         )
 
                     let startTimestamp = timeProvider.GetTimestamp()
-                    let clusterOptions = options.Value.Cluster
+
+                    let bootstrap =
+                        match mode with
+                        | ClusterMode.Kubernetes -> this.resolveBootstrap ()
+                        | _ -> null
+
+                    let hookPresent = not (isNull (box bootstrap))
+
+                    // Kubernetes with a hook must accept cross-pod
+                    // traffic, so it keeps binding all interfaces; every
+                    // other path binds the options-owned hostname
+                    // (loopback by default, 0.0.0.0 inside compose).
+                    let effectiveHostname =
+                        if mode = ClusterMode.Kubernetes && hookPresent then
+                            ClusterActorSystem.kubernetesRemotingHostname
+                        elif String.IsNullOrWhiteSpace clusterOptions.RemotingHostname then
+                            ClusterActorSystem.remotingHostname
+                        else
+                            clusterOptions.RemotingHostname.Trim()
+
+                    // The hook fragment merges into the node configuration
+                    // before the system is created: invalid hook options
+                    // fail here, before the cluster forms.
+                    let fragment =
+                        match bootstrap with
+                        | null -> ""
+                        | hook -> hook.BuildHocon()
 
                     let stamp =
                         SessionSharding.versionStamp clusterOptions.ShardHashVersion clusterOptions.ShardCount
 
                     let config =
                         ConfigurationFactory.ParseString(
-                            ClusterActorSystem.buildClusterHocon clusterOptions remotingPort
+                            ClusterActorSystem.buildClusterHoconFor clusterOptions effectivePort effectiveHostname
+                            + "\n"
+                            + fragment
                         )
 
                     let created = Akka.FSharp.System.create ClusterActorSystem.systemName config
@@ -614,9 +928,11 @@ type internal ClusterActorSystemService(options: IOptions<LegateOptions>, timePr
                                 ImmutableList.CreateRange(ClusterActorSystem.seedAddresses clusterOptions)
                             )
                         | _ ->
-                            // Kubernetes joins nothing until issue 138 ships the
-                            // Akka.Management bootstrap: singleton-until-bootstrap.
-                            cluster.Join(cluster.SelfAddress)
+                            match bootstrap with
+                            | null ->
+                                // No hook: today's singleton self-join.
+                                cluster.Join(cluster.SelfAddress)
+                            | hook -> do! hook.StartAsync((created :> obj), cancellationToken)
 
                         // Touching the extension first injects the sharding
                         // reference.conf fallback; reading settings
@@ -631,7 +947,17 @@ type internal ClusterActorSystemService(options: IOptions<LegateOptions>, timePr
 
                         let entityPropsFactory =
                             System.Func<string, Props>(fun entityId ->
-                                ClusterActorSystem.entityProps entityId (spawnNow ()))
+                                match this.SubscriptionEventStore, this.SubscriptionOptions with
+                                | Some eventStore, Some subscriptionOptions ->
+                                    ClusterActorSystem.entityPropsWithSubscriptions
+                                        entityId
+                                        (spawnNow ())
+                                        {
+                                            EventStore = eventStore
+                                            Options = subscriptionOptions
+                                            Hubs = this.SubscriptionHubs
+                                        }
+                                | _ -> ClusterActorSystem.entityProps entityId (spawnNow ()))
 
                         let regionRef =
                             sharding.Start(SessionSharding.shardTypeName, entityPropsFactory, settings, extractor)
@@ -649,6 +975,21 @@ type internal ClusterActorSystemService(options: IOptions<LegateOptions>, timePr
                                     listener)
 
                         cluster.Subscribe(guard, [| typeof<ClusterEvent.MemberUp> |])
+
+                        // Legate-level startup gate: StartAsync completes
+                        // only once the quorum is Up, bounded by
+                        // JoinTimeout. Failing here terminates the system
+                        // below, so a node never serves without its quorum.
+                        do!
+                            ClusterActorSystem.waitForMembersAsync
+                                (fun () ->
+                                    cluster.State.Members
+                                    |> Seq.filter (fun m -> m.Status = MemberStatus.Up)
+                                    |> Seq.length)
+                                clusterOptions.MinimumMembers
+                                clusterOptions.JoinTimeout
+                                timeProvider
+                                cancellationToken
 
                         systemOpt <- Some created
                         regionOpt <- Some regionRef

@@ -50,6 +50,34 @@ type internal AutoTitleDeps =
         Logger: ILogger | null
     }
 
+// ────────────────── Subscribe routing ──────────────────
+
+/// Where a Subscribe streams from: the process-local bus or the owning
+/// session entity through the shard region. Internal so no Akka type ever
+/// crosses the public API.
+type internal ISubscribeRouter =
+
+    /// Streams the session's events from the cursor: replay-then-live,
+    /// at-least-once with gap detection and redelivery.
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="sessionId">The session to subscribe to.</param>
+    /// <param name="fromSequence">The exclusive cursor.</param>
+    /// <param name="cancellationToken">Abandons the replay and the live wait.</param>
+    /// <returns>The replay-then-live event stream.</returns>
+    abstract Subscribe:
+        tenant: TenantId * sessionId: SessionId * fromSequence: int64 * cancellationToken: CancellationToken ->
+            IAsyncEnumerable<SessionEvent>
+
+/// The Local-mode router: the process-local bus replay-then-live path,
+/// unchanged.
+type internal LocalSubscribeRouter(eventBus: SessionEventBus) =
+
+    do ArgumentNullException.ThrowIfNull(eventBus)
+
+    interface ISubscribeRouter with
+        member _.Subscribe(tenant, sessionId, fromSequence, cancellationToken) =
+            eventBus.Subscribe(tenant, sessionId, fromSequence, cancellationToken)
+
 /// <summary>The session client PromptAndWaitAsync extends.</summary>
 [<Sealed>]
 type SessionClient
@@ -78,6 +106,7 @@ type SessionClient
 
     let semaphores = ConcurrentDictionary<SessionId, SemaphoreSlim>()
     let mutable autoTitle: AutoTitleDeps option = None
+    let mutable subscribeRouter: ISubscribeRouter option = None
 
     /// The durable store prompts, aborts, and session reads go through.
     member internal _.Store: ISessionStore = store
@@ -115,6 +144,17 @@ type SessionClient
     /// order matches Queue append order under concurrent waits.
     member internal _.SemaphoreFor(sessionId: SessionId) : SemaphoreSlim =
         semaphores.GetOrAdd(sessionId, fun _ -> new SemaphoreSlim(1, 1))
+
+    /// The router Subscribe streams through: Local mode delegates to the
+    /// process-local event bus; the cluster modes route through the owning
+    /// session entity with store-replay resume. None means the local bus
+    /// path (existing constructions and tests keep Local behavior
+    /// unchanged); the session client facade sets a cluster router when
+    /// the host runs StaticSeeds or Kubernetes. Set once by the container
+    /// wiring; tests set it directly.
+    member internal _.SubscribeRouter
+        with get (): ISubscribeRouter option = subscribeRouter
+        and set (value: ISubscribeRouter option) = subscribeRouter <- value
 
 // ────────────────── Shared auto-title helper ──────────────────
 

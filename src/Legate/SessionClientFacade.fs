@@ -912,8 +912,12 @@ type SessionClientOperations =
 
     /// Subscribes to the session's events from the cursor: replays the
     /// journal up to the live position, then yields live publishes
-    /// gap-free with no duplicates across the handoff. Unknown session
-    /// throws SessionNotFoundException on the first move.
+    /// gap-free with no duplicates across the handoff. In Local mode this
+    /// is the process-local bus path; in the cluster modes the facade-wired
+    /// router streams from the owning session entity through the shard
+    /// region with store-replay resume (at-least-once: duplicates
+    /// acceptable, gaps are not). Unknown session throws
+    /// SessionNotFoundException on the first move.
     /// <param name="client">The session client. Must not be null.</param>
     /// <param name="sessionId">The session to subscribe to.</param>
     /// <param name="fromSequence">The exclusive cursor: replay events with a sequence strictly greater than it; 0 replays from the journal's first event.</param>
@@ -924,7 +928,10 @@ type SessionClientOperations =
         (client: SessionClient, sessionId: SessionId, fromSequence: int64, cancellationToken: CancellationToken)
         : IAsyncEnumerable<SessionEvent> =
         ArgumentNullException.ThrowIfNull(client)
-        client.EventBus.Subscribe(client.Tenant, sessionId, fromSequence, cancellationToken)
+
+        match client.SubscribeRouter with
+        | Some router -> router.Subscribe(client.Tenant, sessionId, fromSequence, cancellationToken)
+        | None -> client.EventBus.Subscribe(client.Tenant, sessionId, fromSequence, cancellationToken)
 
     /// Reads the session's coarse transcript cells derived from its
     /// journaled events.
@@ -1054,6 +1061,342 @@ type SessionClientListingOperations =
             effective.Continuation,
             cancellationToken
         )
+
+// ──────────────────────────────────────────────────────────────────────────
+// Cross-node subscriptions
+
+/// The cluster-mode Subscribe router (issue 133): streams a session's
+/// events from the owning entity through the shard region with
+/// store-replay resume. Local mode keeps the process-local bus path
+/// (see SessionClientOperations.Subscribe); the facade wires this router
+/// only in StaticSeeds and Kubernetes modes. Delivery is at-least-once:
+/// the stream resumes from its last sequence cursor on entity move or
+/// node restart, sequence numbers let the consumer detect gaps, and
+/// redelivery covers them. Unknown session and expired journal surface
+/// as their typed exceptions; subscriber, cache, and payload bounds bind
+/// from the host options while the global Cluster:MaxWirePayloadBytes
+/// caps every manifest on top.
+module internal ClusterSubscriptions =
+
+    /// How long one entity batch Ask waits before the router rebinds and
+    /// falls back to a direct store page. Warm entities answer in
+    /// milliseconds; the bound only fires when the owner is gone.
+    let askTimeout = TimeSpan.FromSeconds 15.0
+
+    /// How long the live tail waits between end-of-stream polls. Short
+    /// enough that appended events surface promptly, long enough to avoid
+    /// hot-polling the owner; the caller's cancellation abandons the wait.
+    let pollDelay = TimeSpan.FromMilliseconds 50.0
+
+    /// One cluster-mode subscription: entity batches with a direct store
+    /// fallback, resumed from the last delivered sequence.
+    type private ClusterSubscribeEnumerator
+        (
+            resolver: ISessionResolver,
+            eventStore: ISessionEventStore,
+            options: SessionSubscriptionOptions,
+            tenant: TenantId,
+            sessionId: SessionId,
+            fromSequence: int64,
+            subscribeToken: CancellationToken,
+            enumeratorToken: CancellationToken
+        ) =
+
+        do ArgumentNullException.ThrowIfNull(resolver)
+        do ArgumentNullException.ThrowIfNull(eventStore)
+        do ArgumentNullException.ThrowIfNull(options)
+
+        let token = Guid.NewGuid().ToString("N")
+        let queue = Queue<SessionEvent>()
+        let mutable resumeCursor = fromSequence
+        let mutable lastDelivered = fromSequence
+        let mutable current: SessionEvent = Unchecked.defaultof<SessionEvent>
+        let mutable finished = false
+        let mutable detached = false
+        let mutable proxyOpt: IActorRef option = None
+
+        let detachBestEffort () =
+            if not detached then
+                detached <- true
+
+                try
+                    match proxyOpt with
+                    | Some proxy ->
+                        let unsubscribe: CrossNodeSubscriptions.CrossNodeUnsubscribe =
+                            {
+                                Tenant = tenant
+                                SessionId = sessionId
+                                SubscriberToken = token
+                            }
+
+                        proxy.Tell(unsubscribe :> obj)
+                    | None -> ()
+                with _ ->
+                    ()
+
+        let throwForReply (reply: obj) : unit =
+            match reply with
+            | :? CrossNodeSubscriptions.CrossNodeEventBatch -> ()
+            | :? OperationCanceledException as canceled -> raise canceled
+            | :? Exception as error -> raise error
+            | _ ->
+                raise (InvalidOperationException("The owning entity answered the subscription with an unknown reply."))
+
+        let enqueueBatch (batch: CrossNodeSubscriptions.CrossNodeEventBatch) : unit =
+            if not (isNull (box batch.Events)) then
+                for evt in batch.Events do
+                    if not (isNull (box evt)) then
+                        if evt.Sequence.HasValue && evt.Sequence.Value <= lastDelivered then
+                            ()
+                        else
+                            queue.Enqueue(evt)
+
+                            if evt.Sequence.HasValue && evt.Sequence.Value > resumeCursor then
+                                resumeCursor <- evt.Sequence.Value
+
+            if batch.NextCursor > resumeCursor then
+                resumeCursor <- batch.NextCursor
+
+        let applyReplayPage (page: EventReplayPage) : unit =
+            let events =
+                if isNull (box page.Events) then
+                    Array.Empty<SessionEvent>()
+                else
+                    page.Events |> Seq.filter (fun evt -> not (isNull (box evt))) |> Array.ofSeq
+
+            for evt in events do
+                if evt.Sequence.HasValue && evt.Sequence.Value <= lastDelivered then
+                    ()
+                else
+                    let observed = CrossNodeSubscriptions.estimateEventBytes evt
+
+                    if observed > options.MaxEventPayloadBytes then
+                        raise (
+                            EventLimitExceededException(
+                                "perEventBytes",
+                                int64 options.MaxEventPayloadBytes,
+                                int64 observed,
+                                sprintf
+                                    "The event at sequence %d in session %O is %d bytes, above the cross-node bound."
+                                    (if evt.Sequence.HasValue then
+                                         evt.Sequence.Value
+                                     else
+                                         resumeCursor)
+                                    sessionId
+                                    observed
+                            )
+                        )
+
+                    queue.Enqueue(evt)
+
+                    if evt.Sequence.HasValue && evt.Sequence.Value > resumeCursor then
+                        resumeCursor <- evt.Sequence.Value
+
+            if page.NextCursor.HasValue && page.NextCursor.Value > resumeCursor then
+                resumeCursor <- page.NextCursor.Value
+
+        let throwForReplayOutcome (outcome: obj) : unit =
+            match outcome with
+            | :? EventReplayPage as page when not (isNull (box page)) -> applyReplayPage page
+            | :? EventReplayEndOfStream -> ()
+            | :? EventReplayUnknownSession as unknown when not (isNull (box unknown)) ->
+                raise (
+                    SessionNotFoundException(
+                        unknown.SessionId,
+                        sprintf "No session %O exists in tenant %O." unknown.SessionId tenant
+                    )
+                )
+            | :? EventReplayJournalExpired as expired when not (isNull (box expired)) ->
+                raise (
+                    SessionJournalExpiredException(
+                        expired.SessionId,
+                        sprintf "The journal for session %O is gone." expired.SessionId
+                    )
+                )
+            | _ -> raise (InvalidOperationException("The event store returned an unknown replay outcome."))
+
+        let fallbackPageAsync (linkedCt: CancellationToken) : Task<unit> =
+            task {
+                let! outcome =
+                    eventStore.Replay(tenant, sessionId, resumeCursor, CrossNodeSubscriptions.MaxBatchEvents, linkedCt)
+
+                if isNull (box outcome) then
+                    raise (InvalidOperationException("The event store returned null."))
+                else
+                    throwForReplayOutcome outcome
+            }
+
+        member _.Current = current
+
+        member _.MoveNextAsync() : ValueTask<bool> =
+            ValueTask<bool>(
+                task {
+                    use linkedCts =
+                        CancellationTokenSource.CreateLinkedTokenSource(subscribeToken, enumeratorToken)
+
+                    if finished then
+                        return false
+                    else
+                        let mutable step: bool option = None
+
+                        while step.IsNone do
+                            if queue.Count > 0 then
+                                let next = queue.Dequeue()
+                                current <- next
+
+                                if next.Sequence.HasValue && next.Sequence.Value > lastDelivered then
+                                    lastDelivered <- next.Sequence.Value
+
+                                if next :? SessionClosedEvent then
+                                    finished <- true
+                                    detachBestEffort ()
+
+                                step <- Some true
+                            else
+                                let request: CrossNodeSubscriptions.CrossNodeSubscribeRequest =
+                                    {
+                                        Tenant = tenant
+                                        SessionId = sessionId
+                                        FromSequence = resumeCursor
+                                        SubscriberToken = token
+                                    }
+
+                                let! batchOpt =
+                                    task {
+                                        try
+                                            let! proxy =
+                                                match proxyOpt with
+                                                | Some live -> Task.FromResult live
+                                                | None ->
+                                                    task {
+                                                        let! resolved =
+                                                            resolver.ResolveSessionAsync(
+                                                                sessionId.ToString(),
+                                                                linkedCts.Token
+                                                            )
+
+                                                        proxyOpt <- Some resolved
+                                                        return resolved
+                                                    }
+
+                                            use askCts =
+                                                CancellationTokenSource.CreateLinkedTokenSource(
+                                                    linkedCts.Token,
+                                                    (new CancellationTokenSource(askTimeout)).Token
+                                                )
+
+                                            let! reply = proxy.Ask<obj>(request :> obj, askCts.Token)
+
+                                            match reply with
+                                            | :? CrossNodeSubscriptions.CrossNodeEventBatch as batch ->
+                                                enqueueBatch batch
+                                                return Some batch
+                                            | _ ->
+                                                throwForReply reply
+                                                return None
+                                        with
+                                        | :? OperationCanceledException as canceled ->
+                                            if linkedCts.Token.IsCancellationRequested then
+                                                detachBestEffort ()
+                                                return raise canceled
+                                            else
+                                                proxyOpt <- None
+                                                do! fallbackPageAsync linkedCts.Token
+                                                return None
+                                        | :? SessionNotFoundException
+                                        | :? SessionJournalExpiredException
+                                        | :? SessionSubscriptionLimitExceededException
+                                        | :? EventLimitExceededException as fatal ->
+                                            detachBestEffort ()
+                                            return raise fatal
+                                        | _ ->
+                                            proxyOpt <- None
+                                            do! fallbackPageAsync linkedCts.Token
+                                            return None
+                                    }
+
+                                match batchOpt with
+                                | Some batch when batch.Events.Count > 0 || not batch.EndOfStream -> ()
+                                | _ ->
+                                    try
+                                        do! Task.Delay(pollDelay, linkedCts.Token)
+                                    with :? OperationCanceledException as canceled ->
+                                        detachBestEffort ()
+                                        raise canceled
+
+                        match step with
+                        | Some value -> return value
+                        | None -> return false
+                }
+            )
+
+        member _.DisposeAsync() : ValueTask =
+            detachBestEffort ()
+            ValueTask.CompletedTask
+
+        interface IAsyncEnumerator<SessionEvent> with
+            member this.Current = this.Current
+            member this.MoveNextAsync() = this.MoveNextAsync()
+            member this.DisposeAsync() = this.DisposeAsync()
+
+    /// One cluster-mode subscription enumeration over entity batches with
+    /// a direct store fallback.
+    type private ClusterSubscribeEnumerable
+        (
+            resolver: ISessionResolver,
+            eventStore: ISessionEventStore,
+            options: SessionSubscriptionOptions,
+            tenant: TenantId,
+            sessionId: SessionId,
+            fromSequence: int64,
+            subscribeToken: CancellationToken
+        ) =
+
+        interface IAsyncEnumerable<SessionEvent> with
+            member _.GetAsyncEnumerator(cancellationToken: CancellationToken) : IAsyncEnumerator<SessionEvent> =
+                upcast
+                    ClusterSubscribeEnumerator(
+                        resolver,
+                        eventStore,
+                        options,
+                        tenant,
+                        sessionId,
+                        fromSequence,
+                        subscribeToken,
+                        cancellationToken
+                    )
+
+    /// The cluster-mode Subscribe router: entity batches through the
+    /// shard region with store-replay resume. Internal so no Akka type
+    /// ever crosses the public API.
+    type ClusterSubscribeRouter
+        internal (resolver: ISessionResolver, eventStore: ISessionEventStore, options: SessionSubscriptionOptions) =
+
+        do ArgumentNullException.ThrowIfNull(resolver)
+        do ArgumentNullException.ThrowIfNull(eventStore)
+        do ArgumentNullException.ThrowIfNull(options)
+
+        do
+            let violation = options.Validate()
+
+            if not (isNull (box violation)) then
+                raise (ArgumentException(violation, nameof options))
+
+        interface ISubscribeRouter with
+            member _.Subscribe(tenant, sessionId, fromSequence, cancellationToken) =
+                if fromSequence < 0L then
+                    raise (ArgumentOutOfRangeException(nameof fromSequence, "The cursor must not be negative."))
+
+                upcast
+                    ClusterSubscribeEnumerable(
+                        resolver,
+                        eventStore,
+                        options,
+                        tenant,
+                        sessionId,
+                        fromSequence,
+                        cancellationToken
+                    )
 
 // ──────────────────────────────────────────────────────────────────────────
 // Wiring
@@ -1218,6 +1561,22 @@ module internal SessionClientWiring =
             | null -> AgentFileParser.defaultModel
             | model -> ModelReference.Parse(model)
         | model -> ModelReference.Parse(model)
+
+    /// Maps the host Sessions options onto the runtime subscription
+    /// bounds the bus, the entity hubs, and the cluster router enforce.
+    /// Validation runs at the bus/router constructors; this only carries
+    /// the configured values across the options graph.
+    /// <param name="sessions">The configured sessions options. Must not be null.</param>
+    /// <returns>The runtime subscription options.</returns>
+    let subscriptionOptionsOf (sessions: SessionsOptions) : SessionSubscriptionOptions =
+        ArgumentNullException.ThrowIfNull(sessions)
+
+        let options = SessionSubscriptionOptions()
+        options.MaxSubscribersPerSession <- sessions.MaxSubscribersPerSession
+        options.PerSubscriberBufferSize <- sessions.PerSubscriberBufferSize
+        options.ReplayCacheSize <- sessions.SubscriptionReplayCacheSize
+        options.MaxEventPayloadBytes <- sessions.SubscriptionMaxEventPayloadBytes
+        options
 
     /// Builds the client from the container: resolves the stores, bounds,
     /// and hosted actor system, validates the facade options, opts into
@@ -1413,6 +1772,31 @@ module internal SessionClientWiring =
                 }
             )
 
+        // Cross-node subscriptions (issue 133): subscriber, cache, and
+        // payload bounds bind from the host Sessions options into the
+        // runtime subscription options; the cluster service takes the
+        // journal and bounds so its session entities serve remote
+        // subscribers, and the client routes Subscribe through the owning
+        // entity in the cluster modes. Local mode keeps the bus path:
+        // SubscribeRouter stays None and Subscribe delegates to the bus.
+        let subscriptionOptions = subscriptionOptionsOf sessions
+
+        match resolver with
+        | :? ClusterActorSystemService as clustered ->
+            clustered.SubscriptionEventStore <- Some bus.EventStore
+            clustered.SubscriptionOptions <- Some subscriptionOptions
+        | _ -> ()
+
+        match legateOptions.Cluster.Mode with
+        | ClusterMode.StaticSeeds
+        | ClusterMode.Kubernetes ->
+            built.SubscribeRouter <-
+                Some(
+                    ClusterSubscriptions.ClusterSubscribeRouter(resolver, bus.EventStore, subscriptionOptions)
+                    :> ISubscribeRouter
+                )
+        | _ -> ()
+
         built
 
 /// Registers the session client facade: the options default, the event
@@ -1432,7 +1816,17 @@ module internal SessionClientRegistration =
             Func<IServiceProvider, SessionEventBus>(fun provider ->
                 let eventStore = provider.GetRequiredService<ISessionEventStore>()
                 let logger = provider.GetService<ILogger<SessionEventBus>>()
-                new SessionEventBus(eventStore, SessionSubscriptionOptions(), logger))
+
+                let sessions =
+                    match provider.GetService<IOptions<LegateOptions>>() with
+                    | null -> SessionsOptions()
+                    | options when isNull (box options.Value) -> SessionsOptions()
+                    | options ->
+                        match box options.Value.Sessions with
+                        | null -> SessionsOptions()
+                        | _ -> options.Value.Sessions
+
+                new SessionEventBus(eventStore, SessionClientWiring.subscriptionOptionsOf sessions, logger))
         )
         |> ignore
 

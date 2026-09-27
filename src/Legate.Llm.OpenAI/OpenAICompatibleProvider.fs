@@ -23,8 +23,9 @@ open OpenAI.Chat
 // SDK credential, never from the shared client.
 
 /// An LLM provider serving one provider id over an OpenAI-compatible
-/// endpoint. Constructed by the <c>AddOpenAI</c>, <c>AddAnthropic</c>,
-/// <c>AddOllamaCloud</c>, and <c>AddOpenAICompatible</c> registration
+/// endpoint. Constructed by the <c>AddOpenAI</c>,
+/// <c>AddAnthropicCompatible</c>, <c>AddOllamaCloud</c>, and
+/// <c>AddOpenAICompatible</c> registration
 /// extensions; hosts implement no members themselves.
 /// <param name="providerId">The canonical lowercase provider id, for example <c>openai</c>.</param>
 /// <param name="options">The endpoint, default model, timeout, and key settings.</param>

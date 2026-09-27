@@ -30,10 +30,16 @@ type internal PromptWaitHub() =
                 if waiters.Count > 0 then
                     waiters.Dequeue().TrySetResult(result) |> ignore)
 
-    /// Queues a waiter for the next settle.
+    /// Queues a waiter for the next settle. Waiters run their
+    /// continuations asynchronously (the DispatcherWake precedent): the
+    /// settle hook fires on the session actor thread, so an inline
+    /// continuation would run host code on that thread and stall the
+    /// settle it waits for.
     member _.EnqueueSettle() : TaskCompletionSource<TurnResult> =
         lock gate (fun () ->
-            let waiter = TaskCompletionSource<TurnResult>()
+            let waiter =
+                TaskCompletionSource<TurnResult>(TaskCreationOptions.RunContinuationsAsynchronously)
+
             waiters.Enqueue(waiter)
             waiter)
 

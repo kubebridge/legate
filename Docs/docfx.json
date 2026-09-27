@@ -1,0 +1,65 @@
+{
+  "metadata": [
+    {
+      "src": [
+        {
+          "src": "..",
+          "files": [
+            "src/Legate.Abstractions/bin/Release/net10.0/Legate.Abstractions.dll",
+            "src/Legate/bin/Release/net10.0/Legate.dll",
+            "src/Legate.Llm.OpenAI/bin/Release/net10.0/Legate.Llm.OpenAI.dll",
+            "src/Legate.Llm.Google/bin/Release/net10.0/Legate.Llm.Google.dll",
+            "src/Legate.Storage.InMemory/bin/Release/net10.0/Legate.Storage.InMemory.dll",
+            "src/Legate.Storage.FileSystem/bin/Release/net10.0/Legate.Storage.FileSystem.dll",
+            "src/Legate.Storage.Postgres/bin/Release/net10.0/Legate.Storage.Postgres.dll",
+            "src/Legate.Storage.Migrations/bin/Release/net10.0/Legate.Storage.Migrations.dll",
+            "src/Legate.Storage.Sqlite/bin/Release/net10.0/Legate.Storage.Sqlite.dll",
+            "src/Legate.Storage.S3/bin/Release/net10.0/Legate.Storage.S3.dll",
+            "src/Legate.Storage.Packages/bin/Release/net10.0/Legate.Storage.Packages.dll",
+            "src/Legate.Workspace.Process/bin/Release/net10.0/Legate.Workspace.Process.dll",
+            "src/Legate.Workspace.HostDirectory/bin/Release/net10.0/Legate.Workspace.HostDirectory.dll",
+            "src/Legate.Workspace.Docker/bin/Release/net10.0/Legate.Workspace.Docker.dll",
+            "src/Legate.Coordination.Redis/bin/Release/net10.0/Legate.Coordination.Redis.dll",
+            "src/Legate.Mcp/bin/Release/net10.0/Legate.Mcp.dll",
+            "src/Legate.Cluster.Kubernetes/bin/Release/net10.0/Legate.Cluster.Kubernetes.dll"
+          ]
+        }
+      ],
+      "dest": "api",
+      "properties": {
+        "TargetFramework": "net10.0"
+      }
+    }
+  ],
+  "build": {
+    "content": [
+      {
+        "files": [
+          "index.md",
+          "getting-started-cli.md",
+          "getting-started-hosted.md",
+          "configuration.md",
+          "architecture-overview.md",
+          "api/index.md",
+          "api/*.yml",
+          "toc.yml"
+        ],
+        "exclude": [
+          "agents/**",
+          "_site/**",
+          "obj/**"
+        ]
+      }
+    ],
+    "dest": "_site",
+    "globalMetadata": {
+      "_appTitle": "Legate",
+      "_appName": "Legate",
+      "_enableSearch": true
+    },
+    "template": [
+      "default"
+    ],
+    "markdownEngineName": "markdig"
+  }
+}

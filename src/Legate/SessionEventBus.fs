@@ -19,10 +19,13 @@ open Microsoft.Extensions.Logging
 // cluster semantics overkill for a process-local bus); cell derivation and
 // ReadTranscript here (owned by #50).
 
-/// How a live event subscription buffers: the per-session subscriber cap
-/// and the per-subscriber channel bound. Bound from configuration; mutable
-/// so hosts can set properties before registering. Defaults hold 512 live
-/// subscribers per session with 128 buffered events each.
+/// How a live event subscription buffers: the per-session subscriber cap,
+/// the per-subscriber channel bound, the owning-entity replay cache, and
+/// the per-event payload cap. Bound from configuration; mutable so hosts
+/// can set properties before registering. Defaults hold 512 live
+/// subscribers per session with 128 buffered events each, a 256-event
+/// replay cache, and a 1 MiB per-event cap (the global
+/// Cluster:MaxWirePayloadBytes caps every manifest on top of it).
 type SessionSubscriptionOptions() =
 
     /// The live subscribers one session holds. A new subscription past the
@@ -37,6 +40,19 @@ type SessionSubscriptionOptions() =
     /// stalling the publishing turn. Default 128.
     member val PerSubscriberBufferSize: int = 128 with get, set
 
+    /// How many recent journaled events the owning entity keeps in its
+    /// bounded replay cache for resuming cross-node subscribers. Older
+    /// cursors fall back to <see cref="M:Legate.ISessionEventStore.Replay*" />;
+    /// evicted entries redeliver from the store with duplicates allowed
+    /// and no gaps. Default 256.
+    member val ReplayCacheSize: int = 256 with get, set
+
+    /// The largest single session event the owning entity streams to a
+    /// remote subscriber, in bytes. Events above the bound refuse before
+    /// crossing; the global wire maximum caps every manifest on top of
+    /// it. Default 1048576.
+    member val MaxEventPayloadBytes: int = 1048576 with get, set
+
     /// Returns null when every knob is in range, otherwise a message for the
     /// first violation.
     /// <returns>The first violation's message, or null when the settings are valid.</returns>
@@ -45,6 +61,10 @@ type SessionSubscriptionOptions() =
             "MaxSubscribersPerSession must be at least 1."
         elif this.PerSubscriberBufferSize < 1 then
             "PerSubscriberBufferSize must be at least 1."
+        elif this.ReplayCacheSize < 1 then
+            "ReplayCacheSize must be at least 1."
+        elif this.MaxEventPayloadBytes < 1 then
+            "MaxEventPayloadBytes must be at least 1."
         else
             null
 
@@ -302,6 +322,37 @@ type SessionEventBus
 
     let isDisposed () = Volatile.Read(&disposed) = 1
 
+    /// Maps one replay outcome to its read result: pages yield their
+    /// events, end of stream yields empty, and control branches raise
+    /// their typed exceptions. Pure so the resumable read stays a
+    /// straight-line await plus a return.
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="outcome">The replay outcome. Must not be null.</param>
+    /// <returns>The journaled events, in sequence order; empty at end of stream.</returns>
+    let mapReplayOutcome (tenant: TenantId) (outcome: EventReplayOutcome) : IReadOnlyList<SessionEvent> =
+        match outcome with
+        | :? EventReplayPage as page when not (isNull (box page)) ->
+            if isNull (box page.Events) then
+                Array.Empty<SessionEvent>() :> IReadOnlyList<SessionEvent>
+            else
+                page.Events
+        | :? EventReplayEndOfStream -> Array.Empty<SessionEvent>() :> IReadOnlyList<SessionEvent>
+        | :? EventReplayUnknownSession as unknown when not (isNull (box unknown)) ->
+            raise (
+                SessionNotFoundException(
+                    unknown.SessionId,
+                    sprintf "No session %O exists in tenant %O." unknown.SessionId tenant
+                )
+            )
+        | :? EventReplayJournalExpired as expired when not (isNull (box expired)) ->
+            raise (
+                SessionJournalExpiredException(
+                    expired.SessionId,
+                    sprintf "The journal for session %O is gone." expired.SessionId
+                )
+            )
+        | _ -> raise (InvalidOperationException("The event store returned an unknown replay outcome."))
+
     let publishToHub (tenant: TenantId) (sessionId: SessionId) (stamped: IReadOnlyList<SessionEvent>) =
         match hubs.TryGetValue((tenant, sessionId)) with
         | false, _ -> ()
@@ -412,30 +463,7 @@ type SessionEventBus
             if isNull (box outcome) then
                 return raise (InvalidOperationException("The event store returned null."))
             else
-                match outcome with
-                | :? EventReplayPage as page when not (isNull (box page)) ->
-                    if isNull (box page.Events) then
-                        return Array.Empty<SessionEvent>() :> IReadOnlyList<SessionEvent>
-                    else
-                        return page.Events
-                | :? EventReplayEndOfStream -> return Array.Empty<SessionEvent>() :> IReadOnlyList<SessionEvent>
-                | :? EventReplayUnknownSession as unknown when not (isNull (box unknown)) ->
-                    return
-                        raise (
-                            SessionNotFoundException(
-                                unknown.SessionId,
-                                sprintf "No session %O exists in tenant %O." unknown.SessionId tenant
-                            )
-                        )
-                | :? EventReplayJournalExpired as expired when not (isNull (box expired)) ->
-                    return
-                        raise (
-                            SessionJournalExpiredException(
-                                expired.SessionId,
-                                sprintf "The journal for session %O is gone." expired.SessionId
-                            )
-                        )
-                | _ -> return raise (InvalidOperationException("The event store returned an unknown replay outcome."))
+                return mapReplayOutcome tenant outcome
         }
 
     /// Subscribes to the session's events from the cursor: replays the

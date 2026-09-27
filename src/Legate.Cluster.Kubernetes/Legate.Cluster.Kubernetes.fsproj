@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>Legate.Cluster.Kubernetes</RootNamespace>
+    <Description>Kubernetes bootstrap for Legate's clustered runtime: Akka.Management plus Akka.Discovery.KubernetesApi cluster formation.</Description>
+  </PropertyGroup>
+
+  <!-- Compile order is explicit: register every new file here, in dependency order. -->
+  <ItemGroup>
+    <Compile Include="AssemblyInfo.fs" />
+    <Compile Include="KubernetesOptions.fs" />
+    <Compile Include="KubernetesHocon.fs" />
+    <Compile Include="KubernetesBootstrap.fs" />
+    <Compile Include="KubernetesServiceExtensions.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../Legate.Abstractions/Legate.Abstractions.fsproj" />
+    <ProjectReference Include="../Legate/Legate.fsproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Akka" />
+    <PackageReference Include="Akka.Discovery.KubernetesApi" />
+    <PackageReference Include="Akka.Management" />
+    <PackageReference Include="FSharp.Core" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
+    <PackageReference Include="Microsoft.Extensions.Options" />
+    <PackageReference Include="OpenTelemetry.Api" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,14 @@
+- name: Home
+  href: index.md
+- name: Getting started
+  items:
+    - name: CLI harness
+      href: getting-started-cli.md
+    - name: Hosted service
+      href: getting-started-hosted.md
+- name: Configuration
+  href: configuration.md
+- name: Architecture
+  href: architecture-overview.md
+- name: API reference
+  href: api/index.md

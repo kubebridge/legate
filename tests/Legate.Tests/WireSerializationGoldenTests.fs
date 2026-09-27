@@ -99,10 +99,11 @@ let private goldenCursor () : TurnLoop.TurnLoopSuspension =
         Nested = None
     }
 
-/// Builds every live actor-protocol message: all nine SessionActorMessage
-/// cases, all thirteen SuspendableActorMessage cases, every reply case, the
-/// snapshot, a stored session, and the router message. Mirrors the 130
-/// serializer test's coverage so every registered DTO has a representative.
+/// Builds every live wire message: all nine SessionActorMessage cases,
+/// all thirteen SuspendableActorMessage cases, every reply case, the
+/// snapshot, a stored session, the router message, and the four cross-node
+/// subscription cases (issue 133). Mirrors the 130 serializer test's
+/// coverage so every registered DTO has a representative.
 let private everyGoldenMessage () : obj list =
     let entry = goldenEntry "wire golden" 7L
     let session = goldenSession ()
@@ -112,6 +113,39 @@ let private everyGoldenMessage () : obj list =
         ReplyMismatchException(session.Id, "req-9", "No pending request 'req-9'.")
 
     let allowed = HashSet<string>([| "probe-tool" |])
+
+    let subscribeRequest: CrossNodeSubscriptions.CrossNodeSubscribeRequest =
+        {
+            Tenant = TenantId.Default
+            SessionId = session.Id
+            FromSequence = 0L
+            SubscriberToken = "wire-subscriber"
+        }
+
+    let unsubscribeRequest: CrossNodeSubscriptions.CrossNodeUnsubscribe =
+        {
+            Tenant = TenantId.Default
+            SessionId = session.Id
+            SubscriberToken = "wire-subscriber"
+        }
+
+    let goldenEvent: SessionEvent =
+        TextDeltaEvent(
+            session.Id,
+            TurnId.Parse("01ARZ3NDEKTSV4RRFFQ69G5FAX"),
+            Nullable<int64>(7L),
+            fixedTimestamp,
+            "wire event"
+        )
+        :> SessionEvent
+
+    let eventBatch: CrossNodeSubscriptions.CrossNodeEventBatch =
+        {
+            SessionId = session.Id
+            Events = [| goldenEvent |] :> IReadOnlyList<SessionEvent>
+            NextCursor = 7L
+            EndOfStream = true
+        }
 
     let finished =
         SessionActor.SuspendableFinished(entry, goldenCompletion (), 1, allowed)
@@ -174,6 +208,10 @@ let private everyGoldenMessage () : obj list =
         :> obj
         session :> obj
         SessionRouterMessage.ResolveSession(session.Id.ToString()) :> obj
+        subscribeRequest :> obj
+        unsubscribeRequest :> obj
+        eventBatch :> obj
+        goldenEvent :> obj
     ]
 
 // ────────────────── Fixture location ──────────────────
