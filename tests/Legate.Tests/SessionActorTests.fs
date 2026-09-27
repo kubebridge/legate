@@ -3741,6 +3741,360 @@ let ``Kill mid-turn restarts exactly once with the journal prefix intact`` () =
         stopSystem secondSystem
 
 // ──────────────────────────────────────────────────────────────────────────
+// Orphaned in-flight turn (issue 287)
+//
+// A mid-LLM-call kill consumes the inbox through the claim before the
+// marker lands, so the survivor meets Running with an empty inbox and a
+// marker-only journal. The dispatcher never wakes such sessions
+// (GetDispatchCandidates lists only sessions with pending inbox) and the
+// completion redriver only redelivers settled outbox rows, so without
+// entity-start journal-tail recovery the orphan idles silent forever.
+
+[<Fact>]
+let ``Running with empty inbox and marker-only journal settles Failed instead of idling silent`` () =
+    let database = InMemoryDatabase()
+    let store = InMemorySessionStore(database) :> ISessionStore
+    let journal = InMemorySessionEventStore(database) :> ISessionEventStore
+    let created = createSession store
+    ignore (appendStored store created.Id "orphaned")
+
+    let token =
+        match
+            store.ClaimNextTurn(tenant, created.Id, "owner-a", TimeSpan.FromHours 1.0, CancellationToken.None)
+            |> fun task -> task.GetAwaiter().GetResult()
+        with
+        | :? TurnLeaseRenewed as renewed -> renewed.Claim.Token
+        | :? TurnLeaseHeld as held -> held.Claim.Token
+        | _ -> failwith "Expected the prime claim."
+
+    store.UpdateSessionState(tenant, created.Id, SessionState.Running, CancellationToken.None).GetAwaiter().GetResult()
+    |> ignore
+
+    let markerTurn = TurnId.New()
+
+    let marker =
+        TurnStartedEvent(created.Id, markerTurn, Nullable<int64>(), DateTimeOffset.UtcNow) :> SessionEvent
+
+    match
+        journal.Append(
+            tenant,
+            created.Id,
+            token,
+            (ResizeArray<SessionEvent>([| marker |]) :> IReadOnlyList<SessionEvent>),
+            CancellationToken.None
+        )
+        |> fun task -> task.GetAwaiter().GetResult()
+    with
+    | :? EventAppended -> ()
+    | _ -> failwith "Expected the marker append."
+
+    let runner =
+        ScriptSuspendRunner(settledCompletion "never", settledCompletion "never")
+
+    let settled = ResizeArray<TurnResult>()
+
+    use system = createSystem ()
+
+    let baseProps: SessionActorProps =
+        {
+            Store = store
+            Tenant = tenant
+            SessionId = created.Id
+            RunTurn = (fun _ _ -> Task.FromResult(completed "unused"))
+            OnTurnSettled = Some(fun result -> lock settled (fun () -> settled.Add(result)))
+            OnInjectJournaled = None
+            Logger = null
+            Compact = None
+        }
+
+    let deps: SessionActor.SuspendDeps =
+        {
+            EventStore = journal
+            Delay = (TurnLoopTests.NeverDelay() :> ILlmDelay)
+            AskTimeout = TimeSpan.FromMinutes 5.0
+            JournalToken = token
+            RunSuspendable = runner.Func
+            ReprimeJournal = None
+            RefreshCompact = None
+            AgentStore = null
+        }
+
+    spawn system $"orphan-{Guid.NewGuid():N}" (SessionActor.behaviorWithSuspend baseProps deps)
+    |> ignore
+
+    try
+        let failed =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () ->
+                settled.Count = 1 && (storedOf store created.Id).State = SessionState.Idle)
+
+        failed |> should equal true
+        settled[0].Status |> should equal TurnStatus.Failed
+
+        match settled[0].Outcome with
+        | :? TurnFailed as outcome -> outcome.Reason |> should equal SessionActor.CrashFailReason
+        | _ -> failwith "Expected a TurnFailed outcome."
+
+        (pendingOf store created.Id).Count |> should equal 0
+        runner.Attempts.Count |> should equal 0
+
+        let collected =
+            match
+                journal.Replay(tenant, created.Id, 0L, 100, CancellationToken.None)
+                |> fun task -> task.GetAwaiter().GetResult()
+            with
+            | :? EventReplayPage as page -> List.ofSeq page.Events
+            | _ -> failwith "Expected the journal replay."
+
+        collected.Length |> should equal 2
+        collected[0] |> should be ofExactType<TurnStartedEvent>
+        collected[1] |> should be ofExactType<TurnFailedEvent>
+    finally
+        stopSystem system
+
+[<Fact>]
+let ``Running with FailAttempt and empty inbox but no journal tail idles without failing`` () =
+    use system = createSystem ()
+    let store = createStore ()
+    let options = SessionOptions()
+    options.OnCrashResume <- OnCrashResume.FailAttempt
+    let created = createSessionWith store options
+
+    store.UpdateSessionState(tenant, created.Id, SessionState.Running, CancellationToken.None).GetAwaiter().GetResult()
+    |> ignore
+
+    let journal = RecordingEventStore()
+
+    let runner =
+        ScriptSuspendRunner(settledCompletion "never", settledCompletion "never")
+
+    let settled = ResizeArray<TurnResult>()
+
+    spawnSuspendableOver system store journal "test-token" created.Id runner settled
+    |> ignore
+
+    try
+        let idled =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () -> (storedOf store created.Id).State = SessionState.Idle)
+
+        idled |> should equal true
+        Thread.Sleep(250)
+        settled.Count |> should equal 0
+        journal.Appended.Count |> should equal 0
+        runner.Attempts.Count |> should equal 0
+    finally
+        stopSystem system
+
+[<Fact>]
+let ``Orphan fail takeover loser journals nothing under the fresh token`` () =
+    // Fenced winner first: a live token settles the marker-only orphan
+    // with one TurnFailedEvent terminal.
+    let winnerDatabase = InMemoryDatabase()
+    let winnerStore = InMemorySessionStore(winnerDatabase) :> ISessionStore
+    let winnerJournal = InMemorySessionEventStore(winnerDatabase) :> ISessionEventStore
+    let winnerCreated = createSession winnerStore
+    ignore (appendStored winnerStore winnerCreated.Id "orphaned")
+
+    let winnerToken =
+        match
+            winnerStore.ClaimNextTurn(
+                tenant,
+                winnerCreated.Id,
+                "owner-a",
+                TimeSpan.FromHours 1.0,
+                CancellationToken.None
+            )
+            |> fun task -> task.GetAwaiter().GetResult()
+        with
+        | :? TurnLeaseRenewed as renewed -> renewed.Claim.Token
+        | :? TurnLeaseHeld as held -> held.Claim.Token
+        | _ -> failwith "Expected the prime claim."
+
+    let winnerMarkerTurn = TurnId.New()
+
+    let winnerMarker =
+        TurnStartedEvent(winnerCreated.Id, winnerMarkerTurn, Nullable<int64>(), DateTimeOffset.UtcNow) :> SessionEvent
+
+    match
+        winnerJournal.Append(
+            tenant,
+            winnerCreated.Id,
+            winnerToken,
+            (ResizeArray<SessionEvent>([| winnerMarker |]) :> IReadOnlyList<SessionEvent>),
+            CancellationToken.None
+        )
+        |> fun task -> task.GetAwaiter().GetResult()
+    with
+    | :? EventAppended -> ()
+    | _ -> failwith "Expected the marker append."
+
+    winnerStore
+        .UpdateSessionState(tenant, winnerCreated.Id, SessionState.Running, CancellationToken.None)
+        .GetAwaiter()
+        .GetResult()
+    |> ignore
+
+    let winnerRunner =
+        ScriptSuspendRunner(settledCompletion "never", settledCompletion "never")
+
+    let winnerSettled = ResizeArray<TurnResult>()
+
+    use winnerSystem = createSystem ()
+
+    let spawnFenced
+        (system: ActorSystem)
+        (store: ISessionStore)
+        (journal: ISessionEventStore)
+        (sessionId: SessionId)
+        (token: string)
+        (runner: ScriptSuspendRunner)
+        (settled: ResizeArray<TurnResult>)
+        =
+        let baseProps: SessionActorProps =
+            {
+                Store = store
+                Tenant = tenant
+                SessionId = sessionId
+                RunTurn = (fun _ _ -> Task.FromResult(completed "unused"))
+                OnTurnSettled = Some(fun result -> lock settled (fun () -> settled.Add(result)))
+                OnInjectJournaled = None
+                Logger = null
+                Compact = None
+            }
+
+        let deps: SessionActor.SuspendDeps =
+            {
+                EventStore = journal
+                Delay = (TurnLoopTests.NeverDelay() :> ILlmDelay)
+                AskTimeout = TimeSpan.FromMinutes 5.0
+                JournalToken = token
+                RunSuspendable = runner.Func
+                ReprimeJournal = None
+                RefreshCompact = None
+                AgentStore = null
+            }
+
+        spawn system $"orphan-{Guid.NewGuid():N}" (SessionActor.behaviorWithSuspend baseProps deps)
+
+    spawnFenced winnerSystem winnerStore winnerJournal winnerCreated.Id winnerToken winnerRunner winnerSettled
+    |> ignore
+
+    try
+        let winnerWon =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () ->
+                winnerSettled.Count = 1
+                && (storedOf winnerStore winnerCreated.Id).State = SessionState.Idle)
+
+        winnerWon |> should equal true
+        winnerSettled[0].Status |> should equal TurnStatus.Failed
+
+        let winnerCollected =
+            match
+                winnerJournal.Replay(tenant, winnerCreated.Id, 0L, 100, CancellationToken.None)
+                |> fun task -> task.GetAwaiter().GetResult()
+            with
+            | :? EventReplayPage as page -> List.ofSeq page.Events
+            | _ -> failwith "Expected the journal replay."
+
+        winnerCollected.Length |> should equal 2
+        winnerCollected[0] |> should be ofExactType<TurnStartedEvent>
+        winnerCollected[1] |> should be ofExactType<TurnFailedEvent>
+        winnerRunner.Attempts.Count |> should equal 0
+    finally
+        stopSystem winnerSystem
+
+    // Fenced loser: lapse the prime claim, take over with a fresh token,
+    // then run the loser on the stale token. The loser journals nothing.
+    let loserDatabase = InMemoryDatabase()
+    let loserStore = InMemorySessionStore(loserDatabase) :> ISessionStore
+    let loserJournal = InMemorySessionEventStore(loserDatabase) :> ISessionEventStore
+    let loserCreated = createSession loserStore
+    ignore (appendStored loserStore loserCreated.Id "orphaned")
+
+    let loserStale =
+        match
+            loserStore.ClaimNextTurn(
+                tenant,
+                loserCreated.Id,
+                "owner-a",
+                TimeSpan.FromMilliseconds 100.0,
+                CancellationToken.None
+            )
+            |> fun task -> task.GetAwaiter().GetResult()
+        with
+        | :? TurnLeaseRenewed as renewed -> renewed.Claim.Token
+        | :? TurnLeaseHeld as held -> held.Claim.Token
+        | _ -> failwith "Expected the prime claim."
+
+    let loserMarkerTurn = TurnId.New()
+
+    let loserMarker =
+        TurnStartedEvent(loserCreated.Id, loserMarkerTurn, Nullable<int64>(), DateTimeOffset.UtcNow) :> SessionEvent
+
+    match
+        loserJournal.Append(
+            tenant,
+            loserCreated.Id,
+            loserStale,
+            (ResizeArray<SessionEvent>([| loserMarker |]) :> IReadOnlyList<SessionEvent>),
+            CancellationToken.None
+        )
+        |> fun task -> task.GetAwaiter().GetResult()
+    with
+    | :? EventAppended -> ()
+    | _ -> failwith "Expected the marker append."
+
+    loserStore
+        .UpdateSessionState(tenant, loserCreated.Id, SessionState.Running, CancellationToken.None)
+        .GetAwaiter()
+        .GetResult()
+    |> ignore
+
+    Thread.Sleep(500)
+    ignore (appendStored loserStore loserCreated.Id "takeover")
+
+    match
+        loserStore.ClaimNextTurn(tenant, loserCreated.Id, "owner-b", TimeSpan.FromHours 1.0, CancellationToken.None)
+        |> fun task -> task.GetAwaiter().GetResult()
+    with
+    | :? TurnLeaseRenewed
+    | :? TurnLeaseHeld -> ()
+    | _ -> failwith "Expected the takeover claim."
+
+    let loserRunner =
+        ScriptSuspendRunner(settledCompletion "never", settledCompletion "never")
+
+    let loserSettled = ResizeArray<TurnResult>()
+
+    use loserSystem = createSystem ()
+
+    spawnFenced loserSystem loserStore loserJournal loserCreated.Id loserStale loserRunner loserSettled
+    |> ignore
+
+    try
+        // The loser still flips to Idle (store-first, unfenced) but its
+        // fenced journal write is rejected: the journal stays marker-only.
+        let loserDone =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () ->
+                (storedOf loserStore loserCreated.Id).State = SessionState.Idle)
+
+        loserDone |> should equal true
+        Thread.Sleep(500)
+
+        let loserCollected =
+            match
+                loserJournal.Replay(tenant, loserCreated.Id, 0L, 100, CancellationToken.None)
+                |> fun task -> task.GetAwaiter().GetResult()
+            with
+            | :? EventReplayPage as page -> List.ofSeq page.Events
+            | _ -> failwith "Expected the journal replay."
+
+        loserCollected.Length |> should equal 1
+        loserCollected[0] |> should be ofExactType<TurnStartedEvent>
+        loserRunner.Attempts.Count |> should equal 0
+    finally
+        stopSystem loserSystem
+
+// ──────────────────────────────────────────────────────────────────────────
 // Fork and SetAgent (issue 123)
 //
 // The actor half of the repaired plan: every rebind routes through the
