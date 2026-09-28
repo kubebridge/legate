@@ -494,10 +494,17 @@ let ``Multi-iteration turn marks exactly once`` () : Task =
                     result.Iterations |> should equal 2
 
                     // Two provider calls, one marker: later iterations never
-                    // refire the hook.
+                    // refire the hook. The settled turn also journals its
+                    // terminal completion row (issue 289), coexisting with
+                    // the single marker.
                     let! journal = collectJournal client created.Id
-                    journal.Length |> should equal 1
+                    journal.Length |> should equal 2
                     journal.Head |> should be ofExactType<TurnStartedEvent>
+                    journal.Tail.Head |> should be ofExactType<TurnCompletedEvent>
+
+                    journal
+                    |> List.filter (fun event -> event :? TurnStartedEvent)
+                    |> should haveLength 1
                 })
     }
 
@@ -574,14 +581,16 @@ let ``Ask resume marks exactly once`` () : Task =
                     result.Status |> should equal TurnStatus.Completed
 
                     // The resume continuation runs stripped: still exactly
-                    // one marker, plus the resolve event.
+                    // one marker, plus the resolve event and the terminal
+                    // completion row (issue 289).
                     let! settled = collectJournal client created.Id
-                    settled.Length |> should equal 3
+                    settled.Length |> should equal 4
 
                     settled
                     |> List.filter (fun event -> event :? TurnStartedEvent)
                     |> should haveLength 1
 
                     settled[2] |> should be ofExactType<PermissionResolvedEvent>
+                    settled[3] |> should be ofExactType<TurnCompletedEvent>
                 })
     }

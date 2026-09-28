@@ -65,6 +65,7 @@ let private completedResult () : TurnResult =
 let private settledCompletion () : TurnLoop.TurnLoopCompletion =
     {
         Result = completedResult ()
+        TurnId = TurnId.Parse("01ARZ3NDEKTSV4RRFFQ69G5FAX")
         HasPendingInjects = false
         Suspension = None
     }
@@ -78,6 +79,7 @@ let private liveCursor () : TurnLoop.TurnLoopSuspension =
 
     {
         RequestId = "req-1"
+        OriginTurnId = TurnId.Parse("01ARZ3NDEKTSV4RRFFQ69G5FAX")
         ToolName = "probe-tool"
         ToolCallId = "call-1"
         Kind = TurnLoop.SuspensionKind.PermissionSuspension
@@ -147,6 +149,7 @@ let private everyLiveMessage () : obj list =
             entry,
             {
                 Result = completedResult ()
+                TurnId = TurnId.Parse("01ARZ3NDEKTSV4RRFFQ69G5FAX")
                 HasPendingInjects = true
                 Suspension = Some(liveCursor ())
             },
@@ -169,7 +172,7 @@ let private everyLiveMessage () : obj list =
         SessionActor.SuspendableInterruptPrompt(entry.Payload, CancellationToken.None) :> obj
         finished :> obj
         suspended :> obj
-        SessionActor.SuspendableFaulted(entry, error, 1) :> obj
+        SessionActor.SuspendableFaulted(entry, error, 1, None) :> obj
         SessionActor.ReplyEntry(entry) :> obj
         SessionActor.SuspendableGetSnapshot :> obj
         SessionActor.SuspendTimedOut("req-1") :> obj
@@ -401,7 +404,8 @@ let ``Fault DTO maps exceptions to reason strings and rebuilds the fault path`` 
     | other -> failwith $"Expected a SessionActorMessage but rebuilt '{other.GetType().Name}'."
 
     let nameless =
-        WireDtos.toWire (SessionActor.SuspendableFaulted(entry, Exception(""), 2)) :?> WireDtos.SuspendableFaultedDto
+        WireDtos.toWire (SessionActor.SuspendableFaulted(entry, Exception(""), 2, None))
+        :?> WireDtos.SuspendableFaultedDto
 
     nameless.Reason |> should equal "Exception"
     nameless.Attempt |> should equal 2
@@ -471,6 +475,7 @@ let ``Suspended cursor round-trips without its nested resume`` () =
     let completion: TurnLoop.TurnLoopCompletion =
         {
             Result = completedResult ()
+            TurnId = TurnId.Parse("01ARZ3NDEKTSV4RRFFQ69G5FAX")
             HasPendingInjects = true
             Suspension = Some(liveCursor ())
         }
@@ -483,6 +488,8 @@ let ``Suspended cursor round-trips without its nested resume`` () =
     dto.Suspension.RequestId |> should equal "req-1"
     dto.Suspension.Kind |> should equal "permission"
     dto.Suspension.PendingCall.Name |> should equal "probe-tool"
+    dto.TurnId |> should equal "01ARZ3NDEKTSV4RRFFQ69G5FAX"
+    dto.Suspension.OriginTurnId |> should equal "01ARZ3NDEKTSV4RRFFQ69G5FAX"
 
     let json = JsonSerializer.Serialize(dto, WireSerialization.wireOptions ())
 
@@ -499,6 +506,7 @@ let ``Suspended cursor round-trips without its nested resume`` () =
             attempt |> should equal 2
             granted.Contains("probe-tool") |> should equal true
             rebuilt.HasPendingInjects |> should equal true
+            rebuilt.TurnId |> should equal (TurnId.Parse("01ARZ3NDEKTSV4RRFFQ69G5FAX"))
 
             match rebuilt.Suspension with
             | None -> failwith "Expected the suspended cursor to survive the wire."
@@ -509,8 +517,20 @@ let ``Suspended cursor round-trips without its nested resume`` () =
                 cursor.InputTokens |> should equal 3L
                 cursor.HistorySnapshot.Count |> should equal 1
                 cursor.Nested |> should equal None
+                cursor.OriginTurnId |> should equal (TurnId.Parse("01ARZ3NDEKTSV4RRFFQ69G5FAX"))
         | other -> failwith $"Expected SuspendableFinished but rebuilt '{other.GetType().Name}'."
     | other -> failwith $"Expected a SuspendableActorMessage but rebuilt '{other.GetType().Name}'."
+
+[<Fact>]
+let ``Old finished payloads without turn ids default to the turn-cell fallback`` () =
+    // Wire compat (issue 289): payloads written before the additive turn-id
+    // fields read back with null ids, which the settle choke points resolve
+    // through the turn cell and the CurrentTurnId snapshot.
+    let dto = WireDtos.SuspendableFinishedDto()
+    (isNull (box dto.TurnId)) |> should equal true
+
+    let suspension = WireDtos.SuspensionDto()
+    (isNull (box suspension.OriginTurnId)) |> should equal true
 
 // ────────────────── Fail-closed envelope ──────────────────
 

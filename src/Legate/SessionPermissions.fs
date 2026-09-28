@@ -148,7 +148,7 @@ module internal SessionPermissions =
                 with _ ->
                     ()
 
-        fun entry _attempt allowed cursor reply seed runnerToken onTurnStarted ->
+        fun entry _attempt allowed cursor reply seed runnerToken onTurnStarted turnId ->
             let tools, loopOptions = resolveInputs entry
 
             // Fail fast outside the task computation: a null tool set or
@@ -217,7 +217,7 @@ module internal SessionPermissions =
                                 consume
                                 gate
                                 entry.SessionId
-                                (TurnId.New())
+                                turnId
                                 None
                                 allowed
                     | Some live, Some reply when live.Nested.IsSome ->
@@ -281,8 +281,8 @@ module internal SessionPermissions =
                                 client
                                 history
                                 tools
-                                // Retries are fresh runs under a new turn id:
-                                // mark at the first provider-call entry.
+                                // Retries run under the supplied turn id: mark
+                                // at the first provider-call entry.
                                 { loopOptions with
                                     OnTurnStarted = onTurnStarted
                                 }
@@ -294,7 +294,7 @@ module internal SessionPermissions =
                                 consume
                                 gate
                                 entry.SessionId
-                                (TurnId.New())
+                                turnId
                                 None
                                 allowed
                     | _ ->

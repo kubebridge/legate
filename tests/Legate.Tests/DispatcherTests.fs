@@ -5,6 +5,7 @@ open System
 open System.Collections.Generic
 open System.Diagnostics
 open System.Diagnostics.Metrics
+open System.IO
 open System.Threading
 open System.Threading.Tasks
 open Akka.Actor
@@ -12,6 +13,7 @@ open Akka.FSharp
 open FsUnit.Xunit
 open Legate
 open Legate.Storage.InMemory
+open Legate.Storage.Sqlite
 open Legate.Testing
 open Microsoft.Extensions.AI
 open Microsoft.Extensions.DependencyInjection
@@ -157,6 +159,54 @@ type private DispatchJournal() =
         member _.DeferCleanup(_, sessionId, _, _) =
             Task.FromResult(EventCleanupRejected(sessionId, "staleClaim") :> EventCleanupSettlement)
 
+/// A quiet era reader (issue 289): pre-era, so the orphan sweep stays off
+/// unless a fact opts in with markedEra.
+let private preEra: TenantId -> SessionId -> CancellationToken -> Task<bool> =
+    fun _ _ _ -> Task.FromResult false
+
+/// A marked era reader (issue 289): every session reads era-marked.
+let private markedEra: TenantId -> SessionId -> CancellationToken -> Task<bool> =
+    fun _ _ _ -> Task.FromResult true
+
+/// Seeds one marker row for the turn id into the test journal, blocking.
+let private seedMarker (journal: DispatchJournal) (sessionId: SessionId) (turnId: TurnId) : unit =
+    let marker =
+        TurnStartedEvent(sessionId, turnId, Nullable<int64>(), DateTimeOffset.UtcNow) :> SessionEvent
+
+    let batch = ResizeArray<SessionEvent>([| marker |]) :> IReadOnlyList<SessionEvent>
+
+    (journal :> ISessionEventStore).Append(tenant, sessionId, "test-token", batch, CancellationToken.None)
+    |> fun task -> task.GetAwaiter().GetResult() |> ignore
+
+/// Seeds one terminal completion row for the turn id into the test
+/// journal, blocking.
+let private seedTerminal (journal: DispatchJournal) (sessionId: SessionId) (turnId: TurnId) : unit =
+    let terminal =
+        TurnCompletedEvent(sessionId, turnId, Nullable<int64>(), DateTimeOffset.UtcNow) :> SessionEvent
+
+    let batch = ResizeArray<SessionEvent>([| terminal |]) :> IReadOnlyList<SessionEvent>
+
+    (journal :> ISessionEventStore).Append(tenant, sessionId, "test-token", batch, CancellationToken.None)
+    |> fun task -> task.GetAwaiter().GetResult() |> ignore
+
+/// Replays the test journal from the start, blocking.
+let private journalEvents (journal: DispatchJournal) (sessionId: SessionId) : IReadOnlyList<SessionEvent> =
+    match
+        (journal :> ISessionEventStore).Replay(tenant, sessionId, 0L, 100, CancellationToken.None)
+        |> fun task -> task.GetAwaiter().GetResult()
+    with
+    | :? EventReplayPage as page when not (isNull (box page)) && not (isNull (box page.Events)) -> page.Events
+    | _ -> ResizeArray<SessionEvent>() :> IReadOnlyList<SessionEvent>
+
+/// Every TurnFailedEvent in the replayed journal for the turn id.
+let private failedFor (journal: DispatchJournal) (sessionId: SessionId) (turnId: TurnId) : TurnFailedEvent list =
+    journalEvents journal sessionId
+    |> Seq.choose (fun event ->
+        match event with
+        | :? TurnFailedEvent as failed when failed.TurnId.Equals(turnId) -> Some failed
+        | _ -> None)
+    |> List.ofSeq
+
 /// A completed TurnResult carrying assistant text.
 let private completed text =
     {
@@ -171,6 +221,7 @@ let private completed text =
 let private settledCompletion text : TurnLoop.TurnLoopCompletion =
     {
         Result = completed text
+        TurnId = Unchecked.defaultof<TurnId>
         HasPendingInjects = false
         Suspension = None
     }
@@ -190,7 +241,7 @@ type private ScriptSuspendRunner(completions: TurnLoop.TurnLoopCompletion list) 
 
     /// The runner as the suspendable delegate.
     member _.Func: SessionActor.SuspendableRunner =
-        fun entry _ _ _ _ _ _ _ ->
+        fun entry _ _ _ _ _ _ _ _ ->
             lock gate (fun () ->
                 calls <- calls + 1
                 entries.Add(entry))
@@ -221,7 +272,7 @@ type private GatedSuspendRunner(completion: TurnLoop.TurnLoopCompletion) =
 
     /// The runner as the suspendable delegate.
     member _.Func: SessionActor.SuspendableRunner =
-        fun entry _ _ _ _ _ _ _ ->
+        fun entry _ _ _ _ _ _ _ _ ->
             lock gate (fun () ->
                 calls <- calls + 1
                 entries.Add(entry))
@@ -240,6 +291,7 @@ let private suspendCursor (requestId: string) (toolName: string) : TurnLoop.Turn
 
     {
         RequestId = requestId
+        OriginTurnId = Unchecked.defaultof<TurnId>
         ToolName = toolName
         ToolCallId = "call-1"
         Kind = TurnLoop.PermissionSuspension
@@ -268,6 +320,7 @@ let private suspendedCompletion (cursor: TurnLoop.TurnLoopSuspension) : TurnLoop
                     }
                 Outcome = null
             }
+        TurnId = cursor.OriginTurnId
         HasPendingInjects = false
         Suspension = Some cursor
     }
@@ -311,6 +364,7 @@ let private spawnSuspendable
             ReprimeJournal = None
             RefreshCompact = None
             AgentStore = null
+            EraMarked = preEra
         }
 
     spawn system $"dispatch-{Guid.NewGuid():N}" (SessionActor.behaviorWithSuspend baseProps deps)
@@ -348,6 +402,8 @@ let ``Authoritative poll wakes Idle sessions with stored work and no wake`` () =
         let! result =
             Dispatcher.passOnceAsync
                 store
+                (DispatchJournal() :> ISessionEventStore)
+                preEra
                 tenant
                 (SessionsOptions())
                 (DispatcherOptions())
@@ -396,6 +452,8 @@ let ``Tripped process limit keeps the session queued`` () =
         let! result =
             Dispatcher.passOnceAsync
                 store
+                (DispatchJournal() :> ISessionEventStore)
+                preEra
                 tenant
                 sessions
                 (DispatcherOptions())
@@ -434,7 +492,16 @@ let ``Tripped tenant limit keeps the sessions queued`` () =
         let resolve = RecordingResolve()
 
         let! result =
-            Dispatcher.passOnceAsync store tenant sessions dispatcher resolve.Func clock CancellationToken.None
+            Dispatcher.passOnceAsync
+                store
+                (DispatchJournal() :> ISessionEventStore)
+                preEra
+                tenant
+                sessions
+                dispatcher
+                resolve.Func
+                clock
+                CancellationToken.None
 
         result.Started |> should equal 0
         result.QueuedProcess |> should equal 0
@@ -469,6 +536,8 @@ let ``Tripped agent limit keeps the sessions queued`` () =
         let! result =
             Dispatcher.passOnceAsync
                 store
+                (DispatchJournal() :> ISessionEventStore)
+                preEra
                 tenant
                 (SessionsOptions())
                 dispatcher
@@ -521,7 +590,16 @@ let ``Gate order is labeling only: process wins over tenant over agent`` () =
         let resolve = RecordingResolve()
 
         let! result =
-            Dispatcher.passOnceAsync store tenant sessions dispatcher resolve.Func clock CancellationToken.None
+            Dispatcher.passOnceAsync
+                store
+                (DispatchJournal() :> ISessionEventStore)
+                preEra
+                tenant
+                sessions
+                dispatcher
+                resolve.Func
+                clock
+                CancellationToken.None
 
         // The process limit labels the queued session even though the
         // tenant and agent limits trip too: no precedence, only labeling.
@@ -556,6 +634,8 @@ let ``Local in-flight gate bounds one pass under capacity`` () =
         let! result =
             Dispatcher.passOnceAsync
                 store
+                (DispatchJournal() :> ISessionEventStore)
+                preEra
                 tenant
                 sessions
                 (DispatcherOptions())
@@ -604,7 +684,16 @@ let ``Pass follows HasMore across bounded batches`` () =
             }
 
         let! result =
-            Dispatcher.passOnceAsync store tenant (SessionsOptions()) dispatcher resolve clock CancellationToken.None
+            Dispatcher.passOnceAsync
+                store
+                (DispatchJournal() :> ISessionEventStore)
+                preEra
+                tenant
+                (SessionsOptions())
+                dispatcher
+                resolve
+                clock
+                CancellationToken.None
 
         result.Started |> should equal 2
         result.Queued |> should equal 0
@@ -630,6 +719,8 @@ let ``Started sessions record the inbox-age dispatch latency`` () =
         collectDoubles (fun () ->
             Dispatcher.passOnceAsync
                 store
+                (DispatchJournal() :> ISessionEventStore)
+                preEra
                 tenant
                 (SessionsOptions())
                 (DispatcherOptions())
@@ -958,6 +1049,10 @@ let private buildServiceProvider
 
     let services = ServiceCollection()
     services.AddSingleton<ISessionStore>(store) |> ignore
+
+    services.AddSingleton<ISessionEventStore>(journal :> ISessionEventStore)
+    |> ignore
+
     services.AddSingleton<SessionClient>(client) |> ignore
     services.AddSingleton<DispatcherWakeSink>(DispatcherWakeSink()) |> ignore
 
@@ -1028,3 +1123,512 @@ let ``DispatcherService resolves its store lazily at loop start`` () =
     Assert.Throws<InvalidOperationException>(fun () ->
         service.RunOnceAsync(CancellationToken.None).GetAwaiter().GetResult() |> ignore)
     |> ignore
+
+// ──────────────────────────────────────────────────────────────────────────
+// Orphan sweep: lease-gated poke for live-turn orphans (issue 289)
+//
+// Idle sessions still carrying a live turn with a consumed inbox never
+// appear in the pending sweep, so a second bounded sweep lease-gates
+// them through an atomic priming claim: an expired or missing lease lets
+// the poke win and resolve, while a live lease makes the poke lose
+// silently and re-consume its bootstrap. The TestClock stays frozen
+// unless a fact advances it past the prime lease, so wins and losses
+// are deterministic without sleeps.
+
+/// Claims the session's appended entry so the row reads Idle with a live
+/// turn and a consumed inbox, and returns the winning claim.
+let private claimLiveTurn (store: ISessionStore) (sessionId: SessionId) (lease: TimeSpan) : TurnClaim =
+    match
+        store.ClaimNextTurn(tenant, sessionId, "owner-a", lease, CancellationToken.None)
+        |> fun task -> task.GetAwaiter().GetResult()
+    with
+    | :? TurnLeaseRenewed as renewed -> renewed.Claim
+    | :? TurnLeaseHeld as held -> held.Claim
+    | _ -> failwith "Expected the prime claim."
+
+[<Fact>]
+let ``Orphan sweep pokes Idle sessions with a live turn and an empty inbox`` () =
+    task {
+        let store, clock = createStore ()
+        let created = createSession store (AgentId.New())
+        appendStored store created.Id "orphaned" |> ignore
+        let prime = claimLiveTurn store created.Id (TimeSpan.FromMinutes 5.0)
+
+        // The victim's lease lapses: the poke must win. The journal holds
+        // the marker with no terminal row for the live turn on an
+        // era-marked session.
+        let journal = DispatchJournal()
+        seedMarker journal created.Id prime.TurnId
+        clock.Advance(TimeSpan.FromMinutes 6.0)
+
+        let resolve = RecordingResolve()
+
+        let! result =
+            Dispatcher.passOnceAsync
+                store
+                (journal :> ISessionEventStore)
+                markedEra
+                tenant
+                (SessionsOptions())
+                (DispatcherOptions())
+                resolve.Func
+                clock
+                CancellationToken.None
+
+        // The winner settles directly inside the sweep: no entity
+        // involvement, so nothing resolves, but the pass counts the
+        // settle as started.
+        result.Started |> should equal 1
+        result.Queued |> should equal 0
+        resolve.Resolved.Count |> should equal 0
+
+        // Exactly one fenced TurnFailedEvent carries the orphan id with
+        // the crash reason.
+        let failed = failedFor journal created.Id prime.TurnId
+        failed.Length |> should equal 1
+        failed[0].Reason |> should equal SessionActor.CrashFailReason
+
+        // The winning claim consumed the poke bootstrap and the prime
+        // settled quietly: nothing pends and no live turn stands.
+        pendingOf store created.Id |> fun pending -> pending.Count |> should equal 0
+
+        let after = storedOf store created.Id
+        after.CurrentTurnId.HasValue |> should equal false
+    }
+
+[<Fact>]
+let ``Orphan sweep never pokes a healthy session holding a live lease`` () =
+    task {
+        let store, clock = createStore ()
+        let created = createSession store (AgentId.New())
+        appendStored store created.Id "primed" |> ignore
+        let prime = claimLiveTurn store created.Id (TimeSpan.FromHours 1.0)
+
+        // Marker-only journal on an era-marked session, but the lease is
+        // live: the lease gate still wins and the poke loses.
+        let journal = DispatchJournal()
+        seedMarker journal created.Id prime.TurnId
+
+        let resolve = RecordingResolve()
+
+        let! result =
+            Dispatcher.passOnceAsync
+                store
+                (journal :> ISessionEventStore)
+                markedEra
+                tenant
+                (SessionsOptions())
+                (DispatcherOptions())
+                resolve.Func
+                clock
+                CancellationToken.None
+
+        // The poke loses silently: nothing resolves, nothing starts, the
+        // bootstrap is re-consumed, the live turn is untouched, and the
+        // loser journals nothing.
+        result.Started |> should equal 0
+        result.Queued |> should equal 0
+        resolve.Resolved.Count |> should equal 0
+        pendingOf store created.Id |> fun pending -> pending.Count |> should equal 0
+        journalEvents journal created.Id |> fun events -> events.Count |> should equal 1
+
+        let after = storedOf store created.Id
+        after.CurrentTurnId.HasValue |> should equal true
+        after.CurrentTurnId.Value |> should equal prime.TurnId
+    }
+
+[<Fact>]
+let ``Orphan sweep skips settled sessions with no live turn`` () =
+    task {
+        let store, clock = createStore ()
+        let created = createSession store (AgentId.New())
+        appendStored store created.Id "settled" |> ignore
+        let prime = claimLiveTurn store created.Id (TimeSpan.FromMinutes 5.0)
+
+        let! settled = store.SettleTurn(tenant, prime, TurnStatus.Completed, null, CancellationToken.None)
+        settled |> should be ofExactType<TurnSettled>
+
+        let resolve = RecordingResolve()
+        let journal = DispatchJournal()
+
+        let! result =
+            Dispatcher.passOnceAsync
+                store
+                (journal :> ISessionEventStore)
+                markedEra
+                tenant
+                (SessionsOptions())
+                (DispatcherOptions())
+                resolve.Func
+                clock
+                CancellationToken.None
+
+        result.Started |> should equal 0
+        result.Queued |> should equal 0
+        resolve.Resolved.Count |> should equal 0
+    }
+
+[<Fact>]
+let ``Orphan sweep leaves sessions with pending inbox to the authoritative poll`` () =
+    task {
+        let store, clock = createStore ()
+        let created = createSession store (AgentId.New())
+        appendStored store created.Id "queued" |> ignore
+
+        let resolve = RecordingResolve()
+        let journal = DispatchJournal()
+
+        let! result =
+            Dispatcher.passOnceAsync
+                store
+                (journal :> ISessionEventStore)
+                markedEra
+                tenant
+                (SessionsOptions())
+                (DispatcherOptions())
+                resolve.Func
+                clock
+                CancellationToken.None
+
+        // The pending sweep wakes it exactly once: the orphan sweep sees
+        // the pending inbox and stays out.
+        result.Started |> should equal 1
+        result.Queued |> should equal 0
+        resolve.Resolved.Count |> should equal 1
+        resolve.Resolved[0] |> should equal created.Id
+        pendingOf store created.Id |> fun pending -> pending.Count |> should equal 1
+    }
+
+[<Fact>]
+let ``Takeover race settles on exactly one winner with loser-zero-effects`` () =
+    task {
+        let store, clock = createStore ()
+        let created = createSession store (AgentId.New())
+        appendStored store created.Id "orphaned" |> ignore
+        let prime = claimLiveTurn store created.Id (TimeSpan.FromMinutes 5.0)
+
+        // Marker-only journal on an era-marked session; both passes race
+        // after the victim's lease lapses.
+        let journal = DispatchJournal()
+        seedMarker journal created.Id prime.TurnId
+        clock.Advance(TimeSpan.FromMinutes 6.0)
+
+        let winner = RecordingResolve()
+        let loser = RecordingResolve()
+
+        let pass (resolve: RecordingResolve) =
+            Dispatcher.passOnceAsync
+                store
+                (journal :> ISessionEventStore)
+                markedEra
+                tenant
+                (SessionsOptions())
+                (DispatcherOptions())
+                resolve.Func
+                clock
+                CancellationToken.None
+
+        let! results = Task.WhenAll([| pass winner; pass loser |])
+
+        // Exactly one poke wins and settles directly, whichever pass ran
+        // first: the atomic priming claim leaves the loser with zero
+        // effects, and no entity ever resolves.
+        (winner.Resolved.Count + loser.Resolved.Count) |> should equal 0
+        (results[0].Started + results[1].Started) |> should equal 1
+        results[0].Queued |> should equal 0
+        results[1].Queued |> should equal 0
+
+        // Loser-zero-effects: both bootstraps are consumed (the winner's
+        // by its claim, the loser's by its cleanup), one terminal lands
+        // for the orphan id, no live turn stands, and the loser journals
+        // nothing.
+        pendingOf store created.Id |> fun pending -> pending.Count |> should equal 0
+
+        let failed = failedFor journal created.Id prime.TurnId
+        failed.Length |> should equal 1
+        failed[0].Reason |> should equal SessionActor.CrashFailReason
+        journalEvents journal created.Id |> fun events -> events.Count |> should equal 2
+
+        let after = storedOf store created.Id
+        after.CurrentTurnId.HasValue |> should equal false
+    }
+
+[<Fact>]
+let ``Orphan sweep pokes live-turn orphans over the SQLite store`` () =
+    // Relational parity for the sweep's store interactions (ListSessions
+    // Idle filter, CurrentTurnId surfacing, atomic priming claim): the
+    // smoke runs Postgres, whose SQL mirrors the SQLite shape. Opens the
+    // temp-file database inline: SqliteTestFixture compiles later in
+    // this project, so the sweep module cannot see it.
+    task {
+        let clock = TestClock()
+
+        let path =
+            Path.Combine(Path.GetTempPath(), "legate-sqlite-" + Guid.NewGuid().ToString("N") + ".db")
+
+        let database = SqliteDatabase.Open(path, clock)
+
+        try
+            let store = SqliteStoreFactory.sessionStore database
+            let created = createSession store (AgentId.New())
+            appendStored store created.Id "orphaned" |> ignore
+            let prime = claimLiveTurn store created.Id (TimeSpan.FromMinutes 5.0)
+
+            // Marker-only journal on an era-marked session; the victim's
+            // lease lapses on the shared TestClock, so the poke must win.
+            let journal = DispatchJournal()
+            seedMarker journal created.Id prime.TurnId
+            clock.Advance(TimeSpan.FromMinutes 6.0)
+
+            let resolve = RecordingResolve()
+
+            let! result =
+                Dispatcher.passOnceAsync
+                    store
+                    (journal :> ISessionEventStore)
+                    markedEra
+                    tenant
+                    (SessionsOptions())
+                    (DispatcherOptions())
+                    resolve.Func
+                    clock
+                    CancellationToken.None
+
+            result.Started |> should equal 1
+            result.Queued |> should equal 0
+            resolve.Resolved.Count |> should equal 0
+            pendingOf store created.Id |> fun pending -> pending.Count |> should equal 0
+
+            // The winner settles directly: one fenced terminal for the
+            // orphan id and no live turn left standing.
+            let failed = failedFor journal created.Id prime.TurnId
+            failed.Length |> should equal 1
+
+            let after = storedOf store created.Id
+            after.CurrentTurnId.HasValue |> should equal false
+        finally
+            (database :> IDisposable).Dispose()
+
+            for suffix in [ ""; ".lock"; "-wal"; "-shm" ] do
+                try
+                    File.Delete(path + suffix)
+                with _ ->
+                    ()
+    }
+
+[<Fact>]
+let ``Orphan sweep skips live turns with a terminal row`` () =
+    task {
+        let store, clock = createStore ()
+        let created = createSession store (AgentId.New())
+        appendStored store created.Id "orphaned" |> ignore
+        let prime = claimLiveTurn store created.Id (TimeSpan.FromMinutes 5.0)
+
+        // Marker plus terminal row for the live turn on an era-marked
+        // session: healthy restart shape, never an orphan.
+        let journal = DispatchJournal()
+        seedMarker journal created.Id prime.TurnId
+        seedTerminal journal created.Id prime.TurnId
+        clock.Advance(TimeSpan.FromMinutes 6.0)
+
+        let resolve = RecordingResolve()
+
+        let! result =
+            Dispatcher.passOnceAsync
+                store
+                (journal :> ISessionEventStore)
+                markedEra
+                tenant
+                (SessionsOptions())
+                (DispatcherOptions())
+                resolve.Func
+                clock
+                CancellationToken.None
+
+        result.Started |> should equal 0
+        result.Queued |> should equal 0
+        resolve.Resolved.Count |> should equal 0
+        pendingOf store created.Id |> fun pending -> pending.Count |> should equal 0
+
+        let after = storedOf store created.Id
+        after.CurrentTurnId.HasValue |> should equal true
+        after.CurrentTurnId.Value |> should equal prime.TurnId
+    }
+
+[<Fact>]
+let ``Orphan sweep skips pre-era live turns`` () =
+    task {
+        let store, clock = createStore ()
+        let created = createSession store (AgentId.New())
+        appendStored store created.Id "orphaned" |> ignore
+        let prime = claimLiveTurn store created.Id (TimeSpan.FromMinutes 5.0)
+
+        // Marker-only journal, but the session predates the completion
+        // era: pre-era quiet, never an orphan.
+        let journal = DispatchJournal()
+        seedMarker journal created.Id prime.TurnId
+        clock.Advance(TimeSpan.FromMinutes 6.0)
+
+        let resolve = RecordingResolve()
+
+        let! result =
+            Dispatcher.passOnceAsync
+                store
+                (journal :> ISessionEventStore)
+                preEra
+                tenant
+                (SessionsOptions())
+                (DispatcherOptions())
+                resolve.Func
+                clock
+                CancellationToken.None
+
+        result.Started |> should equal 0
+        result.Queued |> should equal 0
+        resolve.Resolved.Count |> should equal 0
+        pendingOf store created.Id |> fun pending -> pending.Count |> should equal 0
+
+        let after = storedOf store created.Id
+        after.CurrentTurnId.HasValue |> should equal true
+        after.CurrentTurnId.Value |> should equal prime.TurnId
+    }
+
+[<Fact>]
+let ``Orphan sweep re-pokes after a prior poke claim expired through the fallback`` () =
+    task {
+        let store, clock = createStore ()
+        let created = createSession store (AgentId.New())
+        appendStored store created.Id "orphaned" |> ignore
+        let victim = claimLiveTurn store created.Id (TimeSpan.FromMinutes 5.0)
+
+        // The orphan marker names the victim turn.
+        let journal = DispatchJournal()
+        seedMarker journal created.Id victim.TurnId
+
+        // A prior sweep's poke won after the victim's lease lapsed, then
+        // the process died before settling: the live turn now names the
+        // marker-less poke prime, so only the journal-derived fallback
+        // still names the orphan.
+        clock.Advance(TimeSpan.FromMinutes 6.0)
+        appendStored store created.Id "stale poke" |> ignore
+        let stale = claimLiveTurn store created.Id (TimeSpan.FromMinutes 5.0)
+        stale.TurnId |> should not' (equal victim.TurnId)
+        clock.Advance(TimeSpan.FromMinutes 6.0)
+
+        let resolve = RecordingResolve()
+
+        let! result =
+            Dispatcher.passOnceAsync
+                store
+                (journal :> ISessionEventStore)
+                markedEra
+                tenant
+                (SessionsOptions())
+                (DispatcherOptions())
+                resolve.Func
+                clock
+                CancellationToken.None
+
+        // The fallback re-candidates the orphan: the winner settles
+        // directly with no entity involvement.
+        result.Started |> should equal 1
+        result.Queued |> should equal 0
+        resolve.Resolved.Count |> should equal 0
+
+        let failed = failedFor journal created.Id victim.TurnId
+        failed.Length |> should equal 1
+        failed[0].Reason |> should equal SessionActor.CrashFailReason
+
+        pendingOf store created.Id |> fun pending -> pending.Count |> should equal 0
+
+        let after = storedOf store created.Id
+        after.CurrentTurnId.HasValue |> should equal false
+    }
+
+[<Fact>]
+let ``Won poke settles exactly once with a single fenced terminal`` () =
+    task {
+        let store, clock = createStore ()
+        let created = createSession store (AgentId.New())
+        appendStored store created.Id "orphaned" |> ignore
+        let prime = claimLiveTurn store created.Id (TimeSpan.FromMinutes 5.0)
+
+        let journal = DispatchJournal()
+        seedMarker journal created.Id prime.TurnId
+        clock.Advance(TimeSpan.FromMinutes 6.0)
+
+        let resolve = RecordingResolve()
+
+        let pass () =
+            Dispatcher.passOnceAsync
+                store
+                (journal :> ISessionEventStore)
+                markedEra
+                tenant
+                (SessionsOptions())
+                (DispatcherOptions())
+                resolve.Func
+                clock
+                CancellationToken.None
+
+        let! first = pass ()
+        first.Started |> should equal 1
+
+        // The orphan id is terminated now: a second pass stays quiet, so
+        // the terminal lands exactly once.
+        let! second = pass ()
+        second.Started |> should equal 0
+        second.Queued |> should equal 0
+        resolve.Resolved.Count |> should equal 0
+
+        journalEvents journal created.Id |> fun events -> events.Count |> should equal 2
+
+        let failed = failedFor journal created.Id prime.TurnId
+        failed.Length |> should equal 1
+        failed[0].Reason |> should equal SessionActor.CrashFailReason
+    }
+
+[<Fact>]
+let ``Losing poke journals nothing`` () =
+    task {
+        let store, clock = createStore ()
+        let created = createSession store (AgentId.New())
+        appendStored store created.Id "primed" |> ignore
+        let prime = claimLiveTurn store created.Id (TimeSpan.FromHours 1.0)
+
+        // Marker-only journal on an era-marked session, but the lease is
+        // live: the poke loses the priming claim.
+        let journal = DispatchJournal()
+        seedMarker journal created.Id prime.TurnId
+
+        let resolve = RecordingResolve()
+
+        let! result =
+            Dispatcher.passOnceAsync
+                store
+                (journal :> ISessionEventStore)
+                markedEra
+                tenant
+                (SessionsOptions())
+                (DispatcherOptions())
+                resolve.Func
+                clock
+                CancellationToken.None
+
+        result.Started |> should equal 0
+        result.Queued |> should equal 0
+        resolve.Resolved.Count |> should equal 0
+
+        // Loser-zero-effects at the journal: only the seeded marker
+        // stands, with no terminal for any turn.
+        journalEvents journal created.Id |> fun events -> events.Count |> should equal 1
+
+        failedFor journal created.Id prime.TurnId
+        |> fun failed -> failed.Length |> should equal 0
+
+        pendingOf store created.Id |> fun pending -> pending.Count |> should equal 0
+
+        let after = storedOf store created.Id
+        after.CurrentTurnId.HasValue |> should equal true
+        after.CurrentTurnId.Value |> should equal prime.TurnId
+    }

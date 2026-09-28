@@ -184,7 +184,11 @@ type private RunningTurn =
     {
         /// The inbox entry the turn executes.
         Entry: InboxEntry
-        /// The source Close cancels to abort the turn.
+        /// The turn the attempt runs as (issue 289): the CurrentTurnId
+        /// snapshot at start, or a fresh mint when the row carries none.
+        /// The settle choke points journal the terminal event under it.
+        TurnId: TurnId
+        /// The source Close cancels to abort it.
         Cts: CancellationTokenSource
     }
 
@@ -1013,6 +1017,18 @@ module internal SessionActor =
         let startTurn (entry: InboxEntry) : RunningTurn =
             let cts = new CancellationTokenSource()
 
+            // Snapshot the live turn (issue 289): the claimed turn id the
+            // settle choke points journal under. A missing row or an empty
+            // snapshot mints fresh, preserving the pre-plumbing shape.
+            let turnId =
+                try
+                    match awaitTask (props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None)) with
+                    | null -> TurnId.New()
+                    | session when session.CurrentTurnId.HasValue -> session.CurrentTurnId.Value
+                    | _ -> TurnId.New()
+                with _ ->
+                    TurnId.New()
+
             let runTask =
                 try
                     let started = props.RunTurn entry cts.Token
@@ -1041,7 +1057,11 @@ module internal SessionActor =
                     self.Tell(SessionTurnSettled(entry, completed.Result)))
             |> ignore
 
-            { Entry = entry; Cts = cts }
+            {
+                Entry = entry
+                TurnId = turnId
+                Cts = cts
+            }
 
         /// Settles a finished turn attempt: consumes the attempt's entry
         /// store-first, then drains the next pending entry into a new turn
@@ -1802,9 +1822,11 @@ module internal SessionActor =
     /// resumption note) on crash-resume activation and is None elsewhere:
     /// a seeded run leads its runner history input with the seed instead
     /// of the entry-derived message. The in-call marker hook (issue 284)
-    /// rides last: Some journals the fenced TurnStartedEvent at the first
+    /// rides second to last: Some journals the fenced TurnStartedEvent at the first
     /// provider-call entry, None journals nothing (resumes already marked
-    /// before they suspended). Tests inject scripted runners; the
+    /// before they suspended). The turn id rides last (issue 289): the
+    /// actor-supplied loop-run id the marker, the completion, and the
+    /// settle choke points all key on. Tests inject scripted runners; the
     /// TurnLoop-backed runner wires
     /// TurnLoop.runSuspendableAsync plus the resume continuations.
     type SuspendableRunner =
@@ -1816,6 +1838,7 @@ module internal SessionActor =
             -> IList<ChatMessage> option
             -> CancellationToken
             -> TurnLoop.TurnStartedHook option
+            -> TurnId
             -> Task<TurnLoop.TurnLoopCompletion>
 
     /// What a suspendable session actor is built from: the base actor
@@ -1861,6 +1884,11 @@ module internal SessionActor =
             /// SetAgent facade validation precedent). Never drives tool
             /// resolution.
             AgentStore: IAgentStore | null
+            /// Reads the completion era (issue 289): true once Open or Fork
+            /// marked the session, false for pre-era sessions. The
+            /// entity-start predicate consults it exactly like the journal.
+            /// Never null.
+            EraMarked: CompletionEra.CompletionEraReader
         }
 
     /// A rebuilt pending request from the journal: the crash path carries
@@ -1888,6 +1916,10 @@ module internal SessionActor =
         {
             /// The inbox entry the parked turn executes.
             Entry: InboxEntry
+            /// The turn the parked run executes (issue 289): captured at
+            /// suspend from the completion, or the live-turn snapshot for a
+            /// crash rebuild. The AskTimeout journal carries it.
+            TurnId: TurnId
             /// The live cursor, or None after a crash rebuild.
             Cursor: TurnLoop.TurnLoopSuspension option
             /// The rebuilt pending, or None for a live suspension.
@@ -1972,8 +2004,11 @@ module internal SessionActor =
             attempt: int *
             allowed: HashSet<string>
 
-        /// The suspendable turn faulted. One-way from the turn task.
-        | SuspendableFaulted of entry: InboxEntry * error: Exception * attempt: int
+        /// The suspendable turn faulted. One-way from the turn task. The
+        /// turn id rides last (issue 289): Some when the fault arrived
+        /// from a running attempt, None when the runner never started
+        /// (a miswired or null runner faults before any mint).
+        | SuspendableFaulted of entry: InboxEntry * error: Exception * attempt: int * turnId: TurnId option
 
         /// A Reply inbox entry arrived for the suspended turn. Answered with
         /// SessionReplyReply; a mismatch rejects with ReplyMismatchException.
@@ -2326,6 +2361,9 @@ module internal SessionActor =
         if isNull (box suspend.RunSuspendable) then
             raise (ArgumentNullException(nameof suspend))
 
+        if isNull (box suspend.EraMarked) then
+            raise (ArgumentNullException(nameof suspend))
+
         if suspend.AskTimeout <= TimeSpan.Zero then
             raise (ArgumentOutOfRangeException(nameof suspend, "SuspendDeps.AskTimeout must be positive."))
 
@@ -2368,7 +2406,99 @@ module internal SessionActor =
         // re-prime, so later Compacts journal under the live token.
         let mutable currentCompact = props.Compact
 
-        let failInterruptedTurn (entryOpt: InboxEntry option) : unit =
+        // The turn id the running attempt executes as (issue 289): set by
+        // startSuspendable and resumeSuspendable, cleared when the attempt
+        // reports. The SuspendableFinished/Faulted handlers resolve the
+        // settling id from the carried id, then this cell, then the
+        // CurrentTurnId snapshot, else journal nothing.
+        let mutable runningTurnId: TurnId option = None
+
+        /// Snapshots the session row's live turn, or None when the row is
+        /// missing, the turn settled to null, or the read fails.
+        /// <returns>The live turn id, or None.</returns>
+        let currentTurnSnapshot () : TurnId option =
+            try
+                match awaitTask (props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None)) with
+                | null -> None
+                | session when session.CurrentTurnId.HasValue -> Some session.CurrentTurnId.Value
+                | _ -> None
+            with _ ->
+                None
+
+        /// Resolves the settling turn id (issue 289): the
+        /// completion-carried id, then the running attempt's cell, then
+        /// the CurrentTurnId snapshot, else None (journal nothing).
+        /// <param name="carried">The completion-carried turn id.</param>
+        /// <returns>The settling turn id, or None.</returns>
+        let resolveSettlingTurnId (carried: TurnId) : TurnId option =
+            if not (carried.Equals(Unchecked.defaultof<TurnId>)) then
+                Some carried
+            else
+                match runningTurnId with
+                | Some live -> Some live
+                | None -> currentTurnSnapshot ()
+
+        /// Re-primes the journal through the spawn wiring: a fresh bootstrap
+        /// plus ClaimNextTurn, or None when the host never re-primes, the
+        /// prime fails, or a live claim is held (takeover, or a restart
+        /// inside the old prime's lease). Total: a throwing prime reads as
+        /// None and the recorded rebind retries at the next boundary.
+        /// <returns>The live claim, or None.</returns>
+        let reprimeNow () : TurnClaim option =
+            match suspend.ReprimeJournal with
+            | None -> None
+            | Some reprime ->
+                try
+                    reprime ()
+                with _ ->
+                    None
+
+        /// Settles a claim Completed with a null outcome, best-effort: the
+        /// first settle wins and a retry of the same outcome observes it, so
+        /// only the settled/already-settled outcomes read as settled. Total:
+        /// a rejected or faulted settle reads as false.
+        /// <param name="claim">The claim fencing the settlement. Must not be null.</param>
+        /// <returns>True when the turn settled.</returns>
+        let settleTurnQuiet (claim: TurnClaim) : bool =
+            try
+                match
+                    awaitTask (
+                        props.Store.SettleTurn(props.Tenant, claim, TurnStatus.Completed, null, CancellationToken.None)
+                    )
+                with
+                | :? TurnSettled -> true
+                | :? TurnAlreadySettled -> true
+                | _ -> false
+            with _ ->
+                false
+
+        /// Settles the primed journal claim the spawn (or a re-prime)
+        /// holds: synthesizes the claim from the row's CurrentTurnId stamp
+        /// plus the token cell, so the settle needs no plumbed claim object
+        /// and survives restarts. Live or lapsed-but-uncontested it clears
+        /// CurrentTurnIds; a stale claim rejects with no effects. Total: the
+        /// outcome is advisory (the re-prime below gates the apply), so
+        /// every failure is swallowed.
+        let settlePrimedNow () : unit =
+            try
+                match awaitTask (props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None)) with
+                | null -> ()
+                | session ->
+                    if session.CurrentTurnId.HasValue then
+                        let claim =
+                            {
+                                TurnId = session.CurrentTurnId.Value
+                                Token = journalToken
+                                Owner = ""
+                                ExpiresAt = DateTimeOffset.MinValue
+                                Attempt = 1
+                            }
+
+                        settleTurnQuiet claim |> ignore
+            with _ ->
+                ()
+
+        let failInterruptedTurn (liveId: TurnId option) (entryOpt: InboxEntry option) : unit =
             let result =
                 {
                     AssistantText = ""
@@ -2414,32 +2544,157 @@ module internal SessionActor =
             with _ ->
                 ()
 
-            try
-                let failedEvent =
-                    TurnFailedEvent(
-                        props.SessionId,
-                        TurnId.New(),
-                        Nullable<int64>(),
-                        DateTimeOffset.UtcNow,
-                        CrashFailReason
+            // The crash-path terminal (issue 289): the CurrentTurnId
+            // snapshot the crash path never ran a loop for. Fenced under
+            // the live journal token; a settled-NULL turn (None) journals
+            // nothing.
+            match liveId with
+            | Some turnId ->
+                try
+                    let failedEvent =
+                        TurnFailedEvent(
+                            props.SessionId,
+                            turnId,
+                            Nullable<int64>(),
+                            DateTimeOffset.UtcNow,
+                            CrashFailReason
+                        )
+                        :> SessionEvent
+
+                    let events =
+                        ResizeArray<SessionEvent>([| failedEvent |]) :> IReadOnlyList<SessionEvent>
+
+                    awaitTask (
+                        JournalWriter.appendWithTokenAsync
+                            suspend.EventStore
+                            props.Tenant
+                            props.SessionId
+                            journalToken
+                            events
+                            CancellationToken.None
                     )
-                    :> SessionEvent
+                    |> ignore
+                with _ ->
+                    ()
+            | None -> ()
 
-                let events =
-                    ResizeArray<SessionEvent>([| failedEvent |]) :> IReadOnlyList<SessionEvent>
+        /// Reads the journal state for one turn id (issue 289): whether the
+        /// journal holds the TurnStartedEvent marker for the id, whether
+        /// any terminal row (TurnCompleted, TurnFailed, TurnAborted,
+        /// SessionClosed) carries it, and the latest marker id with no
+        /// terminal row (the journal-derived orphan). Read-only: never
+        /// appends. A failed replay reads as no marker, so the probe stays
+        /// quiet.
+        ///
+        /// The fallback exists because a winning prime replaces the row's
+        /// turn id: after the dispatcher's poke-claim (or the spawn prime)
+        /// wins post-expiry, CurrentTurnId names the prime, never the
+        /// orphan, so marker-for-live-id alone would stay quiet forever.
+        /// The orphan id survives only in the journal.
+        /// <param name="liveId">The live turn to inspect.</param>
+        /// <returns>The marker flag and terminal flag for the live id, plus the latest unterminated marker id.</returns>
+        let journalOrphanState (liveId: TurnId) : bool * bool * TurnId option =
+            let rec replay
+                cursor
+                (marker: bool)
+                (terminal: bool)
+                (markers: ResizeArray<TurnId>)
+                (terminals: HashSet<TurnId>)
+                =
+                let outcome =
+                    try
+                        awaitTask (
+                            suspend.EventStore.Replay(
+                                props.Tenant,
+                                props.SessionId,
+                                cursor,
+                                100,
+                                CancellationToken.None
+                            )
+                        )
+                    with _ ->
+                        Unchecked.defaultof<EventReplayOutcome>
 
-                awaitTask (
-                    JournalWriter.appendWithTokenAsync
-                        suspend.EventStore
-                        props.Tenant
-                        props.SessionId
-                        journalToken
-                        events
-                        CancellationToken.None
-                )
-                |> ignore
-            with _ ->
-                ()
+                match outcome with
+                | :? EventReplayPage as page when not (isNull (box page)) ->
+                    let mutable foundMarker = marker
+                    let mutable foundTerminal = terminal
+                    let mutable nextCursor = cursor
+
+                    if not (isNull (box page.Events)) then
+                        for event in page.Events do
+                            if not (isNull (box event)) then
+                                if event.TurnId.Equals(liveId) then
+                                    match event with
+                                    | :? TurnStartedEvent -> foundMarker <- true
+                                    | :? TurnCompletedEvent
+                                    | :? TurnFailedEvent
+                                    | :? TurnAbortedEvent
+                                    | :? SessionClosedEvent -> foundTerminal <- true
+                                    | _ -> ()
+
+                                match event with
+                                | :? TurnStartedEvent -> markers.Add(event.TurnId)
+                                | :? TurnCompletedEvent
+                                | :? TurnFailedEvent
+                                | :? TurnAbortedEvent
+                                | :? SessionClosedEvent -> terminals.Add(event.TurnId) |> ignore
+                                | _ -> ()
+
+                        if page.NextCursor.HasValue then
+                            nextCursor <- page.NextCursor.Value
+
+                    if page.NextCursor.HasValue then
+                        replay nextCursor foundMarker foundTerminal markers terminals
+                    else
+                        let fallback =
+                            markers
+                            |> Seq.filter (fun candidate -> not (terminals.Contains(candidate)))
+                            |> Seq.tryLast
+
+                        foundMarker, foundTerminal, fallback
+                | _ ->
+                    let fallback =
+                        markers
+                        |> Seq.filter (fun candidate -> not (terminals.Contains(candidate)))
+                        |> Seq.tryLast
+
+                    marker, terminal, fallback
+
+            replay 0L false false (ResizeArray<TurnId>()) (HashSet<TurnId>())
+
+        /// Reads whether the live turn is an orphan (issue 289), in order:
+        /// the settling id (the live id when its marker stands unterminated,
+        /// else the journal-derived orphan the prime replaced), an
+        /// era-marked session, and a won re-prime (a live lease held
+        /// elsewhere reads quiet). The won claim's token is adopted into
+        /// the journal cell so fenced writes land; the caller settles the
+        /// prime quietly after failing the orphan (a never-ran prime
+        /// journals nothing).
+        /// <param name="liveId">The live turn to probe.</param>
+        /// <returns>The settling turn id with the won prime claim, or None when the session stays quiet.</returns>
+        let probeOrphanTurn (liveId: TurnId) : (TurnId * TurnClaim) option =
+            let marker, terminal, fallback = journalOrphanState liveId
+
+            let settling = if marker && not terminal then Some liveId else fallback
+
+            match settling with
+            | None -> None
+            | Some settlingId ->
+                let marked =
+                    try
+                        awaitTask (suspend.EraMarked props.Tenant props.SessionId CancellationToken.None)
+                    with _ ->
+                        false
+
+                if not marked then
+                    None
+                else
+                    match reprimeNow () with
+                    | None -> None
+                    | Some prime ->
+                        journalToken <- prime.Token
+                        Some(settlingId, prime)
 
         let initialRecovered: SessionState * RebuiltPending option * InboxEntry option =
             let found =
@@ -2448,6 +2703,15 @@ module internal SessionActor =
             match found with
             | null -> SessionState.Idle, None, None
             | session ->
+                // The crash-path terminal id (issue 289): the live turn
+                // the crash interrupted, or None for a settled-NULL row
+                // (which journals nothing).
+                let liveId =
+                    if session.CurrentTurnId.HasValue then
+                        Some session.CurrentTurnId.Value
+                    else
+                        None
+
                 match session.State with
                 | SessionState.Running ->
                     let drainable =
@@ -2465,7 +2729,7 @@ module internal SessionActor =
                     | OnCrashResume.FailAttempt ->
                         match drainable with
                         | Some _ ->
-                            failInterruptedTurn drainable
+                            failInterruptedTurn liveId drainable
                             SessionState.Idle, None, None
                         | None ->
                             // Marker-only orphan (issue 287): the claim
@@ -2482,7 +2746,7 @@ module internal SessionActor =
                                     false
 
                             if orphaned then
-                                failInterruptedTurn None
+                                failInterruptedTurn liveId None
                                 SessionState.Idle, None, None
                             else
                                 awaitTask (
@@ -2516,7 +2780,7 @@ module internal SessionActor =
                                     false
 
                             if orphaned then
-                                failInterruptedTurn None
+                                failInterruptedTurn liveId None
                                 SessionState.Idle, None, None
                             else
                                 awaitTask (
@@ -2535,7 +2799,48 @@ module internal SessionActor =
                         rebuildPendingFromJournal suspend.EventStore props.Tenant props.SessionId
 
                     SessionState.WaitingForInput, rebuilt, None
-                | SessionState.Idle -> SessionState.Idle, None, None
+                | SessionState.Idle ->
+                    // Live-turn orphan probe (issue 289): an Idle row still
+                    // carrying a live turn whose journal holds an
+                    // unterminated marker — for the live id itself, or for
+                    // the orphan id a won prime replaced (the marker is the
+                    // only surviving record of it) — on an era-marked
+                    // session with no live lease elsewhere, enters the
+                    // Running-branch shape so entity start runs the
+                    // journal-tail recovery. Settled-NULL, terminated,
+                    // empty-tail, live-lease, and pre-era sessions all stay
+                    // quiet with the turn preserved; the losing branch
+                    // journals nothing (loser-zero-effects).
+                    if session.CurrentTurnId.HasValue then
+                        let liveId = session.CurrentTurnId.Value
+
+                        match probeOrphanTurn liveId with
+                        | None -> SessionState.Idle, None, None
+                        | Some(settlingId, prime) ->
+                            let drainable =
+                                try
+                                    let pending =
+                                        awaitTask (
+                                            props.Store.ReadPendingInbox(
+                                                props.Tenant,
+                                                props.SessionId,
+                                                CancellationToken.None
+                                            )
+                                        )
+
+                                    selectDrainableEntries pending |> List.tryHead
+                                with _ ->
+                                    None
+
+                            match drainable with
+                            | Some entry when crashKnobOf session <> OnCrashResume.FailAttempt ->
+                                SessionState.Running, None, Some entry
+                            | _ ->
+                                failInterruptedTurn (Some settlingId) drainable
+                                settleTurnQuiet prime |> ignore
+                                SessionState.Idle, None, None
+                    else
+                        SessionState.Idle, None, None
                 | SessionState.Closed -> SessionState.Closed, None, None
                 | unknown -> unknown, None, None
 
@@ -2565,6 +2870,10 @@ module internal SessionActor =
                     Some
                         {
                             Entry = entry
+                            TurnId =
+                                match currentTurnSnapshot () with
+                                | Some live -> live
+                                | None -> Unchecked.defaultof<TurnId>
                             Cursor = None
                             Rebuilt = Some rebuilt
                             Allowed = readGrantsNow ()
@@ -2822,28 +3131,117 @@ module internal SessionActor =
                         CancellationToken.None
                 )
 
-        let journalTimeout () : unit =
-            let turnId = TurnId.New()
-            let stamp = DateTimeOffset.UtcNow
+        /// Reads the failure reason to journal for a Failed result: the
+        /// typed outcome reason when present, else the assistant text,
+        /// else a fixed fallback. Never synthesizes secrets: both sources
+        /// are contract-bound to never carry them.
+        /// <param name="result">The Failed result.</param>
+        /// <returns>The reason the terminal event carries.</returns>
+        let failedReasonOf (result: TurnResult) : string =
+            match result.Outcome with
+            | :? TurnFailed as failed when not (isNull (box failed)) && not (String.IsNullOrEmpty failed.Reason) ->
+                failed.Reason
+            | :? TurnAgentRejected as rejected when
+                not (isNull (box rejected)) && not (String.IsNullOrEmpty rejected.Reason)
+                ->
+                rejected.Reason
+            | _ when not (String.IsNullOrEmpty result.AssistantText) -> result.AssistantText
+            | _ -> "The turn failed."
 
-            let event =
-                TurnFailedEvent(props.SessionId, turnId, Nullable<int64>(), stamp, AskTimeoutReason) :> SessionEvent
+        /// Journals the terminal completion event for one settled turn
+        /// (issue 289): Completed maps to TurnCompletedEvent, Aborted to
+        /// TurnAbortedEvent under the winning cause and reason, Failed to
+        /// TurnFailedEvent under the outcome reason. Exactly once per
+        /// settling turn id, fenced under the live journal token via
+        /// appendWithTokenAsync; best-effort (verdict-first): a rejected
+        /// or failed write carries no further turn to fail, and the loser
+        /// branch journals nothing (loser-zero-effects).
+        /// <param name="turnId">The settling turn's id.</param>
+        /// <param name="result">The settled (possibly abort-mapped) result.</param>
+        let journalSettledCompletion (turnId: TurnId) (result: TurnResult) : unit =
+            try
+                let stamp = DateTimeOffset.UtcNow
 
-            let events = ResizeArray<SessionEvent>([| event |]) :> IReadOnlyList<SessionEvent>
+                let eventOpt: SessionEvent option =
+                    match result.Status with
+                    | TurnStatus.Completed ->
+                        TurnCompletedEvent(props.SessionId, turnId, Nullable<int64>(), stamp) :> SessionEvent
+                        |> Some
+                    | TurnStatus.Aborted ->
+                        match result.Outcome with
+                        | :? TurnAborted as aborted when not (isNull (box aborted)) ->
+                            TurnAbortedEvent(
+                                props.SessionId,
+                                turnId,
+                                Nullable<int64>(),
+                                stamp,
+                                aborted.Cause,
+                                aborted.Reason
+                            )
+                            :> SessionEvent
+                            |> Some
+                        | _ ->
+                            TurnAbortedEvent(
+                                props.SessionId,
+                                turnId,
+                                Nullable<int64>(),
+                                stamp,
+                                StopCause.ExplicitAbort,
+                                InterruptReason
+                            )
+                            :> SessionEvent
+                            |> Some
+                    | TurnStatus.Failed ->
+                        TurnFailedEvent(props.SessionId, turnId, Nullable<int64>(), stamp, failedReasonOf result)
+                        :> SessionEvent
+                        |> Some
+                    | _ -> None
 
-            // Through the journal writer, best-effort: the turn already
-            // settles Failed, so a rejected or failed write carries no
-            // further turn to fail.
-            awaitTask (
-                JournalWriter.appendWithTokenAsync
-                    suspend.EventStore
-                    props.Tenant
-                    props.SessionId
-                    journalToken
-                    events
-                    CancellationToken.None
-            )
-            |> ignore
+                match eventOpt with
+                | None -> ()
+                | Some event ->
+                    let events = ResizeArray<SessionEvent>([| event |]) :> IReadOnlyList<SessionEvent>
+
+                    awaitTask (
+                        JournalWriter.appendWithTokenAsync
+                            suspend.EventStore
+                            props.Tenant
+                            props.SessionId
+                            journalToken
+                            events
+                            CancellationToken.None
+                    )
+                    |> ignore
+            with _ ->
+                ()
+
+        let journalTimeout (turnId: TurnId) : unit =
+            // The parked turn id (issue 289): the default id (a cursor
+            // that never carried one) journals nothing, while the settle
+            // effects below run unchanged.
+            if turnId.Equals(Unchecked.defaultof<TurnId>) then
+                ()
+            else
+                let stamp = DateTimeOffset.UtcNow
+
+                let event =
+                    TurnFailedEvent(props.SessionId, turnId, Nullable<int64>(), stamp, AskTimeoutReason) :> SessionEvent
+
+                let events = ResizeArray<SessionEvent>([| event |]) :> IReadOnlyList<SessionEvent>
+
+                // Through the journal writer, best-effort: the turn already
+                // settles Failed, so a rejected or failed write carries no
+                // further turn to fail.
+                awaitTask (
+                    JournalWriter.appendWithTokenAsync
+                        suspend.EventStore
+                        props.Tenant
+                        props.SessionId
+                        journalToken
+                        events
+                        CancellationToken.None
+                )
+                |> ignore
 
         /// Builds the Failed result an authority refusal settles: zero
         /// iterations and usage, the typed rejection carrying which branch
@@ -2860,33 +3258,14 @@ module internal SessionActor =
                 Outcome = TurnAgentRejected(failure, reason) :> TurnOutcome
             }
 
-        /// Journals an authority refusal as a TurnFailedEvent, best-effort:
-        /// the turn already settles Failed, so a rejected or failed write
-        /// carries no further turn to fail (the AskTimeout journalTimeout
-        /// precedent).
+        /// Journals an authority refusal as nothing (issue 289): the runner
+        /// never ran, so no turn id ever existed for the entry and
+        /// borrowing the prime id would misattribute. The entry is
+        /// consumed, the session returns Idle, and the absent marker keeps
+        /// the orphan trigger quiet. Kept as a named step so the refusal
+        /// path reads explicitly.
         /// <param name="reason">Why the turn refused to run. Never contains secrets or tool arguments.</param>
-        let journalAuthorityFailure (reason: string) : unit =
-            try
-                let turnId = TurnId.New()
-                let stamp = DateTimeOffset.UtcNow
-
-                let event =
-                    TurnFailedEvent(props.SessionId, turnId, Nullable<int64>(), stamp, reason) :> SessionEvent
-
-                let events = ResizeArray<SessionEvent>([| event |]) :> IReadOnlyList<SessionEvent>
-
-                awaitTask (
-                    JournalWriter.appendWithTokenAsync
-                        suspend.EventStore
-                        props.Tenant
-                        props.SessionId
-                        journalToken
-                        events
-                        CancellationToken.None
-                )
-                |> ignore
-            with _ ->
-                ()
+        let journalAuthorityFailure (_reason: string) : unit = ()
 
         /// Checks the per-turn execution authority for a fresh turn start:
         /// re-reads the session's agent from the store. Missing, disabled,
@@ -2971,6 +3350,17 @@ module internal SessionActor =
             // provider call with zero effects).
             let markerToken = journalToken
 
+            // The actor-supplied loop-run id (issue 289): the live-turn
+            // snapshot the marker, the completion, and the settle choke
+            // points all key on. A missing snapshot mints fresh,
+            // preserving the pre-plumbing marker shape.
+            let runTurnId =
+                match currentTurnSnapshot () with
+                | Some live -> live
+                | None -> TurnId.New()
+
+            runningTurnId <- Some runTurnId
+
             let onTurnStarted: TurnLoop.TurnStartedHook option =
                 Some(fun turnId cancellationToken ->
                     journalTurnStartedAsync
@@ -2981,18 +3371,35 @@ module internal SessionActor =
                         turnId
                         cancellationToken)
 
+            // None when the runner never started (a synchronously throwing
+            // or null-returning runner faults before any mint): the fault
+            // handler then falls back to the turn cell and the snapshot.
+            let mutable faultTurnId: TurnId option = Some runTurnId
+
             let runTask =
                 try
                     let started =
-                        suspend.RunSuspendable entry attempt allowed None None seed CancellationToken.None onTurnStarted
+                        suspend.RunSuspendable
+                            entry
+                            attempt
+                            allowed
+                            None
+                            None
+                            seed
+                            CancellationToken.None
+                            onTurnStarted
+                            runTurnId
 
                     if isNull (box started) then
+                        faultTurnId <- None
+
                         Task.FromException<TurnLoop.TurnLoopCompletion>(
                             InvalidOperationException("The suspendable turn runner returned null.")
                         )
                     else
                         started
                 with ex ->
+                    faultTurnId <- None
                     Task.FromException<TurnLoop.TurnLoopCompletion>(ex)
 
             runTask.ContinueWith(fun (completed: Task<TurnLoop.TurnLoopCompletion>) ->
@@ -3001,7 +3408,8 @@ module internal SessionActor =
                         SuspendableFaulted(
                             entry,
                             OperationCanceledException("The suspendable turn was aborted."),
-                            attempt
+                            attempt,
+                            faultTurnId
                         )
                     )
                 elif completed.IsFaulted then
@@ -3012,7 +3420,7 @@ module internal SessionActor =
                             :> Exception
                         | aggregate -> aggregate.GetBaseException()
 
-                    suspendSelf.Tell(SuspendableFaulted(entry, error, attempt))
+                    suspendSelf.Tell(SuspendableFaulted(entry, error, attempt, faultTurnId))
                 else
                     suspendSelf.Tell(SuspendableFinished(entry, completed.Result, attempt, allowed)))
             |> ignore
@@ -3022,6 +3430,13 @@ module internal SessionActor =
                 match parked.Cursor with
                 | Some live -> Some live
                 | None -> None
+
+            // Resumes continue the parked turn id (issue 289): the origin
+            // id the suspend carried, so the settled completion keys on
+            // the same id the marker journaled.
+            runningTurnId <- Some parked.TurnId
+
+            let mutable faultTurnId: TurnId option = Some parked.TurnId
 
             let runTask =
                 try
@@ -3037,14 +3452,18 @@ module internal SessionActor =
                             // A resumed turn already marked before it
                             // suspended: no marker on resume.
                             None
+                            parked.TurnId
 
                     if isNull (box started) then
+                        faultTurnId <- None
+
                         Task.FromException<TurnLoop.TurnLoopCompletion>(
                             InvalidOperationException("The suspendable turn runner returned null.")
                         )
                     else
                         started
                 with ex ->
+                    faultTurnId <- None
                     Task.FromException<TurnLoop.TurnLoopCompletion>(ex)
 
             runTask.ContinueWith(fun (completed: Task<TurnLoop.TurnLoopCompletion>) ->
@@ -3053,7 +3472,8 @@ module internal SessionActor =
                         SuspendableFaulted(
                             parked.Entry,
                             OperationCanceledException("The resumed turn was aborted."),
-                            nextAttempt
+                            nextAttempt,
+                            faultTurnId
                         )
                     )
                 elif completed.IsFaulted then
@@ -3063,7 +3483,7 @@ module internal SessionActor =
                             InvalidOperationException("The resumed turn faulted without an exception.") :> Exception
                         | aggregate -> aggregate.GetBaseException()
 
-                    suspendSelf.Tell(SuspendableFaulted(parked.Entry, error, nextAttempt))
+                    suspendSelf.Tell(SuspendableFaulted(parked.Entry, error, nextAttempt, faultTurnId))
                 else
                     suspendSelf.Tell(SuspendableFinished(parked.Entry, completed.Result, nextAttempt, parked.Allowed)))
             |> ignore
@@ -3144,66 +3564,6 @@ module internal SessionActor =
                         { wiring with
                             JournalToken = fresh.Token
                         })
-
-        /// Re-primes the journal through the spawn wiring: a fresh bootstrap
-        /// plus ClaimNextTurn, or None when the host never re-primes, the
-        /// prime fails, or a live claim is held (takeover, or a restart
-        /// inside the old prime's lease). Total: a throwing prime reads as
-        /// None and the recorded rebind retries at the next boundary.
-        /// <returns>The live claim, or None.</returns>
-        let reprimeNow () : TurnClaim option =
-            match suspend.ReprimeJournal with
-            | None -> None
-            | Some reprime ->
-                try
-                    reprime ()
-                with _ ->
-                    None
-
-        /// Settles a claim Completed with a null outcome, best-effort: the
-        /// first settle wins and a retry of the same outcome observes it, so
-        /// only the settled/already-settled outcomes read as settled. Total:
-        /// a rejected or faulted settle reads as false.
-        /// <param name="claim">The claim fencing the settlement. Must not be null.</param>
-        /// <returns>True when the turn settled.</returns>
-        let settleTurnQuiet (claim: TurnClaim) : bool =
-            try
-                match
-                    awaitTask (
-                        props.Store.SettleTurn(props.Tenant, claim, TurnStatus.Completed, null, CancellationToken.None)
-                    )
-                with
-                | :? TurnSettled -> true
-                | :? TurnAlreadySettled -> true
-                | _ -> false
-            with _ ->
-                false
-
-        /// Settles the primed journal claim the spawn (or a re-prime)
-        /// holds: synthesizes the claim from the row's CurrentTurnId stamp
-        /// plus the token cell, so the settle needs no plumbed claim object
-        /// and survives restarts. Live or lapsed-but-uncontested it clears
-        /// CurrentTurnIds; a stale claim rejects with no effects. Total: the
-        /// outcome is advisory (the re-prime below gates the apply), so
-        /// every failure is swallowed.
-        let settlePrimedNow () : unit =
-            try
-                match awaitTask (props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None)) with
-                | null -> ()
-                | session ->
-                    if session.CurrentTurnId.HasValue then
-                        let claim =
-                            {
-                                TurnId = session.CurrentTurnId.Value
-                                Token = journalToken
-                                Owner = ""
-                                ExpiresAt = DateTimeOffset.MinValue
-                                Attempt = 1
-                            }
-
-                        settleTurnQuiet claim |> ignore
-            with _ ->
-                ()
 
         /// Reads the agent the session converses with now, for the switch
         /// audit: the row before the rebind lands. Total: a missing row or
@@ -3673,8 +4033,13 @@ module internal SessionActor =
                         // new turn, else returns to Idle.
                         // <param name="entry">The entry the attempt executed.</param>
                         // <param name="result">The result the actor settles.</param>
+                        // <param name="turnId">The settling turn's id, or None when no loop id ever existed.</param>
                         // <returns>The next loop state.</returns>
-                        let settleEntryNow (entry: InboxEntry) (result: TurnResult) : SessionState =
+                        let settleEntryNow
+                            (entry: InboxEntry)
+                            (result: TurnResult)
+                            (turnId: TurnId option)
+                            : SessionState =
                             let positions = [| entry.Position |] :> IReadOnlyList<int64>
 
                             awaitTask (
@@ -3689,6 +4054,17 @@ module internal SessionActor =
 
                             notifySettled result
                             dispatchCompletion props result |> ignore
+
+                            // Terminal completion event (issue 289):
+                            // verdict-first (the store-first settle above
+                            // decided the terminal kind), journaled
+                            // best-effort under the live token. A prime
+                            // that never ran never reaches here, and a
+                            // fault before any mint (None) journals
+                            // nothing.
+                            match turnId with
+                            | Some tid -> journalSettledCompletion tid result
+                            | None -> ()
 
                             if result.Status = TurnStatus.Completed && autoCloseEnabled props then
                                 // AutoClose (issue 82): the first Completed
@@ -3769,9 +4145,18 @@ module internal SessionActor =
 
                                 let carriedAllowed = if isNull (box allowed) then HashSet<string>() else allowed
 
+                                // No running attempt remains once parked:
+                                // the parked turn id carries the settle
+                                // identity from here on.
+                                runningTurnId <- None
+
                                 let parked =
                                     {
                                         Entry = entry
+                                        TurnId =
+                                            match resolveSettlingTurnId completion.TurnId with
+                                            | Some live -> live
+                                            | None -> Unchecked.defaultof<TurnId>
                                         Cursor = Some cursor
                                         Rebuilt = None
                                         Allowed = carriedAllowed
@@ -3794,15 +4179,20 @@ module internal SessionActor =
                         | _ ->
                             // Settled, or suspended after a stop won: the
                             // stop settles Aborted with no suspend event
-                            // journaled and nothing parked for a Reply.
-                            let next = settleEntryNow entry carried
+                            // journaled and nothing parked for a Reply. The
+                            // settling id resolves completion-carried, then
+                            // turn-cell, then snapshot, else the terminal
+                            // journals nothing.
+                            let settling = resolveSettlingTurnId completion.TurnId
+                            runningTurnId <- None
+                            let next = settleEntryNow entry carried settling
                             return! loop next None resolved
                     | SessionState.WaitingForInput, Some parked when parked.Cursor.IsNone && parked.Rebuilt.IsSome ->
                         // Crash-retry path should never produce a running
                         // finish while still parked; ignore stale completions.
                         return! loop state suspended resolved
                     | _ -> return! loop state suspended resolved
-                | SuspendableFaulted(entry, _, _) ->
+                | SuspendableFaulted(entry, error, _, faultTurnId) ->
                     match state, suspended with
                     | SessionState.Running, None ->
                         // A recorded stop wins even over a real fault:
@@ -3811,12 +4201,49 @@ module internal SessionActor =
                         let stop = pendingStop
                         pendingStop <- None
 
+                        // The fault's settling id (issue 289): the
+                        // message-carried id, then the turn cell, then the
+                        // snapshot; None (fault before any mint) journals
+                        // nothing while the settle effects run unchanged.
+                        let settling =
+                            match faultTurnId with
+                            | Some _ as resolved -> resolved
+                            | None ->
+                                match runningTurnId with
+                                | Some _ as resolved -> resolved
+                                | None -> currentTurnSnapshot ()
+
+                        runningTurnId <- None
+
                         match stop with
                         | Some(cause, reason) ->
                             let settled = abortedSuspendResult cause reason
                             notifySettled settled
                             dispatchCompletion props settled |> ignore
-                        | None -> ()
+
+                            match settling with
+                            | Some tid -> journalSettledCompletion tid settled
+                            | None -> ()
+                        | None ->
+                            match settling with
+                            | Some tid ->
+                                let faultName =
+                                    if isNull (box error) then
+                                        "Exception"
+                                    else
+                                        error.GetType().Name
+
+                                let failed =
+                                    {
+                                        AssistantText = ""
+                                        Status = TurnStatus.Failed
+                                        Iterations = 0
+                                        Usage = { InputTokens = 0L; OutputTokens = 0L }
+                                        Outcome = TurnFailed(sprintf "The turn faulted: %s." faultName) :> TurnOutcome
+                                    }
+
+                                journalSettledCompletion tid failed
+                            | None -> ()
 
                         let positions = [| entry.Position |] :> IReadOnlyList<int64>
 
@@ -4056,7 +4483,7 @@ module internal SessionActor =
                             with _ ->
                                 ()
 
-                            journalTimeout ()
+                            journalTimeout parked.TurnId
 
                             let result = timeoutResult ()
                             notifySettled result
@@ -4795,6 +5222,7 @@ module internal SessionActor =
     /// <param name="runSuspendable">Runs one suspendable attempt, bound to the DI-resolved policy. Never null.</param>
     /// <param name="compactFor">Builds the on-demand compaction wiring for one session from its primed journal token, or None when the host compacts nothing. Must not be null; return None to answer CompactNotNeeded.</param>
     /// <param name="agentStore">The agent catalog the per-turn authority gate reads, or null when the host runs without one: the gate is skipped then.</param>
+    /// <param name="eraMarked">Reads the completion era the entity-start probe consults (issue 289). Never null.</param>
     /// <returns>A factory mapping a session id string to a suspendable child spawn.</returns>
     let spawnSuspendFactory
         (store: ISessionStore)
@@ -4807,6 +5235,7 @@ module internal SessionActor =
         (runSuspendable: SuspendableRunner)
         (compactFor: SessionId -> string -> CompactDeps option)
         (agentStore: IAgentStore | null)
+        (eraMarked: CompletionEra.CompletionEraReader)
         : (string -> IActorContext -> string -> IActorRef) =
         ArgumentNullException.ThrowIfNull(store)
         ArgumentNullException.ThrowIfNull(eventStore)
@@ -4823,6 +5252,9 @@ module internal SessionActor =
 
         if isNull (box runSuspendable) then
             raise (ArgumentNullException(nameof runSuspendable))
+
+        if isNull (box eraMarked) then
+            raise (ArgumentNullException(nameof eraMarked))
 
         if isNull (box compactFor) then
             raise (ArgumentNullException(nameof compactFor))
@@ -4910,6 +5342,7 @@ module internal SessionActor =
                         ReprimeJournal = Some(fun () -> primeClaim captured)
                         RefreshCompact = Some(compactFor captured)
                         AgentStore = agentStore
+                        EraMarked = eraMarked
                     }
 
                 spawn context name (behaviorWithSuspend props suspend)

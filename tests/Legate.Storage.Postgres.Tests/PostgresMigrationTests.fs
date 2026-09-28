@@ -6,7 +6,7 @@ open Xunit
 
 // First live proof of the shared baseline's schema-qualified DDL path on
 // real PostgreSQL: the Testcontainers database migrates with the default
-// options (schema legate, no prefix) and carries the schema plus all ten
+// options (schema legate, no prefix) and carries the schema plus all eleven
 // baseline tables. The SQLite MigrationTests only ever exercised
 // unqualified DDL.
 module PostgresMigrationTests =
@@ -23,6 +23,7 @@ module PostgresMigrationTests =
             "schedule_occurrences"
             "session_grants"
             "sessions"
+            "turn_completion_era"
             "turns"
         ]
 
@@ -48,7 +49,7 @@ module PostgresMigrationTests =
         reader.Read()
 
     [<Fact>]
-    let ``Baseline migrates the legate schema with all ten tables`` () =
+    let ``Baseline migrates the legate schema with all eleven tables`` () =
         let connectionString = PostgresTestDatabase.ensureReady ()
 
         use connection = new NpgsqlConnection(connectionString)

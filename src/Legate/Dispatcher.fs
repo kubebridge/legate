@@ -22,10 +22,21 @@ open Microsoft.Extensions.Options
 // through the idempotent check-inbox actor message, which starts a turn on
 // the oldest drainable entry when Idle and no-ops otherwise. The
 // in-process wake sink only shortens the wait for the next cycle. No
-// dispatcher-side ClaimNextTurn: claim ownership and fencing stay with the
-// actor's start path. No external services: only ISessionStore, the
-// TimeProvider clock, and the ILlmDelay seam, so Legate still builds and
-// tests with no Redis, Docker, Postgres, or Kubernetes.
+// dispatcher-side ClaimNextTurn on the pending path: claim ownership and
+// fencing stay with the actor's start path. A second internal sweep (issue
+// 289) covers live-turn orphans: Idle sessions still carrying a live turn
+// with a consumed inbox, whose journal holds an unterminated marker — for
+// the live turn id itself, or for the orphan id a won prime replaced (the
+// marker is the only surviving record of it) — on an era-marked session,
+// which the pending sweep above can never list.
+// Each orphan candidate is lease-gated through an atomic priming claim (a
+// live owner wins, the poke loses silently and re-consumes its bootstrap)
+// and a winner settles directly inside the sweep: it journals the fenced
+// TurnFailedEvent for the orphan id under the won poke token and settles
+// the prime quietly, with no entity involvement. Every settle effect stays
+// fenced under the fresh primed claim token. No external services: only
+// ISessionStore, the TimeProvider clock, and the ILlmDelay seam, so Legate
+// still builds and tests with no Redis, Docker, Postgres, or Kubernetes.
 
 // ──────────────────────────────────────────────────────────────────────────
 // One pass
@@ -61,6 +72,93 @@ module internal Dispatcher =
             QueuedAgent = 0
         }
 
+    /// The claim owner identity the orphan poke primes under: distinct
+    /// from the facade prime owner, so forensics tell a poke-won claim
+    /// from an entity-start prime.
+    let private orphanPokeOwner = "legate-dispatcher-orphan-poke"
+
+    /// The bootstrap text the orphan poke appends before its priming
+    /// claim: always consumed by a winning claim or re-consumed on a
+    /// loss, so it never drains as a turn.
+    let private orphanPokeText = "legate orphan poke"
+
+    /// Reads the journal state for one turn id (issue 289): whether the
+    /// journal holds the TurnStartedEvent marker for the id, whether
+    /// any terminal row (TurnCompleted, TurnFailed, TurnAborted,
+    /// SessionClosed) carries it, and the latest marker id with no
+    /// terminal row (the journal-derived orphan, mirroring the
+    /// entity-side journalOrphanState fallback). Read-only: never
+    /// appends. A failed replay reads as no marker, so the candidate
+    /// stays skipped.
+    ///
+    /// The fallback exists because a winning prime replaces the row's
+    /// turn id: after a poke-claim wins post-expiry, CurrentTurnId names
+    /// the prime, never the orphan, so marker-for-live-id alone would
+    /// stay quiet forever. The orphan id survives only in the journal.
+    /// <param name="eventStore">The journal to replay.</param>
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="sessionId">The session to inspect.</param>
+    /// <param name="liveId">The live turn to inspect.</param>
+    /// <param name="cancellationToken">Abandons the replay.</param>
+    /// <returns>The marker flag and the terminal flag for the turn id, plus the latest unterminated marker id.</returns>
+    let private turnStateAsync
+        (eventStore: ISessionEventStore)
+        (tenant: TenantId)
+        (sessionId: SessionId)
+        (liveId: TurnId)
+        (cancellationToken: CancellationToken)
+        : Task<bool * bool * TurnId option> =
+        task {
+            let mutable marker = false
+            let mutable terminal = false
+            let markers = ResizeArray<TurnId>()
+            let terminals = HashSet<TurnId>()
+            let mutable cursor = 0L
+            let mutable paging = true
+
+            while paging do
+                try
+                    let! outcome = eventStore.Replay(tenant, sessionId, cursor, 100, cancellationToken)
+
+                    match outcome with
+                    | :? EventReplayPage as page when not (isNull (box page)) ->
+                        if not (isNull (box page.Events)) then
+                            for event in page.Events do
+                                if not (isNull (box event)) then
+                                    if event.TurnId.Equals(liveId) then
+                                        match event with
+                                        | :? TurnStartedEvent -> marker <- true
+                                        | :? TurnCompletedEvent
+                                        | :? TurnFailedEvent
+                                        | :? TurnAbortedEvent
+                                        | :? SessionClosedEvent -> terminal <- true
+                                        | _ -> ()
+
+                                    match event with
+                                    | :? TurnStartedEvent -> markers.Add(event.TurnId)
+                                    | :? TurnCompletedEvent
+                                    | :? TurnFailedEvent
+                                    | :? TurnAbortedEvent
+                                    | :? SessionClosedEvent -> terminals.Add(event.TurnId) |> ignore
+                                    | _ -> ()
+
+                        if page.NextCursor.HasValue then
+                            cursor <- page.NextCursor.Value
+                        else
+                            paging <- false
+                    | _ -> paging <- false
+                with
+                | :? OperationCanceledException as cancelled -> raise cancelled
+                | _ -> paging <- false
+
+            let fallback =
+                markers
+                |> Seq.filter (fun candidate -> not (terminals.Contains(candidate)))
+                |> Seq.tryLast
+
+            return marker, terminal, fallback
+        }
+
     /// Runs one full pass: pages the tenant's dispatch candidates in bounded
     /// batches following HasMore and wakes every admitted session. The
     /// capacity snapshots read once per pass plus the local in-flight gate
@@ -69,7 +167,19 @@ module internal Dispatcher =
     /// the pass, so gate-blocked sessions that stay pending never spin it.
     /// A vanished session (null row mid-pass) or a per-session wake failure
     /// skips that session for this pass; the next interval retries.
+    /// A second bounded sweep then settles live-turn orphans (issue 289):
+    /// Idle sessions still carrying a live turn with an empty inbox page
+    /// through ListSessions; each candidate must also hold an unterminated
+    /// marker — for the live turn id itself, or for the orphan id a won
+    /// prime replaced (the journal-derived fallback, mirroring the
+    /// entity-side probe) — on an era-marked session before it lease-gates
+    /// through an atomic priming claim, so a live owner always wins and
+    /// the poke loses silently while an expired or missing lease lets the
+    /// poke win and settle directly inside the sweep. Orphan pokes check
+    /// the capacity gate but never consume it and never count as queued.
     /// <param name="store">The durable store.</param>
+    /// <param name="eventStore">The journal orphan candidates read their terminal rows from.</param>
+    /// <param name="eraMarked">Reads whether a session opened in the completion era.</param>
     /// <param name="tenant">The tenant whose pending sessions to sweep.</param>
     /// <param name="sessions">The session knobs carrying the process and per-tenant limits.</param>
     /// <param name="dispatcher">The dispatcher knobs carrying the batch size and the per-agent limit.</param>
@@ -79,6 +189,8 @@ module internal Dispatcher =
     /// <returns>What the pass woke and what stayed queued behind each limit.</returns>
     let passOnceAsync
         (store: ISessionStore)
+        (eventStore: ISessionEventStore)
+        (eraMarked: CompletionEra.CompletionEraReader)
         (tenant: TenantId)
         (sessions: SessionsOptions)
         (dispatcher: DispatcherOptions)
@@ -88,12 +200,16 @@ module internal Dispatcher =
         : Task<DispatchPassResult> =
         task {
             ArgumentNullException.ThrowIfNull(store)
+            ArgumentNullException.ThrowIfNull(eventStore)
             ArgumentNullException.ThrowIfNull(sessions)
             ArgumentNullException.ThrowIfNull(dispatcher)
             ArgumentNullException.ThrowIfNull(clock)
 
             if isNull (box resolve) then
                 raise (ArgumentNullException(nameof resolve))
+
+            if isNull (box eraMarked) then
+                raise (ArgumentNullException(nameof eraMarked))
 
             let maxBatch =
                 if dispatcher.MaxBatchSize > 0 then
@@ -116,6 +232,31 @@ module internal Dispatcher =
             let mutable queuedAgent = 0
             let mutable more = true
 
+            // The cached per-agent snapshot plus this pass's local
+            // in-flight count for one agent: shared by the pending sweep
+            // and the orphan sweep below, so both gate on the same
+            // snapshots.
+            let agentCountsAsync (agentId: AgentId) : Task<int * int> =
+                task {
+                    let! snapshot =
+                        match agentSnapshots.TryGetValue(agentId) with
+                        | true, count -> task { return count }
+                        | false, _ ->
+                            task {
+                                let! count = store.CountSessionsByAgent(tenant, agentId, cancellationToken)
+
+                                agentSnapshots[agentId] <- count
+                                return count
+                            }
+
+                    let startedLocal =
+                        match agentLocal.TryGetValue(agentId) with
+                        | true, count -> count
+                        | false, _ -> 0
+
+                    return snapshot, startedLocal
+                }
+
             while more do
                 let! batch = store.GetDispatchCandidates(tenant, maxBatch, cancellationToken)
 
@@ -136,22 +277,7 @@ module internal Dispatcher =
                             match session with
                             | null -> () // Vanished mid-pass: stays out of this pass.
                             | live ->
-                                let! agentCount =
-                                    match agentSnapshots.TryGetValue(live.AgentId) with
-                                    | true, count -> task { return count }
-                                    | false, _ ->
-                                        task {
-                                            let! count =
-                                                store.CountSessionsByAgent(tenant, live.AgentId, cancellationToken)
-
-                                            agentSnapshots[live.AgentId] <- count
-                                            return count
-                                        }
-
-                                let agentStarted =
-                                    match agentLocal.TryGetValue(live.AgentId) with
-                                    | true, count -> count
-                                    | false, _ -> 0
+                                let! agentCount, agentStarted = agentCountsAsync live.AgentId
 
                                 // Conjunctive gate, checked process ->
                                 // tenant -> agent for observability labeling
@@ -195,6 +321,218 @@ module internal Dispatcher =
                                     | _ -> ()
 
                         more <- batch.HasMore
+
+            // Orphan sweep (issue 289): Idle sessions still carrying a
+            // live turn with a fully consumed inbox never appear in the
+            // pending sweep above, yet their journal may hold an
+            // unterminated marker — for the live turn id itself, or for
+            // the orphan id a won prime replaced (the marker is the only
+            // surviving record of it) — on an era-marked session. Each
+            // candidate lease-gates through an atomic priming claim: a
+            // live owner makes the claim the missing branch, so the poke
+            // loses silently and re-consumes its bootstrap, while an
+            // expired or missing lease lets the poke win and settle
+            // directly inside the sweep, so a later poke re-finds the
+            // orphan through the fallback instead of going single-shot.
+            // Sessions with pending work stay with the authoritative
+            // sweep, and a tripped capacity gate skips the poke silently:
+            // orphans are recovery probes, not dispatch demand, so they
+            // never consume the gate and never count as queued. Bounded
+            // to MaxBatchSize primes per pass, following the ListSessions
+            // continuation like the HasMore paging above.
+            let mutable orphanBudget = maxBatch
+            let mutable orphanContinuation: string | null = null
+            let mutable orphanPaging = true
+
+            while orphanPaging && orphanBudget > 0 do
+                let! page =
+                    store.ListSessions(
+                        tenant,
+                        Nullable(SessionState.Idle),
+                        Nullable<AgentId>(),
+                        Nullable<DateTimeOffset>(),
+                        Nullable<DateTimeOffset>(),
+                        maxBatch,
+                        orphanContinuation,
+                        cancellationToken
+                    )
+
+                if isNull (box page) || isNull (box page.Items) then
+                    orphanPaging <- false
+                else
+                    for row in page.Items do
+                        if orphanBudget > 0 && not (isNull (box row)) && row.CurrentTurnId.HasValue then
+                            try
+                                let! fresh = store.GetSession(tenant, row.Id, cancellationToken)
+
+                                match fresh with
+                                | null -> ()
+                                | current when current.State = SessionState.Closed -> ()
+                                | current ->
+                                    let! agentCount, agentStarted = agentCountsAsync current.AgentId
+
+                                    if runningSnapshot + runningLocal >= sessions.Capacity then
+                                        ()
+                                    elif tenantSnapshot + tenantLocal >= sessions.MaxSessionsPerTenant then
+                                        ()
+                                    elif agentCount + agentStarted >= dispatcher.MaxSessionsPerAgent then
+                                        ()
+                                    else
+                                        let! pending = store.ReadPendingInbox(tenant, current.Id, cancellationToken)
+
+                                        let hasPending =
+                                            not (isNull (box pending))
+                                            && pending |> Seq.exists (fun entry -> not (isNull (box entry)))
+
+                                        if not hasPending then
+                                            // Completion-row-aware plus era-gated candidate (issue 289):
+                                            // the settling id is the live turn id when its marker
+                                            // stands unterminated, else the journal-derived orphan
+                                            // the prime replaced, on an era-marked session.
+                                            // Terminated tails, settled rows, empty tails, and
+                                            // pre-era sessions never consume the orphan budget.
+                                            let liveOpt =
+                                                if current.CurrentTurnId.HasValue then
+                                                    Some current.CurrentTurnId.Value
+                                                else
+                                                    None
+
+                                            let! settlingOpt =
+                                                task {
+                                                    match liveOpt with
+                                                    | None -> return None
+                                                    | Some liveId ->
+                                                        let! marker, terminal, fallback =
+                                                            turnStateAsync
+                                                                eventStore
+                                                                tenant
+                                                                current.Id
+                                                                liveId
+                                                                cancellationToken
+
+                                                        let settling =
+                                                            if marker && not terminal then Some liveId else fallback
+
+                                                        match settling with
+                                                        | None -> return None
+                                                        | Some _ ->
+                                                            try
+                                                                let! marked =
+                                                                    eraMarked tenant current.Id cancellationToken
+
+                                                                if marked then return settling else return None
+                                                            with _ ->
+                                                                return None
+                                                }
+
+                                            match settlingOpt with
+                                            | None -> ()
+                                            | Some settlingId ->
+                                                orphanBudget <- orphanBudget - 1
+
+                                                let bootstrap =
+                                                    UserMessagePayload(UserMessage.Text(orphanPokeText)) :> InboxPayload
+
+                                                let! appended =
+                                                    store.AppendInboxMessage(
+                                                        tenant,
+                                                        current.Id,
+                                                        bootstrap,
+                                                        DeliveryMode.Queue,
+                                                        cancellationToken
+                                                    )
+
+                                                let cleanupPoke () : Task<unit> =
+                                                    task {
+                                                        try
+                                                            let! _ =
+                                                                store.MarkInboxConsumed(
+                                                                    tenant,
+                                                                    current.Id,
+                                                                    [| appended.Position |] :> IReadOnlyList<int64>,
+                                                                    cancellationToken
+                                                                )
+
+                                                            ()
+                                                        with _ ->
+                                                            ()
+                                                    }
+
+                                                let settleDirect (claim: TurnClaim) : Task<unit> =
+                                                    task {
+                                                        try
+                                                            let failedEvent =
+                                                                TurnFailedEvent(
+                                                                    current.Id,
+                                                                    settlingId,
+                                                                    Nullable<int64>(),
+                                                                    clock.GetUtcNow(),
+                                                                    SessionActor.CrashFailReason
+                                                                )
+                                                                :> SessionEvent
+
+                                                            let events =
+                                                                ResizeArray<SessionEvent>([| failedEvent |])
+                                                                :> IReadOnlyList<SessionEvent>
+
+                                                            let! _ =
+                                                                JournalWriter.appendWithTokenAsync
+                                                                    eventStore
+                                                                    tenant
+                                                                    current.Id
+                                                                    claim.Token
+                                                                    events
+                                                                    cancellationToken
+
+                                                            ()
+                                                        with _ ->
+                                                            ()
+
+                                                        try
+                                                            let! _ =
+                                                                store.SettleTurn(
+                                                                    tenant,
+                                                                    claim,
+                                                                    TurnStatus.Completed,
+                                                                    null,
+                                                                    cancellationToken
+                                                                )
+
+                                                            ()
+                                                        with _ ->
+                                                            ()
+
+                                                        do! cleanupPoke ()
+                                                        started <- started + 1
+                                                    }
+
+                                                try
+                                                    let! lease =
+                                                        store.ClaimNextTurn(
+                                                            tenant,
+                                                            current.Id,
+                                                            orphanPokeOwner,
+                                                            sessions.LeaseDuration,
+                                                            cancellationToken
+                                                        )
+
+                                                    match lease with
+                                                    | :? TurnLeaseRenewed as renewed -> do! settleDirect renewed.Claim
+                                                    | :? TurnLeaseHeld as held -> do! settleDirect held.Claim
+                                                    | :? TurnLeaseExpiring as expiring ->
+                                                        do! settleDirect expiring.Claim
+                                                    | _ -> do! cleanupPoke ()
+                                                with
+                                                | :? OperationCanceledException as cancelled ->
+                                                    do! cleanupPoke ()
+                                                    raise cancelled
+                                                | _ -> do! cleanupPoke ()
+                            with
+                            | :? OperationCanceledException as cancelled -> raise cancelled
+                            | _ -> ()
+
+                    orphanContinuation <- page.Continuation
+                    orphanPaging <- not (isNull (box page.Continuation))
 
             return
                 {
@@ -273,9 +611,18 @@ type internal DispatcherService
     member internal this.RunOnceAsync(cancellationToken: CancellationToken) : Task<Dispatcher.DispatchPassResult> =
         task {
             let store = serviceProvider.GetRequiredService<ISessionStore>()
+            let eventStore = serviceProvider.GetRequiredService<ISessionEventStore>()
             let client = serviceProvider.GetRequiredService<SessionClient>()
             let sink = serviceProvider.GetRequiredService<DispatcherWakeSink>()
             let tenant = this.SweepTenant()
+
+            // Completion era (issue 289): the gate the orphan sweep reads;
+            // an absent (or reader-less) registration reads pre-era quiet.
+            let eraMarked: CompletionEra.CompletionEraReader =
+                match serviceProvider.GetService<CompletionEra.CompletionEraGate>() with
+                | null -> CompletionEra.preEraGate.Reader
+                | gate when isNull (box gate.Reader) -> CompletionEra.preEraGate.Reader
+                | gate -> gate.Reader
 
             sink.TakePending() |> ignore
 
@@ -285,6 +632,8 @@ type internal DispatcherService
             return!
                 Dispatcher.passOnceAsync
                     store
+                    eventStore
+                    eraMarked
                     tenant
                     (this.SessionKnobs())
                     (this.DispatcherKnobs())

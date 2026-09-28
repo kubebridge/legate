@@ -73,6 +73,7 @@ let private goldenResult () : TurnResult =
 let private goldenCompletion () : TurnLoop.TurnLoopCompletion =
     {
         Result = goldenResult ()
+        TurnId = TurnId.Parse("01ARZ3NDEKTSV4RRFFQ69G5FAX")
         HasPendingInjects = false
         Suspension = None
     }
@@ -86,6 +87,7 @@ let private goldenCursor () : TurnLoop.TurnLoopSuspension =
 
     {
         RequestId = "req-1"
+        OriginTurnId = TurnId.Parse("01ARZ3NDEKTSV4RRFFQ69G5FAX")
         ToolName = "probe-tool"
         ToolCallId = "call-1"
         Kind = TurnLoop.SuspensionKind.PermissionSuspension
@@ -155,6 +157,7 @@ let private everyGoldenMessage () : obj list =
             entry,
             {
                 Result = goldenResult ()
+                TurnId = TurnId.Parse("01ARZ3NDEKTSV4RRFFQ69G5FAX")
                 HasPendingInjects = true
                 Suspension = Some(goldenCursor ())
             },
@@ -177,7 +180,7 @@ let private everyGoldenMessage () : obj list =
         SessionActor.SuspendableInterruptPrompt(entry.Payload, CancellationToken.None) :> obj
         finished :> obj
         suspended :> obj
-        SessionActor.SuspendableFaulted(entry, error, 1) :> obj
+        SessionActor.SuspendableFaulted(entry, error, 1, None) :> obj
         SessionActor.ReplyEntry(entry) :> obj
         SessionActor.SuspendableGetSnapshot :> obj
         SessionActor.SuspendTimedOut("req-1") :> obj

@@ -107,6 +107,7 @@ type SessionClient
     let semaphores = ConcurrentDictionary<SessionId, SemaphoreSlim>()
     let mutable autoTitle: AutoTitleDeps option = None
     let mutable subscribeRouter: ISubscribeRouter option = None
+    let mutable completionEra: CompletionEra.CompletionEraMarker option = None
 
     /// The durable store prompts, aborts, and session reads go through.
     member internal _.Store: ISessionStore = store
@@ -155,6 +156,14 @@ type SessionClient
     member internal _.SubscribeRouter
         with get (): ISubscribeRouter option = subscribeRouter
         and set (value: ISubscribeRouter option) = subscribeRouter <- value
+
+    /// The completion-era marker Open and Fork call after a successful
+    /// CreateSession (issue 289), or None when the host runs without an
+    /// era gate: unmarked sessions read pre-era (quiet). Set once by the
+    /// container wiring; tests set it directly.
+    member internal _.CompletionEra
+        with get (): CompletionEra.CompletionEraMarker option = completionEra
+        and set (value: CompletionEra.CompletionEraMarker option) = completionEra <- value
 
 // ────────────────── Shared auto-title helper ──────────────────
 

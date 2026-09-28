@@ -103,6 +103,7 @@ let private startService
                 runner
                 (fun _ _ -> None)
                 null
+                (fun _ _ _ -> Task.FromResult false)
         )
 
     (service :> IHostedService).StartAsync(CancellationToken.None).GetAwaiter().GetResult()
@@ -713,7 +714,7 @@ let ``Crash seed carries the resumption note into the runner history input`` () 
         :> IList<ChatMessage>
 
     let fresh =
-        runner entry 1 (HashSet<string>()) None None (Some seed) CancellationToken.None None
+        runner entry 1 (HashSet<string>()) None None (Some seed) CancellationToken.None None (TurnId.New())
         |> fun task -> task.GetAwaiter().GetResult()
 
     fresh.Result.AssistantText |> should equal "done"
@@ -733,6 +734,7 @@ let ``Crash seed carries the resumption note into the runner history input`` () 
             (Some seed)
             CancellationToken.None
             None
+            (TurnId.New())
         |> fun task -> task.GetAwaiter().GetResult()
 
     rebuild.Result.AssistantText |> should equal "done"
@@ -766,9 +768,12 @@ let ``spawnSuspendFactory rejects invalid wiring`` () =
     let _, journal = createStores TimeProvider.System
 
     let runner: SessionActor.SuspendableRunner =
-        fun _ _ _ _ _ _ _ _ -> Task.FromResult(Unchecked.defaultof<TurnLoop.TurnLoopCompletion>)
+        fun _ _ _ _ _ _ _ _ _ -> Task.FromResult(Unchecked.defaultof<TurnLoop.TurnLoopCompletion>)
 
     let store = InMemorySessionStore(InMemoryDatabase()) :> ISessionStore
+
+    let eraMarked: TenantId -> SessionId -> CancellationToken -> Task<bool> =
+        fun _ _ _ -> Task.FromResult false
 
     (fun () ->
         SessionActor.spawnSuspendFactory
@@ -782,6 +787,7 @@ let ``spawnSuspendFactory rejects invalid wiring`` () =
             runner
             (fun _ _ -> None)
             null
+            eraMarked
         |> ignore)
     |> should throw typeof<ArgumentNullException>
 
@@ -797,6 +803,7 @@ let ``spawnSuspendFactory rejects invalid wiring`` () =
             runner
             (fun _ _ -> None)
             null
+            eraMarked
         |> ignore)
     |> should throw typeof<ArgumentException>
 
@@ -812,6 +819,7 @@ let ``spawnSuspendFactory rejects invalid wiring`` () =
             runner
             (fun _ _ -> None)
             null
+            eraMarked
         |> ignore)
     |> should throw typeof<ArgumentOutOfRangeException>
 
@@ -827,5 +835,22 @@ let ``spawnSuspendFactory rejects invalid wiring`` () =
             runner
             Unchecked.defaultof<SessionId -> string -> CompactDeps option>
             null
+            eraMarked
+        |> ignore)
+    |> should throw typeof<ArgumentNullException>
+
+    (fun () ->
+        SessionActor.spawnSuspendFactory
+            store
+            tenant
+            journal
+            (NeverDelay() :> ILlmDelay)
+            (TimeSpan.FromMinutes 5.0)
+            "production"
+            (TimeSpan.FromHours 1.0)
+            runner
+            (fun _ _ -> None)
+            null
+            Unchecked.defaultof<TenantId -> SessionId -> CancellationToken -> Task<bool>>
         |> ignore)
     |> should throw typeof<ArgumentNullException>

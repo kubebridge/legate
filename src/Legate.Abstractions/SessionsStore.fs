@@ -754,6 +754,12 @@ type ISessionStore =
 
     /// Lists sessions of the tenant with pending inbox entries, bounded to
     /// a batch. The dispatcher polls this to wake sessions with work.
+    /// Sessions with no pending inbox entries are never listed here, even
+    /// when they still carry a live turn (a crash orphan whose claim
+    /// consumed the inbox while the row stayed Idle): the dispatcher's
+    /// internal live-turn sweep wakes those through a lease-gated priming
+    /// claim, aligned with the live-turn definition
+    /// <see cref="M:Legate.ISessionStore.CountRunningSessions*" /> counts by.
     /// <param name="tenant">The tenant whose pending sessions to list.</param>
     /// <param name="maxBatch">The maximum number of sessions in the batch; must be positive.</param>
     /// <param name="cancellationToken">Token that abandons the query.</param>
@@ -780,7 +786,10 @@ type ISessionStore =
 
     /// Counts the sessions with a turn in flight across every tenant the
     /// process serves, the per-process capacity input. Atomic snapshot per
-    /// call.
+    /// call. Live-turn-based: a session counts while its
+    /// <see cref="P:Legate.Session.CurrentTurnId" /> is set and stops
+    /// counting when settlement clears it, which is also the predicate the
+    /// dispatcher's internal live-turn orphan sweep pages by.
     /// <param name="cancellationToken">Token that abandons the count.</param>
     /// <returns>The session count with a turn in flight.</returns>
     abstract CountRunningSessions: cancellationToken: CancellationToken -> Task<int>

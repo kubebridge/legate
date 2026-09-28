@@ -621,6 +621,11 @@ module internal TurnLoop =
             /// a permission suspension with it, a QuestionAnswer answers a
             /// question suspension with it as the question id.
             RequestId: string
+            /// The turn that suspended: echoed by the resume continuations
+            /// as the continued run's id, so the settled completion carries
+            /// the origin turn id (issue 289). Internal: the module is
+            /// internal, so no public-surface change.
+            OriginTurnId: TurnId
             /// The tool whose call raised the request (ask_user for questions).
             ToolName: string
             /// The tool-call id that raised the request.
@@ -675,6 +680,11 @@ module internal TurnLoop =
         {
             /// The settled turn result.
             Result: TurnResult
+            /// The turn this run executed: the actor-supplied loop-run id
+            /// (issue 289). The settle choke points journal the terminal
+            /// event under this id. Internal: the module is internal, so
+            /// no public-surface change.
+            TurnId: TurnId
             /// True when Inject entries stayed pending past a would-complete
             /// turn and the actor must start a new turn to act on them.
             HasPendingInjects: bool
@@ -1120,6 +1130,7 @@ module internal TurnLoop =
                                 }
                             Outcome = null
                         }
+                TurnId = Unchecked.defaultof<TurnId>
                 HasPendingInjects = hasPendingInjects ()
                 Suspension = None
             }
@@ -1127,6 +1138,7 @@ module internal TurnLoop =
         let failedCompletion iterations inputTokens outputTokens reason : TurnLoopCompletion =
             {
                 Result = failedResult iterations inputTokens outputTokens reason
+                TurnId = Unchecked.defaultof<TurnId>
                 HasPendingInjects = false
                 Suspension = None
             }
@@ -1193,6 +1205,7 @@ module internal TurnLoop =
                                     Some(
                                         {
                                             Result = finishedResult roundIterations roundInput roundOutput summary
+                                            TurnId = Unchecked.defaultof<TurnId>
                                             HasPendingInjects = hasPendingInjects ()
                                             Suspension = None
                                         }
@@ -1231,6 +1244,7 @@ module internal TurnLoop =
                                     Some(
                                         {
                                             Result = failedResult roundIterations roundInput roundOutput error
+                                            TurnId = Unchecked.defaultof<TurnId>
                                             HasPendingInjects = false
                                             Suspension = None
                                         }
@@ -1597,6 +1611,7 @@ module internal TurnLoop =
                         }
                     Outcome = null
                 }
+            TurnId = suspension.OriginTurnId
             HasPendingInjects = false
             Suspension = Some suspension
         }
@@ -1760,6 +1775,7 @@ module internal TurnLoop =
                                 }
                             Outcome = null
                         }
+                TurnId = turnId
                 HasPendingInjects = hasPendingInjects ()
                 Suspension = None
             }
@@ -1767,6 +1783,7 @@ module internal TurnLoop =
         let failedCompletion iterations inputTokens outputTokens reason : TurnLoopCompletion =
             {
                 Result = failedResult iterations inputTokens outputTokens reason
+                TurnId = turnId
                 HasPendingInjects = false
                 Suspension = None
             }
@@ -1786,6 +1803,7 @@ module internal TurnLoop =
             let suspension =
                 {
                     RequestId = requestId
+                    OriginTurnId = turnId
                     ToolName = toolName
                     ToolCallId = call.CallId
                     Kind = kind
@@ -1890,6 +1908,7 @@ module internal TurnLoop =
             : TurnLoopSuspension =
             {
                 RequestId = mintId ()
+                OriginTurnId = turnId
                 ToolName = cursor.ToolName
                 ToolCallId = taskCall.CallId
                 Kind = cursor.Kind
@@ -2033,6 +2052,7 @@ module internal TurnLoop =
                                     Some(
                                         {
                                             Result = finishedResult roundIterations roundInput roundOutput summary
+                                            TurnId = turnId
                                             HasPendingInjects = hasPendingInjects ()
                                             Suspension = None
                                         }
@@ -2061,6 +2081,7 @@ module internal TurnLoop =
                                     Some(
                                         {
                                             Result = failedResult roundIterations roundInput roundOutput error
+                                            TurnId = turnId
                                             HasPendingInjects = false
                                             Suspension = None
                                         }
@@ -2187,6 +2208,7 @@ module internal TurnLoop =
                                     let suspension =
                                         {
                                             RequestId = requestId
+                                            OriginTurnId = turnId
                                             ToolName = toolName
                                             ToolCallId = call.CallId
                                             Kind = PermissionSuspension
@@ -2389,7 +2411,7 @@ module internal TurnLoop =
                 appendToolResult history suspension.ToolCallId text
 
             let sessionId = Unchecked.defaultof<SessionId>
-            let turnId = Unchecked.defaultof<TurnId>
+            let turnId = suspension.OriginTurnId
 
             let! continued =
                 runSuspendableAsync
@@ -2488,7 +2510,7 @@ module internal TurnLoop =
             appendToolResult history suspension.ToolCallId text
 
             let sessionId = Unchecked.defaultof<SessionId>
-            let turnId = Unchecked.defaultof<TurnId>
+            let turnId = suspension.OriginTurnId
 
             let! continued =
                 runSuspendableAsync

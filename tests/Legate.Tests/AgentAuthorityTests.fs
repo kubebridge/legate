@@ -132,6 +132,7 @@ let private settledCompletion (text: string) : TurnLoop.TurnLoopCompletion =
                 Usage = { InputTokens = 0L; OutputTokens = 0L }
                 Outcome = null
             }
+        TurnId = Unchecked.defaultof<TurnId>
         HasPendingInjects = false
         Suspension = None
     }
@@ -148,7 +149,7 @@ type private ScriptRunner(completions: TurnLoop.TurnLoopCompletion list) =
 
     /// The runner as the suspendable delegate.
     member _.Func: SessionActor.SuspendableRunner =
-        fun entry _ _ _ _ _ _ _ ->
+        fun entry _ _ _ _ _ _ _ _ ->
             lock gate (fun () ->
                 calls <- calls + 1
                 entries.Add(entry))
@@ -172,7 +173,7 @@ type private GatedRunner(second: TurnLoop.TurnLoopCompletion) =
 
     /// The runner as the suspendable delegate.
     member _.Func: SessionActor.SuspendableRunner =
-        fun _ _ _ _ _ _ _ _ ->
+        fun _ _ _ _ _ _ _ _ _ ->
             lock lockObj (fun () -> calls <- calls + 1)
 
             if lock lockObj (fun () -> calls) = 1 then
@@ -239,6 +240,7 @@ let private spawnGated
             ReprimeJournal = None
             RefreshCompact = None
             AgentStore = agents
+            EraMarked = (fun _ _ _ -> Task.FromResult false)
         }
 
     spawn system $"authority-{Guid.NewGuid():N}" (SessionActor.behaviorWithSuspend baseProps deps)
@@ -511,7 +513,9 @@ let ``Missing agent settles Failed with NotFound`` () =
             (outcome :?> TurnAgentRejected).Failure
             |> should equal AgentAuthorityFailure.NotFound
 
-        failedEvents journal |> List.length |> should equal 1
+        // Authority refusals journal nothing (issue 289): the runner never
+        // ran, so no turn id ever existed for the entry.
+        failedEvents journal |> List.length |> should equal 0
         pendingCount store tenant created.Id |> should equal 0
     finally
         stopSystem system
@@ -554,7 +558,9 @@ let ``Disabled agent settles Failed with Disabled`` () =
             (outcome :?> TurnAgentRejected).Failure
             |> should equal AgentAuthorityFailure.Disabled
 
-        failedEvents journal |> List.length |> should equal 1
+        // Authority refusals journal nothing (issue 289): the runner never
+        // ran, so no turn id ever existed for the entry.
+        failedEvents journal |> List.length |> should equal 0
         pendingCount store tenant created.Id |> should equal 0
     finally
         stopSystem system
@@ -601,7 +607,9 @@ let ``Tenant-mismatched agent settles Failed with TenantMismatch`` () =
             (outcome :?> TurnAgentRejected).Failure
             |> should equal AgentAuthorityFailure.TenantMismatch
 
-        failedEvents journal |> List.length |> should equal 1
+        // Authority refusals journal nothing (issue 289): the runner never
+        // ran, so no turn id ever existed for the entry.
+        failedEvents journal |> List.length |> should equal 0
         pendingCount store tenant created.Id |> should equal 0
     finally
         stopSystem system

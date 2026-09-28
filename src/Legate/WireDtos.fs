@@ -234,6 +234,11 @@ module internal WireDtos =
         /// The tool call that raised the request.
         member val PendingCall: FunctionCallContent = Unchecked.defaultof<FunctionCallContent> with get, set
 
+        /// The turn that suspended, as its canonical string (issue 289):
+        /// null on old payloads, which read back as the default turn id
+        /// and fall back to the turn cell at the settle choke points.
+        member val OriginTurnId: string = Unchecked.defaultof<string> with get, set
+
     /// Wire form of SuspendableActorMessage.SuspendableFinished: the entry,
     /// the completion with its suspension in wire form (null when the turn
     /// settled), the attempt, and the granted tool names as an array.
@@ -259,6 +264,11 @@ module internal WireDtos =
 
         /// Tool names the host already allowed for the session.
         member val Allowed: string[] = [||] with get, set
+
+        /// The turn the run executed, as its canonical string (issue 289):
+        /// null on old payloads, which read back as the default turn id
+        /// and fall back to the turn cell at the settle choke points.
+        member val TurnId: string = Unchecked.defaultof<string> with get, set
 
     /// Wire form of SuspendableActorMessage.SuspendableFaulted: the entry,
     /// the fault reason string, and the attempt. The live exception never
@@ -476,6 +486,29 @@ module internal WireDtos =
         else
             raise (InvalidOperationException($"Unknown suspension kind '{kind}'. Expected permission or question."))
 
+    /// Maps a live turn id onto its wire string (issue 289): null for the
+    /// default id, so old readers never see a blank turn id.
+    /// <param name="turnId">The live turn id.</param>
+    /// <returns>The canonical string, or null for the default id.</returns>
+    let private turnIdToWire (turnId: TurnId) : string =
+        if turnId.Equals(Unchecked.defaultof<TurnId>) then
+            Unchecked.defaultof<string>
+        else
+            turnId.ToString()
+
+    /// Rebuilds a live turn id from its wire string (issue 289): null or
+    /// unparsable input reads as the default id, which the settle choke
+    /// points resolve through the turn-cell fallback.
+    /// <param name="value">The wire string, or null from old payloads.</param>
+    /// <returns>The live turn id, or the default id.</returns>
+    let private turnIdOfWire (value: string) : TurnId =
+        let mutable parsed = Unchecked.defaultof<TurnId>
+
+        if TurnId.TryParse(value, &parsed) then
+            parsed
+        else
+            Unchecked.defaultof<TurnId>
+
     /// Builds one DTO of the given class and sets it through the setter.
     /// <param name="set">Sets the fresh DTO's fields.</param>
     /// <returns>The built DTO.</returns>
@@ -512,6 +545,7 @@ module internal WireDtos =
 
         buildDto (fun (wire: SuspensionDto) ->
             wire.RequestId <- cursor.RequestId
+            wire.OriginTurnId <- turnIdToWire cursor.OriginTurnId
             wire.ToolName <- cursor.ToolName
             wire.ToolCallId <- cursor.ToolCallId
             wire.Kind <- kindToWire cursor.Kind
@@ -549,6 +583,7 @@ module internal WireDtos =
 
         {
             RequestId = wire.RequestId
+            OriginTurnId = turnIdOfWire wire.OriginTurnId
             ToolName = wire.ToolName
             ToolCallId = wire.ToolCallId
             Kind = kindOfWire wire.Kind
@@ -583,11 +618,13 @@ module internal WireDtos =
     /// <param name="result">The settled turn result. Must not be null.</param>
     /// <param name="hasPendingInjects">Whether Inject entries stayed pending.</param>
     /// <param name="suspension">The wire cursor, or null when the turn settled.</param>
+    /// <param name="turnId">The wire turn id, or null from old payloads.</param>
     /// <returns>The live completion.</returns>
     let private completionOfWire
         (result: TurnResult)
         (hasPendingInjects: bool)
         (suspension: SuspensionDto)
+        (turnId: string)
         : TurnLoop.TurnLoopCompletion =
         ArgumentNullException.ThrowIfNull(result)
 
@@ -599,6 +636,7 @@ module internal WireDtos =
 
         {
             Result = result
+            TurnId = turnIdOfWire turnId
             HasPendingInjects = hasPendingInjects
             Suspension = cursor
         }
@@ -724,6 +762,7 @@ module internal WireDtos =
                     dto.HasPendingInjects <- hasPendingInjects
                     dto.Suspension <- suspension
                     dto.Attempt <- attempt
+                    dto.TurnId <- turnIdToWire completion.TurnId
 
                     dto.Allowed <-
                         if isNull (box allowed) then
@@ -731,7 +770,7 @@ module internal WireDtos =
                         else
                             allowed |> Seq.filter (fun name -> not (isNull (box name))) |> Array.ofSeq)
                 :> obj
-            | SessionActor.SuspendableFaulted(entry, error, attempt) ->
+            | SessionActor.SuspendableFaulted(entry, error, attempt, _) ->
                 buildDto (fun (dto: SuspendableFaultedDto) ->
                     dto.Entry <- requireEntry entry
                     dto.Reason <- reasonOf error
@@ -917,7 +956,8 @@ module internal WireDtos =
         elif wire :? SuspendableFinishedDto then
             let dto = wire :?> SuspendableFinishedDto
 
-            let completion = completionOfWire dto.Result dto.HasPendingInjects dto.Suspension
+            let completion =
+                completionOfWire dto.Result dto.HasPendingInjects dto.Suspension dto.TurnId
 
             let allowed =
                 if isNull (box dto.Allowed) then
@@ -928,7 +968,7 @@ module internal WireDtos =
             SessionActor.SuspendableFinished(requireEntry dto.Entry, completion, dto.Attempt, allowed) :> obj
         elif wire :? SuspendableFaultedDto then
             let dto = wire :?> SuspendableFaultedDto
-            SessionActor.SuspendableFaulted(requireEntry dto.Entry, faultOf dto.Reason, dto.Attempt) :> obj
+            SessionActor.SuspendableFaulted(requireEntry dto.Entry, faultOf dto.Reason, dto.Attempt, None) :> obj
         elif wire :? ReplyEntryDto then
             SessionActor.ReplyEntry(requireEntry (wire :?> ReplyEntryDto).Entry) :> obj
         elif wire :? SuspendableGetSnapshotDto then
