@@ -20,9 +20,15 @@ open Microsoft.Extensions.DependencyInjection
 // ──────────────────────────────────────────────────────────────────────────
 // JSON shapes
 
-/// Opens a session: the display title, or null for the runtime default.
+/// Opens a session: the display title, or null for the runtime default,
+/// plus the optional agent id text (omitted or blank means a fresh id,
+/// the historical behavior).
 [<CLIMutable>]
-type OpenRequest = { Title: string | null }
+type OpenRequest =
+    {
+        Title: string | null
+        AgentId: string | null
+    }
 
 /// Prompts a session: non-empty text plus queue, inject, or interrupt
 /// delivery, defaulting to queue.
@@ -124,6 +130,20 @@ let private parseCause (raw: string | null) : StopCause =
     | text when text.Trim().Equals("hostShutdown", StringComparison.OrdinalIgnoreCase) -> StopCause.HostShutdown
     | text -> raise (ArgumentException($"Unknown cause '{text}': expected explicitAbort or hostShutdown."))
 
+/// Parses the optional open agent id: omitted or blank means a fresh id,
+/// anything else must parse or the open answers 400.
+let private parseAgentId (raw: string | null) : AgentId =
+    match raw with
+    | null -> AgentId.New()
+    | text when String.IsNullOrWhiteSpace(text) -> AgentId.New()
+    | text ->
+        let mutable parsed = Unchecked.defaultof<AgentId>
+
+        if AgentId.TryParse(text.Trim(), &parsed) then
+            parsed
+        else
+            raise (ArgumentException($"'{text}' is not an agent id."))
+
 // ──────────────────────────────────────────────────────────────────────────
 // Endpoints
 
@@ -142,7 +162,12 @@ let private openHandler: HttpHandler =
                 | title -> options.Title <- title.Trim()
 
                 let! created =
-                    SessionClientOperations.OpenSessionAsync(client, AgentId.New(), options, ctx.RequestAborted)
+                    SessionClientOperations.OpenSessionAsync(
+                        client,
+                        parseAgentId body.AgentId,
+                        options,
+                        ctx.RequestAborted
+                    )
 
                 return!
                     json

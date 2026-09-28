@@ -19,19 +19,23 @@
 // and the run still proves node-loss survival plus cross-node observation.
 // Either way the printed terminal payload names which path ran.
 //
-// Honest scope note: MinimalHost seeds no agents and opens sessions with a
-// fresh random agent id, so every turn fails fast at agent load (before
-// any LLM call, where the reply delay would hold it). The kill therefore
-// races dispatch/pickup rather than an in-LLM-call turn: what this proves
-// is cross-node inbox recovery (a survivor picks up the pending prompt),
-// exactly-once terminal settlement, a gapless subscriber stream, and
-// keep-majority survival. A deterministic mid-LLM-call kill needs a seeded
-// smoke agent plus open-with-agent-id (a sample-contract change, filed as
-// follow-up, not done here).
+// Mid-LLM-call guarantee: MinimalHost registers a code-defined `smoke`
+// agent under a stable id (HostWiring.fs, overridable via
+// LEGATE_SMOKE_AGENT_ID) and POST /sessions accepts that id, so the turn
+// opens against a resolvable agent, enters the LLM call (where the reply
+// delay below holds it), and the kill lands mid-call: the survivor must
+// resume (RetryTurn/ResumeAttempt) or fail (Fail/FailAttempt) per
+// Turns:CrashResume with no duplicated side effects and no subscriber
+// sequence gap. A TurnFailedEvent carrying the agent-load payload
+// ("No agent ...") means the kill raced dispatch instead and fails the
+// smoke loudly.
 //
 // The scripted reply delay makes the mid-turn kill deterministic: export
 // it before running so compose picks it up (compose reads the environment
-// at up time):
+// at up time). The smoke agent id rides the same path: export
+// LEGATE_SMOKE_AGENT_ID only to override the default both the host and
+// this script share (the host falls back to the default when the override
+// is absent or unparsable; compose defaults each node the same way):
 //
 //   LEGATE_MINIMALHOST_REPLY_DELAY_MS=10000 dotnet fsi samples/cluster-compose/smoke.crash-resume.fsx
 //
@@ -78,6 +82,16 @@ let node3 =
             v.Trim()
 
 let composeDir = Path.Combine(__SOURCE_DIRECTORY__, ".")
+
+// The stable smoke agent id shared with MinimalHost.HostWiring: the
+// default literal must match the host's, and an exported
+// LEGATE_SMOKE_AGENT_ID overrides both (compose defaults each node the
+// same way, so all three nodes serve the same identity).
+let smokeAgentId =
+    match Environment.GetEnvironmentVariable("LEGATE_SMOKE_AGENT_ID") with
+    | null -> "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+    | raw when String.IsNullOrWhiteSpace(raw) -> "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+    | raw -> raw.Trim()
 
 let json =
     JsonSerializerOptions(PropertyNamingPolicy = JsonNamingPolicy.CamelCase, PropertyNameCaseInsensitive = true)
@@ -178,10 +192,10 @@ match Environment.GetEnvironmentVariable("LEGATE_MINIMALHOST_REPLY_DELAY_MS") wi
 runCompose "up --build -d" 20
 waitReady 10.0
 
-info (sprintf "opening session on %s" node1)
+info (sprintf "opening session on %s with the stable smoke agent" node1)
 
 let openDoc =
-    postJson node1 "/sessions" """{"title":"smoke crash-resume"}"""
+    postJson node1 "/sessions" (sprintf """{"title":"smoke crash-resume","agentId":"%s"}""" smokeAgentId)
     |> Async.RunSynchronously
 
 let sessionId = openDoc.RootElement.GetProperty("sessionId").GetString()
@@ -252,32 +266,39 @@ let subscribeTask =
 
 info (sprintf "prompting session from %s (scripted reply)" node1)
 
-let promptTask =
-    postJson node1 (sprintf "/sessions/%s/prompt" sessionId) """{"text":"smoke mid-turn kill","delivery":"queue"}"""
-    |> Async.StartAsTask
+postJson node1 (sprintf "/sessions/%s/prompt" sessionId) """{"text":"smoke mid-turn kill","delivery":"queue"}"""
+|> Async.RunSynchronously
+|> ignore
 
-// Kill node 1 the moment the prompt appends: the turn has not run yet
-// (dispatch polls every few seconds), so a survivor must pick the pending
-// inbox entry up cross-node. Any sleep here only lets the victim process
-// the turn itself; the recovery path under test is survivor pickup.
-info "stopping legate-1 the moment the prompt appends"
-runCompose "stop legate-1" 5 |> ignore
+info "prompt append acknowledged"
 
-let promptResult =
-    try
-        promptTask.Wait(TimeSpan.FromSeconds(60.0)) |> ignore
+// Gate the kill on the turn entering the LLM call: TurnStartedEvent on
+// the node-2 subscriber proves the turn left dispatch, and the reply
+// delay holds the scripted call open past the kill point. A timeout fails
+// loudly instead of racing dispatch like the pre-271 script did.
+info "waiting for TurnStartedEvent before killing legate-1"
 
-        if promptTask.IsCompletedSuccessfully then
-            Some promptTask.Result
-        else
-            None
-    with _ ->
-        None
+let killDeadline = DateTimeOffset.UtcNow.AddMinutes(3.0)
+let mutable started = false
 
-match promptResult with
-| Some _ -> info "prompt append acknowledged"
-| None ->
-    info "prompt append did not acknowledge after the kill (node 1 was already down); continuing on the subscriber"
+while not started && DateTimeOffset.UtcNow < killDeadline do
+    Thread.Sleep(2000)
+
+    for name in seenEvents do
+        if name = "TurnStartedEvent" then
+            started <- true
+
+if not started then
+    fail "never observed TurnStartedEvent from node 2 within 3 minutes: the turn never entered the LLM call"
+
+info "turn started: killing legate-1 mid-LLM-call"
+// SIGKILL, not `stop`: a graceful stop gives the victim its 10s SIGTERM
+// grace, which covers the 10s scripted reply delay, so the victim usually
+// completes the turn itself and the run proves nothing about survivor
+// recovery (vacuous pass). A crash-resume smoke must simulate a crash:
+// SIGKILL dies instantly mid-call, freezing the journal at the marker so
+// the survivor must settle past the claim-lease expiry.
+runCompose "kill legate-1" 5 |> ignore
 
 // Observe from node 2 until a terminal turn event or the timeout.
 let deadline = DateTimeOffset.UtcNow.AddMinutes(4.0)
@@ -318,8 +339,11 @@ match terminal with
 
     if name = "TurnFailedEvent" then
         if terminalPayload.Contains("No agent ") then
-            info
-                "turn failed at agent load (MinimalHost seeds no agents): the kill raced dispatch, proving cross-node pickup, not an LLM-mid-call resume"
+            fail (
+                sprintf
+                    "turn failed at agent load (%s): the kill raced dispatch instead of interrupting the LLM call; the smoke agent was not resolved"
+                    terminalPayload
+            )
         else
             info "crash path: Fail/FailAttempt (Turns:CrashResume=Fail default)"
     else
@@ -402,7 +426,7 @@ let rec pollSurvivors () =
 Async.RunSynchronously(pollSurvivors ())
 
 let survivorOpen =
-    postJson node2 "/sessions" """{"title":"smoke survivor"}"""
+    postJson node2 "/sessions" (sprintf """{"title":"smoke survivor","agentId":"%s"}""" smokeAgentId)
     |> Async.RunSynchronously
 
 let survivorId = survivorOpen.RootElement.GetProperty("sessionId").GetString()

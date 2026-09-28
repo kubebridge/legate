@@ -127,14 +127,19 @@ outcome (`TurnFailedEvent` for Fail/FailAttempt, `TurnCompletedEvent`
 for RetryTurn/ResumeAttempt) and always requires gap-free,
 duplicate-free subscriber sequences plus a single settle.
 
-Honest scope: MinimalHost seeds no agents and opens sessions with a fresh
-random agent id, so turns fail fast at agent load before any LLM call
-(where the reply delay would hold them). The kill therefore races
-dispatch: what the smoke proves is cross-node inbox recovery (a survivor
-picks up the pending prompt), exactly-once terminal settlement, a gapless
-stream, and keep-majority survival, not an LLM-mid-call resume. A
-deterministic mid-call kill needs a seeded smoke agent plus
-open-with-agent-id, a sample-contract change left as follow-up.
+Mid-LLM-call guarantee: MinimalHost registers a code-defined `smoke`
+agent under a stable id (`HostWiring.fs`, default
+`01ARZ3NDEKTSV4RRFFQ69G5FAV`) and `POST /sessions` accepts an optional
+`agentId` (omitted or blank keeps the historical fresh-id behavior; an
+unparsable id answers 400). The smoke opens with that id, waits for
+`TurnStartedEvent` on the node-2 subscriber (proof the turn entered the
+LLM call, where the reply delay holds it), then stops `legate-1`: the
+survivor must resume or fail per the knobs above. A `TurnFailedEvent`
+carrying the agent-load payload (`No agent ...`) means the kill raced
+dispatch instead and fails the smoke loudly. Export
+`LEGATE_SMOKE_AGENT_ID` only to override the default; the host, the
+smoke, and every compose node share it, so all three nodes serve the
+same identity.
 Split-brain partitions (`docker network disconnect`) stay a stretch goal
 and are not covered.
 
