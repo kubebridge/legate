@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Build on Legate: packages, stores, and shipping</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="nav"><div class="wrap">
+  <a class="brand" href="index.html" aria-label="Legate home">
+    <svg width="30" height="30" viewBox="0 0 30 30"><circle cx="15" cy="15" r="13" fill="none" stroke="#f5a524" stroke-width="2.5"/><circle cx="15" cy="15" r="5.5" fill="#f5a524" class="pulse"/><circle cx="15" cy="15" r="9.5" fill="none" stroke="#38bdd9" stroke-width="1" stroke-dasharray="3 3" class="flow"/></svg>
+    Legate
+  </a>
+  <nav class="nav-links">
+    <a href="index.html">Sessions</a>
+    <a href="durability.html">Durability</a>
+    <a class="active" href="build.html">Build</a>
+  </nav>
+</div></header>
+
+<div class="wrap">
+  <div class="hero">
+    <span class="kicker">Page 3: build</span>
+    <h1>References point <span class="accent">inward.</span> Hosts plug in at the edges.</h1>
+    <p class="lede">Everything depends on <code>Legate.Abstractions</code>, which depends on nothing in the solution. Stores, workspaces, LLM providers, and tools are interfaces with defaults. Your business rules enter only through host hooks.</p>
+  </div>
+
+  <section class="block">
+    <h2>Hello, session</h2>
+    <p class="sub">The C#-friendly surface: Tasks, never Async; XML docs on every public member.</p>
+<pre class="code"><span class="c">// Program.cs: register once</span>
+services.<span class="f">AddLegate</span>(options => {
+    options.UsePostgres(postgresConnectionString);
+    options.AddOpenAIProvider(openAiKey, <span class="s">"gpt-4o-mini"</span>);
+    options.AddMcpServer(<span class="s">"docs"</span>, transport);
+});
+
+<span class="c">// Anywhere: open, prompt, stream, steer</span>
+<span class="k">var</span> session = <span class="k">await</span> client.<span class="f">OpenSessionAsync</span>(agentId, tenant);
+<span class="k">await</span> client.<span class="f">PromptAsync</span>(session.Id, userMessage, DeliveryMode.Queue);
+<span class="k">await foreach</span> (<span class="k">var</span> e <span class="k">in</span> client.<span class="f">SubscribeAsync</span>(session.Id, fromSequence: 0)) {
+    renderer.<span class="f">Render</span>(e); <span class="c">// TurnStarted, TextDelta, ToolCallStarted ...</span>
+}
+<span class="k">await</span> client.<span class="f">ReplyAsync</span>(session.Id, permissionDecision); <span class="c">// resume, never start</span></pre>
+  </section>
+
+  <section class="block">
+    <h2>The package map</h2>
+    <p class="sub">Sixteen packages, one rule: inward references only. Abstractions never touches Akka.</p>
+    <div class="grid c3">
+      <div class="card"><h3>Legate.Abstractions</h3><p>Contracts: domain types, store, tool, workspace, policy interfaces. Deps: FSharp.Core plus AI abstractions only.</p></div>
+      <div class="card"><h3>Legate<span class="tag">runtime</span></h3><p>Actors, dispatcher, ReAct loop, built-ins, LLM coordinator, hosted services, <code>AddLegate</code>.</p></div>
+      <div class="card"><h3>Legate.Llm.*</h3><p>OpenAI plus compatible endpoints, Ollama Cloud, Gemini via Google.GenAI.</p></div>
+      <div class="card"><h3>Storage</h3><p>Postgres, SQLite, InMemory, S3, FileSystem, plus shared FluentMigrator migrations with an additive-only rule.</p></div>
+      <div class="card"><h3>Coordination.Redis</h3><p>Distributed LLM admission over Redis: one combined limit across processes.</p></div>
+      <div class="card"><h3>Workspace.*</h3><p>Docker CLI, host directory, or scratch process workspaces behind one runtime interface.</p></div>
+      <div class="card"><h3>Cluster.Kubernetes</h3><p>Akka.Management plus Kubernetes discovery bootstrap with sample manifests and a k3d runbook.</p></div>
+      <div class="card"><h3>Mcp / Testing</h3><p>ModelContextProtocol tool sources; fakes, clock seams, and scripted chat clients for tests.</p></div>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2>Pick a store, keep the contract</h2>
+    <p class="sub">Postgres, SQLite, and InMemory implement the same <code>ISessionStore</code> plus <code>ISessionEventStore</code>, pinned by shared conformance suites.</p>
+    <table class="spec">
+      <tr><th>Need</th><th>Reach for</th><th>Notes</th></tr>
+      <tr><td>Local CLI, no server</td><td>SQLite + HostDirectory</td><td>One file holds sessions, inbox, turns, journal.</td></tr>
+      <tr><td>Hosted multi-tenant</td><td>Postgres + S3 + Docker</td><td>Tenant-scoped everything, versioned migrations.</td></tr>
+      <tr><td>Tests and samples</td><td>InMemory + Process</td><td>Core builds and tests with zero external services.</td></tr>
+      <tr><td>Agent packages</td><td>S3 / FileSystem blob + package stores</td><td>Skills and sub-agents load from packages.</td></tr>
+    </table>
+  </section>
+
+  <section class="block">
+    <h2>Proven at scale, shipped to NuGet</h2>
+    <div class="grid c2">
+      <div class="card"><h3>2189 tests, zero external services for core</h3><p>Unit facts, store conformance across all three session stores, wire golden files, Testcontainers proofs for Redis/Postgres/S3, and the live three-node crash smoke in CI.</p></div>
+      <div class="card"><h3>Cold start around 15 ms</h3><p>Local mode boots an in-process actor system with no remoting, measured against a start-to-first-token budget in the hundreds of milliseconds. Akka stays.</p></div>
+    </div>
+    <h2 style="margin-top:26px">The road here</h2>
+    <div class="timeline">
+      <div class="tl-item shipped"><b>Extracted, not invented</b><span>Legate generalizes the agent engine of BridgeMCP from a job model to a session model, with <code>Docs/ARCHITECTURE.md</code> as the normative target.</span></div>
+      <div class="tl-item shipped"><b>Waves 1 to 3</b><span>Domain, stores, turn loop, tools, permissions, LLM providers, workspaces, MCP: the single-node harness end to end.</span></div>
+      <div class="tl-item shipped"><b>Wave 4: cluster</b><span>Runtime, distributed event bus, Redis admission, Kubernetes bootstrap, wire format, and the crash-resume proof: kill a node mid-LLM-call and watch the turn settle.</span></div>
+      <div class="tl-item shipped"><b>v0.1.0 on NuGet</b><span>First public release published. The API surface is still growing, so expect movement between 0.x releases.</span></div>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2>Get running</h2>
+<pre class="code"><span class="c"># needs the .NET 10 SDK</span>
+dotnet fsi build.fsx -- -t Build   <span class="c"># restore + build</span>
+dotnet fsi build.fsx -- -t Test    <span class="c"># build + run all tests</span>
+dotnet run --project samples/LegateCli   <span class="c"># talk to a session</span></pre>
+  </section>
+
+  <div class="pager">
+    <a class="btn" href="durability.html">Back: Durability</a>
+    <a class="btn primary" href="index.html">Start over: Sessions</a>
+  </div>
+</div>
+
+<footer><div class="wrap">
+  <span>Legate: durable Akka.NET runtime for tool-using AI agents. Apache 2.0.</span>
+  <span class="spacer"></span><span>Page 3 of 3: Build</span>
+</div></footer>
+</body>
+</html>
