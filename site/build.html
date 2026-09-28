@@ -3,14 +3,14 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Build on Legate: two hosts, one runtime</title>
+<title>Build deep dive: hosts, packages, proof</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 30 30'%3E%3Crect width='30' height='30' rx='7' fill='%236b4fd6'/%3E%3Crect x='10' y='10' width='10' height='10' transform='rotate(45 15 15)' fill='white'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="styles.css">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 </head>
 <body>
 <header class="nav"><div class="wrap">
-  <a class="brand" href="index.html" aria-label="Legate home"><span class="brand-mark"><i></i></span>LEGATE</a>
+  <a class="brand" href="overview.html" aria-label="Legate home"><span class="brand-mark"><i></i></span>LEGATE</a>
   <nav class="nav-links">
     <a href="overview.html">Overview</a>
     <a href="index.html">Sessions</a>
@@ -22,65 +22,69 @@
   <a class="github-btn" href="https://github.com/kubebridge/legate">GitHub</a>
 </div></header>
 
-<section class="block" style="border-top:none"><div class="wrap">
+<div class="wrap hero">
+  <span class="kicker">03 / Build deep dive</span>
+  <h1 class="hero-title">Business rules enter at the edges</h1>
+  <p class="lede">The <a href="overview.html">overview</a> compares the two hosts. This page is the builder reference: the six host hooks, the samples that exercise them, the package map, and the proof behind the release.</p>
+  <div class="stats">
+    <div class="stat"><div class="num">2189</div><div class="lbl">tests in Legate.Tests</div></div>
+    <div class="stat"><div class="num">16</div><div class="lbl">packages in the layout</div></div>
+    <div class="stat"><div class="num">41</div><div class="lbl">versioned wire manifests</div></div>
+    <div class="stat"><div class="num">15</div><div class="lbl">ms local cold start</div></div>
+  </div>
+</div>
+
+<section class="block"><div class="wrap">
   <div class="sec-head">
-    <div><span class="sec-no">03 / Build</span>
-      <h2 class="sec-title">Two hosts, one runtime</h2></div>
-    <p class="sec-sub">Session store, event journal, blob storage, workspaces, LLM admission and permissions each sit behind an interface with a default. Swap what you need.</p>
+    <div><span class="sec-no">Host hooks</span>
+      <h2 class="sec-title">Six seams, nothing else</h2></div>
+    <p class="sec-sub">Host hooks are the only places a host's business rules enter the runtime. Legate reports tokens; it never prices them.</p>
   </div>
-
-  <div class="grid c2">
-    <div class="card">
-      <h3>CLI harness</h3>
-      <p>One process, no database server.</p>
-      <dl class="kv">
-        <dt>Store</dt><dd>SQLite, one file</dd>
-        <dt>Workspace</dt><dd>Your working directory</dd>
-        <dt>Approvals</dt><dd>Prompted mid-turn</dd>
-        <dt>Samples</dt><dd><code>LegateCli · MinimalHost</code></dd>
-      </dl>
-    </div>
-    <div class="card">
-      <h3>Hosted service</h3>
-      <p>Many tenants, clustered nodes.</p>
-      <dl class="kv">
-        <dt>Store</dt><dd>Postgres + S3</dd>
-        <dt>Workspace</dt><dd>Sandboxed Docker</dd>
-        <dt>Headless</dt><dd>Sessions close via webhooks</dd>
-        <dt>Samples</dt><dd><code>CSharpHost · Headless · cluster-compose</code></dd>
-      </dl>
-    </div>
+  <div class="card" style="padding:8px 20px">
+    <table class="spec">
+      <tr><th>Hook</th><th>What the host decides</th></tr>
+      <tr><td>ISessionAdmissionPolicy</td><td>Whether a session may start or prompt at all</td></tr>
+      <tr><td>IUsageObserver</td><td>What to record about token usage per turn</td></tr>
+      <tr><td>IModelPolicy</td><td>Which model serves which call</td></tr>
+      <tr><td>IToolSource</td><td>Where custom tools come from (MCP servers plug in here)</td></tr>
+      <tr><td>IPermissionPolicy</td><td>Which tool calls need approval, and from whom</td></tr>
+      <tr><td>IWorkspaceRuntime</td><td>Where tools act: host directory, Docker sandbox, or scratch</td></tr>
+    </table>
   </div>
-
-  <div>
-    <div style="display:flex;align-items:baseline;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:16px">
-      <h3 style="margin:0;font-size:20px;font-weight:600">Sixteen packages, references point inward</h3>
-    </div>
-    <div class="pills">
-      <span class="hot">Legate.Abstractions</span><span>Legate</span><span>Legate.Llm.*</span>
-      <span>Storage.Postgres · SQLite · InMemory · S3</span><span>Coordination.Redis</span>
-      <span>Workspace.*</span><span>Cluster.Kubernetes</span><span>Mcp</span><span>Testing</span>
-    </div>
-    <p style="color:var(--f4);font-size:14px;margin:14px 0 0">Abstractions depends on nothing in the solution and never touches Akka. The C# surface speaks Tasks, never Async, with XML docs on every public member.</p>
-  </div>
-
-  <div class="card">
-    <h3>Hello, session</h3>
-<pre class="code" style="margin-top:12px"><span class="c">// register once</span>
-services.<span class="f">AddLegate</span>(o =&gt; o.UsePostgres(conn));
-<span class="k">var</span> s = <span class="k">await</span> client.<span class="f">OpenSessionAsync</span>(agent, tenant);
-<span class="k">await</span> client.<span class="f">PromptAsync</span>(s.Id, msg);
-<span class="k">await foreach</span> (<span class="k">var</span> e <span class="k">in</span> client.<span class="f">SubscribeAsync</span>(s.Id))
-    render(e); <span class="c">// TurnStarted, TextDelta, ToolCallStarted ...</span>
-<span class="k">await</span> client.<span class="f">ReplyAsync</span>(s.Id, decision); <span class="c">// resume, never start</span></pre>
+  <div class="grid c3" style="margin-top:14px">
+    <div class="card"><h3>LegateCli</h3><p>The agentic CLI: approvals mid-turn, SQLite journal, your working directory.</p></div>
+    <div class="card"><h3>CSharpHost</h3><p>Embedding from C#: sessions inside an ASP.NET host.</p></div>
+    <div class="card"><h3>Headless</h3><p>AutoClose sessions with completion webhooks for pipelines.</p></div>
   </div>
 </div></section>
 
 <section class="block alt"><div class="wrap">
   <div class="sec-head">
+    <div><span class="sec-no">Packages</span>
+      <h2 class="sec-title">Inward references only</h2></div>
+    <p class="sec-sub">Everything depends on <code>Legate.Abstractions</code>, which depends on nothing in the solution and never touches Akka. New packages land under <code>src/&lt;PackageName&gt;/</code> and join <code>Legate.slnx</code>.</p>
+  </div>
+  <div class="pills">
+    <span class="hot">Legate.Abstractions</span><span>Legate</span><span>Legate.Llm.*</span>
+    <span>Storage.Postgres · SQLite · InMemory · S3</span><span>Coordination.Redis</span>
+    <span>Workspace.*</span><span>Cluster.Kubernetes</span><span>Mcp</span><span>Testing</span>
+  </div>
+  <div class="card" style="margin-top:14px;padding:8px 20px">
+    <table class="spec">
+      <tr><th>Need</th><th>Reach for</th><th>Notes</th></tr>
+      <tr><td>Local CLI, no server</td><td>SQLite + HostDirectory</td><td>One file holds sessions, inbox, turns, journal.</td></tr>
+      <tr><td>Hosted multi-tenant</td><td>Postgres + S3 + Docker</td><td>Tenant-scoped everything, additive-only migrations.</td></tr>
+      <tr><td>Tests and samples</td><td>InMemory + Process</td><td>Core builds and tests with zero external services.</td></tr>
+      <tr><td>Agent packages</td><td>S3 / FileSystem blob + package stores</td><td>Skills and sub-agents load from packages.</td></tr>
+    </table>
+  </div>
+</div></section>
+
+<section class="block"><div class="wrap">
+  <div class="sec-head">
     <div><span class="sec-no">Proof</span>
       <h2 class="sec-title">Tested like infrastructure</h2></div>
-    <p class="sec-sub">2189 tests in the core suite, store conformance across Postgres, SQLite and InMemory, wire golden files, Testcontainers proofs, and the live three-node kill smoke. Around 15 ms local cold start.</p>
+    <p class="sec-sub">Store conformance across all three session stores, wire golden files, Testcontainers proofs for Redis, Postgres, and S3, and the live three-node kill smoke in CI.</p>
   </div>
   <div class="timeline">
     <div class="tl-item shipped"><b>Extracted, not invented</b><span>Legate generalizes the BridgeMCP agent engine from a job model to a session model, with <code>Docs/ARCHITECTURE.md</code> as the normative target.</span></div>
@@ -88,27 +92,21 @@ services.<span class="f">AddLegate</span>(o =&gt; o.UsePostgres(conn));
     <div class="tl-item shipped"><b>Wave 4: cluster</b><span>Runtime, distributed event bus, Redis admission, Kubernetes bootstrap, wire format, and the crash-resume proof.</span></div>
     <div class="tl-item shipped"><b>v0.1.0 on NuGet</b><span>First public release published. The surface is still growing, so expect movement between 0.x releases.</span></div>
   </div>
-</div></section>
-
-<section class="block"><div class="wrap">
-  <div class="card" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr));gap:32px 56px;align-items:center;padding:40px">
-    <div>
-      <h3 style="font-size:32px;line-height:1;font-weight:900;text-transform:uppercase">Get running</h3>
-      <p>Needs the .NET 10 SDK. Core builds and tests with no external services.</p>
-      <div class="cta-row" style="margin-top:16px"><a class="btn primary" href="https://github.com/kubebridge/legate">Clone on GitHub</a></div>
-    </div>
-<pre class="code"><span class="c">$</span> dotnet fsi build.fsx -- -t Build
-<span class="c">$</span> dotnet fsi build.fsx -- -t Test
-<span class="c">$</span> dotnet run --project samples/LegateCli</pre>
+  <div class="card" style="margin-top:20px">
+    <h3>Get running</h3>
+<pre class="code" style="margin-top:12px"><span class="c"># needs the .NET 10 SDK</span>
+dotnet fsi build.fsx -- -t Build   <span class="c"># restore + build</span>
+dotnet fsi build.fsx -- -t Test    <span class="c"># build + run all tests</span>
+dotnet run --project samples/LegateCli   <span class="c"># talk to a session</span></pre>
   </div>
-  <div class="pager" style="margin:34px 0 0">
-    <a class="btn" href="durability.html">02 / Durability</a>
-    <a class="btn primary" href="index.html">01 / Sessions</a>
+  <div class="pager" style="margin-top:20px">
+    <a class="btn" href="durability.html">02 / Durability deep dive</a>
+    <a class="btn primary" href="overview.html">Overview</a>
   </div>
 </div></section>
 
 <footer><div class="wrap">
-  <a class="brand" href="index.html" style="font-size:12px"><span class="brand-mark" style="width:20px;height:20px"><i style="width:7px;height:7px"></i></span>LEGATE</a>
+  <a class="brand" href="overview.html" style="font-size:12px"><span class="brand-mark" style="width:20px;height:20px"><i style="width:7px;height:7px"></i></span>LEGATE</a>
   <span class="spacer">A kubebridge project · Apache 2.0</span>
   <nav><a href="https://github.com/kubebridge/legate">GitHub</a><a href="https://www.nuget.org/packages/Legate">NuGet</a><a href="https://github.com/kubebridge/legate/tree/main/Docs">Docs</a></nav>
 </div></footer>
