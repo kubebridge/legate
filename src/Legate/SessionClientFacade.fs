@@ -435,6 +435,17 @@ type SessionClientOperations =
 
             let! created = client.Store.CreateSession(tenant, session, cancellationToken)
 
+            // Completion era (issue 289): mark after a successful create;
+            // a marking failure degrades to pre-era (quiet) and never
+            // fails the open.
+            match client.CompletionEra with
+            | Some mark ->
+                try
+                    do! mark tenant created.Id cancellationToken
+                with _ ->
+                    ()
+            | None -> ()
+
             try
                 let! _ = client.Resolve(created.Id, cancellationToken)
                 ()
@@ -739,6 +750,17 @@ type SessionClientOperations =
                 }
 
             let! created = client.Store.CreateSession(tenant, forked, cancellationToken)
+
+            // Completion era (issue 289): mark after a successful create;
+            // a marking failure degrades to pre-era (quiet) and never
+            // fails the fork.
+            match client.CompletionEra with
+            | Some mark ->
+                try
+                    do! mark tenant created.Id cancellationToken
+                with _ ->
+                    ()
+            | None -> ()
 
             if prefix.Count > 0 then
                 // Prime, copy, and settle under the facade-held claim before
@@ -1578,6 +1600,33 @@ module internal SessionClientWiring =
         options.MaxEventPayloadBytes <- sessions.SubscriptionMaxEventPayloadBytes
         options
 
+    /// Resolves the completion-era reader the entity factory closes over
+    /// (issue 289): the registered gate's reader, or the pre-era reader
+    /// when no gate (or no reader) is registered. Never null and never
+    /// throws for a missing registration.
+    /// <param name="provider">The container to resolve from. Must not be null.</param>
+    /// <returns>The era reader the probe consults.</returns>
+    let eraReaderOf (provider: IServiceProvider) : CompletionEra.CompletionEraReader =
+        ArgumentNullException.ThrowIfNull(provider)
+
+        match provider.GetService<CompletionEra.CompletionEraGate>() with
+        | null -> CompletionEra.preEraGate.Reader
+        | gate when isNull (box gate.Reader) -> CompletionEra.preEraGate.Reader
+        | gate -> gate.Reader
+
+    /// Resolves the completion-era marker Open and Fork call (issue 289):
+    /// the registered gate's marker, or None when no gate (or no marker)
+    /// is registered. A missing gate reads pre-era quiet.
+    /// <param name="provider">The container to resolve from. Must not be null.</param>
+    /// <returns>The era marker, or None.</returns>
+    let eraMarkerOf (provider: IServiceProvider) : CompletionEra.CompletionEraMarker option =
+        ArgumentNullException.ThrowIfNull(provider)
+
+        match provider.GetService<CompletionEra.CompletionEraGate>() with
+        | null -> None
+        | gate when isNull (box gate.Marker) -> None
+        | gate -> Some gate.Marker
+
     /// Builds the client from the container: resolves the stores, bounds,
     /// and hosted actor system, validates the facade options, opts into
     /// suspendable children when an IChatClient is registered, and returns
@@ -1716,6 +1765,7 @@ module internal SessionClientWiring =
                         runner
                         compactFor
                         (provider.GetService<IAgentStore>())
+                        (eraReaderOf provider)
                 )
 
             // The factory lands on the mode-active service only; the idle
@@ -1796,6 +1846,14 @@ module internal SessionClientWiring =
                     :> ISubscribeRouter
                 )
         | _ -> ()
+
+        // Completion era (issue 289): the marker Open and Fork call after
+        // a successful CreateSession, captured here like the event store
+        // and delay above. Absent (or marker-less) gate registration
+        // leaves the client unmarked: pre-era quiet.
+        match eraMarkerOf provider with
+        | None -> ()
+        | Some marker -> built.CompletionEra <- Some marker
 
         built
 

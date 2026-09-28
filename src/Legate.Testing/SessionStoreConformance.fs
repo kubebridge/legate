@@ -567,6 +567,62 @@ type SessionStoreConformance(store: ISessionStore, clock: TestClock, tenant: Ten
         }
 
     [<Fact>]
+    member this.``Idle rows with a live turn surface the live-turn predicate until settlement clears it``() =
+        task {
+            // The orphan-sweep predicate (issue 289): an Idle row whose
+            // claim consumed the inbox still carries its turn id through
+            // ListSessions, while GetDispatchCandidates stays
+            // pending-inbox-only.
+            let! created = store.CreateSession(tenant, this.SampleSession(), CancellationToken.None)
+
+            let message = UserMessagePayload(UserMessage.Text("live turn")) :> InboxPayload
+
+            let! _ = store.AppendInboxMessage(tenant, created.Id, message, DeliveryMode.Queue, CancellationToken.None)
+
+            let! claimed =
+                store.ClaimNextTurn(
+                    tenant,
+                    created.Id,
+                    "live-turn-owner",
+                    TimeSpan.FromMinutes 5.,
+                    CancellationToken.None
+                )
+
+            let claim = (claimed :?> TurnLeaseRenewed).Claim
+
+            let! idle =
+                store.ListSessions(
+                    tenant,
+                    Nullable(SessionState.Idle),
+                    Unchecked.defaultof<Nullable<AgentId>>,
+                    Unchecked.defaultof<Nullable<DateTimeOffset>>,
+                    Unchecked.defaultof<Nullable<DateTimeOffset>>,
+                    10,
+                    null,
+                    CancellationToken.None
+                )
+
+            let row = idle.Items |> Seq.find (fun session -> session.Id = created.Id)
+
+            Assert.True(row.CurrentTurnId.HasValue)
+            Assert.Equal(claim.TurnId, row.CurrentTurnId.Value)
+
+            let! pending = store.GetDispatchCandidates(tenant, 10, CancellationToken.None)
+
+            Assert.DoesNotContain(created.Id, pending.Sessions)
+
+            let! settled = store.SettleTurn(tenant, claim, TurnStatus.Completed, null, CancellationToken.None)
+
+            Assert.True(settled :? TurnSettled)
+
+            let! after = store.GetSession(tenant, created.Id, CancellationToken.None)
+
+            match after with
+            | null -> failwith "expected the session"
+            | session -> Assert.False(session.CurrentTurnId.HasValue)
+        }
+
+    [<Fact>]
     member this.``CountSessionsByTenant scopes to the tenant``() =
         task {
             let! _ = (store.CreateSession(tenant, this.SampleSession(), CancellationToken.None))

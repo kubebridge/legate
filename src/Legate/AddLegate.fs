@@ -86,6 +86,7 @@ type LegateServiceCollectionExtensions =
 
         LegateDefaultRegistration.register services
         LegateStartupChecks.register services
+        CompletionEraRegistration.register services
         SessionArtifactRegistration.register services
         LocalActorSystemRegistration.register services
         ClusterActorSystemRegistration.register services

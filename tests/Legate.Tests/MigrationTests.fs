@@ -166,7 +166,7 @@ let ``Migration options reject a null prefix`` () =
 // Baseline round-trip
 
 [<Fact>]
-let ``Baseline creates all ten tables with their indexes`` () =
+let ``Migrations create all eleven tables with their indexes`` () =
     let keepAlive, connectionString = openDatabase ()
     use _keep = keepAlive
 
@@ -190,6 +190,7 @@ let ``Baseline creates all ten tables with their indexes`` () =
             "schedule_occurrences"
             "session_grants"
             "sessions"
+            "turn_completion_era"
             "turns"
         ]
 
@@ -214,8 +215,22 @@ let ``Baseline creates all ten tables with their indexes`` () =
             "IX_outbox_pending_created"
             "IX_outbox_delivered_at"
             "IX_session_grants_uq_grant"
+            "IX_turn_completion_era_pk_session"
         ] do
         indexes |> should contain expected
+
+[<Fact>]
+let ``Turn completion era table carries the session key`` () =
+    let keepAlive, connectionString = openDatabase ()
+    use _keep = keepAlive
+
+    use provider =
+        buildProvider connectionString (fun (options: MigrationOptions) -> options.Schema <- "")
+
+    migrateUp provider
+
+    columnNames keepAlive "turn_completion_era"
+    |> should equal [ "tenant"; "session_id"; "marked_at" ]
 
 [<Fact>]
 let ``Baseline columns carry the contract shapes`` () =

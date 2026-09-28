@@ -457,7 +457,7 @@ type SessionHarness
                 let runner: SessionActor.SuspendableRunner =
                     // The harness journals through its own fenced observer,
                     // never the in-call marker: no marker hook on any path.
-                    fun entry _attempt allowed cursor reply seed runnerToken _ ->
+                    fun entry _attempt allowed cursor reply seed runnerToken _ turnId ->
                         task {
                             match cursor, reply with
                             | None, None ->
@@ -477,7 +477,7 @@ type SessionHarness
                                         ignore
                                         policy
                                         created.Id
-                                        (TurnId.New())
+                                        turnId
                                         None
                                         allowed
                             | Some live, Some(:? PermissionDecision as decision) ->
@@ -510,7 +510,8 @@ type SessionHarness
                                         allowed
                             | None, Some _ ->
                                 // Crash-rebuild shape: no live cursor, so
-                                // retry the turn from its inbox entry.
+                                // retry the turn from its inbox entry under
+                                // the supplied turn id.
                                 let history = historyOf entry seed
 
                                 return!
@@ -527,7 +528,7 @@ type SessionHarness
                                         ignore
                                         policy
                                         created.Id
-                                        (TurnId.New())
+                                        turnId
                                         None
                                         allowed
                             | _ ->
@@ -579,6 +580,11 @@ type SessionHarness
                         ReprimeJournal = Some reprime
                         RefreshCompact = None
                         AgentStore = null
+                        // Completion era (issue 289): the live reader over
+                        // the harness database. Absent marks read false
+                        // (pre-era quiet); tests mark through
+                        // InMemoryCompletionEra.mark to opt in.
+                        EraMarked = InMemoryCompletionEra.isMarked database
                     }
 
                 let actor =
