@@ -291,8 +291,14 @@ while not started && DateTimeOffset.UtcNow < killDeadline do
 if not started then
     fail "never observed TurnStartedEvent from node 2 within 3 minutes: the turn never entered the LLM call"
 
-info "turn started: stopping legate-1 mid-LLM-call"
-runCompose "stop legate-1" 5 |> ignore
+info "turn started: killing legate-1 mid-LLM-call"
+// SIGKILL, not `stop`: a graceful stop gives the victim its 10s SIGTERM
+// grace, which covers the 10s scripted reply delay, so the victim usually
+// completes the turn itself and the run proves nothing about survivor
+// recovery (vacuous pass). A crash-resume smoke must simulate a crash:
+// SIGKILL dies instantly mid-call, freezing the journal at the marker so
+// the survivor must settle past the claim-lease expiry.
+runCompose "kill legate-1" 5 |> ignore
 
 // Observe from node 2 until a terminal turn event or the timeout.
 let deadline = DateTimeOffset.UtcNow.AddMinutes(4.0)
