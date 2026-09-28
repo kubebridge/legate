@@ -21,6 +21,9 @@
   --vb: oklch(52% 0.2 285);
   --v: oklch(72% 0.14 285);
   --v-soft: oklch(78% 0.12 285);
+  --cy: #46c2e0;
+  --cy-dim: oklch(72% 0.09 210);
+  --am: #f0b429;
   --g: oklch(78.89% 0.12 135.4);
   --r: oklch(68% 0.17 20);
   --font: "Exo 2", system-ui, -apple-system, "Segoe UI", sans-serif;
@@ -71,7 +74,7 @@ h1.hero-title { margin: 0 0 16px; font-size: clamp(40px, 5.6vw, 68px); line-heig
 }
 .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin: 32px 0 0; }
 .stat { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px; text-align: center; }
-.stat .num { font-size: 30px; font-weight: 800; color: var(--v); font-variant-numeric: tabular-nums; }
+.stat .num { font-size: 30px; font-weight: 800; color: var(--cy); font-variant-numeric: tabular-nums; }
 .stat .lbl { font-size: 12.5px; color: var(--f4); }
 
 /* Sections */
