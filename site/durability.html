@@ -3,14 +3,14 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Legate durability: kill a node mid-sentence</title>
+<title>Durability deep dive: journals, claims, clusters</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 30 30'%3E%3Crect width='30' height='30' rx='7' fill='%236b4fd6'/%3E%3Crect x='10' y='10' width='10' height='10' transform='rotate(45 15 15)' fill='white'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="styles.css">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 </head>
 <body>
 <header class="nav"><div class="wrap">
-  <a class="brand" href="index.html" aria-label="Legate home"><span class="brand-mark"><i></i></span>LEGATE</a>
+  <a class="brand" href="overview.html" aria-label="Legate home"><span class="brand-mark"><i></i></span>LEGATE</a>
   <nav class="nav-links">
     <a href="overview.html">Overview</a>
     <a href="index.html">Sessions</a>
@@ -22,40 +22,19 @@
   <a class="github-btn" href="https://github.com/kubebridge/legate">GitHub</a>
 </div></header>
 
-<section class="block" style="border-top:none"><div class="wrap">
+<div class="wrap hero">
+  <span class="kicker">02 / Durability deep dive</span>
+  <h1 class="hero-title">One owner, one journal, zero doubles</h1>
+  <p class="lede">The <a href="overview.html">overview</a> shows the kill. This page shows the machinery underneath: atomic claims, a gap-free event journal with cursor replay, and the cluster that survives the kill.</p>
+</div>
+
+<section class="block"><div class="wrap">
   <div class="sec-head">
-    <div><span class="sec-no">02 / Durability</span>
-      <h2 class="sec-title">Kill a node mid-sentence. The turn survives.</h2></div>
-    <p class="sec-sub">Every turn runs under a lease with an opaque claim token, rechecked before each side effect. CI runs this on three nodes: SIGKILL the owner during an LLM call and the turn settles with no duplicates and no subscriber gap.</p>
+    <div><span class="sec-no">Fencing</span>
+      <h2 class="sec-title">The token is the authority</h2></div>
+    <p class="sec-sub"><code>ClaimNextTurn</code> hands a turn to exactly one caller. Checkpoint, settle, abort, tool calls, and journal writes verify the opaque token store-side at the last moment. A stale token returns lost or rejected instead of acting.</p>
   </div>
-
-  <div class="crash-box">
-    <div class="crash-nodes">
-      <div class="crash-node" id="node0">
-        <div class="row"><code>legate-1</code><span class="dot"></span></div>
-        <span class="st">RUNNING TURN</span><span class="role">Runs the turn</span>
-      </div>
-      <div class="crash-node" id="node1">
-        <div class="row"><code>legate-2</code><span class="dot"></span></div>
-        <span class="st">STANDBY</span><span class="role">Observes, then settles</span>
-      </div>
-      <div class="crash-node" id="node2">
-        <div class="row"><code>legate-3</code><span class="dot"></span></div>
-        <span class="st">UP</span><span class="role">Quorum witness</span>
-      </div>
-      <div class="crash-node">
-        <div class="row"><span style="font-size:10.5px;font-weight:600;letter-spacing:0.08em;color:var(--f4)">JOURNAL</span><span style="font-size:10.5px;color:var(--f4)">gap-free</span></div>
-        <div class="crash-journal"><span style="color:var(--f5)">1</span><span id="cj1" style="color:var(--v)">TurnStarted</span></div>
-        <div class="crash-journal"><span style="color:var(--f5)">2</span><span id="cj2" style="color:var(--g)">TurnFailed</span></div>
-      </div>
-    </div>
-    <div class="crash-foot">
-      <div class="phase-ticks" id="ticks"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
-      <span id="caption">legate-1 claims the turn</span>
-    </div>
-  </div>
-
-  <div class="diagram" style="margin-top:14px">
+  <div class="diagram">
     <svg viewBox="0 0 980 260" role="img" aria-label="Two nodes race for a claim, one wins, the loser is fenced out">
       <defs>
         <marker id="arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#a394f9"/></marker>
@@ -80,21 +59,28 @@
       <line x1="585" y1="150" x2="770" y2="150" stroke="#f2555a" stroke-width="2" stroke-dasharray="5 5" marker-end="url(#arr2)"/>
       <text x="678" y="98" text-anchor="middle" fill="#f2555a" font-size="12">loser: no claimable turn</text>
     </svg>
-    <div class="caption"><code>ClaimNextTurn</code> admits exactly one owner. A stale token is rejected, never obeyed. A correlation id is evidence, never authority.</div>
-  </div>
-
-  <div class="grid c3" style="margin-top:14px">
-    <div class="card"><h3>Fenced claims</h3><p>Checkpoint, settle, abort, tool calls, journal writes: every side effect verifies the token store-side at the last moment.</p></div>
-    <div class="card"><h3>One transaction per step</h3><p>Inbox append, claim, renew, checkpoint and settle are atomic. Readers never see half a step.</p></div>
-    <div class="card"><h3>Tenancy in the store</h3><p>Every store call carries a <code>TenantId</code>. Isolation is enforced below the host.</p></div>
+    <div class="caption">Inbox append, claim, renew, checkpoint, settle: each lands in one transaction. Readers never see a half-applied step.</div>
   </div>
 </div></section>
 
 <section class="block alt"><div class="wrap">
   <div class="sec-head">
+    <div><span class="sec-no">Journal</span>
+      <h2 class="sec-title">Replayable by cursor</h2></div>
+    <p class="sec-sub">The event journal is the audit trail and the source of <code>Subscribe</code>. Batches append under the turn claim token; the store stamps gap-free 1-based sequences, and a stale token rejects the whole batch with zero writes.</p>
+  </div>
+  <div class="grid c3">
+    <div class="card"><h3>Cursor replay</h3><p>Bounded pages by exclusive int64 cursor: page with <code>NextCursor</code>, end of stream, unknown session, expired journal. Subscribers resume exactly where they left off.</p></div>
+    <div class="card"><h3>Bounded by config</h3><p>Per-event bytes, per-session count and bytes, batch size. A breach throws <code>EventLimitExceededException</code> before any part of the batch lands.</p></div>
+    <div class="card"><h3>Janitor with a lease</h3><p>Journal cleanup is itself claimed (<code>TryClaimCleanup</code>, <code>CompleteCleanup</code>, <code>DeferCleanup</code>), so retention never races a live tail.</p></div>
+  </div>
+</div></section>
+
+<section class="block"><div class="wrap">
+  <div class="sec-head">
     <div><span class="sec-no">The saga</span>
       <h2 class="sec-title">Four issues, one green smoke</h2></div>
-    <p class="sec-sub">Each layer of the crash-resume proof exposed the next, and each shipped with its own tests. This is the loop above, frame by frame.</p>
+    <p class="sec-sub">Each layer of the crash-resume proof exposed the next, and each shipped with its own tests. The animated loop on the overview is this story compressed.</p>
   </div>
   <div class="timeline">
     <div class="tl-item shipped"><b>Marker (#284)</b><span>A fenced <code>TurnStartedEvent</code> journaled at provider-call entry: the deterministic in-call signal no production path previously emitted.</span></div>
@@ -104,11 +90,11 @@
   </div>
 </div></section>
 
-<section class="block"><div class="wrap">
+<section class="block alt"><div class="wrap">
   <div class="sec-head">
     <div><span class="sec-no">Cluster</span>
-      <h2 class="sec-title">Clustered when you want it</h2></div>
-    <p class="sec-sub">Same actor logic in single-node and clustered mode. The bar: <code>Legate</code> builds and tests with no Redis, Docker, Postgres, or Kubernetes.</p>
+      <h2 class="sec-title">Same logic, sharded</h2></div>
+    <p class="sec-sub">Actor logic is shared between single-node and clustered mode; translation happens at the serialization boundary. The bar: core builds and tests with no external services.</p>
   </div>
   <div class="grid c2">
     <div class="card"><h3>Runtime</h3><p><code>StaticSeeds</code> joins named seeds and shards entities by session id; <code>Kubernetes</code> bootstraps via Akka.Management plus discovery. Keep-majority split-brain, readiness gates, graceful drain.</p></div>
@@ -116,47 +102,16 @@
     <div class="card"><h3>Wire format</h3><p>Token-less DTOs under versioned <code>legate.*.v1</code> envelopes with golden files. Current and current-minus-one accepted; everything else fails closed.</p></div>
     <div class="card"><h3>Redis admission</h3><p>Two processes on one Redis respect one combined LLM limit: FIFO waiters with TTL, owner-fenced leases, fail policies, a startup canary gating readiness.</p></div>
   </div>
-  <div class="pager" style="margin:34px 0 0">
-    <a class="btn" href="index.html">01 / Sessions</a>
-    <a class="btn primary" href="build.html">03 / Build</a>
+  <div class="pager" style="margin-top:20px">
+    <a class="btn" href="index.html">01 / Sessions deep dive</a>
+    <a class="btn primary" href="build.html">03 / Build deep dive</a>
   </div>
 </div></section>
 
 <footer><div class="wrap">
-  <a class="brand" href="index.html" style="font-size:12px"><span class="brand-mark" style="width:20px;height:20px"><i style="width:7px;height:7px"></i></span>LEGATE</a>
+  <a class="brand" href="overview.html" style="font-size:12px"><span class="brand-mark" style="width:20px;height:20px"><i style="width:7px;height:7px"></i></span>LEGATE</a>
   <span class="spacer">A kubebridge project · Apache 2.0</span>
   <nav><a href="https://github.com/kubebridge/legate">GitHub</a><a href="https://www.nuget.org/packages/Legate">NuGet</a><a href="https://github.com/kubebridge/legate/tree/main/Docs">Docs</a></nav>
 </div></footer>
-
-<script>
-(function () {
-  var VB = '#6b4fd6', V = '#a394f9', G = '#7ee2a8', R = '#f2555a',
-      F4 = '#8a8a9a', B = '#3a3a4d', DIM = 'rgba(255,255,255,0.08)';
-  var CAPTIONS = ['legate-1 claims the turn', 'TurnStarted journaled at provider-call entry', 'TurnStarted journaled at provider-call entry', 'SIGKILL legate-1 mid-LLM-call', 'SIGKILL legate-1 mid-LLM-call', 'legate-2 recovers the journal tail under a fresh claim', 'legate-2 recovers the journal tail under a fresh claim', 'One terminal event. Zero duplicates, no subscriber gap.', 'One terminal event. Zero duplicates, no subscriber gap.', 'One terminal event. Zero duplicates, no subscriber gap.', 'Restarting the loop', 'Restarting the loop'];
-  var n0 = document.getElementById('node0'), n1 = document.getElementById('node1');
-  var ticks = document.getElementById('ticks').children;
-  var caption = document.getElementById('caption');
-  var cj1 = document.getElementById('cj1'), cj2 = document.getElementById('cj2');
-  function paint(el, border, bg, dot, st, stColor, opacity) {
-    el.style.borderColor = border; el.style.background = bg; el.style.opacity = opacity;
-    el.querySelector('.dot').style.background = dot;
-    var s = el.querySelector('.st'); s.textContent = st; s.style.color = stColor;
-  }
-  var p = 0;
-  setInterval(function () {
-    p = (p + 1) % 12;
-    if (p < 3) paint(n0, VB, 'rgba(107,79,214,0.10)', V, 'RUNNING TURN', V, 1);
-    else if (p < 5) paint(n0, R, 'rgba(242,85,90,0.10)', R, 'SIGKILLED', R, 1);
-    else paint(n0, B, 'transparent', F4, 'SIGKILLED', F4, 0.45);
-    if (p < 5) paint(n1, B, 'transparent', F4, 'STANDBY', F4, 1);
-    else if (p < 7) paint(n1, VB, 'rgba(107,79,214,0.10)', V, 'CLAIMING', V, 1);
-    else paint(n1, G, 'transparent', G, 'SETTLED: FAIL', G, 1);
-    cj1.style.opacity = p >= 1 ? 1 : 0.15;
-    cj2.style.opacity = p >= 7 ? 1 : 0.15;
-    for (var i = 0; i < ticks.length; i++) ticks[i].classList.toggle('hit', i <= p);
-    caption.textContent = CAPTIONS[p];
-  }, 1100);
-})();
-</script>
 </body>
 </html>
