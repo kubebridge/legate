@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Legate durability: claims, journals, and crash resume</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="nav"><div class="wrap">
+  <a class="brand" href="index.html" aria-label="Legate home">
+    <svg width="30" height="30" viewBox="0 0 30 30"><circle cx="15" cy="15" r="13" fill="none" stroke="#f5a524" stroke-width="2.5"/><circle cx="15" cy="15" r="5.5" fill="#f5a524" class="pulse"/><circle cx="15" cy="15" r="9.5" fill="none" stroke="#38bdd9" stroke-width="1" stroke-dasharray="3 3" class="flow"/></svg>
+    Legate
+  </a>
+  <nav class="nav-links">
+    <a href="index.html">Sessions</a>
+    <a class="active" href="durability.html">Durability</a>
+    <a href="build.html">Build</a>
+  </nav>
+</div></header>
+
+<div class="wrap">
+  <div class="hero">
+    <span class="kicker">Page 2: durability</span>
+    <h1>Kill a node <span class="accent">mid-sentence.</span> The turn survives.</h1>
+    <p class="lede">Every turn runs under a lease with an opaque claim token. Every side effect re-checks that token at the last moment, every event lands in a gap-free journal, and on restart the session replays and resumes or fails cleanly. A correlation id is evidence, never authority.</p>
+  </div>
+
+  <section class="block">
+    <h2>Fencing: one owner, zero doubles</h2>
+    <p class="sub"><code>ClaimNextTurn</code> hands a turn to exactly one caller. Checkpoint, settle, abort, tool calls, and journal writes all verify the token store-side. A stale token returns lost or rejected instead of acting.</p>
+    <div class="diagram">
+      <svg viewBox="0 0 980 260" role="img" aria-label="Two nodes race for a claim, one wins, the loser is fenced out">
+        <defs>
+          <marker id="arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#38bdd9"/></marker>
+        </defs>
+        <rect x="30" y="70" width="180" height="120" rx="14" fill="#161c2c" stroke="#38bdd9" stroke-width="2" class="node-up"/>
+        <text x="120" y="120" text-anchor="middle" fill="#e8ecf5" font-size="16" font-weight="bold">Node A</text>
+        <text x="120" y="143" text-anchor="middle" fill="#3ddc84" font-size="13" font-weight="bold">WINS claim</text>
+        <text x="120" y="163" text-anchor="middle" fill="#9aa4bd" font-size="12" font-family="monospace">token: opaque</text>
+        <rect x="770" y="70" width="180" height="120" rx="14" fill="#161c2c" stroke="#f2555a" stroke-width="2"/>
+        <text x="860" y="120" text-anchor="middle" fill="#e8ecf5" font-size="16" font-weight="bold">Node B</text>
+        <text x="860" y="143" text-anchor="middle" fill="#f2555a" font-size="13" font-weight="bold">FENCED OUT</text>
+        <text x="860" y="163" text-anchor="middle" fill="#9aa4bd" font-size="12" font-family="monospace">stale: rejected</text>
+        <rect x="400" y="40" width="180" height="180" rx="14" fill="#161c2c" stroke="#f5a524" stroke-width="2"/>
+        <text x="490" y="85" text-anchor="middle" fill="#e8ecf5" font-size="16" font-weight="bold">Turn store</text>
+        <text x="490" y="108" text-anchor="middle" fill="#9aa4bd" font-size="12">atomic claim</text>
+        <circle cx="490" cy="150" r="20" fill="none" stroke="#f5a524" stroke-width="2" class="pulse"/>
+        <text x="490" y="155" text-anchor="middle" fill="#f5a524" font-size="12" font-weight="bold">1</text>
+        <text x="490" y="192" text-anchor="middle" fill="#9aa4bd" font-size="12">exactly one winner</text>
+        <line x1="210" y1="110" x2="395" y2="110" stroke="#3ddc84" stroke-width="2.5" class="flow" marker-end="url(#arr2)"/>
+        <line x1="395" y1="150" x2="210" y2="150" stroke="#3ddc84" stroke-width="2.5" class="flow" marker-end="url(#arr2)"/>
+        <line x1="770" y1="110" x2="585" y2="110" stroke="#f2555a" stroke-width="2" stroke-dasharray="5 5" marker-end="url(#arr2)"/>
+        <line x1="585" y1="150" x2="770" y2="150" stroke="#f2555a" stroke-width="2" stroke-dasharray="5 5" marker-end="url(#arr2)"/>
+        <text x="675" y="100" text-anchor="middle" fill="#f2555a" font-size="12">loser sees: no claimable turn</text>
+      </svg>
+      <div class="caption">The atomic claim admits one owner. Every later write carries the token; losers observe rejection, never a double claim.</div>
+    </div>
+    <div class="grid c3" style="margin-top:14px">
+      <div class="card"><h3>Atomicity</h3><p>Inbox append, claim, renew, checkpoint, settle: each lands in one transaction. Readers never see a half-applied step.</p></div>
+      <div class="card"><h3>Result objects</h3><p>Lease states and settlements are values callers branch on, with stable wire discriminators. Only control-plane misuse throws.</p></div>
+      <div class="card"><h3>Tenancy</h3><p>Every store call carries a <code>TenantId</code>. Isolation is enforced in the stores, not just the host.</p></div>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2>The crash-resume saga, live in CI</h2>
+    <p class="sub">The three-node compose harness opens a session, waits for the journaled <code>TurnStartedEvent</code>, SIGKILLs the executing node mid-LLM-call, and demands the turn settle with no duplicated side effects and no subscriber gap. Watch the loop.</p>
+    <div class="diagram">
+      <svg viewBox="0 0 980 300" role="img" aria-label="Animated kill and recovery across three nodes">
+        <defs>
+          <marker id="arr3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#3ddc84"/></marker>
+        </defs>
+        <rect x="40" y="60" width="150" height="110" rx="14" fill="#161c2c" stroke="#38bdd9" stroke-width="2"/>
+        <text x="115" y="105" text-anchor="middle" fill="#e8ecf5" font-size="15" font-weight="bold">legate-1</text>
+        <text x="115" y="128" text-anchor="middle" fill="#9aa4bd" font-size="12">runs the turn</text>
+        <text x="115" y="150" text-anchor="middle" fill="#f2555a" font-size="13" font-weight="bold" class="kill-flash">SIGKILLED</text>
+        <rect x="300" y="60" width="150" height="110" rx="14" fill="#161c2c" stroke="#38bdd9" stroke-width="2" class="node-up"/>
+        <text x="375" y="105" text-anchor="middle" fill="#e8ecf5" font-size="15" font-weight="bold">legate-2</text>
+        <text x="375" y="128" text-anchor="middle" fill="#9aa4bd" font-size="12">observes</text>
+        <text x="375" y="150" text-anchor="middle" fill="#3ddc84" font-size="13" font-weight="bold" class="settle-in">settles: Fail</text>
+        <rect x="560" y="60" width="150" height="110" rx="14" fill="#161c2c" stroke="#26304a" stroke-width="2"/>
+        <text x="635" y="105" text-anchor="middle" fill="#e8ecf5" font-size="15" font-weight="bold">legate-3</text>
+        <text x="635" y="128" text-anchor="middle" fill="#9aa4bd" font-size="12">quorum witness</text>
+        <rect x="790" y="60" width="150" height="110" rx="14" fill="#161c2c" stroke="#f5a524" stroke-width="2"/>
+        <text x="865" y="105" text-anchor="middle" fill="#e8ecf5" font-size="15" font-weight="bold">Journal</text>
+        <text x="865" y="128" text-anchor="middle" fill="#f5a524" font-size="12" font-family="monospace">seq 1, 2, ...</text>
+        <text x="865" y="150" text-anchor="middle" fill="#9aa4bd" font-size="12">gap-free</text>
+        <line x1="190" y1="200" x2="190" y2="250" stroke="#38bdd9" stroke-width="2"/>
+        <line x1="375" y1="200" x2="375" y2="250" stroke="#38bdd9" stroke-width="2"/>
+        <line x1="635" y1="200" x2="635" y2="250" stroke="#26304a" stroke-width="2"/>
+        <line x1="865" y1="200" x2="865" y2="250" stroke="#f5a524" stroke-width="2"/>
+        <line x1="120" y1="225" x2="860" y2="225" stroke="#3ddc84" stroke-width="2.5" class="flow" marker-end="url(#arr3)"/>
+        <text x="490" y="215" text-anchor="middle" fill="#3ddc84" font-size="12" font-family="monospace">TurnStarted seq 1 -&gt; ... -&gt; TurnFailed seq 2, one terminal, zero dupes</text>
+      </svg>
+      <div class="caption">The kill flashes, the survivor settles. Marker, completion, and predicate all key on one fenced turn id.</div>
+    </div>
+    <div class="timeline" style="margin-top:20px">
+      <div class="tl-item shipped"><b>Marker (#284)</b><span>A fenced <code>TurnStartedEvent</code> is journaled at provider-call entry, giving the smoke a deterministic in-call signal that no production path previously emitted.</span></div>
+      <div class="tl-item shipped"><b>Tail recovery (#287)</b><span>Entity start routes Idle-with-live-turn plus unterminated-tail rows through journal-tail recovery under the fresh primed claim.</span></div>
+      <div class="tl-item shipped"><b>Completion era (#289)</b><span>One terminal event per settled turn, an era gate for old marker-only histories, and a dispatcher sweep that re-pokes and settles directly when survivors go quiet.</span></div>
+      <div class="tl-item shipped"><b>Seeded smoke (#271)</b><span>Stable smoke agent, open-with-agent-id, short-lease overlay, SIGKILL mid-call. Green in CI: Fail per policy, frames 1..2 gap-free and duplicate-free.</span></div>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2>Clustered when you want it</h2>
+    <p class="sub">Same actor logic in single-node and clustered mode. The test-suite bar: <code>Legate</code> builds and tests with no Redis, Docker, Postgres, or Kubernetes.</p>
+    <div class="grid c2">
+      <div class="card"><h3>Runtime</h3><p><code>StaticSeeds</code> joins named seeds and shards entities by session id; <code>Kubernetes</code> bootstraps via Akka.Management plus discovery. Keep-majority split-brain resolution, readiness gates (self Up, session role, zero unreachable, strict majority), graceful drain against live turn counts.</p></div>
+      <div class="card"><h3>Event bus</h3><p>Cross-node <code>Subscribe</code> routes through the owning entity with a bounded replay cache. A subscriber on node A tails a session on node B and resumes gap-free from its cursor after a real restart. At-least-once, always.</p></div>
+      <div class="card"><h3>Wire format</h3><p>Every cross-node message is a token-less DTO under a versioned <code>legate.*.v1</code> envelope with golden files. Readers accept current and current-minus-one; anything else fails closed before deserializing.</p></div>
+      <div class="card"><h3>Redis admission</h3><p>Two processes on one Redis respect one combined LLM concurrency limit: FIFO waiters with TTL, owner-fenced leases, fail-closed or bounded fail-open, a startup canary gating readiness.</p></div>
+    </div>
+  </section>
+
+  <div class="pager">
+    <a class="btn" href="index.html">Back: Sessions</a>
+    <a class="btn primary" href="build.html">Next: Build on Legate</a>
+  </div>
+</div>
+
+<footer><div class="wrap">
+  <span>Legate: durable Akka.NET runtime for tool-using AI agents. Apache 2.0.</span>
+  <span class="spacer"></span><span>Page 2 of 3: Durability</span>
+</div></footer>
+</body>
+</html>

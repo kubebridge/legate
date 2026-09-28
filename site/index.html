@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Legate: a durable runtime for tool-using AI agents</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="nav"><div class="wrap">
+  <a class="brand" href="index.html" aria-label="Legate home">
+    <svg width="30" height="30" viewBox="0 0 30 30"><circle cx="15" cy="15" r="13" fill="none" stroke="#f5a524" stroke-width="2.5"/><circle cx="15" cy="15" r="5.5" fill="#f5a524" class="pulse"/><circle cx="15" cy="15" r="9.5" fill="none" stroke="#38bdd9" stroke-width="1" stroke-dasharray="3 3" class="flow"/></svg>
+    Legate
+  </a>
+  <nav class="nav-links">
+    <a class="active" href="index.html">Sessions</a>
+    <a href="durability.html">Durability</a>
+    <a href="build.html">Build</a>
+  </nav>
+</div></header>
+
+<div class="wrap">
+  <div class="hero">
+    <span class="kicker">Agent harness for .NET</span>
+    <h1>A <span class="accent">durable runtime</span> for tool-using AI agents</h1>
+    <p class="lede">Register Legate in your host with <code>AddLegate(...)</code>, point it at LLM providers, hand it tools, and it runs <strong>sessions</strong>: long-lived conversations you can prompt at any time, steer mid-turn, abort, resume after a crash, and replay. F# on .NET 10, powered by Akka.NET, Apache 2.0, on NuGet as <code>Legate 0.1.0</code>.</p>
+    <div class="cta-row">
+      <a class="btn primary" href="build.html">Start building</a>
+      <a class="btn" href="durability.html">How durability works</a>
+    </div>
+    <div class="stats">
+      <div class="stat"><div class="num" data-count="2189">0</div><div class="lbl">tests in Legate.Tests</div></div>
+      <div class="stat"><div class="num" data-count="16">0</div><div class="lbl">packages in the layout</div></div>
+      <div class="stat"><div class="num" data-count="41">0</div><div class="lbl">versioned wire manifests</div></div>
+      <div class="stat"><div class="num" data-count="15">0</div><div class="lbl">ms local cold start</div></div>
+    </div>
+  </div>
+
+  <section class="block">
+    <h2>The mental model</h2>
+    <p class="sub">Think of the backend of an agentic CLI: a session, one primary verb (send a message), a stream of events back, and the power to answer, steer, or abort while the agent works.</p>
+    <div class="diagram">
+      <svg viewBox="0 0 980 300" role="img" aria-label="Host prompts a session, the ReAct loop runs, events stream back">
+        <defs>
+          <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#38bdd9"/></marker>
+        </defs>
+        <rect x="20" y="90" width="170" height="120" rx="14" fill="#161c2c" stroke="#38bdd9" stroke-width="2"/>
+        <text x="105" y="140" text-anchor="middle" fill="#e8ecf5" font-size="17" font-weight="bold">Host</text>
+        <text x="105" y="163" text-anchor="middle" fill="#9aa4bd" font-size="12">CLI / service</text>
+        <text x="105" y="182" text-anchor="middle" fill="#38bdd9" font-size="12" font-family="monospace">Prompt()</text>
+        <rect x="405" y="60" width="170" height="180" rx="14" fill="#161c2c" stroke="#f5a524" stroke-width="2"/>
+        <text x="490" y="110" text-anchor="middle" fill="#e8ecf5" font-size="17" font-weight="bold">Session</text>
+        <text x="490" y="133" text-anchor="middle" fill="#9aa4bd" font-size="12">sharded entity</text>
+        <circle cx="490" cy="175" r="24" fill="none" stroke="#f5a524" stroke-width="2" class="pulse"/>
+        <text x="490" y="180" text-anchor="middle" fill="#f5a524" font-size="13" font-weight="bold">ReAct</text>
+        <text x="490" y="218" text-anchor="middle" fill="#9aa4bd" font-size="12">turn loop</text>
+        <rect x="790" y="90" width="170" height="120" rx="14" fill="#161c2c" stroke="#a78bfa" stroke-width="2"/>
+        <text x="875" y="140" text-anchor="middle" fill="#e8ecf5" font-size="17" font-weight="bold">Tools</text>
+        <text x="875" y="163" text-anchor="middle" fill="#9aa4bd" font-size="12">MCP / built-ins</text>
+        <text x="875" y="182" text-anchor="middle" fill="#a78bfa" font-size="12" font-family="monospace">ask_user</text>
+        <line x1="190" y1="130" x2="400" y2="130" stroke="#38bdd9" stroke-width="2" class="flow" marker-end="url(#arr)"/>
+        <text x="295" y="118" text-anchor="middle" fill="#38bdd9" font-size="12" font-family="monospace">UserMessage</text>
+        <line x1="400" y1="170" x2="190" y2="170" stroke="#38bdd9" stroke-width="2" class="flow" marker-end="url(#arr)"/>
+        <text x="295" y="192" text-anchor="middle" fill="#38bdd9" font-size="12" font-family="monospace">SessionEvent stream</text>
+        <line x1="575" y1="130" x2="785" y2="130" stroke="#a78bfa" stroke-width="2" class="flow" marker-end="url(#arr)"/>
+        <text x="680" y="118" text-anchor="middle" fill="#a78bfa" font-size="12" font-family="monospace">tool call</text>
+        <line x1="785" y1="170" x2="575" y2="170" stroke="#a78bfa" stroke-width="2" class="flow" marker-end="url(#arr)"/>
+        <text x="680" y="192" text-anchor="middle" fill="#a78bfa" font-size="12" font-family="monospace">tool result</text>
+        <ellipse cx="490" cy="272" rx="120" ry="16" fill="none" stroke="#26304a" stroke-width="1.5"/>
+        <text x="490" y="276" text-anchor="middle" fill="#9aa4bd" font-size="12">journal: every step persisted</text>
+      </svg>
+      <div class="caption">Prompt goes in, a live event stream comes out, tools fire under permission policy. Everything is journaled.</div>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2>Seven concepts, no more</h2>
+    <p class="sub">The whole model fits on an index card. There is deliberately no job type: a headless run is just a session with options.</p>
+    <div class="grid c3">
+      <div class="card"><h3>Agent</h3><p>A definition: model config, system prompt, tools, skills, sub-agents, permission defaults, package source.</p></div>
+      <div class="card"><h3>Session<span class="tag">core</span></h3><p>A conversation with one agent. Id, tenant, title, state, transcript, inbox, workspace binding. Lives until closed or expired.</p></div>
+      <div class="card"><h3>UserMessage</h3><p>Text, file, or image parts. The only thing that starts a turn, journaled before it is acted on.</p></div>
+      <div class="card"><h3>Reply</h3><p>The host answering a permission or a question. Resumes a suspended turn, never starts one.</p></div>
+      <div class="card"><h3>Turn<span class="tag">core</span></h3><p>One ReAct run. Ends on stop, abort, or budget; suspends on reply. The lease and claim unit.</p></div>
+      <div class="card"><h3>SessionEvent</h3><p>Fine-grained ordered journal: TurnStarted, TextDelta, ToolCallStarted, TurnCompleted. Hosts render these.</p></div>
+      <div class="card"><h3>SessionCell</h3><p>The coarse transcript (user, assistant, tool call/result, system), derived from events for replay and UI.</p></div>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2>A turn, step by step</h2>
+    <p class="sub">Watch one prompt travel through the runtime. The highlight advances on its own.</p>
+    <div class="stepper" id="stepper">
+      <div class="step"><div class="n">1</div><div><strong>Prompt lands in the inbox.</strong><p>The message is appended to <code>ISessionStore</code> and the dispatcher wakes the session entity (sharded in cluster mode, a local child actor otherwise).</p></div></div>
+      <div class="step"><div class="n">2</div><div><strong>The turn is claimed under a lease.</strong><p>Exactly one owner wins. Every later side effect re-checks the opaque claim token at the last moment.</p></div></div>
+      <div class="step"><div class="n">3</div><div><strong>Workspace, agent, model.</strong><p>The workspace binds, the agent package loads (<code>AGENTS.md</code>, skills), and a rate-limited <code>IChatClient</code> is built.</p></div></div>
+      <div class="step"><div class="n">4</div><div><strong>Tools assemble.</strong><p>Built-ins (file, exec, skill, task, <code>ask_user</code>), custom HTTP tools, every <code>IToolSource</code>. Each call passes <code>IPermissionPolicy</code>.</p></div></div>
+      <div class="step"><div class="n">5</div><div><strong>The ReAct loop runs.</strong><p>Events flow to the journal and live subscribers; injected messages fold in at iteration boundaries.</p></div></div>
+      <div class="step"><div class="n">6</div><div><strong>Settle and rest.</strong><p>Usage checkpoints, the turn settles, the session returns to <code>Idle</code> or waits for input. Headless sessions close via the completion sink.</p></div></div>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2>Two first-class hosts</h2>
+    <div class="grid c2">
+      <div class="card"><h3>CLI harness</h3><p>One process, no database server. Tools act on your working directory, approvals pop mid-turn, SQLite holds the journal. Samples: <code>LegateCli</code>, <code>MinimalHost</code>.</p></div>
+      <div class="card"><h3>Hosted service</h3><p>Many tenants, clustered nodes, Postgres plus S3, sandboxed workspaces, headless sessions with webhooks. Samples: <code>CSharpHost</code>, <code>Headless</code>, <code>cluster-compose</code>.</p></div>
+    </div>
+  </section>
+
+  <div class="pager">
+    <span></span>
+    <a class="btn primary" href="durability.html">Next: Durability and crash resume</a>
+  </div>
+</div>
+
+<footer><div class="wrap">
+  <span>Legate: durable Akka.NET runtime for tool-using AI agents. Apache 2.0.</span>
+  <span class="spacer"></span><span>Page 1 of 3: Sessions</span>
+</div></footer>
+
+<script>
+(function () {
+  var els = document.querySelectorAll('.stat .num');
+  function animate(el) {
+    var target = parseInt(el.getAttribute('data-count'), 10);
+    var start = null, dur = 1400;
+    function frame(t) {
+      if (!start) start = t;
+      var p = Math.min((t - start) / dur, 1);
+      el.textContent = Math.round(target * (1 - Math.pow(1 - p, 3))).toLocaleString('en-US');
+      if (p < 1) requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+  }
+  var seen = false;
+  function onScroll() {
+    if (seen) return;
+    seen = true;
+    els.forEach(function (el, i) { setTimeout(function () { animate(el); }, i * 150); });
+  }
+  window.addEventListener('scroll', onScroll, { once: true });
+  onScroll();
+  var steps = document.querySelectorAll('#stepper .step');
+  var idx = 0;
+  function cycle() {
+    steps.forEach(function (s) { s.classList.remove('on'); });
+    steps[idx].classList.add('on');
+    idx = (idx + 1) % steps.length;
+  }
+  if (steps.length) { cycle(); setInterval(cycle, 2200); }
+})();
+</script>
+</body>
+</html>
