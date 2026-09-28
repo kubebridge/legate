@@ -10,6 +10,7 @@
 # (e.g. 60): a smoke-scoped turn-claim lease so the victim claim expires
 # inside the observation window and survivors settle the orphaned turn.
 # Absent means the one-hour host default (production behavior).
+# Compose default 60s is smoke-scoped so CI observes expiry without an export.
 # The smoke owns the lifecycle (up --build, quorum wait, mid-turn kill,
 # survivor checks, teardown on success). The smoke agent id defaults to
 # the stable literal the host and the smoke share; export
@@ -85,7 +86,7 @@ services:
       Legate__Llm__DistributedCoordination__Mode: Redis
       Legate__Llm__DistributedCoordination__ConnectionString: redis:6379
       LEGATE_MINIMALHOST_REPLY_DELAY_MS: ${LEGATE_MINIMALHOST_REPLY_DELAY_MS:-0}
-      LEGATE_SESSION_LEASE_SECONDS: ${LEGATE_SESSION_LEASE_SECONDS:-}
+      LEGATE_SESSION_LEASE_SECONDS: ${LEGATE_SESSION_LEASE_SECONDS:-60}
       LEGATE_SMOKE_AGENT_ID: ${LEGATE_SMOKE_AGENT_ID:-01ARZ3NDEKTSV4RRFFQ69G5FAV}
     networks:
       - legate-cluster
@@ -125,7 +126,7 @@ services:
       Legate__Llm__DistributedCoordination__Mode: Redis
       Legate__Llm__DistributedCoordination__ConnectionString: redis:6379
       LEGATE_MINIMALHOST_REPLY_DELAY_MS: ${LEGATE_MINIMALHOST_REPLY_DELAY_MS:-0}
-      LEGATE_SESSION_LEASE_SECONDS: ${LEGATE_SESSION_LEASE_SECONDS:-}
+      LEGATE_SESSION_LEASE_SECONDS: ${LEGATE_SESSION_LEASE_SECONDS:-60}
       LEGATE_SMOKE_AGENT_ID: ${LEGATE_SMOKE_AGENT_ID:-01ARZ3NDEKTSV4RRFFQ69G5FAV}
     networks:
       - legate-cluster
@@ -165,7 +166,7 @@ services:
       Legate__Llm__DistributedCoordination__Mode: Redis
       Legate__Llm__DistributedCoordination__ConnectionString: redis:6379
       LEGATE_MINIMALHOST_REPLY_DELAY_MS: ${LEGATE_MINIMALHOST_REPLY_DELAY_MS:-0}
-      LEGATE_SESSION_LEASE_SECONDS: ${LEGATE_SESSION_LEASE_SECONDS:-}
+      LEGATE_SESSION_LEASE_SECONDS: ${LEGATE_SESSION_LEASE_SECONDS:-60}
       LEGATE_SMOKE_AGENT_ID: ${LEGATE_SMOKE_AGENT_ID:-01ARZ3NDEKTSV4RRFFQ69G5FAV}
     networks:
       - legate-cluster
