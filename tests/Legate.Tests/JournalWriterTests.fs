@@ -878,6 +878,7 @@ let private testCursor (requestId: string) (question: string) : TurnLoop.TurnLoo
 
     {
         RequestId = requestId
+        OriginTurnId = Unchecked.defaultof<TurnId>
         ToolName = TurnLoop.AskUserToolName
         ToolCallId = "c1"
         Kind = TurnLoop.QuestionSuspension
@@ -906,6 +907,7 @@ let private suspendedOn (cursor: TurnLoop.TurnLoopSuspension) : TurnLoop.TurnLoo
                     }
                 Outcome = null
             }
+        TurnId = cursor.OriginTurnId
         HasPendingInjects = false
         Suspension = Some cursor
     }
@@ -943,7 +945,7 @@ let private spawnWriterActor
         }
 
     let runner: SessionActor.SuspendableRunner =
-        fun _ _ _ _ _ _ _ _ -> Task.FromResult(completion)
+        fun _ _ _ _ _ _ _ _ _ -> Task.FromResult(completion)
 
     let deps: SessionActor.SuspendDeps =
         {
@@ -955,6 +957,7 @@ let private spawnWriterActor
             ReprimeJournal = None
             RefreshCompact = None
             AgentStore = null
+            EraMarked = (fun _ _ _ -> Task.FromResult false)
         }
 
     spawn system $"journal-{Guid.NewGuid():N}" (SessionActor.behaviorWithSuspend baseProps deps)
@@ -1208,3 +1211,25 @@ let ``Scoped token append redacts fixture secrets from captured logs`` () =
     for entry in entries do
         entry.Text.Contains(secret) |> should equal false
         entry.Text.Contains(JournalWriter.RedactedText) |> should equal true
+
+[<Fact>]
+let ``Terminal completion events pass sanitizing unchanged`` () =
+    // Text-free terminal rows (issue 289) ride the catch-all: no text to
+    // redact and no byte-fit impact.
+    let sessionId = SessionId.New()
+    let turnId = TurnId.New()
+    let stamp = DateTimeOffset.UtcNow
+    let noSequence = Unchecked.defaultof<Nullable<int64>>
+
+    let completed =
+        TurnCompletedEvent(sessionId, turnId, noSequence, stamp) :> SessionEvent
+
+    let keptCompleted = JournalWriter.sanitizeEvent completed :?> TurnCompletedEvent
+    keptCompleted.SessionId |> should equal sessionId
+    keptCompleted.TurnId |> should equal turnId
+
+    let failed =
+        TurnFailedEvent(sessionId, turnId, noSequence, stamp, "settled") :> SessionEvent
+
+    let keptFailed = JournalWriter.sanitizeEvent failed :?> TurnFailedEvent
+    keptFailed.TurnId |> should equal turnId

@@ -55,6 +55,54 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
     member private this.InboxTable = qualified options "inbox"
     member private _.TurnsTable = qualified options "turns"
     member private this.OutboxTable = qualified options "outbox"
+    member private this.EraTable = qualified options "turn_completion_era"
+
+    /// Marks the session era-marked (issue 289): an idempotent upsert
+    /// over the turn_completion_era table. Internal: the registration
+    /// closes the runtime's era gate over it. A missing table (migrations
+    /// not run) throws, and the gate degrades to pre-era quiet.
+    member internal this.MarkCompletionEraAsync
+        (tenant: TenantId, sessionId: SessionId, _cancellationToken: CancellationToken)
+        : Task =
+        this.EnsureMigrated()
+
+        transact options (fun connection transaction ->
+            use cmd =
+                command
+                    connection
+                    transaction
+                    $"INSERT INTO {this.EraTable} (tenant, session_id, marked_at) VALUES (@t, @sid, @now) ON CONFLICT (tenant, session_id) DO UPDATE SET marked_at = @now"
+
+            textParam cmd "t" (tenant.ToString())
+            textParam cmd "sid" (sessionId.ToString())
+            textParam cmd "now" (stamp this.UtcNow)
+            cmd.ExecuteNonQuery() |> ignore)
+        |> Task.FromResult
+        :> Task
+
+    /// Reads whether the session is era-marked (issue 289): true once
+    /// marked, false for absent rows (pre-era quiet). Internal: the
+    /// registration closes the runtime's era gate over it.
+    member internal this.IsCompletionEraMarkedAsync
+        (tenant: TenantId, sessionId: SessionId, _cancellationToken: CancellationToken)
+        : Task<bool> =
+        this.EnsureMigrated()
+
+        transact options (fun connection transaction ->
+            use cmd =
+                command
+                    connection
+                    transaction
+                    $"SELECT 1 FROM {this.EraTable} WHERE tenant = @t AND session_id = @sid LIMIT 1"
+
+            textParam cmd "t" (tenant.ToString())
+            textParam cmd "sid" (sessionId.ToString())
+
+            use reader = cmd.ExecuteReader()
+            let found = reader.Read()
+            reader.Close()
+            found)
+        |> Task.FromResult
 
     member private _.SessionColumns =
         "id, tenant, agent_id, title, state, current_turn_id, created_at, updated_at, closed_at, workspace_binding, options_json, permission_grants_json"

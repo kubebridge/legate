@@ -67,6 +67,7 @@ type SqliteSessionStore(database: SqliteDatabase) =
     let inboxTable () = database.Table "inbox"
     let turnsTable () = database.Table "turns"
     let outboxTable () = database.Table "outbox"
+    let eraTable () = database.Table "turn_completion_era"
 
     let grantsOf (session: Session) : List<string> =
         if isNull (box session.PermissionGrants) then
@@ -369,6 +370,50 @@ type SqliteSessionStore(database: SqliteDatabase) =
             readSession reader
         else
             raise (SessionNotFoundException(sessionId, sprintf "No session %O exists in tenant %O." sessionId tenant))
+
+    /// Marks the session era-marked (issue 289): an idempotent upsert
+    /// over the turn_completion_era table. Internal: the registration
+    /// closes the runtime's era gate over it. A missing table (migrations
+    /// not run) throws, and the gate degrades to pre-era quiet.
+    member internal _.MarkCompletionEraAsync
+        (tenant: TenantId, sessionId: SessionId, _cancellationToken: CancellationToken)
+        : Task =
+        task {
+            lock database.Gate (fun () ->
+                use connection = database.OpenConnection()
+                use command = connection.CreateCommand()
+
+                command.CommandText <-
+                    $"INSERT INTO \"%s{eraTable ()}\" (tenant, session_id, marked_at) VALUES ($tenant, $session, $now) ON CONFLICT (tenant, session_id) DO UPDATE SET marked_at = $now"
+
+                command.Parameters.AddWithValue("$tenant", tenant.Value) |> ignore
+                command.Parameters.AddWithValue("$session", sessionId.Value) |> ignore
+                command.Parameters.AddWithValue("$now", toIso database.UtcNow) |> ignore
+                command.ExecuteNonQuery() |> ignore)
+        }
+        :> Task
+
+    /// Reads whether the session is era-marked (issue 289): true once
+    /// marked, false for absent rows (pre-era quiet). Internal: the
+    /// registration closes the runtime's era gate over it.
+    member internal _.IsCompletionEraMarkedAsync
+        (tenant: TenantId, sessionId: SessionId, _cancellationToken: CancellationToken)
+        : Task<bool> =
+        task {
+            return
+                lock database.Gate (fun () ->
+                    use connection = database.OpenConnection()
+                    use command = connection.CreateCommand()
+
+                    command.CommandText <-
+                        $"SELECT 1 FROM \"%s{eraTable ()}\" WHERE tenant = $tenant AND session_id = $session LIMIT 1"
+
+                    command.Parameters.AddWithValue("$tenant", tenant.Value) |> ignore
+                    command.Parameters.AddWithValue("$session", sessionId.Value) |> ignore
+
+                    use reader = command.ExecuteReader()
+                    reader.Read())
+        }
 
     interface ISessionStore with
 

@@ -21,6 +21,7 @@
 
   <ItemGroup>
     <ProjectReference Include="../Legate.Abstractions/Legate.Abstractions.fsproj" />
+    <ProjectReference Include="../Legate/Legate.fsproj" />
     <ProjectReference Include="../Legate.Storage.Migrations/Legate.Storage.Migrations.fsproj" />
   </ItemGroup>
 

@@ -1261,6 +1261,39 @@ let private readAllEvents (client: SessionClient) (sessionId: SessionId) : Task<
         return List.ofSeq collected
     }
 
+/// Waits for the settled turn's terminal completion row to land (issue
+/// 289): the settle waiter fires on the result observation, while the
+/// terminal event journals best-effort just after, so prefix reads must
+/// await it for deterministic counts (one terminal row per completed
+/// turn). Returns the full journal once the terminal lands.
+/// <param name="client">The session client.</param>
+/// <param name="sessionId">The session whose terminal row to await.</param>
+/// <returns>The journal with its terminal completion row.</returns>
+let private awaitTerminal (client: SessionClient) (sessionId: SessionId) : Task<SessionEvent list> =
+    task {
+        let deadline = DateTime.UtcNow + waitBound
+        let mutable events = List.empty<SessionEvent>
+        let mutable landed = false
+
+        while not landed && DateTime.UtcNow < deadline do
+            let! read = readAllEvents client sessionId
+            events <- read
+
+            landed <-
+                match List.tryLast read with
+                | Some(:? TurnCompletedEvent) -> true
+                | Some _ -> false
+                | None -> false
+
+            if not landed then
+                do! Task.Delay(25)
+
+        match List.tryLast events with
+        | Some(:? TurnCompletedEvent) -> return events
+        | Some _ -> return raise (TimeoutException("The test timed out waiting for the terminal completion row."))
+        | None -> return raise (TimeoutException("The test timed out waiting for the terminal completion row."))
+    }
+
 /// The agent-switch events in a journal, in sequence order.
 let private switchEventsOf (events: SessionEvent list) : AgentSwitchedEvent list =
     [
@@ -1586,7 +1619,7 @@ let ``Fork copies the prefix and references the source`` () : Task =
                     first.Status |> should equal TurnStatus.Completed
                     first.AssistantText |> should equal "src"
 
-                    let! sourceEvents = readAllEvents client created.Id
+                    let! sourceEvents = awaitTerminal client created.Id
                     Assert.True(sourceEvents.Length > 0)
                     let prefixLength = int64 sourceEvents.Length
 
@@ -1687,7 +1720,7 @@ let ``Fork clamps beyond-tail and allows closed and empty prefixes`` () : Task =
 
                     let! _ = awaitWhat waiter.Task "the source turn to settle"
 
-                    let! sourceEvents = readAllEvents client created.Id
+                    let! sourceEvents = awaitTerminal client created.Id
                     Assert.True(sourceEvents.Length > 0)
 
                     let! _ = client.Store.CloseSession(client.Tenant, created.Id, CancellationToken.None)
@@ -2393,5 +2426,76 @@ let ``PromptAsync on a missing session throws and fires no title`` () : Task =
                         ()
 
                     titleClient.Calls |> should equal 0
+                })
+    }
+
+// ──────────────────────────────────────────────────────────────────────────
+// Completion era marking (issue 289)
+
+[<Fact>]
+let ``OpenSessionAsync marks the completion era`` () : Task =
+    task {
+        use provider =
+            (createServices (scripted [ ScriptStep.Text "done" ]) (sourced [])).BuildServiceProvider()
+
+        return!
+            withClient provider (fun client ->
+                task {
+                    let marked = ResizeArray<TenantId * SessionId>()
+
+                    client.CompletionEra <-
+                        Some(fun tenant sessionId _ ->
+                            marked.Add((tenant, sessionId))
+                            Task.CompletedTask)
+
+                    let! created = openSession client
+
+                    marked.Count |> should equal 1
+                    marked[0] |> should equal (client.Tenant, created.Id)
+                })
+    }
+
+[<Fact>]
+let ``ForkAsync marks the completion era`` () : Task =
+    task {
+        use provider =
+            (createServices (scripted [ ScriptStep.Text "done" ]) (sourced [])).BuildServiceProvider()
+
+        return!
+            withClient provider (fun client ->
+                task {
+                    let marked = ResizeArray<TenantId * SessionId>()
+
+                    client.CompletionEra <-
+                        Some(fun tenant sessionId _ ->
+                            marked.Add((tenant, sessionId))
+                            Task.CompletedTask)
+
+                    let! created = openSession client
+
+                    let! forked = SessionClientOperations.ForkAsync(client, created.Id, 0L, CancellationToken.None)
+
+                    marked.Count |> should equal 2
+                    marked[0] |> should equal (client.Tenant, created.Id)
+                    marked[1] |> should equal (client.Tenant, forked.Id)
+                })
+    }
+
+[<Fact>]
+let ``OpenSessionAsync succeeds when the era marker fails`` () : Task =
+    task {
+        use provider =
+            (createServices (scripted [ ScriptStep.Text "done" ]) (sourced [])).BuildServiceProvider()
+
+        return!
+            withClient provider (fun client ->
+                task {
+                    // A marking failure degrades to pre-era (quiet) and
+                    // never fails the open.
+                    client.CompletionEra <-
+                        Some(fun _ _ _ -> Task.FromException(InvalidOperationException("era store down")))
+
+                    let! created = openSession client
+                    (isNull (box created)) |> should equal false
                 })
     }
