@@ -132,6 +132,23 @@ let private smokeAgentId () : AgentId =
         else
             AgentId.Parse(smokeAgentIdDefault)
 
+/// Reads the smoke-scoped session claim lease in seconds: the
+/// SessionClientOptions.LeaseDuration default (one hour) when the
+/// environment carries no positive integer. A short lease (e.g. 60s) lets
+/// the cluster-compose crash-resume smoke observe survivor recovery inside
+/// its observation window; absent or invalid preserves production behavior.
+let private sessionLeaseDuration () : TimeSpan =
+    match Environment.GetEnvironmentVariable("LEGATE_SESSION_LEASE_SECONDS") with
+    | null -> TimeSpan.FromHours 1.0
+    | raw when String.IsNullOrWhiteSpace(raw) -> TimeSpan.FromHours 1.0
+    | raw ->
+        let mutable value = 0
+
+        if Int32.TryParse(raw.Trim(), &value) && value > 0 then
+            TimeSpan.FromSeconds(float value)
+        else
+            TimeSpan.FromHours 1.0
+
 /// Builds the container: InMemory session and event stores over one shared
 /// database by default, the process workspace, scripted-by-default
 /// providers, and the chat client the facade opts into suspendable
@@ -211,6 +228,14 @@ let buildServices (services: IServiceCollection) (configuration: IConfiguration)
             |> ignore)
     )
     |> ignore
+
+    // Smoke-scoped claim lease: a host-owned SessionClientOptions wins
+    // over the facade TryAdd default (plain Add appends and resolves
+    // last), so the compose smoke can expire the victim claim inside its
+    // window without touching the one-hour src default.
+    let leaseOptions = SessionClientOptions()
+    leaseOptions.LeaseDuration <- sessionLeaseDuration ()
+    services.AddSingleton(leaseOptions) |> ignore
 
     // The Postgres registration above replaces the session store; the
     // event store is registered here, so it is only InMemory when Postgres
