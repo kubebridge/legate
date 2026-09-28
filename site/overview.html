@@ -85,13 +85,13 @@ pre,code{font-family:"JetBrains Mono",ui-monospace,monospace}
     <div style="background:oklch(18% 0.014 286);border:1px solid oklch(27.4% 0.013 286);border-radius:12px;padding:32px;overflow-x:auto">
       <div style="min-width:880px;display:flex;flex-direction:column;gap:28px">
         <div style="display:grid;grid-template-columns:1fr 120px 1fr 120px 1fr 120px 1fr;align-items:center">
-          <div style="border:1px solid oklch(37% 0.013 286);border-radius:8px;padding:16px;display:flex;flex-direction:column;gap:4px"><span style="font-size:10.5px;font-weight:600;letter-spacing:0.08em;color:oklch(55.2% 0.014 286)">HOST</span><span style="font-weight:700;font-size:16px">CLI or service</span><code style="font-size:11.5px;color:oklch(70.7% 0.013 286)">AddLegate(...)</code></div>
+          <div style="border:1px solid oklch(60% 0.1 210 / 0.55);border-radius:8px;padding:16px;display:flex;flex-direction:column;gap:4px"><span style="font-size:10.5px;font-weight:600;letter-spacing:0.08em;color:oklch(75% 0.09 210)">HOST</span><span style="font-weight:700;font-size:16px">CLI or service</span><code style="font-size:11.5px;color:oklch(70.7% 0.013 286)">AddLegate(...)</code></div>
           <div style="display:flex;flex-direction:column;align-items:center;gap:6px;padding:0 8px"><code id="edge0l" style="font-size:11px">Prompt()</code><div id="edge0" class="flowline" style="height:2px;width:100%"></div></div>
           <div style="border:1px solid oklch(52% 0.2 285 / 0.6);background:oklch(52% 0.2 285 / 0.1);border-radius:8px;padding:16px;display:flex;flex-direction:column;gap:4px"><span style="font-size:10.5px;font-weight:600;letter-spacing:0.08em;color:oklch(78% 0.12 285)">SESSION</span><span style="font-weight:700;font-size:16px">Sharded entity</span><code style="font-size:11.5px;color:oklch(70.7% 0.013 286)">inbox · lease</code></div>
           <div style="display:flex;flex-direction:column;align-items:center;gap:6px;padding:0 8px"><code id="edge1l" style="font-size:11px">claim</code><div id="edge1" class="flowline" style="height:2px;width:100%"></div></div>
           <div style="border:1px solid oklch(37% 0.013 286);border-radius:8px;padding:16px;display:flex;flex-direction:column;gap:4px"><span style="font-size:10.5px;font-weight:600;letter-spacing:0.08em;color:oklch(55.2% 0.014 286)">TURN</span><span style="font-weight:700;font-size:16px">ReAct loop</span><code style="font-size:11.5px;color:oklch(70.7% 0.013 286)">IChatClient</code></div>
           <div style="display:flex;flex-direction:column;align-items:center;gap:6px;padding:0 8px"><code id="edge2l" style="font-size:11px">call / result</code><div id="edge2" class="flowline" style="height:2px;width:100%"></div></div>
-          <div style="border:1px solid oklch(37% 0.013 286);border-radius:8px;padding:16px;display:flex;flex-direction:column;gap:4px"><span style="font-size:10.5px;font-weight:600;letter-spacing:0.08em;color:oklch(55.2% 0.014 286)">TOOLS</span><span style="font-weight:700;font-size:16px">MCP · built-ins</span><code style="font-size:11.5px;color:oklch(70.7% 0.013 286)">ask_user · exec</code></div>
+          <div style="border:1px solid oklch(70% 0.12 90 / 0.5);border-radius:8px;padding:16px;display:flex;flex-direction:column;gap:4px"><span style="font-size:10.5px;font-weight:600;letter-spacing:0.08em;color:oklch(75% 0.1 90)">TOOLS</span><span style="font-weight:700;font-size:16px">MCP · built-ins</span><code style="font-size:11.5px;color:oklch(70.7% 0.013 286)">ask_user · exec</code></div>
         </div>
         <div style="display:flex;align-items:center;gap:12px">
           <code id="edge3l" style="font-size:11px;white-space:nowrap">SessionEvent stream → host</code>
@@ -256,7 +256,7 @@ pre,code{font-family:"JetBrains Mono",ui-monospace,monospace}
 var V='oklch(72% 0.14 285)',VB='oklch(52% 0.2 285)',G='oklch(78.89% 0.12 135.4)',
     F2='oklch(87.1% 0.006 286)',F4='oklch(55.2% 0.014 286)',F5='oklch(44.2% 0.013 286)',B='oklch(27.4% 0.013 286)',
     R='oklch(68% 0.17 20)',DIMB='oklch(21% 0.013 286)';
-var JOURNAL=[['TurnStarted','turn_8f2c',V],['TextDelta','"Checking the policy"',F2],['ToolCallStarted','read_file',F2],['ToolCallCompleted','212 lines',F2],['TurnCompleted','stop',G]];
+var JOURNAL=[['TurnStarted','turn_8f2c',V],['TextDelta','"Checking the policy"','#7fd4e8'],['ToolCallStarted','read_file','#f2c879'],['ToolCallCompleted','212 lines',F2],['TurnCompleted','stop',G]];
 var STEPS=[
  ['Prompt lands in the inbox','The message is appended to the session store and the dispatcher wakes the session entity: sharded in cluster mode, a local child actor otherwise.','ISessionStore'],
  ['The turn is claimed under a lease','Exactly one owner wins. Every later side effect re-checks the opaque claim token at the last moment.','ClaimNextTurn'],
