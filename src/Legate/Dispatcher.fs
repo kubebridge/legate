@@ -466,7 +466,7 @@ module internal Dispatcher =
                                                                     current.Id,
                                                                     settlingId,
                                                                     Nullable<int64>(),
-                                                                    DateTimeOffset.UtcNow,
+                                                                    clock.GetUtcNow(),
                                                                     SessionActor.CrashFailReason
                                                                 )
                                                                 :> SessionEvent
