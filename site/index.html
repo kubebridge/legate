@@ -4,13 +4,13 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Sessions deep dive: the Legate client API</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 30 30'%3E%3Crect width='30' height='30' rx='7' fill='%236b4fd6'/%3E%3Crect x='10' y='10' width='10' height='10' transform='rotate(45 15 15)' fill='white'/%3E%3C/svg%3E">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 30 30'%3E%3Crect width='30' height='30' rx='7' fill='%236ea8ff'/%3E%3Crect x='13' y='6' width='4' height='18' fill='white'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="styles.css">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 </head>
 <body>
 <header class="nav"><div class="wrap">
-  <a class="brand" href="overview.html" aria-label="Legate home"><svg width="26" height="26" viewBox="0 0 32 32" aria-hidden="true"><path d="M8 5h6v3H8Z" fill="var(--c)"/><path d="M8 9.5h6v3H8Z" fill="var(--a)"/><path d="M8 14h6v3H8Z" fill="var(--p)"/><path d="M8 18.5h6v3H8Z" fill="var(--g)"/><path d="M8 23h17v3H8Z" fill="var(--ink)"/></svg>LEGATE</a>
+  <a class="brand" href="overview.html" aria-label="Legate home"><svg width="26" height="26" viewBox="0 0 32 32" aria-hidden="true"><path d="M9 6h3v21H9Z" fill="var(--ink)"/><path d="M12 7H25L23.4 9.4H12Z" fill="var(--logo-b)"/><path d="M12 10.2H22.87L21.27 12.6H12Z" fill="var(--logo-b)"/><path d="M12 13.4H21.27L22.87 15.8H12Z" fill="var(--logo-b)"/><path d="M12 16.6H23.4L25 19H12Z" fill="var(--logo-b)"/></svg>LEGATE</a>
   <nav class="nav-links">
     <a href="overview.html">Overview</a>
     <a class="active" href="index.html">Sessions</a>
@@ -62,11 +62,11 @@
   <div class="diagram">
     <svg viewBox="0 0 980 240" role="img" aria-label="Session state machine">
       <defs>
-        <marker id="sarr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#a394f9"/></marker>
+        <marker id="sarr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#9fb2fb"/></marker>
       </defs>
-      <rect x="40" y="80" width="170" height="80" rx="40" fill="var(--panel)" stroke="#6b4fd6" stroke-width="1.5" class="pulse"/>
+      <rect x="40" y="80" width="170" height="80" rx="40" fill="var(--panel)" stroke="#6f80f2" stroke-width="1.5" class="pulse"/>
       <text x="125" y="127" text-anchor="middle" fill="var(--ink)" font-size="17" font-weight="bold">Idle</text>
-      <rect x="405" y="80" width="170" height="80" rx="40" fill="rgba(107,79,214,0.10)" stroke="#6b4fd6" stroke-width="1.5"/>
+      <rect x="405" y="80" width="170" height="80" rx="40" fill="rgba(107,79,214,0.10)" stroke="#6f80f2" stroke-width="1.5"/>
       <text x="490" y="127" text-anchor="middle" fill="var(--ink)" font-size="17" font-weight="bold">Running</text>
       <rect x="770" y="30" width="170" height="70" rx="35" fill="var(--panel)" stroke="var(--line-soft)" stroke-width="1.5"/>
       <text x="855" y="72" text-anchor="middle" fill="var(--ink)" font-size="15" font-weight="bold">WaitingForInput</text>
@@ -110,7 +110,7 @@ TurnResult result = <span class="k">await</span> client.<span class="f">PromptAn
 </div></section>
 
 <footer><div class="wrap">
-  <a class="brand" href="overview.html" style="font-size:12px"><svg width="20" height="20" viewBox="0 0 32 32" aria-hidden="true"><path d="M8 5h6v3H8Z" fill="var(--c)"/><path d="M8 9.5h6v3H8Z" fill="var(--a)"/><path d="M8 14h6v3H8Z" fill="var(--p)"/><path d="M8 18.5h6v3H8Z" fill="var(--g)"/><path d="M8 23h17v3H8Z" fill="var(--ink)"/></svg>LEGATE</a>
+  <a class="brand" href="overview.html" style="font-size:12px"><svg width="20" height="20" viewBox="0 0 32 32" aria-hidden="true"><path d="M9 6h3v21H9Z" fill="var(--ink)"/><path d="M12 7H25L23.4 9.4H12Z" fill="var(--logo-b)"/><path d="M12 10.2H22.87L21.27 12.6H12Z" fill="var(--logo-b)"/><path d="M12 13.4H21.27L22.87 15.8H12Z" fill="var(--logo-b)"/><path d="M12 16.6H23.4L25 19H12Z" fill="var(--logo-b)"/></svg>LEGATE</a>
   <span class="spacer">A <a href="https://kubebridge.com">kubebridge</a> project · Apache 2.0</span>
   <nav><a href="https://github.com/kubebridge/legate">GitHub</a><a href="https://www.nuget.org/packages/Legate">NuGet</a><a href="https://github.com/kubebridge/legate/tree/main/Docs">Docs</a></nav>
 </div></footer>
