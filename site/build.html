@@ -10,7 +10,7 @@
 </head>
 <body>
 <header class="nav"><div class="wrap">
-  <a class="brand" href="overview.html" aria-label="Legate home"><span class="brand-mark"><i></i></span>LEGATE</a>
+  <a class="brand" href="overview.html" aria-label="Legate home"><svg width="26" height="26" viewBox="0 0 32 32" aria-hidden="true"><path d="M8 5h6v3H8Z" fill="var(--c)"/><path d="M8 9.5h6v3H8Z" fill="var(--a)"/><path d="M8 14h6v3H8Z" fill="var(--p)"/><path d="M8 18.5h6v3H8Z" fill="var(--g)"/><path d="M8 23h17v3H8Z" fill="var(--ink)"/></svg>LEGATE</a>
   <nav class="nav-links">
     <a href="overview.html">Overview</a>
     <a href="index.html">Sessions</a>
@@ -19,6 +19,7 @@
     <a href="https://github.com/kubebridge/legate/tree/main/Docs">Docs</a>
   </nav>
   <span class="ver-pill">v0.1.0</span>
+  <button class="theme-btn" type="button" aria-label="Switch color theme"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"></path></svg></button>
   <a class="github-btn" href="https://github.com/kubebridge/legate">GitHub</a>
 </div></header>
 
@@ -106,9 +107,36 @@ dotnet run --project samples/LegateCli   <span class="c"># talk to a session</sp
 </div></section>
 
 <footer><div class="wrap">
-  <a class="brand" href="overview.html" style="font-size:12px"><span class="brand-mark" style="width:20px;height:20px"><i style="width:7px;height:7px"></i></span>LEGATE</a>
-  <span class="spacer">A kubebridge project · Apache 2.0</span>
+  <a class="brand" href="overview.html" style="font-size:12px"><svg width="20" height="20" viewBox="0 0 32 32" aria-hidden="true"><path d="M8 5h6v3H8Z" fill="var(--c)"/><path d="M8 9.5h6v3H8Z" fill="var(--a)"/><path d="M8 14h6v3H8Z" fill="var(--p)"/><path d="M8 18.5h6v3H8Z" fill="var(--g)"/><path d="M8 23h17v3H8Z" fill="var(--ink)"/></svg>LEGATE</a>
+  <span class="spacer">A <a href="https://kubebridge.com">kubebridge</a> project · Apache 2.0</span>
   <nav><a href="https://github.com/kubebridge/legate">GitHub</a><a href="https://www.nuget.org/packages/Legate">NuGet</a><a href="https://github.com/kubebridge/legate/tree/main/Docs">Docs</a></nav>
 </div></footer>
+<script>
+(function(){
+var SUN='<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"></path></svg>';
+var MOON='<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"></path></svg>';
+var root=document.documentElement;
+function osLight(){return window.matchMedia&&window.matchMedia('(prefers-color-scheme: light)').matches;}
+function apply(){
+  var pref='auto';
+  try{var s=localStorage.getItem('legate-theme');if(s)pref=s;}catch(e){}
+  var resolved=pref==='auto'?(osLight()?'light':'dark'):pref;
+  if(pref==='auto')root.removeAttribute('data-theme');else root.setAttribute('data-theme',resolved);
+  var dark=resolved==='dark';
+  document.querySelectorAll('.theme-btn').forEach(function(b){
+    b.setAttribute('aria-label',dark?'Switch to light mode':'Switch to dark mode');
+    b.setAttribute('title',dark?'Switch to light mode':'Switch to dark mode');
+    b.innerHTML=dark?SUN:MOON;
+  });
+}
+document.querySelectorAll('.theme-btn').forEach(function(b){b.addEventListener('click',function(){
+  var cur=root.getAttribute('data-theme')||(osLight()?'light':'dark');
+  try{localStorage.setItem('legate-theme',cur==='dark'?'light':'dark');}catch(e){}
+  apply();
+});});
+if(window.matchMedia)window.matchMedia('(prefers-color-scheme: light)').addEventListener('change',apply);
+apply();
+})();
+</script>
 </body>
 </html>
