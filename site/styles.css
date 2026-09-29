@@ -119,6 +119,7 @@ h2.sec-title { margin: 0; font-size: clamp(32px, 4vw, 44px); line-height: 1; fon
 /* Tables */
 table.spec { width: 100%; border-collapse: collapse; font-size: 14px; }
 table.spec th, table.spec td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+table.spec tr:last-child th, table.spec tr:last-child td { border-bottom: none; }
 table.spec th { color: var(--v); font-size: 12.5px; text-transform: uppercase; letter-spacing: 1px; font-family: var(--mono); font-weight: 600; }
 table.spec td { color: var(--f3); }
 table.spec td:first-child { color: #fff; font-weight: 600; white-space: nowrap; }
