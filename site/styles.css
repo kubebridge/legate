@@ -109,19 +109,19 @@ pre, code, .mono { font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, 
   backdrop-filter: blur(10px); border-bottom: 1px solid var(--line);
 }
 .nav .wrap { display: flex; align-items: center; gap: 32px; height: 60px; }
-.brand { display: flex; align-items: center; gap: 8px; color: #fff; font-weight: 700; letter-spacing: 0.12em; font-size: 14px; }
+.brand { display: flex; align-items: center; gap: 8px; color: var(--ink); font-weight: 700; letter-spacing: 0.12em; font-size: 14px; }
 .brand svg { display: block; flex: none; }
 .nav-links { display: flex; gap: 24px; font-size: 14px; flex: 1; flex-wrap: wrap; }
 .nav-links a { color: oklch(87.1% 0.006 286); }
 .nav-links a.active { color: #fff; font-weight: 700; }
-.ver-pill { font-family: var(--mono); font-size: 11px; color: var(--f3); border: 1px solid var(--line); border-radius: 4px; padding: 4px 8px; white-space: nowrap; }
+.ver-pill { font-family: var(--mono); font-size: 11px; color: oklch(70.7% 0.013 286); border: 1px solid oklch(27.4% 0.013 286); border-radius: 4px; padding: 4px 8px; white-space: nowrap; }
 .theme-btn {
   width: 32px; height: 32px; display: grid; place-items: center; flex: none;
   background: transparent; border: 1px solid var(--line-soft); border-radius: 6px;
   color: oklch(87.1% 0.006 286); cursor: pointer; padding: 0;
 }
 .theme-btn:hover { border-color: var(--vb); color: #fff; }
-.github-btn { font-size: 13px; font-weight: 600; color: #fff !important; border: 1px solid var(--line-soft); border-radius: 6px; padding: 7px 12px; white-space: nowrap; }
+.github-btn { font-size: 13px; font-weight: 600; color: #fff !important; border: 1px solid oklch(37% 0.013 286); border-radius: 6px; padding: 7px 12px; white-space: nowrap; }
 .github-btn:hover { border-color: var(--vb); }
 
 /* Page hero */

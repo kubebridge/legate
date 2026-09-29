@@ -9,7 +9,7 @@
 <style>
 @font-face{font-family:"Exo 2";src:url("fonts/Exo2-VariableFont_wght.ttf") format("truetype-variations");font-weight:100 900;font-display:swap}
 html{scroll-behavior:smooth}
-body{margin:0;background:oklch(14.1% 0.014 286);color:#fff;font-family:"Exo 2",system-ui,sans-serif;-webkit-font-smoothing:antialiased}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:"Exo 2",system-ui,sans-serif;-webkit-font-smoothing:antialiased}
 a{color:var(--v);text-decoration:none}
 a:hover{color:oklch(80% 0.1 262)}
 pre,code{font-family:"JetBrains Mono",ui-monospace,monospace}
@@ -35,10 +35,10 @@ pre,code{font-family:"JetBrains Mono",ui-monospace,monospace}
     </a>
     <nav style="display:flex;gap:24px;font-size:14px;flex:1;flex-wrap:wrap">
       <a href="overview.html" style="color:#fff;font-weight:700">Overview</a>
-      <a href="index.html" style="color:var(--fg-2)">Sessions</a>
-      <a href="durability.html" style="color:var(--fg-2)">Durability</a>
-      <a href="build.html" style="color:var(--fg-2)">Build</a>
-      <a href="https://github.com/kubebridge/legate/tree/main/Docs" style="color:var(--fg-2)">Docs</a>
+      <a href="index.html" style="color:oklch(87.1% 0.006 286)">Sessions</a>
+      <a href="durability.html" style="color:oklch(87.1% 0.006 286)">Durability</a>
+      <a href="build.html" style="color:oklch(87.1% 0.006 286)">Build</a>
+      <a href="https://github.com/kubebridge/legate/tree/main/Docs" style="color:oklch(87.1% 0.006 286)">Docs</a>
     </nav>
     <span style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--fg-3);border:1px solid var(--line);border-radius:4px;padding:4px 8px">v0.1.0</span>
     <button class="theme-btn" type="button" aria-label="Switch color theme" style="width:32px;height:32px;display:grid;place-items:center;background:transparent;border:1px solid var(--line-2);border-radius:6px;color:var(--fg-2);cursor:pointer;padding:0;flex:none"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"></path></svg></button>
@@ -152,17 +152,17 @@ pre,code{font-family:"JetBrains Mono",ui-monospace,monospace}
     <div style="border:1px solid var(--line);border-radius:12px;background:var(--surf-2);overflow:hidden">
       <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,200px),1fr));gap:16px;padding:24px">
         <div class="nodecard" id="node0" style="border:1px solid;border-radius:8px;padding:18px;display:flex;flex-direction:column;gap:10px">
-          <div style="display:flex;justify-content:space-between;align-items:center"><code style="font-size:13px;color:#fff">legate-1</code><div class="dot" style="width:8px;height:8px;border-radius:50%"></div></div>
+          <div style="display:flex;justify-content:space-between;align-items:center"><code style="font-size:13px;color:var(--ink)">legate-1</code><div class="dot" style="width:8px;height:8px;border-radius:50%"></div></div>
           <span class="st" style="font-size:10.5px;font-weight:600;letter-spacing:0.08em">RUNNING TURN</span>
           <span style="font-size:13px;color:var(--fg-3)">Runs the turn</span>
         </div>
         <div class="nodecard" id="node1" style="border:1px solid;border-radius:8px;padding:18px;display:flex;flex-direction:column;gap:10px">
-          <div style="display:flex;justify-content:space-between;align-items:center"><code style="font-size:13px;color:#fff">legate-2</code><div class="dot" style="width:8px;height:8px;border-radius:50%"></div></div>
+          <div style="display:flex;justify-content:space-between;align-items:center"><code style="font-size:13px;color:var(--ink)">legate-2</code><div class="dot" style="width:8px;height:8px;border-radius:50%"></div></div>
           <span class="st" style="font-size:10.5px;font-weight:600;letter-spacing:0.08em">STANDBY</span>
           <span style="font-size:13px;color:var(--fg-3)">Observes, then settles</span>
         </div>
         <div class="nodecard" id="node2" style="border:1px solid;border-radius:8px;padding:18px;display:flex;flex-direction:column;gap:10px">
-          <div style="display:flex;justify-content:space-between;align-items:center"><code style="font-size:13px;color:#fff">legate-3</code><div class="dot" style="width:8px;height:8px;border-radius:50%"></div></div>
+          <div style="display:flex;justify-content:space-between;align-items:center"><code style="font-size:13px;color:var(--ink)">legate-3</code><div class="dot" style="width:8px;height:8px;border-radius:50%"></div></div>
           <span class="st" style="font-size:10.5px;font-weight:600;letter-spacing:0.08em">UP</span>
           <span style="font-size:13px;color:var(--fg-3)">Quorum witness</span>
         </div>
