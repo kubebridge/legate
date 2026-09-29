@@ -4,13 +4,13 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Sessions deep dive: the Legate client API</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 30 30'%3E%3Crect width='30' height='30' rx='7' fill='%236b4fd6'/%3E%3Crect x='10' y='10' width='10' height='10' transform='rotate(45 15 15)' fill='white'/%3E%3C/svg%3E">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 30 30'%3E%3Crect width='30' height='30' rx='7' fill='%236ea8ff'/%3E%3Crect x='13' y='6' width='4' height='18' fill='white'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="styles.css">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 </head>
 <body>
 <header class="nav"><div class="wrap">
-  <a class="brand" href="overview.html" aria-label="Legate home"><span class="brand-mark"><i></i></span>LEGATE</a>
+  <a class="brand" href="overview.html" aria-label="Legate home"><svg width="26" height="26" viewBox="0 0 32 32" aria-hidden="true"><path d="M9 6h3v21H9Z" fill="var(--ink)"/><path d="M12 7H25L23.4 9.4H12Z" fill="var(--logo-b)"/><path d="M12 10.2H22.87L21.27 12.6H12Z" fill="var(--logo-b)"/><path d="M12 13.4H21.27L22.87 15.8H12Z" fill="var(--logo-b)"/><path d="M12 16.6H23.4L25 19H12Z" fill="var(--logo-b)"/></svg>LEGATE</a>
   <nav class="nav-links">
     <a href="overview.html">Overview</a>
     <a class="active" href="index.html">Sessions</a>
@@ -19,6 +19,7 @@
     <a href="https://github.com/kubebridge/legate/tree/main/Docs">Docs</a>
   </nav>
   <span class="ver-pill">v0.1.0</span>
+  <button class="theme-btn" type="button" aria-label="Switch color theme"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"></path></svg></button>
   <a class="github-btn" href="https://github.com/kubebridge/legate">GitHub</a>
 </div></header>
 
@@ -61,16 +62,16 @@
   <div class="diagram">
     <svg viewBox="0 0 980 240" role="img" aria-label="Session state machine">
       <defs>
-        <marker id="sarr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#a394f9"/></marker>
+        <marker id="sarr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#9fb2fb"/></marker>
       </defs>
-      <rect x="40" y="80" width="170" height="80" rx="40" fill="#1a1a26" stroke="#6b4fd6" stroke-width="1.5" class="pulse"/>
-      <text x="125" y="127" text-anchor="middle" fill="#ffffff" font-size="17" font-weight="bold">Idle</text>
-      <rect x="405" y="80" width="170" height="80" rx="40" fill="rgba(107,79,214,0.10)" stroke="#6b4fd6" stroke-width="1.5"/>
-      <text x="490" y="127" text-anchor="middle" fill="#ffffff" font-size="17" font-weight="bold">Running</text>
-      <rect x="770" y="30" width="170" height="70" rx="35" fill="#1a1a26" stroke="#3a3a4d" stroke-width="1.5"/>
-      <text x="855" y="72" text-anchor="middle" fill="#ffffff" font-size="15" font-weight="bold">WaitingForInput</text>
-      <rect x="770" y="130" width="170" height="70" rx="35" fill="#1a1a26" stroke="#3a3a4d" stroke-width="1.5"/>
-      <text x="855" y="172" text-anchor="middle" fill="#ffffff" font-size="15" font-weight="bold">Closed</text>
+      <rect x="40" y="80" width="170" height="80" rx="40" fill="var(--panel)" stroke="#6f80f2" stroke-width="1.5" class="pulse"/>
+      <text x="125" y="127" text-anchor="middle" fill="var(--ink)" font-size="17" font-weight="bold">Idle</text>
+      <rect x="405" y="80" width="170" height="80" rx="40" fill="rgba(107,79,214,0.10)" stroke="#6f80f2" stroke-width="1.5"/>
+      <text x="490" y="127" text-anchor="middle" fill="var(--ink)" font-size="17" font-weight="bold">Running</text>
+      <rect x="770" y="30" width="170" height="70" rx="35" fill="var(--panel)" stroke="var(--line-soft)" stroke-width="1.5"/>
+      <text x="855" y="72" text-anchor="middle" fill="var(--ink)" font-size="15" font-weight="bold">WaitingForInput</text>
+      <rect x="770" y="130" width="170" height="70" rx="35" fill="var(--panel)" stroke="var(--line-soft)" stroke-width="1.5"/>
+      <text x="855" y="172" text-anchor="middle" fill="var(--ink)" font-size="15" font-weight="bold">Closed</text>
       <line x1="210" y1="110" x2="400" y2="110" stroke="#46c2e0" stroke-width="2" class="flow" marker-end="url(#sarr)"/>
       <text x="305" y="98" text-anchor="middle" fill="#46c2e0" font-size="12" font-family="monospace">Prompt()</text>
       <line x1="575" y1="100" x2="765" y2="65" stroke="#f0b429" stroke-width="2" class="flow" marker-end="url(#sarr)"/>
@@ -79,8 +80,8 @@
       <text x="672" y="180" text-anchor="middle" fill="#f0b429" font-size="12" font-family="monospace">settle / abort</text>
       <line x1="765" y1="85" x2="580" y2="115" stroke="#3ddc84" stroke-width="2" class="flow" marker-end="url(#sarr)"/>
       <text x="672" y="112" text-anchor="middle" fill="#3ddc84" font-size="12" font-family="monospace">Reply()</text>
-      <line x1="490" y1="160" x2="490" y2="205" stroke="#3a3a4d" stroke-width="1.5"/>
-      <text x="490" y="222" text-anchor="middle" fill="#8a8a9a" font-size="12">settle returns to Idle · AutoClose closes headless sessions</text>
+      <line x1="490" y1="160" x2="490" y2="205" stroke="var(--line-soft)" stroke-width="1.5"/>
+      <text x="490" y="222" text-anchor="middle" fill="var(--f3)" font-size="12">settle returns to Idle · AutoClose closes headless sessions</text>
     </svg>
     <div class="caption">Prompt starts, reply resumes, settle rests. Headless sessions close through the completion sink.</div>
   </div>
@@ -109,9 +110,36 @@ TurnResult result = <span class="k">await</span> client.<span class="f">PromptAn
 </div></section>
 
 <footer><div class="wrap">
-  <a class="brand" href="overview.html" style="font-size:12px"><span class="brand-mark" style="width:20px;height:20px"><i style="width:7px;height:7px"></i></span>LEGATE</a>
-  <span class="spacer">A kubebridge project · Apache 2.0</span>
+  <a class="brand" href="overview.html" style="font-size:12px"><svg width="20" height="20" viewBox="0 0 32 32" aria-hidden="true"><path d="M9 6h3v21H9Z" fill="var(--ink)"/><path d="M12 7H25L23.4 9.4H12Z" fill="var(--logo-b)"/><path d="M12 10.2H22.87L21.27 12.6H12Z" fill="var(--logo-b)"/><path d="M12 13.4H21.27L22.87 15.8H12Z" fill="var(--logo-b)"/><path d="M12 16.6H23.4L25 19H12Z" fill="var(--logo-b)"/></svg>LEGATE</a>
+  <span class="spacer">A <a href="https://kubebridge.com">kubebridge</a> project · Apache 2.0</span>
   <nav><a href="https://github.com/kubebridge/legate">GitHub</a><a href="https://www.nuget.org/packages/Legate">NuGet</a><a href="https://github.com/kubebridge/legate/tree/main/Docs">Docs</a></nav>
 </div></footer>
+<script>
+(function(){
+var SUN='<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"></path></svg>';
+var MOON='<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"></path></svg>';
+var root=document.documentElement;
+function osLight(){return window.matchMedia&&window.matchMedia('(prefers-color-scheme: light)').matches;}
+function apply(){
+  var pref='auto';
+  try{var s=localStorage.getItem('legate-theme');if(s)pref=s;}catch(e){}
+  var resolved=pref==='auto'?(osLight()?'light':'dark'):pref;
+  if(pref==='auto')root.removeAttribute('data-theme');else root.setAttribute('data-theme',resolved);
+  var dark=resolved==='dark';
+  document.querySelectorAll('.theme-btn').forEach(function(b){
+    b.setAttribute('aria-label',dark?'Switch to light mode':'Switch to dark mode');
+    b.setAttribute('title',dark?'Switch to light mode':'Switch to dark mode');
+    b.innerHTML=dark?SUN:MOON;
+  });
+}
+document.querySelectorAll('.theme-btn').forEach(function(b){b.addEventListener('click',function(){
+  var cur=root.getAttribute('data-theme')||(osLight()?'light':'dark');
+  try{localStorage.setItem('legate-theme',cur==='dark'?'light':'dark');}catch(e){}
+  apply();
+});});
+if(window.matchMedia)window.matchMedia('(prefers-color-scheme: light)').addEventListener('change',apply);
+apply();
+})();
+</script>
 </body>
 </html>
