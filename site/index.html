@@ -16,7 +16,6 @@
     <a class="active" href="index.html">Sessions</a>
     <a href="durability.html">Durability</a>
     <a href="build.html">Build</a>
-    <a href="https://github.com/kubebridge/legate/tree/main/Docs">Docs</a>
   </nav>
   <span class="ver-pill">v0.1.0</span>
   <button class="theme-btn" type="button" aria-label="Switch color theme"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"></path></svg></button>
@@ -47,9 +46,9 @@
     </table>
   </div>
   <div class="grid c3">
-    <div class="card"><h3>Queue</h3><p>Append to the inbox. The message waits its turn behind whatever is running.</p></div>
-    <div class="card"><h3>Inject</h3><p>Fold into the running turn at the next iteration boundary. Steering without aborting.</p></div>
-    <div class="card"><h3>Interrupt</h3><p>Abort the running turn and start fresh. The operator override.</p></div>
+    <div class="card accent-top"><h3>Queue</h3><p>Append to the inbox. The message waits its turn behind whatever is running.</p></div>
+    <div class="card accent-top cy"><h3>Inject</h3><p>Fold into the running turn at the next iteration boundary. Steering without aborting.</p></div>
+    <div class="card accent-top am"><h3>Interrupt</h3><p>Abort the running turn and start fresh. The operator override.</p></div>
   </div>
 </div></section>
 
@@ -112,7 +111,7 @@ TurnResult result = <span class="k">await</span> client.<span class="f">PromptAn
 <footer><div class="wrap">
   <a class="brand" href="overview.html" style="font-size:12px"><svg width="20" height="20" viewBox="0 0 32 32" aria-hidden="true"><path d="M9 6h3v21H9Z" fill="var(--ink)"/><path d="M12 7H25L23.4 9.4H12Z" fill="var(--logo-b)"/><path d="M12 10.2H22.87L21.27 12.6H12Z" fill="var(--logo-b)"/><path d="M12 13.4H21.27L22.87 15.8H12Z" fill="var(--logo-b)"/><path d="M12 16.6H23.4L25 19H12Z" fill="var(--logo-b)"/></svg>LEGATE</a>
   <span class="spacer">A <a href="https://kubebridge.com">kubebridge</a> project · Apache 2.0</span>
-  <nav><a href="https://github.com/kubebridge/legate">GitHub</a><a href="https://www.nuget.org/packages/Legate">NuGet</a><a href="https://github.com/kubebridge/legate/tree/main/Docs">Docs</a></nav>
+  <nav><a href="https://github.com/kubebridge/legate">GitHub</a><a href="https://www.nuget.org/packages/Legate">NuGet</a></nav>
 </div></footer>
 <script>
 (function(){

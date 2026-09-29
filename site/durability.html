@@ -16,7 +16,6 @@
     <a href="index.html">Sessions</a>
     <a class="active" href="durability.html">Durability</a>
     <a href="build.html">Build</a>
-    <a href="https://github.com/kubebridge/legate/tree/main/Docs">Docs</a>
   </nav>
   <span class="ver-pill">v0.1.0</span>
   <button class="theme-btn" type="button" aria-label="Switch color theme"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"></path></svg></button>
@@ -31,7 +30,7 @@
 
 <section class="block"><div class="wrap">
   <div class="sec-head">
-    <div><span class="sec-no">Fencing</span>
+    <div><span class="sec-no pk">Fencing</span>
       <h2 class="sec-title">The token is the authority</h2></div>
     <p class="sec-sub"><code>ClaimNextTurn</code> hands a turn to exactly one caller. Checkpoint, settle, abort, tool calls, and journal writes verify the opaque token store-side at the last moment. A stale token returns lost or rejected instead of acting.</p>
   </div>
@@ -48,7 +47,7 @@
       <text x="860" y="118" text-anchor="middle" fill="var(--ink)" font-size="16" font-weight="bold">Node B</text>
       <text x="860" y="142" text-anchor="middle" fill="#f2555a" font-size="13" font-weight="bold">FENCED OUT</text>
       <text x="860" y="163" text-anchor="middle" fill="var(--f3)" font-size="12" font-family="monospace">stale: rejected</text>
-      <rect x="400" y="40" width="180" height="180" rx="10" fill="rgba(107,79,214,0.10)" stroke="#6f80f2" stroke-width="1.5"/>
+      <rect x="400" y="40" width="180" height="180" rx="10" fill="rgba(111,128,242,0.10)" stroke="#6f80f2" stroke-width="1.5"/>
       <text x="490" y="82" text-anchor="middle" fill="var(--ink)" font-size="16" font-weight="bold">Turn store</text>
       <text x="490" y="105" text-anchor="middle" fill="var(--f3)" font-size="12">atomic claim</text>
       <circle cx="490" cy="148" r="20" fill="none" stroke="#6f80f2" stroke-width="2" class="pulse"/>
@@ -66,20 +65,20 @@
 
 <section class="block alt"><div class="wrap">
   <div class="sec-head">
-    <div><span class="sec-no">Journal</span>
+    <div><span class="sec-no pk">Journal</span>
       <h2 class="sec-title">Replayable by cursor</h2></div>
     <p class="sec-sub">The event journal is the audit trail and the source of <code>Subscribe</code>. Batches append under the turn claim token; the store stamps gap-free 1-based sequences, and a stale token rejects the whole batch with zero writes.</p>
   </div>
   <div class="grid c3">
-    <div class="card"><h3>Cursor replay</h3><p>Bounded pages by exclusive int64 cursor: page with <code>NextCursor</code>, end of stream, unknown session, expired journal. Subscribers resume exactly where they left off.</p></div>
-    <div class="card"><h3>Bounded by config</h3><p>Per-event bytes, per-session count and bytes, batch size. A breach throws <code>EventLimitExceededException</code> before any part of the batch lands.</p></div>
-    <div class="card"><h3>Janitor with a lease</h3><p>Journal cleanup is itself claimed (<code>TryClaimCleanup</code>, <code>CompleteCleanup</code>, <code>DeferCleanup</code>), so retention never races a live tail.</p></div>
+    <div class="card accent-top"><h3>Cursor replay</h3><p>Bounded pages by exclusive int64 cursor: page with <code>NextCursor</code>, end of stream, unknown session, expired journal. Subscribers resume exactly where they left off.</p></div>
+    <div class="card accent-top cy"><h3>Bounded by config</h3><p>Per-event bytes, per-session count and bytes, batch size. A breach throws <code>EventLimitExceededException</code> before any part of the batch lands.</p></div>
+    <div class="card accent-top am"><h3>Janitor with a lease</h3><p>Journal cleanup is itself claimed (<code>TryClaimCleanup</code>, <code>CompleteCleanup</code>, <code>DeferCleanup</code>), so retention never races a live tail.</p></div>
   </div>
 </div></section>
 
 <section class="block"><div class="wrap">
   <div class="sec-head">
-    <div><span class="sec-no">The saga</span>
+    <div><span class="sec-no pk">The saga</span>
       <h2 class="sec-title">Four issues, one green smoke</h2></div>
     <p class="sec-sub">Each layer of the crash-resume proof exposed the next, and each shipped with its own tests. The animated loop on the overview is this story compressed.</p>
   </div>
@@ -93,7 +92,7 @@
 
 <section class="block alt"><div class="wrap">
   <div class="sec-head">
-    <div><span class="sec-no">Cluster</span>
+    <div><span class="sec-no pk">Cluster</span>
       <h2 class="sec-title">Same logic, sharded</h2></div>
     <p class="sec-sub">Actor logic is shared between single-node and clustered mode; translation happens at the serialization boundary. The bar: core builds and tests with no external services.</p>
   </div>
@@ -112,7 +111,7 @@
 <footer><div class="wrap">
   <a class="brand" href="overview.html" style="font-size:12px"><svg width="20" height="20" viewBox="0 0 32 32" aria-hidden="true"><path d="M9 6h3v21H9Z" fill="var(--ink)"/><path d="M12 7H25L23.4 9.4H12Z" fill="var(--logo-b)"/><path d="M12 10.2H22.87L21.27 12.6H12Z" fill="var(--logo-b)"/><path d="M12 13.4H21.27L22.87 15.8H12Z" fill="var(--logo-b)"/><path d="M12 16.6H23.4L25 19H12Z" fill="var(--logo-b)"/></svg>LEGATE</a>
   <span class="spacer">A <a href="https://kubebridge.com">kubebridge</a> project · Apache 2.0</span>
-  <nav><a href="https://github.com/kubebridge/legate">GitHub</a><a href="https://www.nuget.org/packages/Legate">NuGet</a><a href="https://github.com/kubebridge/legate/tree/main/Docs">Docs</a></nav>
+  <nav><a href="https://github.com/kubebridge/legate">GitHub</a><a href="https://www.nuget.org/packages/Legate">NuGet</a></nav>
 </div></footer>
 <script>
 (function(){
