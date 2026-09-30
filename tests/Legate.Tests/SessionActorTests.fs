@@ -1088,7 +1088,7 @@ type private ScriptSuspendRunner(first: TurnLoop.TurnLoopCompletion, second: Tur
 
     /// The runner as the suspendable delegate.
     member _.Func: SessionActor.SuspendableRunner =
-        fun _ attempt _ cursor reply _ _ _ _ ->
+        fun _ attempt _ cursor reply _ _ _ _ _ _ ->
             attempts.Add(attempt)
             cursors.Add(cursor)
             replies.Add(reply)
@@ -3417,7 +3417,7 @@ type private GatedSuspendRunner(second: TurnLoop.TurnLoopCompletion) =
     member _.Release() = gate.TrySetResult(second) |> ignore
 
     member _.Func: SessionActor.SuspendableRunner =
-        fun _ attempt _ _ _ _ _ _ _ ->
+        fun _ attempt _ _ _ _ _ _ _ _ _ ->
             attempts.Add(attempt)
             calls <- calls + 1
 
@@ -5026,7 +5026,7 @@ type private EchoTurnRunner(makeResult: TurnResult) =
 
     /// The runner as the suspendable delegate.
     member _.Func: SessionActor.SuspendableRunner =
-        fun _ _ _ _ _ _ _ _ turnId ->
+        fun _ _ _ _ _ _ _ _ _ _ turnId ->
             seen.Add(turnId)
 
             Task.FromResult(
@@ -5128,7 +5128,7 @@ let ``Faulted turn journals one terminal event and settles Idle`` () =
     let seen = ResizeArray<TurnId>()
 
     let runner: SessionActor.SuspendableRunner =
-        fun _ _ _ _ _ _ _ _ turnId ->
+        fun _ _ _ _ _ _ _ _ _ _ turnId ->
             seen.Add(turnId)
 
             if seen.Count = 1 then
@@ -5195,7 +5195,7 @@ let ``Suspended turn journals nothing until the resumed turn settles under the o
     let seen = ResizeArray<TurnId>()
 
     let runner: SessionActor.SuspendableRunner =
-        fun _ _ _ cursor reply _ _ _ turnId ->
+        fun _ _ _ cursor reply _ _ _ _ _ turnId ->
             seen.Add(turnId)
 
             match cursor, reply with

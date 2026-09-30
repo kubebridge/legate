@@ -269,6 +269,109 @@ type internal SessionActorProps =
 // ──────────────────────────────────────────────────────────────────────────
 // Behaviour
 
+/// The fenced journal appends for facade-driven turns (issue 321):
+/// testable wrappers around the fenced writer mirroring
+/// journalTurnStartedAsync. Extracted so wrapper-level fencing tests drive
+/// the same mapping the live actor uses: a stale-token rejection raises
+/// TurnLeaseLostException so the takeover loser stops with zero effects; a
+/// failed write returns silently and the turn proceeds (best-effort
+/// observability).
+module internal SessionJournal =
+
+    /// Journals one cumulative usage checkpoint for a facade-driven turn
+    /// (issue 321): a UsageEvent carrying the turn's accumulated totals
+    /// under the given journal token through the fenced writer.
+    /// <param name="eventStore">The journal the checkpoint appends to.</param>
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="sessionId">The session whose journal appends.</param>
+    /// <param name="token">The journal token snapshot fencing the write.</param>
+    /// <param name="turnId">The turn the usage was checkpointed for.</param>
+    /// <param name="inputTokens">The input tokens the turn had consumed.</param>
+    /// <param name="outputTokens">The output tokens the turn had produced.</param>
+    /// <param name="cancellationToken">Abandons the append.</param>
+    let journalUsageAsync
+        (eventStore: ISessionEventStore)
+        (tenant: TenantId)
+        (sessionId: SessionId)
+        (token: string)
+        (turnId: TurnId)
+        (inputTokens: int64)
+        (outputTokens: int64)
+        (cancellationToken: CancellationToken)
+        : Task<unit> =
+        task {
+            let checkpoint =
+                UsageEvent(
+                    sessionId,
+                    turnId,
+                    Unchecked.defaultof<Nullable<int64>>,
+                    DateTimeOffset.UtcNow,
+                    inputTokens,
+                    outputTokens
+                )
+                :> SessionEvent
+
+            let batch =
+                ResizeArray<SessionEvent>([| checkpoint |]) :> IReadOnlyList<SessionEvent>
+
+            match! JournalWriter.appendWithTokenAsync eventStore tenant sessionId token batch cancellationToken with
+            | JournalWriter.JournalAppended _ -> ()
+            | JournalWriter.JournalRejected _ -> return raise (TurnLoop.TurnLeaseLostException())
+            | JournalWriter.JournalFailed _ -> ()
+        }
+
+    /// Journals one skill load for a facade-driven turn (issue 321): the
+    /// SkillLoadedEvent the SkillTool's onLoaded carried, re-keyed under
+    /// the running turn when the tool was bound with a stale id, through
+    /// the fenced writer.
+    /// <param name="eventStore">The journal the event appends to.</param>
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="sessionId">The session whose journal appends.</param>
+    /// <param name="token">The journal token snapshot fencing the write.</param>
+    /// <param name="turnId">The running turn the load ran inside.</param>
+    /// <param name="loaded">The loaded event the tool reported.</param>
+    /// <param name="cancellationToken">Abandons the append.</param>
+    let journalSkillLoadedAsync
+        (eventStore: ISessionEventStore)
+        (tenant: TenantId)
+        (sessionId: SessionId)
+        (token: string)
+        (turnId: TurnId)
+        (loaded: SkillLoadedEvent)
+        (cancellationToken: CancellationToken)
+        : Task<unit> =
+        task {
+            let companions =
+                if isNull (box loaded) || isNull (box loaded.Companions) then
+                    ResizeArray<string>() :> IReadOnlyList<string>
+                else
+                    loaded.Companions
+
+            let skillName =
+                if isNull (box loaded) || isNull (box loaded.SkillName) then
+                    ""
+                else
+                    loaded.SkillName
+
+            let event =
+                SkillLoadedEvent(
+                    sessionId,
+                    turnId,
+                    Unchecked.defaultof<Nullable<int64>>,
+                    DateTimeOffset.UtcNow,
+                    skillName,
+                    companions
+                )
+                :> SessionEvent
+
+            let batch = ResizeArray<SessionEvent>([| event |]) :> IReadOnlyList<SessionEvent>
+
+            match! JournalWriter.appendWithTokenAsync eventStore tenant sessionId token batch cancellationToken with
+            | JournalWriter.JournalAppended _ -> ()
+            | JournalWriter.JournalRejected _ -> return raise (TurnLoop.TurnLeaseLostException())
+            | JournalWriter.JournalFailed _ -> ()
+        }
+
 /// The session actor behaviour and its client boundary. Internal so no Akka
 /// type ever crosses the public API.
 module internal SessionActor =
@@ -1822,11 +1925,16 @@ module internal SessionActor =
     /// resumption note) on crash-resume activation and is None elsewhere:
     /// a seeded run leads its runner history input with the seed instead
     /// of the entry-derived message. The in-call marker hook (issue 284)
-    /// rides second to last: Some journals the fenced TurnStartedEvent at the first
+    /// rides fourth to last: Some journals the fenced TurnStartedEvent at the first
     /// provider-call entry, None journals nothing (resumes already marked
-    /// before they suspended). The turn id rides last (issue 289): the
-    /// actor-supplied loop-run id the marker, the completion, and the
-    /// settle choke points all key on. Tests inject scripted runners; the
+    /// before they suspended). The usage-checkpoint hook (issue 321) rides
+    /// third to last and the skill-load hook second to last: Some journals
+    /// the fenced UsageEvent at iteration boundaries plus settle and the
+    /// fenced SkillLoadedEvent per successful load, None journals nothing.
+    /// Resumes carry usage and skill hooks (post-resume work checkpoints)
+    /// while OnTurnStarted stays None there. The turn id rides last (issue
+    /// 289): the actor-supplied loop-run id the marker, the completion, and
+    /// the settle choke points all key on. Tests inject scripted runners; the
     /// TurnLoop-backed runner wires
     /// TurnLoop.runSuspendableAsync plus the resume continuations.
     type SuspendableRunner =
@@ -1838,6 +1946,8 @@ module internal SessionActor =
             -> IList<ChatMessage> option
             -> CancellationToken
             -> TurnLoop.TurnStartedHook option
+            -> TurnLoop.UsageCheckpointHook option
+            -> TurnLoop.SkillLoadedHook option
             -> TurnId
             -> Task<TurnLoop.TurnLoopCompletion>
 
@@ -3408,6 +3518,33 @@ module internal SessionActor =
                         turnId
                         cancellationToken)
 
+            // Usage and skill hooks (issue 321): fenced under the same token
+            // snapshot, so a takeover loser journals nothing for either kind.
+            // Fresh runs carry all three; resumes carry usage and skill but
+            // no marker (see resumeSuspendable).
+            let onUsageCheckpoint: TurnLoop.UsageCheckpointHook option =
+                Some(fun inputTokens outputTokens cancellationToken ->
+                    SessionJournal.journalUsageAsync
+                        suspend.EventStore
+                        props.Tenant
+                        props.SessionId
+                        markerToken
+                        runTurnId
+                        inputTokens
+                        outputTokens
+                        cancellationToken)
+
+            let onSkillLoaded: TurnLoop.SkillLoadedHook option =
+                Some(fun loaded cancellationToken ->
+                    SessionJournal.journalSkillLoadedAsync
+                        suspend.EventStore
+                        props.Tenant
+                        props.SessionId
+                        markerToken
+                        runTurnId
+                        loaded
+                        cancellationToken)
+
             // None when the runner never started (a synchronously throwing
             // or null-returning runner faults before any mint): the fault
             // handler then falls back to the turn cell and the snapshot.
@@ -3425,6 +3562,8 @@ module internal SessionActor =
                             seed
                             CancellationToken.None
                             onTurnStarted
+                            onUsageCheckpoint
+                            onSkillLoaded
                             runTurnId
 
                     if isNull (box started) then
@@ -3473,6 +3612,36 @@ module internal SessionActor =
             // the same id the marker journaled.
             runningTurnId <- Some parked.TurnId
 
+            // Resumes already marked before they suspended (no marker), but
+            // post-resume iteration boundaries and settles still checkpoint
+            // usage and post-resume skill loads still journal (issue 321),
+            // fenced under the live token so a takeover loser journals
+            // nothing.
+            let resumeToken = journalToken
+
+            let onUsageResumed: TurnLoop.UsageCheckpointHook option =
+                Some(fun inputTokens outputTokens cancellationToken ->
+                    SessionJournal.journalUsageAsync
+                        suspend.EventStore
+                        props.Tenant
+                        props.SessionId
+                        resumeToken
+                        parked.TurnId
+                        inputTokens
+                        outputTokens
+                        cancellationToken)
+
+            let onSkillResumed: TurnLoop.SkillLoadedHook option =
+                Some(fun loaded cancellationToken ->
+                    SessionJournal.journalSkillLoadedAsync
+                        suspend.EventStore
+                        props.Tenant
+                        props.SessionId
+                        resumeToken
+                        parked.TurnId
+                        loaded
+                        cancellationToken)
+
             let mutable faultTurnId: TurnId option = Some parked.TurnId
 
             let runTask =
@@ -3489,6 +3658,8 @@ module internal SessionActor =
                             // A resumed turn already marked before it
                             // suspended: no marker on resume.
                             None
+                            onUsageResumed
+                            onSkillResumed
                             parked.TurnId
 
                     if isNull (box started) then

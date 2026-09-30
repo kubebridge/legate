@@ -2155,3 +2155,95 @@ let ``Turn loop logs carry all six scopes and redact tool secrets`` () =
             entry.Scopes |> List.exists (fun (name, _) -> name = key) |> should equal true
 
         entry.Text.Contains(secret) |> should equal false
+
+// ──────────────────────────────────────────────────────────────────────────
+// Usage checkpoints (issue 321): cumulative totals at boundaries plus settle
+
+[<Fact>]
+let ``Usage checkpoints fire cumulative totals at iteration boundaries and settle`` () =
+    let invocations = ref []
+    let fn = stubTool "lookup" "out" invocations
+
+    let firstCalls =
+        ResizeArray<ScriptToolCall>([| ScriptToolCall("c1", "lookup") |]) :> IReadOnlyList<ScriptToolCall>
+
+    let client =
+        scripted
+            [
+                ScriptStep.ToolCalls(firstCalls, 10L, 5L)
+                ScriptStep.Text("done", 3L, 2L)
+            ]
+
+    let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+    let seen = ResizeArray<int64 * int64>()
+
+    let options =
+        { TurnLoop.TurnLoopOptions.Default with
+            OnUsageCheckpoint =
+                Some(fun input output _ ->
+                    seen.Add((input, output))
+                    Task.FromResult(()))
+        }
+
+    let completion =
+        TurnLoop.runSuspendableAsync
+            (client :> IChatClient)
+            history
+            (makeTools [ "lookup", fn ])
+            options
+            (NeverDelay() :> ILlmDelay)
+            CancellationToken.None
+            alwaysLeased
+            (fun () -> ResizeArray<InboxEntry>() :> IReadOnlyList<InboxEntry>)
+            ignore
+            ignore
+            (Unchecked.defaultof<IPermissionPolicy>)
+            (SessionId.New())
+            (TurnId.New())
+            None
+            (HashSet<string>())
+        |> fun task -> task.GetAwaiter().GetResult()
+
+    completion.Result.Status |> should equal TurnStatus.Completed
+    completion.Result.Usage.InputTokens |> should equal 13L
+    completion.Result.Usage.OutputTokens |> should equal 7L
+
+    // One boundary checkpoint after the first iteration plus one settle
+    // checkpoint with the final totals; the zero-zero first boundary skips.
+    seen |> List.ofSeq |> should equal [ (10L, 5L); (13L, 7L) ]
+
+[<Fact>]
+let ``Usage checkpoints skip when the turn spends nothing`` () =
+    let client = scripted [ textStep "done" ]
+    let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+    let seen = ResizeArray<int64 * int64>()
+
+    let options =
+        { TurnLoop.TurnLoopOptions.Default with
+            OnUsageCheckpoint =
+                Some(fun input output _ ->
+                    seen.Add((input, output))
+                    Task.FromResult(()))
+        }
+
+    let completion =
+        TurnLoop.runSuspendableAsync
+            (client :> IChatClient)
+            history
+            (makeTools [])
+            options
+            (NeverDelay() :> ILlmDelay)
+            CancellationToken.None
+            alwaysLeased
+            (fun () -> ResizeArray<InboxEntry>() :> IReadOnlyList<InboxEntry>)
+            ignore
+            ignore
+            (Unchecked.defaultof<IPermissionPolicy>)
+            (SessionId.New())
+            (TurnId.New())
+            None
+            (HashSet<string>())
+        |> fun task -> task.GetAwaiter().GetResult()
+
+    completion.Result.Status |> should equal TurnStatus.Completed
+    seen.Count |> should equal 0

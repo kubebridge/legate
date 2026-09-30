@@ -148,7 +148,46 @@ module internal SessionPermissions =
                 with _ ->
                     ()
 
-        fun entry _attempt allowed cursor reply seed runnerToken onTurnStarted turnId ->
+        /// Binds the running turn's skill journal hook into the pre-built
+        /// tool map (issue 321): hosts build the skill tool once per
+        /// session with a log-only onLoaded, so the runner rebinds it per
+        /// turn to the fenced journal callback, preserving the host
+        /// callback and re-keying under the running turn. Reads the merged
+        /// OnSkillLoaded hook, so the TurnLoop option is consumed in the
+        /// runner rather than staying write-only. Non-skill maps and
+        /// non-SkillFunction entries pass through untouched.
+        /// <param name="tools">The pre-built session tool map.</param>
+        /// <param name="turnId">The running turn the load runs inside.</param>
+        /// <param name="hook">The merged skill-load journal hook, or None.</param>
+        /// <returns>The tool map the turn runs with.</returns>
+        let bindSkillHook
+            (tools: IReadOnlyDictionary<string, AITool>)
+            (turnId: TurnId)
+            (hook: TurnLoop.SkillLoadedHook option)
+            : IReadOnlyDictionary<string, AITool> =
+            match hook with
+            | None -> tools
+            | Some journal ->
+                if isNull (box tools) then
+                    tools
+                elif not (tools.ContainsKey SkillTool.ToolName) then
+                    tools
+                else
+                    let current = tools[SkillTool.ToolName]
+
+                    let callback =
+                        Func<SkillLoadedEvent, Task>(fun loaded -> journal loaded CancellationToken.None)
+
+                    let rebound = SkillTool.TryBindJournalHook(current, turnId, callback)
+
+                    if Object.ReferenceEquals(rebound, current) then
+                        tools
+                    else
+                        let table = Dictionary<string, AITool>(tools, StringComparer.Ordinal)
+                        table[SkillTool.ToolName] <- rebound
+                        table :> IReadOnlyDictionary<string, AITool>
+
+        fun entry _attempt allowed cursor reply seed runnerToken onTurnStarted onUsageCheckpoint onSkillLoaded turnId ->
             let tools, loopOptions = resolveInputs entry
 
             // Fail fast outside the task computation: a null tool set or
@@ -199,16 +238,27 @@ module internal SessionPermissions =
                         let! systemPrompt = resolveSystem ()
                         let history = historyOf entry systemPrompt seed
 
+                        // Fresh runs mark at the first provider-call entry
+                        // through the behavior-supplied hook and checkpoint
+                        // usage plus skill loads through the fenced journal
+                        // hooks (issue 321). The skill map rebinds per turn
+                        // so the pre-built host tool journals under the
+                        // running claim.
+                        let merged =
+                            { loopOptions with
+                                OnTurnStarted = onTurnStarted
+                                OnUsageCheckpoint = onUsageCheckpoint
+                                OnSkillLoaded = onSkillLoaded
+                            }
+
+                        let boundTools = bindSkillHook tools turnId merged.OnSkillLoaded
+
                         return!
                             TurnLoop.runSuspendableAsync
                                 client
                                 history
-                                tools
-                                // Fresh runs mark at the first provider-call
-                                // entry through the behavior-supplied hook.
-                                { loopOptions with
-                                    OnTurnStarted = onTurnStarted
-                                }
+                                boundTools
+                                merged
                                 loopDelay
                                 runnerToken
                                 (fun () -> true)
@@ -235,36 +285,54 @@ module internal SessionPermissions =
                         let resume = live.Nested.Value
                         return! resume.ResumeAsync reply runnerToken
                     | Some live, Some(:? PermissionDecision as decision) ->
+                        // Resumes already marked before they suspended: never
+                        // mark on resume, but carry the usage and skill hooks
+                        // so post-resume work checkpoints and loads journal
+                        // (issue 321), with the skill map rebound per turn.
+                        let merged =
+                            { loopOptions with
+                                OnTurnStarted = None
+                                OnUsageCheckpoint = onUsageCheckpoint
+                                OnSkillLoaded = onSkillLoaded
+                            }
+
+                        let boundTools = bindSkillHook tools turnId merged.OnSkillLoaded
+
                         return!
                             TurnLoop.resumePermissionAsync
                                 live
                                 decision.Decision
                                 client
                                 live.HistorySnapshot
-                                tools
-                                // Resumes already marked before they
-                                // suspended: never mark on resume.
-                                { loopOptions with
-                                    OnTurnStarted = None
-                                }
+                                boundTools
+                                merged
                                 loopDelay
                                 runnerToken
                                 (fun () -> true)
                                 gate
                                 allowed
                     | Some live, Some(:? QuestionAnswer as answer) ->
+                        // Resumes already marked before they suspended: never
+                        // mark on resume, but carry the usage and skill hooks
+                        // so post-resume work checkpoints and loads journal
+                        // (issue 321), with the skill map rebound per turn.
+                        let merged =
+                            { loopOptions with
+                                OnTurnStarted = None
+                                OnUsageCheckpoint = onUsageCheckpoint
+                                OnSkillLoaded = onSkillLoaded
+                            }
+
+                        let boundTools = bindSkillHook tools turnId merged.OnSkillLoaded
+
                         return!
                             TurnLoop.resumeQuestionAsync
                                 live
                                 answer.Answer
                                 client
                                 live.HistorySnapshot
-                                tools
-                                // Resumes already marked before they
-                                // suspended: never mark on resume.
-                                { loopOptions with
-                                    OnTurnStarted = None
-                                }
+                                boundTools
+                                merged
                                 loopDelay
                                 runnerToken
                                 (fun () -> true)
@@ -276,16 +344,25 @@ module internal SessionPermissions =
                         let! rebuildPrompt = resolveSystem ()
                         let history = historyOf entry rebuildPrompt seed
 
+                        // Retries run under the supplied turn id: mark at the
+                        // first provider-call entry and carry the usage and
+                        // skill hooks (issue 321), with the skill map rebound
+                        // per turn.
+                        let merged =
+                            { loopOptions with
+                                OnTurnStarted = onTurnStarted
+                                OnUsageCheckpoint = onUsageCheckpoint
+                                OnSkillLoaded = onSkillLoaded
+                            }
+
+                        let boundTools = bindSkillHook tools turnId merged.OnSkillLoaded
+
                         return!
                             TurnLoop.runSuspendableAsync
                                 client
                                 history
-                                tools
-                                // Retries run under the supplied turn id: mark
-                                // at the first provider-call entry.
-                                { loopOptions with
-                                    OnTurnStarted = onTurnStarted
-                                }
+                                boundTools
+                                merged
                                 loopDelay
                                 runnerToken
                                 (fun () -> true)
