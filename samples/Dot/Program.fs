@@ -105,19 +105,28 @@ type DotStart =
         Ask: bool
         /// MCP config file to attach extra tools from, or null for none.
         McpPath: string | null
+        /// One-shot query for -p|--print, or null for the REPL. Runs one
+        /// Headless-shaped turn (PromptAndWaitAsync with the Headless exit
+        /// map) instead of entering the REPL.
+        Print: string | null
+        /// Output shape for the one-shot path: "text" prints only the final
+        /// answer to stdout, "json" streams session events as JSONL to
+        /// stdout with diagnostics on stderr. Ignored without -p|--print.
+        Mode: string
     }
 
 /// Builds the --help text over the resolved database path: usage, session
 /// storage, the provider and model flags with the default order, the
-/// unsandboxed workspace with its container-sandboxing expectation, and
-/// the --ask escape.
+/// unsandboxed workspace with its container-sandboxing expectation,
+/// the --ask escape, and the one-shot print/JSON modes.
 /// <param name="dbPath">The resolved database file path.</param>
 /// <returns>The usage text.</returns>
 let private helpText (dbPath: string) : string =
-    "Usage: Dot [--provider <id>] [--model <provider/model>] [--resume <session-id>] [--sessions|--list] [--scripted] [--wait-minutes <n>] [--ask] [--mcp <path>] "
+    "Usage: Dot [--provider <id>] [--model <provider/model>] [--resume <session-id>] [--sessions|--list] [-p|--print <query>] [--mode text|json] [--scripted] [--wait-minutes <n>] [--ask] [--mcp <path>] "
     + storageHelp dbPath
     + " Providers anthropic, openai, and google register only when ANTHROPIC_API_KEY, OPENAI_API_KEY, or GOOGLE_API_KEY is set (keys flow from the environment through Legate:Llm:Providers:<id>:ApiKey binding only, never printed or persisted). With exactly one key set dot just works; with several, --provider picks, else the default order anthropic, openai, google wins; --model <provider/model> overrides the model (--provider/--model apply to live mode; --scripted pins the scripted transport). /model lists the options mid-session and switches without losing the transcript. "
-    + " Tools run against the working directory through the host-directory runtime with no sandbox: sandbox the run in a container (as pi does) or pass --ask for per-call approval (allow once, allow for session, deny). The workspace root fence stays on in every mode."
+    + " Tools run against the working directory through the host-directory runtime with no sandbox: sandbox the run in a container (as pi does) or pass --ask for per-call approval (allow once, allow for session, deny). The workspace root fence stays on in every mode. "
+    + " One-shot print: -p|--print <query> runs one Headless-shaped turn (PromptAndWaitAsync under --wait-minutes with the Dot agent) instead of the REPL, printing only the final answer to stdout and exiting 0 completed, 2 aborted, 1 failed, 3 anything else (--resume attaches instead of opening; --sessions still lists). JSON stream: --mode json with -p streams session events as JSONL to stdout (one $type-polymorphic event per line, DotExport options) for scripting as dot --mode json -p \"<query>\" | <jsonl-parser>, with every human diagnostic on stderr; without -p --mode is ignored and the REPL runs in text."
 
 /// Parses the dot arguments into a start plan. Unknown flags fail with a
 /// usage error naming the flag; missing values fail naming the flag.
@@ -132,6 +141,8 @@ let parseArgs (argv: string[]) : DotStart =
     let mutable waitMinutes = 5.0
     let mutable ask = false
     let mutable mcp: string | null = null
+    let mutable print: string | null = null
+    let mutable mode = "text"
 
     let mutable index = 0
 
@@ -150,6 +161,17 @@ let parseArgs (argv: string[]) : DotStart =
         | "--resume" -> resume <- take "--resume"
         | "--sessions"
         | "--list" -> listSessions <- true
+        | "-p"
+        | "--print" -> print <- take "-p"
+        | "--mode" ->
+            let raw = take "--mode"
+
+            if String.Equals(raw, "text", StringComparison.OrdinalIgnoreCase) then
+                mode <- "text"
+            elif String.Equals(raw, "json", StringComparison.OrdinalIgnoreCase) then
+                mode <- "json"
+            else
+                raise (ArgumentException("The --mode flag needs text or json (--mode text|json).", "--mode"))
         | "--scripted" -> scripted <- true
         | "--wait-minutes" ->
             let raw = take "--wait-minutes"
@@ -196,6 +218,13 @@ let parseArgs (argv: string[]) : DotStart =
             raise (ArgumentException("The --mcp flag needs a non-empty config path.", "--mcp"))
         | raw -> raw.Trim()
 
+    let printValue: string | null =
+        match print with
+        | null -> null
+        | raw when String.IsNullOrWhiteSpace raw ->
+            raise (ArgumentException("The -p flag needs a non-empty query.", "-p"))
+        | raw -> raw.Trim()
+
     {
         Scripted = scripted
         Provider = providerValue
@@ -205,6 +234,8 @@ let parseArgs (argv: string[]) : DotStart =
         WaitMinutes = waitMinutes
         Ask = ask
         McpPath = mcpValue
+        Print = printValue
+        Mode = mode
     }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -745,6 +776,319 @@ let private listSessionsAsync (client: SessionClient) (cancellationToken: Cancel
         return 0
     }
 
+// ──────────────────────────────────────────────────────────────────────────
+// One-shot print/JSON (issue 310)
+
+/// The exit code for a settled turn result: 0 when the turn completed, 2
+/// when the host aborted it, 1 when it failed, 3 for anything else. Copies
+/// the samples/Headless map verbatim, including the 3-else branch, so
+/// exit-code drift is a copy-paste diff.
+/// <param name="status">The settled turn status.</param>
+/// <returns>The process exit code.</returns>
+let private exitFor (status: TurnStatus) : int =
+    match status with
+    | TurnStatus.Completed -> 0
+    | TurnStatus.Aborted -> 2
+    | TurnStatus.Failed -> 1
+    | TurnStatus.Pending
+    | TurnStatus.Running
+    | TurnStatus.Suspended
+    | _ -> 3
+
+/// Opens the one-shot session: the Dot agent row, durable SQLite, the
+/// resolved host instruction files, and the --wait-minutes timeout so
+/// PromptAndWaitAsync runs under the flag. No AutoClose: the session stays
+/// durable for --sessions/--resume like the REPL.
+/// <param name="client">The session client.</param>
+/// <param name="agentId">The model-carrying agent the session converses with.</param>
+/// <param name="waitBound">The settle wait bound from --wait-minutes.</param>
+/// <param name="cancellationToken">Abandons the open.</param>
+/// <returns>The opened session.</returns>
+let private openPrintSessionAsync
+    (client: SessionClient)
+    (agentId: AgentId)
+    (waitBound: TimeSpan)
+    (cancellationToken: CancellationToken)
+    : Task<Session> =
+    task {
+        let options = SessionOptions()
+        options.Title <- "dot -p"
+        options.HostInstructionFiles <- DotContext.resolveHostInstructionFiles Environment.CurrentDirectory
+        options.Timeout <- Nullable<TimeSpan>(waitBound)
+        return! SessionClientOperations.OpenSessionAsync(client, agentId, options, cancellationToken)
+    }
+
+/// Resolves the one-shot session: opens a new print session, or attaches
+/// the --resume session after probing its journal. The probe throws
+/// SessionNotFoundException for unknown ids, so scripting fails instead of
+/// silently opening a new session.
+/// <param name="client">The session client.</param>
+/// <param name="agentId">The model-carrying agent new sessions converse with.</param>
+/// <param name="start">The start plan: resume pick and wait bound.</param>
+/// <param name="waitBound">The settle wait bound from --wait-minutes.</param>
+/// <param name="cancellationToken">Abandons the resolve.</param>
+/// <returns>The session id and the exclusive event cursor before the turn.</returns>
+let private resolvePrintSessionAsync
+    (client: SessionClient)
+    (agentId: AgentId)
+    (start: DotStart)
+    (waitBound: TimeSpan)
+    (cancellationToken: CancellationToken)
+    : Task<SessionId * int64> =
+    task {
+        match start.Resume with
+        | null ->
+            let! created = openPrintSessionAsync client agentId waitBound cancellationToken
+            return created.Id, 0L
+        | resumeText ->
+            let trimmed = resumeText.Trim()
+            let mutable parsed = Unchecked.defaultof<SessionId>
+
+            if not (SessionId.TryParse(trimmed, &parsed)) then
+                raise (ArgumentException($"The --resume value '{trimmed}' is not a session id.", "--resume"))
+
+            let! events = DotExport.readAllEventsAsync client parsed cancellationToken
+            let mutable cursor = 0L
+
+            if not (isNull (box events)) then
+                for evt in events do
+                    if not (isNull (box evt)) && evt.Sequence.HasValue && evt.Sequence.Value > cursor then
+                        cursor <- evt.Sequence.Value
+
+            return parsed, cursor
+    }
+
+/// True when the event terminates the one-shot turn.
+let private isPrintTerminal (evt: SessionEvent) : bool =
+    not (isNull (box evt))
+    && (evt :? TurnCompletedEvent || evt :? TurnAbortedEvent || evt :? TurnFailedEvent)
+
+/// Runs the -p one-shot in text mode: one PromptAndWaitAsync turn, only the
+/// final answer on stdout, SESSION/RESULT diagnostics on stderr, Headless
+/// exit map.
+/// <param name="client">The session client.</param>
+/// <param name="sessionId">The session to prompt.</param>
+/// <param name="query">The one-shot query. Must not be empty.</param>
+/// <returns>The process exit code.</returns>
+let private runPrintTextAsync (client: SessionClient) (sessionId: SessionId) (query: string) : Task<int> =
+    task {
+        try
+            let! result =
+                SessionClientExtensions.PromptAndWaitAsync(
+                    client,
+                    sessionId,
+                    UserMessage.Text query,
+                    CancellationToken.None
+                )
+
+            Console.Error.WriteLine($"SESSION {sessionId}")
+            Console.Error.WriteLine($"RESULT {result.Status}")
+
+            if not (isNull (box result.AssistantText)) then
+                Console.Out.WriteLine(result.AssistantText)
+                Console.Out.Flush()
+
+            return exitFor result.Status
+        with
+        | :? DeadlineExceededException as exceeded ->
+            Console.Error.WriteLine($"dot: DEADLINE {exceeded.Message} (the turn keeps running).")
+            return 1
+        | :? PermissionApprovalRequiredException as suspended ->
+            Console.Error.WriteLine(
+                $"dot: the turn needs approval for tool '{suspended.ToolName}' (request {suspended.RequestId}): answer in the REPL or rerun without --ask."
+            )
+
+            return 1
+        | error ->
+            Console.Error.WriteLine($"dot: {error.Message}")
+            return 1
+    }
+
+/// Runs the -p one-shot in JSON mode: streams session events from the
+/// pre-turn cursor as JSONL on stdout (one $type-polymorphic event per
+/// line, DotExport options) while PromptAndWaitAsync settles the turn, with
+/// every human diagnostic on stderr. Stdout stays pure JSONL so
+/// dot --mode json -p "<query>" | <jsonl-parser> proves scriptability.
+/// <param name="client">The session client.</param>
+/// <param name="sessionId">The session to prompt.</param>
+/// <param name="startCursor">The exclusive cursor before the turn.</param>
+/// <param name="query">The one-shot query. Must not be empty.</param>
+/// <returns>The process exit code.</returns>
+let private runPrintJsonAsync
+    (client: SessionClient)
+    (sessionId: SessionId)
+    (startCursor: int64)
+    (query: string)
+    : Task<int> =
+    task {
+        use streamCts = new CancellationTokenSource()
+        let collected = ResizeArray<SessionEvent>()
+
+        let streamTask =
+            task {
+                try
+                    let stream =
+                        SessionClientOperations.Subscribe(client, sessionId, startCursor, streamCts.Token)
+
+                    let enumerator = stream.GetAsyncEnumerator(streamCts.Token)
+
+                    try
+                        let mutable go = true
+
+                        while go do
+                            try
+                                let! has = enumerator.MoveNextAsync().AsTask()
+
+                                if not has then
+                                    go <- false
+                                else
+                                    let evt = enumerator.Current
+
+                                    if not (isNull (box evt)) then
+                                        collected.Add(evt)
+                                        Console.Out.WriteLine(DotExport.toJsonLine evt)
+                                        Console.Out.Flush()
+                            with :? OperationCanceledException ->
+                                go <- false
+                    finally
+                        try
+                            enumerator.DisposeAsync().AsTask() |> ignore
+                        with _ ->
+                            ()
+                with
+                | :? OperationCanceledException -> ()
+                | error -> Console.Error.WriteLine($"dot: json stream failed: {error.Message}")
+            }
+
+        let! settled, failure =
+            task {
+                try
+                    let! result =
+                        SessionClientExtensions.PromptAndWaitAsync(
+                            client,
+                            sessionId,
+                            UserMessage.Text query,
+                            CancellationToken.None
+                        )
+
+                    return Some result, None
+                with error ->
+                    return None, Some error
+            }
+
+        try
+            let deadline = DateTimeOffset.UtcNow.AddSeconds(10.0)
+            let mutable waited = false
+
+            while not waited do
+                let terminal = lock collected (fun () -> collected |> Seq.exists isPrintTerminal)
+
+                if terminal || DateTimeOffset.UtcNow >= deadline then
+                    waited <- true
+                else
+                    do! Task.Delay(50)
+        with _ ->
+            ()
+
+        try
+            streamCts.Cancel()
+        with _ ->
+            ()
+
+        try
+            do! streamTask.WaitAsync(TimeSpan.FromSeconds(5.0))
+        with _ ->
+            ()
+
+        Console.Error.WriteLine($"SESSION {sessionId}")
+
+        match settled, failure with
+        | Some result, _ ->
+            Console.Error.WriteLine($"RESULT {result.Status}")
+
+            if not (isNull (box result.AssistantText)) && result.AssistantText <> "" then
+                Console.Error.WriteLine($"TEXT {result.AssistantText}")
+
+            return exitFor result.Status
+        | None, Some(:? DeadlineExceededException as exceeded) ->
+            Console.Error.WriteLine($"dot: DEADLINE {exceeded.Message} (the turn keeps running).")
+            return 1
+        | None, Some(:? PermissionApprovalRequiredException as suspended) ->
+            Console.Error.WriteLine(
+                $"dot: the turn needs approval for tool '{suspended.ToolName}' (request {suspended.RequestId}): answer in the REPL or rerun without --ask."
+            )
+
+            return 1
+        | None, Some error ->
+            Console.Error.WriteLine($"dot: {error.Message}")
+            return 1
+        | None, None ->
+            Console.Error.WriteLine("dot: the one-shot turn resolved with no outcome.")
+            return 1
+    }
+
+/// Runs the -p one-shot: opens (or --resume attaches) one SQLite-backed
+/// session with the Dot agent, runs the single prompt through
+/// PromptAndWaitAsync under --wait-minutes, and exits with the Headless map
+/// (0 completed / 2 aborted / 1 failed, 3 anything else). Text mode prints
+/// only the final answer to stdout; JSON mode streams Subscribe-from-cursor
+/// JSONL to stdout with diagnostics on stderr.
+/// <param name="client">The session client.</param>
+/// <param name="agents">The agent store.</param>
+/// <param name="packages">The package store the sample skill uploads to.</param>
+/// <param name="start">The start plan: print query, mode, resume, and wait bound.</param>
+/// <param name="initialModel">The model the Dot agent carries.</param>
+/// <param name="cancellationToken">Abandons the turn.</param>
+/// <returns>The process exit code.</returns>
+let private runPrintAsync
+    (client: SessionClient)
+    (agents: IAgentStore)
+    (packages: IAgentPackageStore)
+    (start: DotStart)
+    (initialModel: ModelReference)
+    (cancellationToken: CancellationToken)
+    : Task<int> =
+    task {
+        ArgumentNullException.ThrowIfNull(client)
+        ArgumentNullException.ThrowIfNull(agents)
+        ArgumentNullException.ThrowIfNull(packages)
+        ArgumentNullException.ThrowIfNull(start)
+
+        let query =
+            match start.Print with
+            | null -> raise (ArgumentException("The -p flag needs a non-empty query.", "-p"))
+            | raw when String.IsNullOrWhiteSpace raw ->
+                raise (ArgumentException("The -p flag needs a non-empty query.", "-p"))
+            | raw -> raw.Trim()
+
+        let waitBound = TimeSpan.FromMinutes(start.WaitMinutes)
+
+        let isJson = String.Equals(start.Mode, "json", StringComparison.OrdinalIgnoreCase)
+
+        try
+            let! agentId = ReplEngine.ensureModelAgentAsync agents packages initialModel cancellationToken
+            let! sessionId, startCursor = resolvePrintSessionAsync client agentId start waitBound cancellationToken
+
+            if isJson then
+                return! runPrintJsonAsync client sessionId startCursor query
+            else
+                return! runPrintTextAsync client sessionId query
+        with
+        | :? SqliteLockedException as locked -> return raise locked
+        | :? ArgumentException as invalid ->
+            Console.Error.WriteLine(invalid.Message)
+            return 2
+        | :? SessionNotFoundException as missing ->
+            Console.Error.WriteLine($"dot: {missing.Message}")
+            return 1
+        | :? InvalidSessionStateException as invalid ->
+            Console.Error.WriteLine($"dot: {invalid.Message}")
+            return 1
+        | error ->
+            Console.Error.WriteLine($"dot: {error.Message}")
+            return 1
+    }
+
 /// Prints the second-process locked error naming the database path.
 /// <param name="dbPath">The resolved database file path.</param>
 /// <param name="locked">The typed locked error.</param>
@@ -808,21 +1152,25 @@ let main (argv: string[]) : int =
                                         let opts = ReplEngine.describeProviders registered
                                         ReplEngine.selectReference opts start.Provider start.Model, opts
 
-                                let waitBound = TimeSpan.FromMinutes(start.WaitMinutes)
+                                if not (isNull (box start.Print)) then
+                                    return!
+                                        runPrintAsync client agents packages start initialModel CancellationToken.None
+                                else
+                                    let waitBound = TimeSpan.FromMinutes(start.WaitMinutes)
 
-                                let engine =
-                                    ReplEngine.Engine(
-                                        client,
-                                        agents,
-                                        packages,
-                                        Console.In,
-                                        Console.Out,
-                                        waitBound,
-                                        initialModel,
-                                        options
-                                    )
+                                    let engine =
+                                        ReplEngine.Engine(
+                                            client,
+                                            agents,
+                                            packages,
+                                            Console.In,
+                                            Console.Out,
+                                            waitBound,
+                                            initialModel,
+                                            options
+                                        )
 
-                                return! engine.RunAsync(start.Resume, CancellationToken.None)
+                                    return! engine.RunAsync(start.Resume, CancellationToken.None)
                         with
                         | :? SqliteLockedException as locked ->
                             reportLocked dbPath locked

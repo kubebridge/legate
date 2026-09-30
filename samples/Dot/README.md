@@ -1,17 +1,45 @@
 # Dot
 
 Dot is the single-process Legate coding-agent sample: a REPL over durable
-SQLite sessions that drives an agent against your working directory.
+SQLite sessions that drives an agent against your working directory, plus
+one-shot print (`-p`) and JSON event-stream (`--mode json`) modes that make
+it scriptable like `pi -p` and `pi --mode json`.
+
+## Install and run
+
+Prerequisites: the .NET 10 SDK pinned in `global.json` (`10.0.100`,
+`rollForward: latestFeature`). No database server, no Docker, no keys for
+the scripted path.
+
+Plain `dotnet run` from the repo root (in-repo build, no install step):
+
+```bash
+dotnet run --project samples/Dot/Dot.fsproj -- --scripted -p "hello"
+dotnet run --project samples/Dot/Dot.fsproj -- --help
+```
+
+Build first through the repo chain when iterating with the suite:
+
+```bash
+dotnet fsi build.fsx -- -t Build
+dotnet run --project samples/Dot/Dot.fsproj --no-build -- --scripted
+```
+
+Dot is a sample host, never a packed library: `Dot.fsproj` sets
+`IsPackable=false` and it ships no NuGet package. It is registered in
+`Legate.slnx` under `/samples/` with an explicit `<Compile Include>` order
+and SPDX headers, inside the Fantomas `samples/` scope.
 
 ## Sessions
 
 Sessions live in one SQLite file, so transcripts survive process exit for
-`/sessions` (newest-first list) and `/resume` (attach by id or open
+`/sessions` (newest-first list), `--sessions`/`--list` (same list without
+the REPL), and `/resume` / `--resume` (attach by id or, in the REPL, open
 index, including across processes). The file resolves to
 `%APPDATA%/dot/dot.db` on Windows and `$XDG_CONFIG_HOME/dot/dot.db` (else
-`~/.config/dot/dot.db`) on Unix; set `DOT_DB_PATH` to override it. Only
-one dot process may open the file: a second process exits with a locked
-error naming the path.
+`~/.config/dot/dot.db`) on Unix; set `DOT_DB_PATH` to override it (the
+smoke runs use a temp file per invocation). Only one dot process may open
+the file: a second process exits with a locked error naming the path.
 
 REPL commands: `/new [title]`, `/sessions`, `/resume <id-or-index>`,
 `/model [provider[/model]]`, `/steer <text>`, `/follow <text>`, `/abort`,
@@ -19,6 +47,49 @@ REPL commands: `/new [title]`, `/sessions`, `/resume <id-or-index>`,
 `/export <file>`, `/<template>`, `/quit`. Unknown slash commands reprint
 the usage; a `/<name>` that matches a prompt template expands it instead
 (see below).
+
+CLI flags: `--provider <id>`, `--model <provider/model>`,
+`--resume <session-id>`, `--sessions`/`--list`, `-p`/`--print <query>`,
+`--mode text|json`, `--scripted`, `--wait-minutes <n>`, `--ask`,
+`--mcp <path>`, `--help`/`-h`. Missing values fail naming the flag;
+unknown flags fail naming the flag; `--mode` accepts only `text`/`json`;
+`-p` needs a non-empty query; `--wait-minutes` needs a positive number.
+
+## One-shot print
+
+`dot -p "<query>"` (or `--print`) runs one Headless-shaped turn with the
+Dot agent instead of the REPL: it opens (or `--resume` attaches) one
+SQLite-backed session, runs the single prompt through `PromptAndWaitAsync`
+under `--wait-minutes`, prints only the final answer to stdout, and exits
+with the Headless map (0 completed, 2 aborted, 1 failed, 3 anything else).
+`SESSION`/`RESULT` diagnostics go to stderr so stdout stays pipe-clean:
+
+```bash
+dotnet run --project samples/Dot/Dot.fsproj -- --scripted -p "smoke"
+```
+
+`--sessions` still lists when combined; otherwise `-p` takes the one-shot
+path and the REPL never starts. `--resume <session-id>` attaches instead
+of opening (unknown ids fail instead of silently opening); `--provider`,
+`--model`, `--wait-minutes`, `--ask`, and `--mcp` apply as in the REPL.
+Usage errors exit 2 naming the flag; runtime failures exit 1.
+
+## JSON event stream
+
+`dot --mode json -p "<query>"` streams session events as JSONL on stdout
+(one `$type`-polymorphic event per line, the `DotExport` options, so the
+pipe and `/export` share one wire format) for scripting:
+
+```bash
+dotnet run --project samples/Dot/Dot.fsproj -- --scripted --mode json -p "smoke" | python -c "import sys,json; [json.loads(l) for l in sys.stdin if l.strip()]"
+```
+
+Every human diagnostic (`SESSION`, `RESULT`, `TEXT`, errors) goes to
+stderr in this mode; stdout carries nothing but JSONL. The stream replays
+`Subscribe`-from-cursor (the pre-turn cursor), so a `--resume` rerun
+streams only the new turn's events. Without `-p`, `--mode` is ignored and
+the REPL runs in text. Quiet the framework logs for pure pipes with
+`Logging__LogLevel__Default=None` (the smoke tests already do).
 
 ## Steering, follow-ups, and branches
 
@@ -114,6 +185,21 @@ current one) and `/model <provider[/model]>` switches mid-session through
 workspace binding survive the switch. Unknown providers and unparsable
 references fail naming the known ids; a missing key names its env var.
 
+## Environment keys
+
+| Key | Effect |
+|-----|--------|
+| `DOT_DB_PATH` | Overrides the SQLite file (per-run temp files in smoke). |
+| `ANTHROPIC_API_KEY` | Enables the `anthropic` provider (OpenAI-compatible preset). |
+| `OPENAI_API_KEY` | Enables the `openai` provider. |
+| `GOOGLE_API_KEY` | Enables the `google` provider. |
+| `Legate__Llm__Providers__<id>__ApiKey` | Direct binding already-set wins over the plain key. |
+| `XDG_CONFIG_HOME` | Unix config base when `DOT_DB_PATH` is unset. |
+| `Logging__LogLevel__Default` | Set `None` for pure `--mode json` pipes. |
+
+Keys flow from the environment through configuration binding only, are
+never printed or persisted, and never appear in logs, issues, or PRs.
+
 ## Workspace and tools
 
 Dot binds the working directory through the host-directory workspace
@@ -134,7 +220,9 @@ commands as your user with your environment.
 `--ask` opts into per-call approval for runs outside a sandbox. Each tool
 call suspends the turn with an inline prompt: allow once, allow for the
 session, or deny. A deny runs nothing and the turn continues coherently;
-an allow-for-session grant lasts for that session only.
+an allow-for-session grant lasts for that session only. `-p` one-shots do
+not answer approvals inline: a suspended turn exits 1 naming the request
+(answer in the REPL or rerun without `--ask`).
 
 The workspace root fence stays on in every policy mode: paths that escape
 the working directory are rejected, and writes under `input/` are refused.
@@ -146,9 +234,48 @@ file (the `LegateCli` precedent: stdio and streamable-HTTP servers). A
 missing path fails startup naming the path. Attached servers stop with
 the process.
 
+## Pi-to-Legate map
+
+| pi | dot (Legate) |
+|----|---------------|
+| `pi -p "query"` print mode | `dot -p "query"` / `--print`: same Headless shape (`PromptAndWaitAsync`, exit map 0/2/1/3) with the Dot agent and workspace attached. |
+| `pi --mode json` event stream | `dot --mode json -p "query"`: `Subscribe`-from-cursor JSONL on stdout (`$type` contract), diagnostics on stderr. |
+| pi coding tools over cwd | Dot seven coding built-ins over the host-directory workspace (`CodingTools.fs`). |
+| pi allow-all default | Dot allow-all default; `--ask` mirrors per-call approval. |
+| pi container sandboxing | Same expectation: run unsandboxed dot in a container; the root fence is not a sandbox. |
+| pi sessions/transcripts | SQLite-backed Legate sessions (`--sessions`, `--resume`, `/tree`, `/fork`). |
+| pi skills/templates | Dot `review` skill package plus `/.agent/templates/<name>.md` expansion. |
+| pi provider/model flags | `--provider`, `--model`, `/model` over the Legate LLM layer. |
+
+## Deliberate cuts (each adoptable by a later issue)
+
+- No RPC/SDK modes: dot is a single-process CLI sample; a daemon or
+  client SDK would need a wire protocol and auth story first.
+- No themes: output is stable plain text/JSONL for scripting; styling
+  would break the pipe contract.
+- No extension system: tools come from the seven coding built-ins, the
+  sample skill, templates, and `--mcp`; a plugin loader is future work.
+- No `/share` gist upload: export stays local (`/export` file); sharing
+  needs an auth and redaction story first.
+- No per-turn injection extensions and no custom compaction models:
+  context files plus Legate defaults cover the sample; custom hooks would
+  widen the host surface.
+- No `Alt+Enter` key handling: console commands are the interface, so
+  piped stdin steers deterministically.
+- No pricing: Legate reports tokens only, so `/session` shows tokens and
+  never prices.
+- No per-call tool counts in `/session`: the runtime journals no per-call
+  tool events for facade-driven turns, so the summary reports messages,
+  turns, and tokens only.
+- No `SkillLoadedEvent` journal seam from dot: skill loads are host-log
+  only; a runtime journal seam is future work.
+- No parameter substitution in templates: file text becomes the message
+  unchanged, keeping expansion predictable.
+
 ## Modes
 
 Dot runs on scripted transports when no provider key is set (or under
 `--scripted`): no keys, no network, a canned model for exercising the
-loop, the slash commands, the permissions, and the tools. With a provider
-key set dot runs live on the selected provider and model (see above).
+loop, the slash commands, the permissions, the tools, `-p`, and
+`--mode json`. With a provider key set dot runs live on the selected
+provider and model (see above).

@@ -102,8 +102,128 @@ Target.create "CheckHeaders" (fun _ ->
 
 // Smoke-runs both samples on scripted transports (no keys, no network):
 // Headless proves one prompt, its exit code, and its signed webhook, and
-// CSharpHost proves the C# facade path with a permission reply. Runs on the
+// CSharpHost proves the C# facade path with a permission reply. Dot proves
+// the one-shot print (-p, final answer on stdout, Headless exit map) and
+// the JSON event stream (--mode json -p piped through a JSONL parser,
+// every stdout line carrying $type). Each Dot run gets its own temp
+// DOT_DB_PATH file with provider keys removed. Runs on the
 // Debug binaries the Build target produced, so it depends on Build.
+let dotSmokeWorkdir () : string * string =
+    let workdir =
+        System.IO.Path.Combine(System.IO.Path.GetTempPath(), System.IO.Path.GetRandomFileName())
+
+    System.IO.Directory.CreateDirectory(workdir) |> ignore
+    workdir, System.IO.Path.Combine(workdir, "dot.db")
+
+let runDotCapture (arguments: string list) (dbPath: string) : int * string * string =
+    let info = System.Diagnostics.ProcessStartInfo("dotnet")
+
+    for argument in
+        "run"
+        :: "--project"
+        :: "samples/Dot/Dot.fsproj"
+        :: "--no-build"
+        :: "--"
+        :: arguments do
+        info.ArgumentList.Add(argument)
+
+    info.RedirectStandardOutput <- true
+    info.RedirectStandardError <- true
+    info.UseShellExecute <- false
+    info.WorkingDirectory <- rootPath
+    info.Environment["DOT_DB_PATH"] <- dbPath
+    info.Environment["Logging__LogLevel__Default"] <- "None"
+    info.Environment.Remove("ANTHROPIC_API_KEY") |> ignore
+    info.Environment.Remove("OPENAI_API_KEY") |> ignore
+    info.Environment.Remove("GOOGLE_API_KEY") |> ignore
+    info.Environment.Remove("Legate__Llm__Providers__anthropic__ApiKey") |> ignore
+    info.Environment.Remove("Legate__Llm__Providers__openai__ApiKey") |> ignore
+    info.Environment.Remove("Legate__Llm__Providers__Google__ApiKey") |> ignore
+
+    match System.Diagnostics.Process.Start(info) with
+    | null -> failwith "Could not start the dot smoke process."
+    | child ->
+        use _ = child
+
+        let finished =
+            child.WaitForExit(int (System.TimeSpan.FromMinutes(3.0).TotalMilliseconds))
+
+        if not finished then
+            try
+                child.Kill(true)
+            with _ ->
+                ()
+
+            failwith "The dot smoke run timed out after three minutes."
+
+        let stdout = child.StandardOutput.ReadToEnd()
+        let stderr = child.StandardError.ReadToEnd()
+        child.ExitCode, stdout, stderr
+
+let checkSmokeContains (output: string) (marker: string) : unit =
+    if not (output.Contains(marker, System.StringComparison.Ordinal)) then
+        failwithf "The dot smoke output misses '%s'. Full output:\n%s" marker output
+
+let dotPrintSmoke () : unit =
+    let workdir, dbPath = dotSmokeWorkdir ()
+
+    try
+        let exit, stdout, stderr = runDotCapture [ "--scripted"; "-p"; "smoke" ] dbPath
+
+        if exit <> 0 then
+            failwithf "The dot print smoke exited %d, expected 0. Stdout:\n%s\nStderr:\n%s" exit stdout stderr
+
+        checkSmokeContains stdout "dot scripted answer"
+        checkSmokeContains stderr "RESULT Completed"
+        printfn "Dot print smoke passed (exit 0, final answer on stdout)."
+    finally
+        try
+            System.IO.Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+let dotJsonSmoke () : unit =
+    let workdir, dbPath = dotSmokeWorkdir ()
+
+    try
+        let exit, stdout, stderr =
+            runDotCapture
+                [
+                    "--scripted"
+                    "--mode"
+                    "json"
+                    "-p"
+                    "smoke"
+                ]
+                dbPath
+
+        if exit <> 0 then
+            failwithf "The dot JSON smoke exited %d, expected 0. Stdout:\n%s\nStderr:\n%s" exit stdout stderr
+
+        let lines =
+            stdout.Split([| '\r'; '\n' |], System.StringSplitOptions.RemoveEmptyEntries)
+
+        if lines.Length = 0 then
+            failwithf "The dot JSON smoke produced no JSONL lines. Stderr:\n%s" stderr
+
+        for line in lines do
+            try
+                use doc = System.Text.Json.JsonDocument.Parse(line)
+                let mutable discriminator = Unchecked.defaultof<System.Text.Json.JsonElement>
+
+                if not (doc.RootElement.TryGetProperty("$type", &discriminator)) then
+                    failwithf "The dot JSON smoke line carries no $type: %s" line
+            with ex ->
+                failwithf "The dot JSON smoke line is not JSON: %s (%s)" line ex.Message
+
+        checkSmokeContains stderr "RESULT Completed"
+        printfn "Dot JSON smoke passed (%d JSONL lines, every line carries $type)." lines.Length
+    finally
+        try
+            System.IO.Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
 Target.create "SmokeSamples" (fun _ ->
     run
         dotnet
@@ -127,7 +247,10 @@ Target.create "SmokeSamples" (fun _ ->
             "--"
             "--scripted"
         ]
-        rootPath)
+        rootPath
+
+    dotPrintSmoke ()
+    dotJsonSmoke ())
 
 // Produces Release NuGet packages for every packable project into ./artifacts.
 // Builds in Release itself, so it does not depend on the Debug Build target.

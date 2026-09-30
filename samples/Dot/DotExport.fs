@@ -158,9 +158,20 @@ let summarize (events: SessionEvent seq) : int * int * int64 * int64 =
 // Writers
 
 /// The JSON options exports serialise with: the plain defaults the durable
-/// layer speaks, so every line carries its $type discriminator.
+/// layer speaks, so every line carries its $type discriminator. Reused by
+/// the --mode json stdout stream, so the pipe and the file share one wire
+/// format.
 /// <returns>The export JSON options.</returns>
-let private exportOptions () : JsonSerializerOptions = JsonSerializerOptions()
+let exportOptions () : JsonSerializerOptions = JsonSerializerOptions()
+
+/// Serializes one journaled event to its JSONL line with the export
+/// options: one $type-polymorphic event per line on stdout in --mode json.
+/// <param name="evt">The event to serialize. Must not be null.</param>
+/// <returns>The JSON line.</returns>
+let toJsonLine (evt: SessionEvent) : string =
+    ArgumentNullException.ThrowIfNull(evt)
+    let options = exportOptions ()
+    JsonSerializer.Serialize(box evt, typeof<SessionEvent>, options)
 
 /// Writes the journal as JSONL: one $type-polymorphic event per line,
 /// overwriting any existing content like write_file.
@@ -172,15 +183,13 @@ let writeJsonlAsync (path: string) (events: SessionEvent seq) (cancellationToken
 
     task {
         use writer = new StreamWriter(path, false, Encoding.UTF8)
-        let options = exportOptions ()
 
         if not (isNull (box events)) then
             for evt in events do
                 cancellationToken.ThrowIfCancellationRequested()
 
                 if not (isNull (box evt)) then
-                    let line = JsonSerializer.Serialize(box evt, typeof<SessionEvent>, options)
-                    do! writer.WriteLineAsync(line)
+                    do! writer.WriteLineAsync(toJsonLine evt)
 
         do! writer.FlushAsync()
     }
