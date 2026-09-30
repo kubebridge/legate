@@ -17,6 +17,8 @@
 
   <ItemGroup>
     <ProjectReference Include="../../src/Legate/Legate.fsproj" />
+    <ProjectReference Include="../../src/Legate.Llm.Google/Legate.Llm.Google.fsproj" />
+    <ProjectReference Include="../../src/Legate.Llm.OpenAI/Legate.Llm.OpenAI.fsproj" />
     <ProjectReference Include="../../src/Legate.Mcp/Legate.Mcp.fsproj" />
     <ProjectReference Include="../../src/Legate.Storage.Sqlite/Legate.Storage.Sqlite.fsproj" />
     <ProjectReference Include="../../src/Legate.Workspace.HostDirectory/Legate.Workspace.HostDirectory.fsproj" />

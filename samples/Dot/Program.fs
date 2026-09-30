@@ -7,10 +7,12 @@ open System.IO
 open System.Threading
 open System.Threading.Tasks
 open Legate
+open Legate.Llm.OpenAI
 open Legate.Mcp
 open Legate.Storage.Sqlite
 open Legate.Workspace.HostDirectory
 open Microsoft.Extensions.AI
+open Microsoft.Extensions.Configuration
 open Microsoft.Extensions.DependencyInjection
 open Microsoft.Extensions.Hosting
 
@@ -19,15 +21,23 @@ open Microsoft.Extensions.Hosting
 // process exit for list (newest-first) and resume. The interactive
 // slash-command REPL (#304) drives each turn as waiter-queued-before-prompt
 // plus Subscribe streaming with inline permission/question replies, over
-// the /new, /sessions, /resume, /abort, /compact, and /quit commands.
-// Mirrors the samples/Headless scripted precedent; scripted support stays
-// host-local, never a Legate.Testing reference (test-only package).
-// The workspace is the working directory through the host-directory
-// runtime with the dot-local coding tools (#306): read_file, write_file,
-// list_files, edit_file, glob, grep, and exec under a pi-faithful
-// allow-all default, with the opt-in --ask policy the REPL answers inline
-// (allow-once / allow-for-session / deny). Root fencing stays on in every
-// policy mode. Steering commands belong to #308.
+// the /new, /sessions, /resume, /model, /abort, /compact, and /quit
+// commands. Live providers (#307) register only when their env key is
+// present (Anthropic through the OpenAI-compatible preset under id
+// anthropic, OpenAI, Google), with keys flowing from the environment
+// through IConfiguration binding only, never printed or persisted; with
+// exactly one key set dot just works, with several --provider picks, else
+// the default order anthropic, openai, google wins, and --model overrides
+// the model. Mid-session /model switches through SetAgentAsync against a
+// model-carrying agent row, so the transcript and workspace binding
+// survive. Mirrors the samples/Headless scripted precedent; scripted
+// support stays host-local, never a Legate.Testing reference (test-only
+// package). The workspace is the working directory through the
+// host-directory runtime with the dot-local coding tools (#306): read_file,
+// write_file, list_files, edit_file, glob, grep, and exec under a
+// pi-faithful allow-all default, with the opt-in --ask policy the REPL
+// answers inline (allow-once / allow-for-session / deny). Root fencing
+// stays on in every policy mode. Steering commands belong to #308.
 
 // ──────────────────────────────────────────────────────────────────────────
 // Database path
@@ -70,10 +80,16 @@ let private storageHelp (dbPath: string) : string =
 /// How dot was asked to start.
 type DotStart =
     {
-        /// Scripted transports instead of live providers (always true:
-        /// live wiring belongs to later children, so the flag is accepted
-        /// for forward compatibility with the smoke invocation).
+        /// Force scripted transports even when live keys are set. Live mode
+        /// registers when a provider key is present; with no keys dot falls
+        /// back to scripted, so the flag is only needed to pin scripted.
         Scripted: bool
+        /// Provider id pick for live mode, or null for automatic: the single
+        /// registered provider, else the default order.
+        Provider: string | null
+        /// Model reference override in <provider/model> form, or null for
+        /// the provider default.
+        Model: string | null
         /// Session id to attach at REPL startup, or null to open.
         Resume: string | null
         /// List stored sessions newest-first instead of entering the REPL.
@@ -89,13 +105,15 @@ type DotStart =
     }
 
 /// Builds the --help text over the resolved database path: usage, session
-/// storage, the unsandboxed workspace with its container-sandboxing
-/// expectation, and the --ask escape.
+/// storage, the provider and model flags with the default order, the
+/// unsandboxed workspace with its container-sandboxing expectation, and
+/// the --ask escape.
 /// <param name="dbPath">The resolved database file path.</param>
 /// <returns>The usage text.</returns>
 let private helpText (dbPath: string) : string =
-    "Usage: Dot [--resume <session-id>] [--sessions|--list] [--scripted] [--wait-minutes <n>] [--ask] [--mcp <path>] "
+    "Usage: Dot [--provider <id>] [--model <provider/model>] [--resume <session-id>] [--sessions|--list] [--scripted] [--wait-minutes <n>] [--ask] [--mcp <path>] "
     + storageHelp dbPath
+    + " Providers anthropic, openai, and google register only when ANTHROPIC_API_KEY, OPENAI_API_KEY, or GOOGLE_API_KEY is set (keys flow from the environment through Legate:Llm:Providers:<id>:ApiKey binding only, never printed or persisted). With exactly one key set dot just works; with several, --provider picks, else the default order anthropic, openai, google wins; --model <provider/model> overrides the model (--provider/--model apply to live mode; --scripted pins the scripted transport). /model lists the options mid-session and switches without losing the transcript. "
     + " Tools run against the working directory through the host-directory runtime with no sandbox: sandbox the run in a container (as pi does) or pass --ask for per-call approval (allow once, allow for session, deny). The workspace root fence stays on in every mode."
 
 /// Parses the dot arguments into a start plan. Unknown flags fail with a
@@ -103,7 +121,9 @@ let private helpText (dbPath: string) : string =
 /// <param name="argv">The process arguments.</param>
 /// <returns>The start plan.</returns>
 let parseArgs (argv: string[]) : DotStart =
-    let mutable scripted = true
+    let mutable scripted = false
+    let mutable provider: string | null = null
+    let mutable model: string | null = null
     let mutable resume: string | null = null
     let mutable listSessions = false
     let mutable waitMinutes = 5.0
@@ -122,6 +142,8 @@ let parseArgs (argv: string[]) : DotStart =
 
     while index < argv.Length do
         match argv[index] with
+        | "--provider" -> provider <- take "--provider"
+        | "--model" -> model <- take "--model"
         | "--resume" -> resume <- take "--resume"
         | "--sessions"
         | "--list" -> listSessions <- true
@@ -150,6 +172,20 @@ let parseArgs (argv: string[]) : DotStart =
             raise (ArgumentException("The --resume flag needs a non-empty session id.", "--resume"))
         | raw -> raw.Trim()
 
+    let providerValue: string | null =
+        match provider with
+        | null -> null
+        | raw when String.IsNullOrWhiteSpace raw ->
+            raise (ArgumentException("The --provider flag needs a non-empty provider id.", "--provider"))
+        | raw -> raw.Trim()
+
+    let modelValue: string | null =
+        match model with
+        | null -> null
+        | raw when String.IsNullOrWhiteSpace raw ->
+            raise (ArgumentException("The --model flag needs a non-empty <provider/model> reference.", "--model"))
+        | raw -> raw.Trim()
+
     let mcpValue: string | null =
         match mcp with
         | null -> null
@@ -159,6 +195,8 @@ let parseArgs (argv: string[]) : DotStart =
 
     {
         Scripted = scripted
+        Provider = providerValue
+        Model = modelValue
         Resume = resumeValue
         ListSessions = listSessions
         WaitMinutes = waitMinutes
@@ -420,7 +458,64 @@ type private StaticSource(tools: IReadOnlyList<AITool>) =
         member _.GetTools(_) = Task.FromResult(tools)
 
 // ──────────────────────────────────────────────────────────────────────────
+// Provider keys (issue 307)
+
+/// Whether the environment carries the provider key: the registration
+/// gate, mirroring the samples/MinimalHost precedent.
+let private hasKey (name: string) : bool =
+    not (String.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(name)))
+
+/// Whether any live provider key is present.
+let private hasLiveKey () : bool =
+    hasKey "ANTHROPIC_API_KEY" || hasKey "OPENAI_API_KEY" || hasKey "GOOGLE_API_KEY"
+
+/// Bridges the plain provider env keys into the Legate provider sections
+/// before the host builds its configuration, so `export ANTHROPIC_API_KEY`
+/// satisfies the Legate:Llm:Providers:anthropic:ApiKey binding the Add*
+/// registration reads (AGENTS.md Agent Login names both sources). A
+/// Legate:Llm:Providers:<id>:ApiKey value already in the environment wins:
+/// the bridge only fills blanks. Process memory only: nothing is printed
+/// or persisted.
+let private bridgeProviderKeys () : unit =
+    let bridge (plain: string) (compound: string) : unit =
+        if String.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(compound)) then
+            let value = Environment.GetEnvironmentVariable(plain)
+
+            if not (String.IsNullOrWhiteSpace value) then
+                Environment.SetEnvironmentVariable(compound, value)
+
+    bridge "ANTHROPIC_API_KEY" "Legate__Llm__Providers__anthropic__ApiKey"
+    bridge "OPENAI_API_KEY" "Legate__Llm__Providers__openai__ApiKey"
+    bridge "GOOGLE_API_KEY" "Legate__Llm__Providers__Google__ApiKey"
+
+// ──────────────────────────────────────────────────────────────────────────
 // Host building
+
+/// Resolves the live chat client: the selected provider serving the
+/// selected model reference. Unknown providers and unparsable references
+/// fail naming the known ids; a missing key names its env var.
+/// <param name="provider">The built container.</param>
+/// <param name="start">The start plan: provider and model picks.</param>
+/// <returns>The chat client for the selected model.</returns>
+let private selectLiveClient (provider: IServiceProvider) (start: DotStart) : IChatClient =
+    let registered =
+        provider.GetServices<ILlmProvider>()
+        |> Seq.filter (fun candidate -> not (isNull (box candidate)))
+        |> List.ofSeq
+
+    let options = ReplEngine.describeProviders registered
+    let reference = ReplEngine.selectReference options start.Provider start.Model
+
+    match
+        registered
+        |> List.tryFind (fun candidate ->
+            String.Equals(candidate.Id, reference.Provider, StringComparison.OrdinalIgnoreCase))
+    with
+    | None ->
+        let known = options |> List.map (fun option -> option.Id) |> String.concat ", "
+
+        raise (InvalidOperationException($"No provider '{reference.Provider}' is registered (known: {known})."))
+    | Some live -> live.CreateChatClient(reference, null)
 
 /// Builds the container: one UseSqlite file plus every store over it
 /// (migrations, WAL mode, and the busy timeout ride on the open), a
@@ -428,12 +523,26 @@ type private StaticSource(tools: IReadOnlyList<AITool>) =
 /// policy by default (the every-call ask policy under --ask; the facade
 /// runner reads the container policy), the scripted echo tool plus the
 /// dot-local coding tools bound to the session workspace, the optional
-/// mcp.json attach, and the scripted provider. No live branches: live
-/// wiring belongs to later children.
+/// mcp.json attach, and the scripted provider or the live providers. Live
+/// providers register only when their env key is present (Anthropic rides
+/// the OpenAI-compatible preset under id anthropic: the native AddAnthropic
+/// never registers alongside it, last registration wins); keys flow from
+/// the environment through IConfiguration binding only (see
+/// bridgeProviderKeys), never printed or persisted.
 /// <param name="services">The container to add the host to.</param>
 /// <param name="dbPath">The SQLite file path. Created with its directory on first use.</param>
-/// <param name="start">The start plan: ask policy and MCP config path.</param>
-let private buildServices (services: IServiceCollection) (dbPath: string) (start: DotStart) : unit =
+/// <param name="start">The start plan: ask policy, MCP config path, and provider/model picks.</param>
+/// <param name="configuration">The application configuration providers bind from.</param>
+/// <param name="useScripted">True for the scripted transport: no live branches.</param>
+let private buildServices
+    (services: IServiceCollection)
+    (dbPath: string)
+    (start: DotStart)
+    (configuration: IConfiguration)
+    (useScripted: bool)
+    : unit =
+    ArgumentNullException.ThrowIfNull(configuration)
+
     SqliteServiceCollectionExtensions.UseSqlite(services, dbPath) |> ignore
 
     LegateServiceCollectionExtensions.AddLegate(
@@ -455,6 +564,17 @@ let private buildServices (services: IServiceCollection) (dbPath: string) (start
 
             builder.Tools.AddSource<CodingTools.CodingToolSource>() |> ignore
 
+            if not useScripted then
+                if hasKey "ANTHROPIC_API_KEY" then
+                    builder.Llm.AddAnthropicCompatible(configuration) |> ignore
+
+                if hasKey "OPENAI_API_KEY" then
+                    builder.Llm.AddOpenAI(configuration) |> ignore
+
+                if hasKey "GOOGLE_API_KEY" then
+                    Legate.Llm.GoogleServiceCollectionExtensions.AddGoogle(builder.Services, configuration)
+                    |> ignore
+
             match start.McpPath with
             | null -> ()
             | path ->
@@ -465,12 +585,18 @@ let private buildServices (services: IServiceCollection) (dbPath: string) (start
     )
     |> ignore
 
-    let client = scriptedClient ()
+    if useScripted then
+        let client = scriptedClient ()
 
-    services.AddSingleton<ILlmProvider>(StubScriptedProvider(client) :> ILlmProvider)
-    |> ignore
+        services.AddSingleton<ILlmProvider>(StubScriptedProvider(client) :> ILlmProvider)
+        |> ignore
 
-    services.AddSingleton<IChatClient>(client :> IChatClient) |> ignore
+        services.AddSingleton<IChatClient>(client :> IChatClient) |> ignore
+    else
+        services.AddSingleton<IChatClient>(
+            Func<IServiceProvider, IChatClient>(fun provider -> selectLiveClient provider start)
+        )
+        |> ignore
 
 /// Stops the MCP lifecycle sources so subprocess servers exit with dot.
 /// Mirrors the samples/LegateCli precedent; host-local, like the scripted
@@ -531,8 +657,12 @@ let private reportLocked (dbPath: string) (locked: SqliteLockedException) : unit
 let main (argv: string[]) : int =
     let runAsync (start: DotStart) (dbPath: string) : Task<int> =
         task {
+            // Scripted unless live mode was asked for with keys to serve
+            // it: --scripted pins scripted, and no keys fall back to it.
+            let useScripted = start.Scripted || not (hasLiveKey ())
+
             let application = Host.CreateApplicationBuilder()
-            buildServices application.Services dbPath start
+            buildServices application.Services dbPath start application.Configuration useScripted
 
             use host = application.Build()
 
@@ -551,9 +681,38 @@ let main (argv: string[]) : int =
                             if start.ListSessions then
                                 return! listSessionsAsync client CancellationToken.None
                             else
+                                let registered =
+                                    host.Services.GetServices<ILlmProvider>()
+                                    |> Seq.filter (fun candidate -> not (isNull (box candidate)))
+                                    |> List.ofSeq
+
+                                let initialModel, options =
+                                    if useScripted then
+                                        ModelReference.Parse("scripted/scripted"),
+                                        ([
+                                            {
+                                                Id = "scripted"
+                                                DefaultModel = "scripted"
+                                                EnvVar = null
+                                            }
+                                        ]
+                                        : ReplEngine.ProviderOption list)
+                                    else
+                                        let opts = ReplEngine.describeProviders registered
+                                        ReplEngine.selectReference opts start.Provider start.Model, opts
+
                                 let waitBound = TimeSpan.FromMinutes(start.WaitMinutes)
 
-                                let engine = ReplEngine.Engine(client, agents, Console.In, Console.Out, waitBound)
+                                let engine =
+                                    ReplEngine.Engine(
+                                        client,
+                                        agents,
+                                        Console.In,
+                                        Console.Out,
+                                        waitBound,
+                                        initialModel,
+                                        options
+                                    )
 
                                 return! engine.RunAsync(start.Resume, CancellationToken.None)
                         with
@@ -587,6 +746,7 @@ let main (argv: string[]) : int =
                 Unchecked.defaultof<DotStart>
 
         let dbPath = resolveDbPath ()
+        bridgeProviderKeys ()
         runAsync start dbPath |> fun runner -> runner.GetAwaiter().GetResult()
     with
     | :? SqliteLockedException as locked ->
