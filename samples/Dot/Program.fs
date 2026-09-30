@@ -22,7 +22,7 @@ open Microsoft.Extensions.Hosting
 // slash-command REPL (#304) drives each turn as waiter-queued-before-prompt
 // plus Subscribe streaming with inline permission/question replies, over
 // the /new, /sessions, /resume, /model, /steer, /follow, /abort, /compact,
-// /tree, /fork, /clone, and /quit commands. Live providers (#307) register
+// /tree, /fork, /clone, /session, /export, /<template>, and /quit commands. Live providers (#307) register
 // only when their env key is present (Anthropic through the OpenAI-compatible
 // preset under id anthropic, OpenAI, Google), with keys flowing from the
 // environment through IConfiguration binding only, never printed or
@@ -225,9 +225,13 @@ type private ScriptStep =
     | ToolCall of callId: string * toolName: string * args: (string * obj) list
 
 /// Probe scripts keyed by the prompt marker that selects them: scripted
-/// acceptances for the coding tools over the working directory. Each
-/// probe replaces the default queue once per process, so the shared
-/// steps below stay byte-identical for the existing smoke runs.
+/// acceptances for the coding tools over the working directory, the skill
+/// tool over the sample review package (skill-load, skill-missing), and
+/// the context-file rewrite (ctx-edit). Each probe replaces the default
+/// queue once per process, so the shared steps below stay byte-identical
+/// for the existing smoke runs. ctx-check is dynamic instead (see
+/// serveProbe): every mention answers with the markers the current system
+/// prompt carries, so an edit between turns steers the next answer.
 /// <param name="marker">The prompt marker selecting the probe.</param>
 /// <returns>The probe's model steps.</returns>
 let private probeScript (marker: string) : ScriptStep list =
@@ -314,6 +318,28 @@ let private probeScript (marker: string) : ScriptStep list =
             ToolCall("call-slow-steer", "slow-echo", [])
             Text "slow-steer done"
         ]
+    | "skill-load" ->
+        [
+            ToolCall("call-skill-load", "skill", [ "name", "review" :> obj ])
+            Text "SKILL-LOAD-DONE-309"
+        ]
+    | "skill-missing" ->
+        [
+            ToolCall("call-skill-missing", "skill", [ "name", "nosuchskill309" :> obj ])
+            Text "SKILL-MISSING-DONE-309"
+        ]
+    | "ctx-edit" ->
+        [
+            ToolCall(
+                "call-ctx-edit",
+                "write_file",
+                [
+                    "path", "AGENTS.md" :> obj
+                    "content", "# dot context probe\n\nCTX-AGENTS-BETA-309 steering active.\n" :> obj
+                ]
+            )
+            Text "CTX-EDIT-DONE-309"
+        ]
     | _ -> []
 
 /// Minimal inline scripted chat client: serves the queued steps, then a
@@ -331,7 +357,9 @@ type private ScriptedClient(steps: Queue<ScriptStep>) =
     let served = HashSet<string>(StringComparer.Ordinal)
 
     /// The probe markers in match order: no marker contains another, so
-    /// the first mention wins.
+    /// the first mention wins. ctx-check stays out: it answers dynamically
+    /// from the current system prompt markers on every mention (see
+    /// serveProbe), so an edit between turns steers the next answer.
     let probeMarkers =
         [
             "coding-write"
@@ -340,6 +368,9 @@ type private ScriptedClient(steps: Queue<ScriptStep>) =
             "coding-outside"
             "coding-exec"
             "slow-steer"
+            "skill-load"
+            "skill-missing"
+            "ctx-edit"
         ]
 
     /// True when any incoming message mentions the marker.
@@ -353,21 +384,56 @@ type private ScriptedClient(steps: Queue<ScriptStep>) =
             && not (isNull (box message.Text))
             && message.Text.Contains(marker, StringComparison.Ordinal))
 
+    /// True when any incoming system message mentions the marker: the
+    /// context-file proof scans the composed system prompt only, never the
+    /// transcript, so an edit between turns steers the next answer only
+    /// when the runtime re-read the files this turn.
+    /// <param name="messages">The chat messages.</param>
+    /// <param name="marker">The context marker.</param>
+    /// <returns>True when a system message mentions the marker.</returns>
+    let mentionsSystem (messages: ChatMessage seq) (marker: string) : bool =
+        messages
+        |> Seq.exists (fun message ->
+            not (isNull (box message))
+            && not (isNull (box message.Text))
+            && message.Role = ChatRole.System
+            && message.Text.Contains(marker, StringComparison.Ordinal))
+
     /// Refills the queue with the first unserved probe the messages
-    /// mention, if any.
+    /// mention, if any. ctx-check refills on every mention (never marked
+    /// served): the answer names the context markers the current system
+    /// prompt carries, proving the runtime re-read the files this turn.
     /// <param name="messages">The chat messages.</param>
     let serveProbe (messages: ChatMessage seq) : unit =
-        match
-            probeMarkers
-            |> List.tryFind (fun marker -> not (served.Contains marker) && mentions messages marker)
-        with
-        | None -> ()
-        | Some marker ->
-            served.Add marker |> ignore
-            steps.Clear()
+        if mentions messages "ctx-check" then
+            let agentsPart =
+                if mentionsSystem messages "CTX-AGENTS-BETA-309" then
+                    "beta"
+                elif mentionsSystem messages "CTX-AGENTS-ALPHA-309" then
+                    "alpha"
+                else
+                    "none"
 
-            for step in probeScript marker do
-                steps.Enqueue step
+            let systemPart =
+                if mentionsSystem messages "CTX-SYSTEM-ONE-309" then
+                    "one"
+                else
+                    "none"
+
+            steps.Clear()
+            steps.Enqueue(Text $"CTX-SEEN-309 agents={agentsPart} system={systemPart}")
+        else
+            match
+                probeMarkers
+                |> List.tryFind (fun marker -> not (served.Contains marker) && mentions messages marker)
+            with
+            | None -> ()
+            | Some marker ->
+                served.Add marker |> ignore
+                steps.Clear()
+
+                for step in probeScript marker do
+                    steps.Enqueue step
 
     /// True when the incoming messages ask for the slow-turn probe.
     /// <param name="messages">The chat messages.</param>
@@ -438,8 +504,10 @@ type private StubScriptedProvider(client: IChatClient) =
 /// the ask policy, then plain answers. Under allow-all the echo call is
 /// auto-approved and the turn completes with the first answer. Prompts
 /// naming a coding probe (coding-write, coding-edit, coding-two,
-/// coding-outside, coding-exec) swap the queue for that probe's tool
-/// steps instead.
+/// coding-outside, coding-exec), a skill probe (skill-load, skill-missing),
+/// or the context rewrite (ctx-edit) swap the queue for that probe's tool
+/// steps instead; prompts naming ctx-check answer with the context markers
+/// the current system prompt carries.
 let private scriptedClient () : ScriptedClient =
     let steps = Queue<ScriptStep>()
     steps.Enqueue(ToolCall("call-1", "scripted-echo", []))
@@ -600,6 +668,8 @@ let private buildServices
 
             builder.Tools.AddSource<CodingTools.CodingToolSource>() |> ignore
 
+            builder.Tools.AddSource<DotSkills.SkillToolSource>() |> ignore
+
             if not useScripted then
                 if hasKey "ANTHROPIC_API_KEY" then
                     builder.Llm.AddAnthropicCompatible(configuration) |> ignore
@@ -707,6 +777,7 @@ let main (argv: string[]) : int =
             // its router.
             let client = host.Services.GetRequiredService<SessionClient>()
             let agents = host.Services.GetRequiredService<IAgentStore>()
+            let packages = host.Services.GetRequiredService<IAgentPackageStore>()
 
             try
                 do! host.StartAsync(CancellationToken.None)
@@ -743,6 +814,7 @@ let main (argv: string[]) : int =
                                     ReplEngine.Engine(
                                         client,
                                         agents,
+                                        packages,
                                         Console.In,
                                         Console.Out,
                                         waitBound,

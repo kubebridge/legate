@@ -239,7 +239,7 @@ let ``Repl streams turns serves slash commands and prints usage for unknown`` ()
 
         check
             output
-            "Commands: /new [title], /sessions, /resume <id-or-index>, /model [provider[/model]], /steer <text>, /follow <text>, /abort, /compact, /tree, /fork <sequence>, /clone, /quit."
+            "Commands: /new [title], /sessions, /resume <id-or-index>, /model [provider[/model]], /steer <text>, /follow <text>, /abort, /compact, /tree, /fork <sequence>, /clone, /session, /export <file>, /<template>, /quit."
 
         checkNoErrors output
     finally
@@ -1162,6 +1162,223 @@ let ``Steering commands need text and fork needs a sequence`` () =
         check output "ERROR /follow needs text"
         check output "ERROR /fork needs a sequence"
         check output "is not a number"
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+// ──────────────────────────────────────────────────────────────────────────
+// Context files, skills, templates, export, and session (issue 309): the
+// scripted probes run marker-bearing AGENTS.md/SYSTEM.md through the
+// every-turn re-read, the sample review skill through the skill tool, a
+// temp .agent/templates file through /name, and the journal through
+// /export JSONL/HTML plus /session counts.
+
+[<Fact>]
+let ``Context files steer every turn and edits apply on the next turn`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+
+    try
+        File.WriteAllText(
+            Path.Combine(workdir, "AGENTS.md"),
+            "# dot context probe\n\nCTX-AGENTS-ALPHA-309 steering active.\n"
+        )
+
+        File.WriteAllText(
+            Path.Combine(workdir, "SYSTEM.md"),
+            "# dot system probe\n\nCTX-SYSTEM-ONE-309 project prompt.\n"
+        )
+
+        let exit, stdout, stderr =
+            runDot
+                dotDll
+                [ "--scripted" ]
+                (script
+                    [
+                        "ctx-check first"
+                        "ctx-edit rewrite"
+                        "ctx-check second"
+                        "/quit"
+                    ])
+                workdir
+                dbPath
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 0
+        // The first turn saw the files as opened; the rewrite landed
+        // through write_file mid-run and the third turn re-read it.
+        check output "CTX-SEEN-309 agents=alpha system=one"
+        check output "CTX-EDIT-DONE-309"
+        check output "CTX-SEEN-309 agents=beta system=one"
+
+        let agents = File.ReadAllText(Path.Combine(workdir, "AGENTS.md"))
+
+        agents.Contains("CTX-AGENTS-BETA-309", StringComparison.Ordinal)
+        |> should equal true
+
+        checkNoErrors output
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+[<Fact>]
+let ``Skill loads the sample review skill and missing names it`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+
+    // The host log carries the load: the runtime journals no per-call
+    // tool events on this path, so the log-only onLoaded line is the
+    // host-observable proof the skill tool served the uploaded package.
+    let skillLog =
+        [
+            "Logging__LogLevel__Dot.DotSkills.SkillToolSource", "Information"
+        ]
+
+    try
+        let loadExit, loadOut, loadErr =
+            runDotEnv dotDll [ "--scripted" ] (script [ "skill-load probe"; "/quit" ]) workdir dbPath skillLog
+
+        let loadOutput = loadOut + Environment.NewLine + loadErr
+
+        loadExit |> should equal 0
+        check loadOutput "SKILL-LOAD-DONE-309"
+        check loadOutput "RESULT Completed"
+        check loadOutput "loaded skill 'review'"
+        checkNoErrors loadOutput
+
+        let missingExit, missingOut, missingErr =
+            runDotEnv dotDll [ "--scripted" ] (script [ "skill-missing probe"; "/quit" ]) workdir dbPath skillLog
+
+        let missingOutput = missingOut + Environment.NewLine + missingErr
+
+        missingExit |> should equal 0
+        check missingOutput "SKILL-MISSING-DONE-309"
+        check missingOutput "RESULT Completed"
+        // The unknown name diagnosed without loading anything.
+        checkAbsent missingOutput "loaded skill"
+        checkNoErrors missingOutput
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+[<Fact>]
+let ``Template expands verbatim and missing lists available`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+    let templates = Path.Combine(workdir, ".agent", "templates")
+
+    try
+        Directory.CreateDirectory(templates) |> ignore
+        // The template body carries a probe marker: expansion enqueues it
+        // verbatim, so the skill probe firing proves the file text became
+        // the prompt.
+        File.WriteAllText(Path.Combine(templates, "doskill.md"), "skill-load probe")
+
+        let exit, stdout, stderr =
+            runDot
+                dotDll
+                [ "--scripted" ]
+                (script
+                    [
+                        "/doskill"
+                        "/nosuchtemplate309"
+                        "/quit"
+                    ])
+                workdir
+                dbPath
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 0
+        check output "TEMPLATE doskill"
+        check output "SKILL-LOAD-DONE-309"
+        check output "UNKNOWN-COMMAND /nosuchtemplate309"
+        check output "TEMPLATES doskill"
+        checkNoErrors output
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+[<Fact>]
+let ``Export writes JSONL and HTML and refuses escape`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+
+    try
+        let exit, stdout, stderr =
+            runDot
+                dotDll
+                [ "--scripted" ]
+                (script
+                    [
+                        "hello"
+                        "/export transcript.jsonl"
+                        "/export page.html"
+                        "/export ../evil.jsonl"
+                        "/quit"
+                    ])
+                workdir
+                dbPath
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 0
+        check output "EXPORTED "
+        check output "transcript.jsonl"
+        check output "page.html"
+        // The escape is refused naming the invalid target; the ERROR line
+        // is expected here, so no checkNoErrors on this run.
+        check output "ERROR The /export target is invalid"
+
+        let jsonl = probeFile output (Path.Combine(workdir, "transcript.jsonl"))
+
+        for line in jsonl.Split([| '\n' |], StringSplitOptions.RemoveEmptyEntries) do
+            check line "$type"
+
+        let html = probeFile output (Path.Combine(workdir, "page.html"))
+        check html "<table"
+        check html "TurnCompletedEvent"
+
+        let parent =
+            match Path.GetDirectoryName(workdir) with
+            | null -> workdir
+            | dir -> dir
+
+        if File.Exists(Path.Combine(parent, "evil.jsonl")) then
+            failwith $"The escaped export landed outside the workdir. Full output:{Environment.NewLine}{output}"
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+[<Fact>]
+let ``Session reports counts and tokens without prices`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+
+    try
+        let exit, stdout, stderr =
+            runDot dotDll [ "--scripted" ] (script [ "hello"; "/session"; "/quit" ]) workdir dbPath
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 0
+        check output "messages=1 turns=1"
+        check output "input-tokens=0 output-tokens=0"
+        checkAbsent output "price"
+        checkAbsent output "cost"
+        checkAbsent output "$"
+        checkNoErrors output
     finally
         try
             Directory.Delete(workdir, true)

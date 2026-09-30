@@ -15,8 +15,10 @@ error naming the path.
 
 REPL commands: `/new [title]`, `/sessions`, `/resume <id-or-index>`,
 `/model [provider[/model]]`, `/steer <text>`, `/follow <text>`, `/abort`,
-`/compact`, `/tree`, `/fork <sequence>`, `/clone`, `/quit`. Unknown slash
-commands reprint the usage.
+`/compact`, `/tree`, `/fork <sequence>`, `/clone`, `/session`,
+`/export <file>`, `/<template>`, `/quit`. Unknown slash commands reprint
+the usage; a `/<name>` that matches a prompt template expands it instead
+(see below).
 
 ## Steering, follow-ups, and branches
 
@@ -38,6 +40,61 @@ to the full journal and a cursor below the first sequence forks an empty
 transcript. `/clone` duplicates the active branch (a tail fork) when that
 falls out for free. No `Alt+Enter` key handling; console commands are the
 interface.
+
+## Context files
+
+At session open dot resolves `AGENTS.md` in every directory from the
+filesystem root down to the working directory (root first) plus the
+nearest `SYSTEM.md` upward from the working directory, and passes them as
+the session's host instruction files. Dot's default prompt is empty
+(agents carry an empty system prompt), so a present `SYSTEM.md` occupies
+the lead host-file slot as the project prompt and every `AGENTS.md`
+appends after it; absent files simply contribute nothing. The runtime
+re-reads every listed file on every turn, so an edit between turns steers
+the next turn. No per-turn injection extensions and no custom compaction
+models; auto-compaction rides the Legate defaults.
+
+## Skills
+
+Dot uploads a sample `review` skill (`.agent/skills/review/SKILL.md`,
+read-only built-ins only) into each ensured agent's package and serves the
+`skill` tool through its own tool source, so the model loads the skill on
+demand with progressive disclosure. Unknown names return the runtime's
+available-skills error listing the packaged names. Successful loads log
+the skill name through the host logger. Skill loads are
+log-only on the host: dot has no journal seam, so no `SkillLoadedEvent`
+is journaled from dot (content, discovery block, companion staging, and
+diagnosis all work; a runtime journal seam is future work).
+
+## Prompt templates
+
+`/<name>` expands `<working-directory>/.agent/templates/<name>.md`
+verbatim as the next prompt: idle starts a turn, a running turn queues
+behind it like plain input. There is no parameter-substitution syntax;
+the file text becomes the user message unchanged. Unknown names error
+listing the available template names (known commands win over templates).
+One sample ships under `samples/Dot/Templates/commit.md`; copy it into
+`.agent/templates/` to use it.
+
+## Session info
+
+`/session` reports message counts (accepted prompts plus folded
+follow-ups), completed turns, and the token sums: `SESSION <id>
+messages=<n> turns=<n> input-tokens=<n> output-tokens=<n>`. The counts page
+the journal once; the tokens add this process's settled-turn usage on top
+of the journal's `UsageEvent` sums (the runtime journals no usage on this
+path, so without settled turns the sums read zero). Legate reports tokens
+but never prices them, so `/session` shows tokens only. Per-call tool
+counts are not reported: the runtime journals no per-call tool events for
+these turns.
+
+## Transcript export
+
+`/export <file>` pages the journal to the file under the working
+directory: JSONL (one `$type`-polymorphic event per line) by default, or
+escaped static HTML for an `.html` target. Paths resolve under the
+working directory with escape refused, mirroring the coding-tools fence;
+overwrite mirrors `write_file`. There is no `/share` gist upload.
 
 ## Providers and models
 
