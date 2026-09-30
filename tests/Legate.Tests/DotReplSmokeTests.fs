@@ -7,13 +7,17 @@ open System.IO
 open FsUnit.Xunit
 open Xunit
 
-// Dot REPL smoke test (issue 304): runs the built dot binary as a
+// Dot REPL smoke test (issues 304, 306): runs the built dot binary as a
 // subprocess on scripted transports (no live keys, no external services)
 // through the interactive loop over piped stdin: prompt/stream/settle
 // with assistant text, /new, store-backed /sessions, /resume continuing
 // context across processes on one DOT_DB_PATH file, /abort, /compact,
 // /quit, unknown-command usage, the opt-in ask policy with inline
-// permission approval, and the settle-deadline report path. Mirrors the
+// permission approval, and the settle-deadline report path. The issue 306
+// coding probes run the dot-local tools over the smoke workdir (the
+// process working directory): writes and edits with zero friction under
+// the default policy, deny/session answers under --ask, the outside-root
+// fence, exec, --help text, and the --mcp attach. Mirrors the
 // LegateCli smoke precedent; each run gets its own temp database file.
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -109,6 +113,38 @@ let private freshWorkdir () : string * string =
 let private check (output: string) (marker: string) : unit =
     if not (output.Contains(marker, StringComparison.Ordinal)) then
         failwith $"The dot smoke output misses '{marker}'. Full output:{Environment.NewLine}{output}"
+
+/// Fails when the combined output carries the marker.
+let private checkAbsent (output: string) (marker: string) : unit =
+    if output.Contains(marker, StringComparison.Ordinal) then
+        failwith $"The dot smoke output unexpectedly carries '{marker}'. Full output:{Environment.NewLine}{output}"
+
+/// Counts how many times the marker occurs in the combined output.
+let private countOccurrences (output: string) (marker: string) : int =
+    let mutable count = 0
+    let mutable index = output.IndexOf(marker, StringComparison.Ordinal)
+
+    while index >= 0 do
+        count <- count + 1
+        index <- output.IndexOf(marker, index + marker.Length, StringComparison.Ordinal)
+
+    count
+
+/// Fails unless the marker occurs exactly once in the combined output.
+let private checkOnce (output: string) (marker: string) : unit =
+    let count = countOccurrences output marker
+
+    if count <> 1 then
+        failwith
+            $"The dot smoke output carries '{marker}' {count} times, expected once. Full output:{Environment.NewLine}{output}"
+
+/// Reads a file produced by a probe turn, failing with the smoke output
+/// when it is missing.
+let private probeFile (output: string) (path: string) : string =
+    if File.Exists(path) then
+        File.ReadAllText(path)
+    else
+        failwith $"The dot smoke run produced no file at '{path}'. Full output:{Environment.NewLine}{output}"
 
 /// Fails when the combined output carries an ERROR line.
 let private checkNoErrors (output: string) : unit =
@@ -324,6 +360,266 @@ let ``Bad flags fail with usage`` () =
 
         unknownExit |> should equal 2
         check unknownOutput "Unknown flag '--bogus'"
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+// ──────────────────────────────────────────────────────────────────────────
+// Coding tools and approval policy (issue 306): the scripted coding
+// probes run the dot-local tools over the smoke workdir (the process
+// working directory) under the default allow-all policy and the opt-in
+// --ask policy.
+
+[<Fact>]
+let ``Default policy writes a file with zero friction`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+
+    try
+        let exit, stdout, stderr =
+            runDot dotDll [ "--scripted" ] (script [ "coding-write a hello page"; "/quit" ]) workdir dbPath
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 0
+        check output "RESULT Completed"
+        check output "coding-write done"
+        checkAbsent output "PERMISSION tool="
+
+        let content = probeFile output (Path.Combine(workdir, "hello.html"))
+
+        content
+        |> should equal "<!DOCTYPE html>\n<html>\n<body>\n<h1>hello from dot</h1>\n</body>\n</html>\n"
+
+        checkNoErrors output
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+[<Fact>]
+let ``Default policy writes then edits in one turn`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+
+    try
+        let exit, stdout, stderr =
+            runDot dotDll [ "--scripted" ] (script [ "coding-edit the page"; "/quit" ]) workdir dbPath
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 0
+        check output "RESULT Completed"
+        check output "coding-edit done"
+        checkAbsent output "PERMISSION tool="
+
+        let content = probeFile output (Path.Combine(workdir, "site", "index.html"))
+
+        content |> should equal "<h1>hello, edited</h1>\n"
+        checkNoErrors output
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+[<Fact>]
+let ``Ask policy deny runs nothing and the turn continues`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+
+    try
+        let exit, stdout, stderr =
+            runDot
+                dotDll
+                [ "--scripted"; "--ask" ]
+                (script
+                    [
+                        "coding-write a page"
+                        "deny"
+                        "/quit"
+                    ])
+                workdir
+                dbPath
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 0
+        check output "PERMISSION tool=write_file"
+        check output "decision=Deny"
+        check output "RESULT Completed"
+
+        if File.Exists(Path.Combine(workdir, "hello.html")) then
+            failwith $"The denied write still landed. Full output:{Environment.NewLine}{output}"
+
+        checkNoErrors output
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+[<Fact>]
+let ``Ask policy remembers allow for session`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+
+    try
+        let exit, stdout, stderr =
+            runDot
+                dotDll
+                [ "--scripted"; "--ask" ]
+                (script
+                    [
+                        "coding-two files please"
+                        "s"
+                        "/quit"
+                    ])
+                workdir
+                dbPath
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 0
+        check output "decision=AllowForSession"
+        check output "RESULT Completed"
+        // One prompt for two same-tool calls: the first grant covers the
+        // session, so the second call runs silently.
+        checkOnce output "PERMISSION tool="
+
+        let first = probeFile output (Path.Combine(workdir, "probe-a.txt"))
+        let second = probeFile output (Path.Combine(workdir, "probe-b.txt"))
+
+        first |> should equal "alpha\n"
+        second |> should equal "beta\n"
+        checkNoErrors output
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+[<Fact>]
+let ``Writes outside the workspace root are rejected`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+
+    try
+        let exit, stdout, stderr =
+            runDot dotDll [ "--scripted" ] (script [ "coding-outside escape"; "/quit" ]) workdir dbPath
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 0
+        check output "RESULT Completed"
+
+        let parent =
+            match Path.GetDirectoryName(workdir) with
+            | null -> workdir
+            | dir -> dir
+
+        let escaped = Path.Combine(parent, "outside-evil.txt")
+
+        if File.Exists(escaped) then
+            try
+                File.Delete(escaped)
+            with _ ->
+                ()
+
+            failwith $"The outside-root write landed at '{escaped}'. Full output:{Environment.NewLine}{output}"
+
+        checkNoErrors output
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+[<Fact>]
+let ``Exec runs under the default policy`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+
+    try
+        let exit, stdout, stderr =
+            runDot dotDll [ "--scripted" ] (script [ "coding-exec version"; "/quit" ]) workdir dbPath
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 0
+        check output "RESULT Completed"
+        check output "coding-exec done"
+        checkAbsent output "PERMISSION tool="
+        checkNoErrors output
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+[<Fact>]
+let ``Help names the sandboxing expectation and the ask escape`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+
+    try
+        let exit, stdout, stderr =
+            runDot dotDll [ "--help" ] (script [ "/quit" ]) workdir dbPath
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 2
+        check output "sandbox"
+        check output "--ask"
+        check output "--mcp"
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+[<Fact>]
+let ``Missing mcp path fails naming the path`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+    let missing = Path.Combine(workdir, "nope.json")
+
+    try
+        let exit, stdout, stderr =
+            runDot dotDll [ "--scripted"; "--mcp"; missing ] (script [ "/quit" ]) workdir dbPath
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 1
+        check output "does not exist"
+        check output missing
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+[<Fact>]
+let ``Empty mcp config attaches and stays green`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+    let mcpPath = Path.Combine(workdir, "mcp.json")
+
+    try
+        File.WriteAllText(mcpPath, """{"mcpServers": {}}""")
+
+        let exit, stdout, stderr =
+            runDot dotDll [ "--scripted"; "--mcp"; mcpPath ] (script [ "hello"; "/quit" ]) workdir dbPath
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 0
+        check output "RESULT Completed"
+        check output "dot scripted answer"
+        checkNoErrors output
     finally
         try
             Directory.Delete(workdir, true)
