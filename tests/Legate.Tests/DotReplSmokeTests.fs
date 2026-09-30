@@ -894,6 +894,52 @@ let ``Model lists options and switches mid-session`` () =
         with _ ->
             ()
 
+[<Fact>]
+let ``Resume marker names the stored session agent`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+
+    try
+        // Open under the default scripted model, switch to round-two, quit:
+        // the stored session agent is now round-two.
+        let _, firstOut, firstErr =
+            runDot dotDll [ "--scripted" ] (script [ "/model scripted/round-two"; "/quit" ]) workdir dbPath
+
+        let firstOutput = firstOut + Environment.NewLine + firstErr
+        let created = sessionIdOf firstOut
+
+        check firstOutput "MODEL-SWITCHED scripted/round-two applied at once"
+
+        // Resume in a fresh process defaulting to scripted/scripted: the
+        // bare marker must name the stored round-two agent, and the
+        // explicit stored ref must report already (attach-time sync).
+        let exit, resumeOut, resumeErr =
+            runDot
+                dotDll
+                [ "--scripted"; "--resume"; created ]
+                (script
+                    [
+                        "/model"
+                        "/model scripted/round-two"
+                        "/quit"
+                    ])
+                workdir
+                dbPath
+
+        let resumeOutput = resumeOut + Environment.NewLine + resumeErr
+
+        exit |> should equal 0
+        check resumeOutput $"RESUMED {created}"
+        check resumeOutput "MODEL scripted/round-two"
+        check resumeOutput "* scripted default scripted"
+        check resumeOutput "MODEL already scripted/round-two"
+        checkNoErrors resumeOutput
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
 // ──────────────────────────────────────────────────────────────────────────
 // Steering, follow-ups, tree, and fork (issue 308): every path proves
 // itself against the slow slow-steer probe (slow-echo tool, three seconds

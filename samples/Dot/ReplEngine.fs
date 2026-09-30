@@ -1047,12 +1047,13 @@ type Engine
     /// <param name="text">The id or 1-based index.</param>
     /// <param name="cancellationToken">Abandons the probe.</param>
     /// <returns>True when the attach landed.</returns>
-    member private _.AttachAsync(text: string, cancellationToken: CancellationToken) : Task<bool> =
+    member private this.AttachAsync(text: string, cancellationToken: CancellationToken) : Task<bool> =
         task {
             let found = findSession text
 
             if found >= 0 then
                 current <- found
+                do! this.SyncModelAsync(sessions[found].Id, cancellationToken)
                 line $"RESUMED {sessions[found].Id}"
                 return true
             else
@@ -1073,11 +1074,93 @@ type Engine
                             sessions.Add({ Id = parsed; Title = ""; Cursor = 0L })
                             current <- sessions.Count - 1
 
+                        do! this.SyncModelAsync(parsed, cancellationToken)
                         line $"RESUMED {parsed}"
                         return true
                     with :? SessionNotFoundException ->
                         line $"RESUME-FAILED no session {parsed} in this process."
                         return false
+        }
+
+    /// Resolves the model the bare /model marker displays: the current
+    /// session's stored agent row when it resolves, else the
+    /// startup-selected fallback. Never throws: a listing or agent lookup
+    /// failure keeps today's marker instead of crashing it (issue 323).
+    /// The read goes through the public list operation because the
+    /// client's store accessor is internal to the runtime; the agent
+    /// lookup reuses the engine's agent store handle.
+    /// <param name="sessionId">The session whose stored agent to read.</param>
+    /// <param name="cancellationToken">Abandons the lookup.</param>
+    /// <returns>The stored agent's model, or the startup-selected model.</returns>
+    member private _.StoredModelAsync
+        (sessionId: SessionId, cancellationToken: CancellationToken)
+        : Task<ModelReference> =
+        task {
+            try
+                let mutable found: Session = Unchecked.defaultof<Session>
+                let options = SessionListOptions()
+                options.PageSize <- SessionClientListingOperations.MaxPageSize
+
+                let mutable continuation: string | null = null
+                let mutable paging = true
+
+                while paging do
+                    options.Continuation <- continuation
+
+                    let! page = SessionClientListingOperations.ListSessionsAsync(client, options, cancellationToken)
+
+                    if isNull (box page) || isNull (box page.Items) then
+                        paging <- false
+                    else
+                        for listed in page.Items do
+                            if not (isNull (box listed)) && listed.Id.Equals(sessionId) then
+                                found <- listed
+
+                        if isNull (box found) && not (isNull (box page.Continuation)) then
+                            continuation <- page.Continuation
+                        else
+                            paging <- false
+
+                if isNull (box found) then
+                    return currentModel
+                else
+                    let! agent = agents.GetAgent(found.Tenant, found.AgentId, cancellationToken)
+
+                    match agent with
+                    | null -> return currentModel
+                    | resolved -> return resolved.Model
+            with _ ->
+                return currentModel
+        }
+
+    /// Resolves the bare /model display model: the current session's
+    /// stored agent when a session is current and its row resolves, else
+    /// the startup-selected fallback. Never throws.
+    /// <param name="cancellationToken">Abandons the lookup.</param>
+    /// <returns>The model the marker names.</returns>
+    member private this.DisplayModelAsync(cancellationToken: CancellationToken) : Task<ModelReference> =
+        task {
+            try
+                let session = currentSession ()
+                return! this.StoredModelAsync(session.Id, cancellationToken)
+            with _ ->
+                return currentModel
+        }
+
+    /// Best-effort syncs the startup-selected model from the attached
+    /// session's stored agent, so the explicit /model reference equality
+    /// check stays correct after /resume. Never throws: a lookup failure
+    /// leaves the startup value and the display-time read still reports
+    /// truth.
+    /// <param name="sessionId">The session just attached.</param>
+    /// <param name="cancellationToken">Abandons the lookup.</param>
+    member private this.SyncModelAsync(sessionId: SessionId, cancellationToken: CancellationToken) : Task =
+        task {
+            try
+                let! stored = this.StoredModelAsync(sessionId, cancellationToken)
+                currentModel <- stored
+            with _ ->
+                ()
         }
 
     /// Handles one input line. Returns false when the REPL should exit.
@@ -1198,11 +1281,12 @@ type Engine
                 return true
             elif text = "/model" then
                 try
-                    line $"MODEL {currentModel.Value}"
+                    let! display = this.DisplayModelAsync(cancellationToken)
+                    line $"MODEL {display.Value}"
 
                     for option in providerOptions do
                         let marker =
-                            if String.Equals(option.Id, currentModel.Provider, StringComparison.OrdinalIgnoreCase) then
+                            if String.Equals(option.Id, display.Provider, StringComparison.OrdinalIgnoreCase) then
                                 "*"
                             else
                                 " "
@@ -1220,7 +1304,8 @@ type Engine
 
                 try
                     if arg = "" then
-                        line $"MODEL {currentModel.Value}"
+                        let! display = this.DisplayModelAsync(cancellationToken)
+                        line $"MODEL {display.Value}"
                     else
                         let flags: (string | null) * (string | null) =
                             if arg.Contains("/") then null, arg else arg, null
