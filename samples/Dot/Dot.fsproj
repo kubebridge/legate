@@ -10,6 +10,7 @@
 
   <!-- Compile order is explicit: register every new file here, in dependency order. -->
   <ItemGroup>
+    <Compile Include="ReplEngine.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
 
