@@ -3,7 +3,7 @@
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <RootNamespace>Dot</RootNamespace>
-    <Description>Dot host skeleton: one scripted prompt-to-Completed turn proving the AddLegate wiring.</Description>
+    <Description>Dot host with durable SQLite sessions: transcripts survive process exit for resume and list.</Description>
     <IsPackable>false</IsPackable>
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
   </PropertyGroup>
@@ -15,7 +15,7 @@
 
   <ItemGroup>
     <ProjectReference Include="../../src/Legate/Legate.fsproj" />
-    <ProjectReference Include="../../src/Legate.Storage.InMemory/Legate.Storage.InMemory.fsproj" />
+    <ProjectReference Include="../../src/Legate.Storage.Sqlite/Legate.Storage.Sqlite.fsproj" />
     <ProjectReference Include="../../src/Legate.Workspace.Process/Legate.Workspace.Process.fsproj" />
   </ItemGroup>
 
