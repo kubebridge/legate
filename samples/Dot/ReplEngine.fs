@@ -255,12 +255,14 @@ type private PendingTurn =
 /// SetAgentAsync rebind. The ensure also uploads dot's sample review skill
 /// package idempotently and records its version on the agent row's
 /// PackageReference (opaque host bookkeeping the runtime never reads).
+/// Reused by the -p one-shot print path, which opens the same agent row
+/// without entering the REPL.
 /// <param name="agents">The agent store.</param>
 /// <param name="packages">The package store the sample skill uploads to.</param>
 /// <param name="reference">The model the agent carries.</param>
 /// <param name="cancellationToken">Abandons the upsert.</param>
 /// <returns>The agent id conversing under the model.</returns>
-let private ensureModelAgentAsync
+let ensureModelAgentAsync
     (agents: IAgentStore)
     (packages: IAgentPackageStore)
     (reference: ModelReference)
