@@ -3,147 +3,151 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Durability deep dive: journals, claims, clusters</title>
+<title>How sessions recover after a crash | Legate</title>
+<meta name="description" content="How Legate uses durable storage, turn claims, recovery policies, and event replay to recover sessions after a process or node failure.">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 30 30'%3E%3Crect width='30' height='30' rx='7' fill='%236ea8ff'/%3E%3Crect x='13' y='6' width='4' height='18' fill='white'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="styles.css">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 </head>
 <body>
-<header style="position:sticky;top:0;z-index:20;background:oklch(14.1% 0.014 286 / 0.97);backdrop-filter:blur(10px);border-bottom:1px solid oklch(27.4% 0.013 286)">
-<div style="max-width:1200px;margin:0 auto;padding:0 32px;height:60px;display:flex;align-items:center;gap:32px">
-  <a href="overview.html" style="display:flex;align-items:center;gap:8px;color:#fff" aria-label="Legate home">
+<header class="nav">
+<div class="wrap">
+  <a class="brand" href="index.html" aria-label="Legate home">
     <svg width="30" height="30" viewBox="0 0 32 32" style="display:block;flex:none" aria-hidden="true"><path d="M9 6h3v21H9Z" fill="var(--ink)"/><path d="M12 7H25L23.4 9.4H12Z" fill="var(--logo-b)"/><path d="M12 10.2H22.87L21.27 12.6H12Z" fill="var(--logo-b)"/><path d="M12 13.4H21.27L22.87 15.8H12Z" fill="var(--logo-b)"/><path d="M12 16.6H23.4L25 19H12Z" fill="var(--logo-b)"/></svg>
     <span style="font-weight:700;letter-spacing:0.12em;font-size:14px">LEGATE</span>
   </a>
-  <nav style="display:flex;gap:24px;font-size:14px;flex:1;flex-wrap:wrap">
-    <a href="overview.html" style="color:oklch(87.1% 0.006 286)">Overview</a>
-    <a href="index.html" style="color:oklch(87.1% 0.006 286)">Sessions</a>
-    <a href="durability.html" style="color:#fff;font-weight:700">Durability</a>
-    <a href="build.html" style="color:oklch(87.1% 0.006 286)">Build</a>
+  <nav class="nav-links" aria-label="Main navigation">
+    <a href="index.html">Overview</a>
+    <a href="sessions.html">Sessions</a>
+    <a class="active" href="durability.html" aria-current="page">Durability</a>
+    <a href="build.html">Build</a>
   </nav>
-  <span style="font-family:'JetBrains Mono',monospace;font-size:11px;color:oklch(70.7% 0.013 286);border:1px solid oklch(27.4% 0.013 286);border-radius:4px;padding:4px 8px">v0.1.0</span>
-  <button class="theme-btn" type="button" aria-label="Switch color theme" title="Switch color theme" style="width:32px;height:32px;display:grid;place-items:center;background:transparent;border:1px solid oklch(37% 0.013 286);border-radius:6px;color:oklch(87.1% 0.006 286);cursor:pointer;padding:0;flex:none"></button>
-  <a class="gh-btn" href="https://github.com/kubebridge/legate" style="font-size:13px;font-weight:600;color:#fff;border:1px solid oklch(37% 0.013 286);border-radius:6px;padding:7px 12px;white-space:nowrap">GitHub</a>
+  <span class="ver-pill">v0.1.0</span>
+  <button class="theme-btn" type="button" aria-label="Switch color theme" title="Switch color theme"></button>
+  <a class="github-btn" href="https://github.com/kubebridge/legate">GitHub</a>
 </div>
 </header>
 
+<main>
 <div class="wrap hero">
-  <span class="kicker">02 / Durability deep dive</span>
-  <h1 class="hero-title">One owner, one journal, zero doubles</h1>
-  <p class="lede">The <a href="overview.html">overview</a> shows the kill. This page shows the machinery underneath: atomic claims, a gap-free event journal with cursor replay, and the cluster that survives the kill.</p>
+  <span class="kicker">02 / Durability</span>
+  <h1 class="hero-title">How sessions recover after a crash</h1>
+  <p class="lede">With SQLite or Postgres storage, session state and journaled events survive a process restart. When a session is activated again, Legate checks for interrupted work and applies its recovery policy.</p>
+  <p class="lede">A turn can resume as a new attempt or be recorded as failed. In a cluster, another node can take ownership after the previous owner's lease expires.</p>
 </div>
 
-<section class="block"><div class="wrap">
+<section class="block" aria-labelledby="claims"><div class="wrap">
   <div class="sec-head">
-    <div><span class="sec-no pk">Fencing</span>
-      <h2 class="sec-title">The token is the authority</h2></div>
-    <p class="sec-sub"><code>ClaimNextTurn</code> hands a turn to exactly one caller. Checkpoint, settle, abort, tool calls, and journal writes verify the opaque token store-side at the last moment. A stale token returns lost or rejected instead of acting.</p>
+    <div><span class="sec-no pk">Ownership</span>
+      <h2 class="sec-title" id="claims">Claiming a turn</h2></div>
+    <p class="sec-sub">Before running a turn, a worker claims it in the session store. The claim includes a lease and a token identifying the current owner. Competing claims are resolved atomically.</p>
   </div>
-  <div class="diagram">
-    <svg viewBox="0 0 980 260" role="img" aria-label="Two nodes race for a claim, one wins, the loser is fenced out">
+  <div class="diagram" tabindex="0" role="region" aria-label="Turn ownership diagram">
+    <svg viewBox="0 0 980 260" role="img" aria-labelledby="claims-title claims-desc">
+      <title id="claims-title">The store checks the current claim</title>
+      <desc id="claims-desc">Node A now owns the turn. The store accepts its current token and rejects writes from Node B, whose previous claim is stale.</desc>
       <defs>
-        <marker id="arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#9fb2fb"/></marker>
+        <marker id="arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="var(--v)"/></marker>
       </defs>
-      <rect x="30" y="70" width="180" height="120" rx="10" fill="var(--panel)" stroke="#3ddc84" stroke-width="1.5" class="node-up"/>
+      <rect x="30" y="70" width="180" height="120" rx="10" fill="var(--panel)" stroke="var(--g)" stroke-width="1.5"/>
       <text x="120" y="118" text-anchor="middle" fill="var(--ink)" font-size="16" font-weight="bold">Node A</text>
-      <text x="120" y="142" text-anchor="middle" fill="#3ddc84" font-size="13" font-weight="bold">WINS claim</text>
-      <text x="120" y="163" text-anchor="middle" fill="var(--f3)" font-size="12" font-family="monospace">token: opaque</text>
-      <rect x="770" y="70" width="180" height="120" rx="10" fill="var(--panel)" stroke="#f2555a" stroke-width="1.5"/>
+      <text x="120" y="142" text-anchor="middle" fill="var(--g)" font-size="13" font-weight="bold">Current owner</text>
+      <text x="120" y="163" text-anchor="middle" fill="var(--f3)" font-size="12">live claim</text>
+      <rect x="770" y="70" width="180" height="120" rx="10" fill="var(--panel)" stroke="var(--r)" stroke-width="1.5"/>
       <text x="860" y="118" text-anchor="middle" fill="var(--ink)" font-size="16" font-weight="bold">Node B</text>
-      <text x="860" y="142" text-anchor="middle" fill="#f2555a" font-size="13" font-weight="bold">FENCED OUT</text>
-      <text x="860" y="163" text-anchor="middle" fill="var(--f3)" font-size="12" font-family="monospace">stale: rejected</text>
-      <rect x="400" y="40" width="180" height="180" rx="10" fill="rgba(111,128,242,0.10)" stroke="#6f80f2" stroke-width="1.5"/>
-      <text x="490" y="82" text-anchor="middle" fill="var(--ink)" font-size="16" font-weight="bold">Turn store</text>
-      <text x="490" y="105" text-anchor="middle" fill="var(--f3)" font-size="12">atomic claim</text>
-      <circle cx="490" cy="148" r="20" fill="none" stroke="#6f80f2" stroke-width="2" class="pulse"/>
-      <text x="490" y="153" text-anchor="middle" fill="#9fb2fb" font-size="12" font-weight="bold">1</text>
-      <text x="490" y="192" text-anchor="middle" fill="var(--f3)" font-size="12">exactly one winner</text>
-      <line x1="210" y1="108" x2="395" y2="108" stroke="#3ddc84" stroke-width="2.5" class="flow" marker-end="url(#arr2)"/>
-      <line x1="395" y1="150" x2="210" y2="150" stroke="#3ddc84" stroke-width="2.5" class="flow" marker-end="url(#arr2)"/>
-      <line x1="770" y1="108" x2="585" y2="108" stroke="#f2555a" stroke-width="2" stroke-dasharray="5 5" marker-end="url(#arr2)"/>
-      <line x1="585" y1="150" x2="770" y2="150" stroke="#f2555a" stroke-width="2" stroke-dasharray="5 5" marker-end="url(#arr2)"/>
-      <text x="678" y="98" text-anchor="middle" fill="#f2555a" font-size="12">loser: no claimable turn</text>
+      <text x="860" y="142" text-anchor="middle" fill="var(--r)" font-size="13" font-weight="bold">Previous owner</text>
+      <text x="860" y="163" text-anchor="middle" fill="var(--f3)" font-size="12">stale claim</text>
+      <rect x="400" y="40" width="180" height="180" rx="10" fill="var(--panel2)" stroke="var(--v)" stroke-width="1.5"/>
+      <text x="490" y="82" text-anchor="middle" fill="var(--ink)" font-size="16" font-weight="bold">Session store</text>
+      <text x="490" y="105" text-anchor="middle" fill="var(--f3)" font-size="12">checks the claim token</text>
+      <circle cx="490" cy="148" r="20" fill="none" stroke="var(--v)" stroke-width="2"/>
+      <text x="490" y="153" text-anchor="middle" fill="var(--v)" font-size="12" font-weight="bold">A</text>
+      <text x="490" y="192" text-anchor="middle" fill="var(--f3)" font-size="12">current claim</text>
+      <line x1="210" y1="108" x2="395" y2="108" stroke="var(--g)" stroke-width="2" marker-end="url(#arr2)"/>
+      <text x="305" y="98" text-anchor="middle" fill="var(--g)" font-size="12">write with live token</text>
+      <line x1="395" y1="150" x2="210" y2="150" stroke="var(--g)" stroke-width="2" marker-end="url(#arr2)"/>
+      <text x="305" y="175" text-anchor="middle" fill="var(--g)" font-size="12">accepted</text>
+      <line x1="770" y1="108" x2="585" y2="108" stroke="var(--r)" stroke-width="2" stroke-dasharray="5 5" marker-end="url(#arr2)"/>
+      <text x="675" y="98" text-anchor="middle" fill="var(--r)" font-size="12">write with old token</text>
+      <line x1="585" y1="150" x2="770" y2="150" stroke="var(--r)" stroke-width="2" stroke-dasharray="5 5" marker-end="url(#arr2)"/>
+      <text x="675" y="175" text-anchor="middle" fill="var(--r)" font-size="12">rejected</text>
     </svg>
-    <div class="caption">Inbox append, claim, renew, checkpoint, settle: each lands in one transaction. Readers never see a half-applied step.</div>
+    <div class="caption">After Node A takes ownership, Node B's old token cannot authorise further claim-protected store writes.</div>
+  </div>
+  <p class="body-copy">The worker renews its lease while it runs. Store operations such as usage checkpoints, event appends, and settlement verify the claim token. Writes using an expired or replaced claim are rejected. Legate also checks the claim immediately before invoking a tool or notifying a completion sink.</p>
+</div></section>
+
+<section class="block alt" aria-labelledby="recovery"><div class="wrap">
+  <div class="sec-head">
+    <div><span class="sec-no pk">Recovery policy</span>
+      <h2 class="sec-title" id="recovery">Recovering interrupted work</h2></div>
+    <p class="sec-sub">Set <code>SessionOptions.OnCrashResume</code> when opening a session. Events from the previous attempt remain in the journal whichever policy you choose.</p>
+  </div>
+  <div class="card table-card" tabindex="0" role="region" aria-label="Crash recovery policies">
+    <table class="spec">
+      <thead><tr><th scope="col">Policy</th><th scope="col">Recovery behaviour</th></tr></thead>
+      <tbody>
+        <tr><td><code>ResumeAttempt</code></td><td>Start another attempt under a fresh claim, using history rebuilt from the journal. This is the session default.</td></tr>
+        <tr><td><code>FailAttempt</code></td><td>Record the interrupted turn as failed and return the session to idle.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="content-stack">
+    <p class="body-copy">When rebuilding model history, Legate removes the interrupted turn's tool-call and tool-result entries and adds a note explaining the restart.</p>
+    <p class="body-copy">Recovery starts a new attempt. It does not continue an interrupted HTTP request or undo an external action that already completed. Tools that change external systems need to account for retries.</p>
   </div>
 </div></section>
 
-<section class="block alt"><div class="wrap">
+<section class="block" aria-labelledby="journal"><div class="wrap">
   <div class="sec-head">
-    <div><span class="sec-no pk">Journal</span>
-      <h2 class="sec-title">Replayable by cursor</h2></div>
-    <p class="sec-sub">The event journal is the audit trail and the source of <code>Subscribe</code>. Batches append under the turn claim token; the store stamps gap-free 1-based sequences, and a stale token rejects the whole batch with zero writes.</p>
+    <div><span class="sec-no pk">Event journal</span>
+      <h2 class="sec-title" id="journal">Reconnecting to the event stream</h2></div>
+    <p class="sec-sub">Each journaled event receives a sequence number within its session. The store assigns these numbers in order, without gaps between appended events. Pass the last sequence you processed to <code>Subscribe</code> to read later events, then continue with live events.</p>
   </div>
   <div class="grid c3">
-    <div class="card accent-top"><h3>Cursor replay</h3><p>Bounded pages by exclusive int64 cursor: page with <code>NextCursor</code>, end of stream, unknown session, expired journal. Subscribers resume exactly where they left off.</p></div>
-    <div class="card accent-top cy"><h3>Bounded by config</h3><p>Per-event bytes, per-session count and bytes, batch size. A breach throws <code>EventLimitExceededException</code> before any part of the batch lands.</p></div>
-    <div class="card accent-top am"><h3>Janitor with a lease</h3><p>Journal cleanup is itself claimed (<code>TryClaimCleanup</code>, <code>CompleteCleanup</code>, <code>DeferCleanup</code>), so retention never races a live tail.</p></div>
+    <div class="card"><h3><span class="dsq" style="background:var(--vb)" aria-hidden="true"></span>Replay after a disconnect</h3><p>The sequence is an exclusive cursor: passing <code>42</code> requests events after <code>42</code>. Cluster subscriptions use at-least-once delivery, so consumers should use sequence numbers to ignore events they have already processed.</p></div>
+    <div class="card"><h3><span class="dsq" style="background:var(--c)" aria-hidden="true"></span>Bound journal growth</h3><p>Configure limits for event size, batch size, and the total event count and bytes per session. A batch that exceeds a limit is rejected before any of its events are written.</p></div>
+    <div class="card"><h3><span class="dsq" style="background:var(--a)" aria-hidden="true"></span>Handle retention explicitly</h3><p>Journal cleanup uses its own lease to coordinate workers. If the journal has expired, replay reports that condition rather than presenting the missing history as an empty stream.</p></div>
   </div>
 </div></section>
 
-<section class="block"><div class="wrap">
-  <div class="sec-head">
-    <div><span class="sec-no pk">The saga</span>
-      <h2 class="sec-title">Four issues, one green smoke</h2></div>
-    <p class="sec-sub">Each layer of the crash-resume proof exposed the next, and each shipped with its own tests. The animated loop on the overview is this story compressed.</p>
-  </div>
-  <div class="timeline">
-    <div class="tl-item shipped"><b>Marker (#284)</b><span>A fenced <code>TurnStartedEvent</code> journaled at provider-call entry: the deterministic in-call signal no production path previously emitted.</span></div>
-    <div class="tl-item shipped"><b>Tail recovery (#287)</b><span>Entity start routes Idle-with-live-turn plus unterminated-tail rows through journal-tail recovery under the fresh primed claim.</span></div>
-    <div class="tl-item shipped"><b>Completion era (#289)</b><span>One terminal event per settled turn, an era gate for old marker-only histories, and a dispatcher sweep that re-pokes and settles directly when survivors go quiet.</span></div>
-    <div class="tl-item shipped"><b>Seeded smoke (#271)</b><span>Stable smoke agent, open-with-agent-id, short-lease overlay, SIGKILL mid-call. Green in CI: Fail per policy, frames 1..2 gap-free and duplicate-free.</span></div>
-  </div>
-</div></section>
-
-<section class="block alt"><div class="wrap">
+<section class="block alt" aria-labelledby="cluster"><div class="wrap">
   <div class="sec-head">
     <div><span class="sec-no pk">Cluster</span>
-      <h2 class="sec-title">Same logic, sharded</h2></div>
-    <p class="sec-sub">Actor logic is shared between single-node and clustered mode; translation happens at the serialization boundary. The bar: core builds and tests with no external services.</p>
+      <h2 class="sec-title" id="cluster">Running across multiple nodes</h2></div>
+    <p class="sec-sub">Local mode runs an in-process actor system. Cluster mode distributes session actors by session ID. The session behaviour is shared between both modes.</p>
   </div>
   <div class="grid c2">
-    <div class="card"><h3>Runtime</h3><p><code>StaticSeeds</code> joins named seeds and shards entities by session id; <code>Kubernetes</code> bootstraps via Akka.Management plus discovery. Keep-majority split-brain, readiness gates, graceful drain.</p></div>
-    <div class="card"><h3>Event bus</h3><p>Cross-node <code>Subscribe</code> through the owning entity with a bounded replay cache. Node A tails a session on node B and resumes gap-free from its cursor after a real restart.</p></div>
-    <div class="card"><h3>Wire format</h3><p>Token-less DTOs under versioned <code>legate.*.v1</code> envelopes with golden files. Current and current-minus-one accepted; everything else fails closed.</p></div>
-    <div class="card"><h3>Redis admission</h3><p>Two processes on one Redis respect one combined LLM limit: FIFO waiters with TTL, owner-fenced leases, fail policies, a startup canary gating readiness.</p></div>
-  </div>
-  <div class="pager" style="margin-top:20px">
-    <a class="btn" href="index.html">01 / Sessions deep dive</a>
-    <a class="btn primary" href="build.html">03 / Build deep dive</a>
+    <div class="card"><h3>Cluster startup</h3><p>Use <code>StaticSeeds</code> for explicitly configured nodes or the Kubernetes package for discovery. Readiness checks determine when a node can serve traffic.</p></div>
+    <div class="card"><h3>Graceful shutdown</h3><p>Shutdown marks the node unready and allows running work time to finish within a configured grace period before leaving the cluster.</p></div>
+    <div class="card"><h3>Message compatibility</h3><p>Messages sent between nodes use versioned formats and payload-size limits. Unsupported or invalid messages are rejected. Golden-file tests check the encoded formats.</p></div>
+    <div class="card"><h3>Shared model-call limits</h3><p>The optional Redis coordination package applies LLM admission limits across processes, allowing multiple nodes to share the configured capacity.</p></div>
   </div>
 </div></section>
 
+<section class="block" aria-labelledby="recovery-tests"><div class="wrap">
+  <div class="sec-head">
+    <div><span class="sec-no pk">Verification</span>
+      <h2 class="sec-title" id="recovery-tests">Testing recovery</h2></div>
+    <p class="sec-sub">The repository includes a three-node Docker Compose test with Postgres and Redis. It waits until a turn enters a model call, kills the owning process with <code>SIGKILL</code>, then checks recovery and the event stream from a surviving node.</p>
+  </div>
+  <p class="body-copy">Additional tests cover competing claims, expired tokens, journal ordering, and stale workers being stopped before tool invocation.</p>
+  <div class="resource-links">
+    <a href="https://github.com/kubebridge/legate/tree/main/samples/cluster-compose">Explore the recovery test</a>
+    <a href="https://github.com/kubebridge/legate/blob/main/Docs/ARCHITECTURE.md#store-contracts">Read the store contracts</a>
+  </div>
+  <div class="pager">
+    <a class="btn" href="sessions.html">01 / Sessions</a>
+    <a class="btn primary" href="build.html">03 / Build</a>
+  </div>
+</div></section>
+</main>
+
 <footer><div class="wrap">
-  <a class="brand" href="overview.html" style="font-size:12px"><svg width="20" height="20" viewBox="0 0 32 32" aria-hidden="true"><path d="M9 6h3v21H9Z" fill="var(--ink)"/><path d="M12 7H25L23.4 9.4H12Z" fill="var(--logo-b)"/><path d="M12 10.2H22.87L21.27 12.6H12Z" fill="var(--logo-b)"/><path d="M12 13.4H21.27L22.87 15.8H12Z" fill="var(--logo-b)"/><path d="M12 16.6H23.4L25 19H12Z" fill="var(--logo-b)"/></svg>LEGATE</a>
-  <span class="spacer">A <a href="https://kubebridge.com">kubebridge</a> project · Apache 2.0</span>
+  <a class="brand" href="index.html" style="font-size:12px"><svg width="20" height="20" viewBox="0 0 32 32" aria-hidden="true"><path d="M9 6h3v21H9Z" fill="var(--ink)"/><path d="M12 7H25L23.4 9.4H12Z" fill="var(--logo-b)"/><path d="M12 10.2H22.87L21.27 12.6H12Z" fill="var(--logo-b)"/><path d="M12 13.4H21.27L22.87 15.8H12Z" fill="var(--logo-b)"/><path d="M12 16.6H23.4L25 19H12Z" fill="var(--logo-b)"/></svg>LEGATE</a>
+  <span class="spacer">A <a href="https://kubebridge.com">Kubebridge</a> project · Apache 2.0</span>
   <nav><a href="https://github.com/kubebridge/legate">GitHub</a><a href="https://www.nuget.org/packages/Legate">NuGet</a></nav>
 </div></footer>
-<script>
-(function(){
-var SUN='<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"></path></svg>';
-var MOON='<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"></path></svg>';
-var root=document.documentElement;
-function osLight(){return window.matchMedia&&window.matchMedia('(prefers-color-scheme: light)').matches;}
-function apply(){
-  var pref='auto';
-  try{var s=localStorage.getItem('legate-theme');if(s)pref=s;}catch(e){}
-  var resolved=pref==='auto'?(osLight()?'light':'dark'):pref;
-  if(pref==='auto')root.removeAttribute('data-theme');else root.setAttribute('data-theme',resolved);
-  var dark=resolved==='dark';
-  document.querySelectorAll('.theme-btn').forEach(function(b){
-    b.setAttribute('aria-label',dark?'Switch to light mode':'Switch to dark mode');
-    b.setAttribute('title',dark?'Switch to light mode':'Switch to dark mode');
-    b.innerHTML=dark?SUN:MOON;
-  });
-}
-document.querySelectorAll('.theme-btn').forEach(function(b){b.addEventListener('click',function(){
-  var cur=root.getAttribute('data-theme')||(osLight()?'light':'dark');
-  try{localStorage.setItem('legate-theme',cur==='dark'?'light':'dark');}catch(e){}
-  apply();
-});});
-if(window.matchMedia)window.matchMedia('(prefers-color-scheme: light)').addEventListener('change',apply);
-apply();
-})();
-</script>
+<script src="theme.js"></script>
 </body>
 </html>
