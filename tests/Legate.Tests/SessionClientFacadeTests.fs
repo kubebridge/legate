@@ -261,6 +261,79 @@ let ``Prompt queues and settles through the DI runner`` () : Task =
     }
 
 [<Fact>]
+let ``Resume after a completed turn prompts again`` () : Task =
+    task {
+        let chat =
+            scripted
+                [
+                    ScriptStep.Text "first"
+                    ScriptStep.Text "second"
+                ]
+
+        use provider = (createServices chat (sourced [])).BuildServiceProvider()
+        let client = provider.GetRequiredService<SessionClient>()
+        let service = actorServiceOf provider
+        do! (service :> IHostedService).StartAsync(CancellationToken.None)
+
+        try
+            let! created = openSession client
+            let firstWaiter = settleWaiter created.Id
+
+            let! _ =
+                awaitWhat
+                    (SessionClientOperations.PromptAsync(
+                        client,
+                        created.Id,
+                        UserMessage.Text "one",
+                        DeliveryMode.Queue,
+                        CancellationToken.None
+                    ))
+                    "the first prompt to land"
+
+            let! first = awaitWhat firstWaiter.Task "the first turn to settle"
+            first.Status |> should equal TurnStatus.Completed
+            first.AssistantText |> should equal "first"
+
+            // Settle barrier: the snapshot round-trips the mailbox after
+            // the finish handling completed, making the following row read
+            // exact without polling.
+            let! actor = client.Resolve(created.Id, CancellationToken.None)
+            let! _ = SessionActor.getSuspendSnapshotAsync actor CancellationToken.None
+
+            // The Completed-to-Idle settle released the prime, so the
+            // respawn below primes anew instead of falling back to a dead
+            // token against the still-live prime.
+            let! stored = storedOf client created.Id
+            stored.CurrentTurnId.HasValue |> should equal false
+
+            // Restart: the actor system stops and starts over the same
+            // stores, mirroring a process exit and --resume.
+            do! stopQuietly service
+            do! (service :> IHostedService).StartAsync(CancellationToken.None)
+
+            let secondWaiter = settleWaiter created.Id
+
+            let! _ =
+                awaitWhat
+                    (SessionClientOperations.PromptAsync(
+                        client,
+                        created.Id,
+                        UserMessage.Text "two",
+                        DeliveryMode.Queue,
+                        CancellationToken.None
+                    ))
+                    "the follow-up prompt to land"
+
+            let! second = awaitWhat secondWaiter.Task "the resumed turn to settle"
+            second.Status |> should equal TurnStatus.Completed
+            second.AssistantText |> should equal "second"
+
+            (settledOf created.Id).Count |> should equal 2
+        finally
+            stopQuietly service |> fun shutdown -> shutdown.GetAwaiter().GetResult()
+    }
+
+[<Fact>]
 let ``Prompt with Inject folds into the running turn`` () : Task =
     task {
         let entered = new ManualResetEventSlim(false)
