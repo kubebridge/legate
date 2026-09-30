@@ -7,8 +7,9 @@ open System.IO
 open System.Threading
 open System.Threading.Tasks
 open Legate
+open Legate.Mcp
 open Legate.Storage.Sqlite
-open Legate.Workspace.Process
+open Legate.Workspace.HostDirectory
 open Microsoft.Extensions.AI
 open Microsoft.Extensions.DependencyInjection
 open Microsoft.Extensions.Hosting
@@ -21,10 +22,12 @@ open Microsoft.Extensions.Hosting
 // the /new, /sessions, /resume, /abort, /compact, and /quit commands.
 // Mirrors the samples/Headless scripted precedent; scripted support stays
 // host-local, never a Legate.Testing reference (test-only package).
-// Live-provider wiring belongs to later children: there are no live
-// branches here. Approval UX polish belongs to #306 (this host only wires
-// the opt-in ask policy the REPL already answers inline); steering
-// commands belong to #308.
+// The workspace is the working directory through the host-directory
+// runtime with the dot-local coding tools (#306): read_file, write_file,
+// list_files, edit_file, glob, grep, and exec under a pi-faithful
+// allow-all default, with the opt-in --ask policy the REPL answers inline
+// (allow-once / allow-for-session / deny). Root fencing stays on in every
+// policy mode. Steering commands belong to #308.
 
 // ──────────────────────────────────────────────────────────────────────────
 // Database path
@@ -81,14 +84,19 @@ type DotStart =
         /// Ask for every tool call instead of allowing all: the opt-in
         /// ask policy the REPL answers inline.
         Ask: bool
+        /// MCP config file to attach extra tools from, or null for none.
+        McpPath: string | null
     }
 
-/// Builds the --help text over the resolved database path.
+/// Builds the --help text over the resolved database path: usage, session
+/// storage, the unsandboxed workspace with its container-sandboxing
+/// expectation, and the --ask escape.
 /// <param name="dbPath">The resolved database file path.</param>
 /// <returns>The usage text.</returns>
 let private helpText (dbPath: string) : string =
-    "Usage: Dot [--resume <session-id>] [--sessions|--list] [--scripted] [--wait-minutes <n>] [--ask] "
+    "Usage: Dot [--resume <session-id>] [--sessions|--list] [--scripted] [--wait-minutes <n>] [--ask] [--mcp <path>] "
     + storageHelp dbPath
+    + " Tools run against the working directory through the host-directory runtime with no sandbox: sandbox the run in a container (as pi does) or pass --ask for per-call approval (allow once, allow for session, deny). The workspace root fence stays on in every mode."
 
 /// Parses the dot arguments into a start plan. Unknown flags fail with a
 /// usage error naming the flag; missing values fail naming the flag.
@@ -100,6 +108,7 @@ let parseArgs (argv: string[]) : DotStart =
     let mutable listSessions = false
     let mutable waitMinutes = 5.0
     let mutable ask = false
+    let mutable mcp: string | null = null
 
     let mutable index = 0
 
@@ -127,6 +136,7 @@ let parseArgs (argv: string[]) : DotStart =
                     ArgumentException("The --wait-minutes flag needs a positive number of minutes.", "--wait-minutes")
                 )
         | "--ask" -> ask <- true
+        | "--mcp" -> mcp <- take "--mcp"
         | "--help"
         | "-h" -> raise (ArgumentException(helpText (resolveDbPath ()), "--help"))
         | unknown -> raise (ArgumentException($"Unknown flag '{unknown}'.", unknown))
@@ -140,28 +150,125 @@ let parseArgs (argv: string[]) : DotStart =
             raise (ArgumentException("The --resume flag needs a non-empty session id.", "--resume"))
         | raw -> raw.Trim()
 
+    let mcpValue: string | null =
+        match mcp with
+        | null -> null
+        | raw when String.IsNullOrWhiteSpace raw ->
+            raise (ArgumentException("The --mcp flag needs a non-empty config path.", "--mcp"))
+        | raw -> raw.Trim()
+
     {
         Scripted = scripted
         Resume = resumeValue
         ListSessions = listSessions
         WaitMinutes = waitMinutes
         Ask = ask
+        McpPath = mcpValue
     }
 
 // ──────────────────────────────────────────────────────────────────────────
 // Scripted transports (no keys, no external services)
 
 // Asks for every tool call: the opt-in ask policy, so every agent tool
-// call meets a console approval before it runs. Approval UX polish
-// belongs to #306; this is only the policy the REPL answers inline.
+// call (reads and lists included, exec always) meets a console approval
+// before it runs. A deny runs nothing and the turn continues; the REPL
+// answers each request inline (allow-once / allow-for-session / deny).
 type private AskAllPolicy() =
     interface IPermissionPolicy with
         member _.Evaluate(_) = PermissionVerdict.Ask
 
-/// One scripted model step: assistant text or one tool call.
+/// One scripted model step: assistant text or one tool call with its
+/// named arguments.
 type private ScriptStep =
     | Text of string
-    | ToolCall of callId: string * toolName: string
+    | ToolCall of callId: string * toolName: string * args: (string * obj) list
+
+/// Probe scripts keyed by the prompt marker that selects them: scripted
+/// acceptances for the coding tools over the working directory. Each
+/// probe replaces the default queue once per process, so the shared
+/// steps below stay byte-identical for the existing smoke runs.
+/// <param name="marker">The prompt marker selecting the probe.</param>
+/// <returns>The probe's model steps.</returns>
+let private probeScript (marker: string) : ScriptStep list =
+    match marker with
+    | "coding-write" ->
+        [
+            ToolCall(
+                "call-write",
+                "write_file",
+                [
+                    "path", "hello.html" :> obj
+                    "content", "<!DOCTYPE html>\n<html>\n<body>\n<h1>hello from dot</h1>\n</body>\n</html>\n" :> obj
+                ]
+            )
+            Text "coding-write done"
+        ]
+    | "coding-edit" ->
+        [
+            ToolCall(
+                "call-edit-write",
+                "write_file",
+                [
+                    "path", "site/index.html" :> obj
+                    "content", "<h1>hello</h1>\n" :> obj
+                ]
+            )
+            ToolCall(
+                "call-edit",
+                "edit_file",
+                [
+                    "path", "site/index.html" :> obj
+                    "old_string", "<h1>hello</h1>" :> obj
+                    "new_string", "<h1>hello, edited</h1>" :> obj
+                ]
+            )
+            Text "coding-edit done"
+        ]
+    | "coding-two" ->
+        [
+            ToolCall(
+                "call-two-a",
+                "write_file",
+                [
+                    "path", "probe-a.txt" :> obj
+                    "content", "alpha\n" :> obj
+                ]
+            )
+            ToolCall(
+                "call-two-b",
+                "write_file",
+                [
+                    "path", "probe-b.txt" :> obj
+                    "content", "beta\n" :> obj
+                ]
+            )
+            Text "coding-two done"
+        ]
+    | "coding-outside" ->
+        [
+            ToolCall(
+                "call-outside",
+                "write_file",
+                [
+                    "path", "../outside-evil.txt" :> obj
+                    "content", "must not land\n" :> obj
+                ]
+            )
+            Text "coding-outside done"
+        ]
+    | "coding-exec" ->
+        [
+            ToolCall(
+                "call-exec",
+                "exec",
+                [
+                    "command", "dotnet --version" :> obj
+                    "timeout_seconds", 60 :> obj
+                ]
+            )
+            Text "coding-exec done"
+        ]
+    | _ -> []
 
 /// Minimal inline scripted chat client: serves the queued steps, then a
 /// canned answer forever so the open-ended REPL never runs dry. Mirrors
@@ -172,6 +279,48 @@ type private ScriptStep =
 /// deterministically outruns the turn while it keeps running.
 type private ScriptedClient(steps: Queue<ScriptStep>) =
     do ArgumentNullException.ThrowIfNull(steps)
+
+    // Probe markers served so far: history repeats the marker on later
+    // calls, so a served probe never refills the queue twice.
+    let served = HashSet<string>(StringComparer.Ordinal)
+
+    /// The probe markers in match order: no marker contains another, so
+    /// the first mention wins.
+    let probeMarkers =
+        [
+            "coding-write"
+            "coding-edit"
+            "coding-two"
+            "coding-outside"
+            "coding-exec"
+        ]
+
+    /// True when any incoming message mentions the marker.
+    /// <param name="messages">The chat messages.</param>
+    /// <param name="marker">The probe marker.</param>
+    /// <returns>True when the marker is mentioned.</returns>
+    let mentions (messages: ChatMessage seq) (marker: string) : bool =
+        messages
+        |> Seq.exists (fun message ->
+            not (isNull (box message))
+            && not (isNull (box message.Text))
+            && message.Text.Contains(marker, StringComparison.Ordinal))
+
+    /// Refills the queue with the first unserved probe the messages
+    /// mention, if any.
+    /// <param name="messages">The chat messages.</param>
+    let serveProbe (messages: ChatMessage seq) : unit =
+        match
+            probeMarkers
+            |> List.tryFind (fun marker -> not (served.Contains marker) && mentions messages marker)
+        with
+        | None -> ()
+        | Some marker ->
+            served.Add marker |> ignore
+            steps.Clear()
+
+            for step in probeScript marker do
+                steps.Enqueue step
 
     /// True when the incoming messages ask for the slow-turn probe.
     /// <param name="messages">The chat messages.</param>
@@ -191,15 +340,21 @@ type private ScriptedClient(steps: Queue<ScriptStep>) =
                 if isSlowTurn messages then
                     do! Task.Delay(TimeSpan.FromSeconds(1.0), cancellationToken)
 
+                serveProbe messages
+
                 if steps.Count = 0 then
                     return ChatResponse(ChatMessage(ChatRole.Assistant, "dot scripted answer"))
                 else
                     match steps.Dequeue() with
                     | Text text -> return ChatResponse(ChatMessage(ChatRole.Assistant, text))
-                    | ToolCall(callId, toolName) ->
+                    | ToolCall(callId, toolName, args) ->
+                        let arguments = Dictionary<string, obj>()
+
+                        for key, value in args do
+                            arguments[key] <- value
+
                         let call =
-                            FunctionCallContent(callId, toolName, Dictionary<string, obj>() :> IDictionary<string, obj>)
-                            :> AIContent
+                            FunctionCallContent(callId, toolName, arguments :> IDictionary<string, obj>) :> AIContent
 
                         return ChatResponse(ChatMessage(ChatRole.Assistant, ResizeArray<AIContent>([| call |])))
             }
@@ -234,10 +389,13 @@ type private StubScriptedProvider(client: IChatClient) =
 
 /// Creates the scripted chat client: one permission-gated echo call under
 /// the ask policy, then plain answers. Under allow-all the echo call is
-/// auto-approved and the turn completes with the first answer.
+/// auto-approved and the turn completes with the first answer. Prompts
+/// naming a coding probe (coding-write, coding-edit, coding-two,
+/// coding-outside, coding-exec) swap the queue for that probe's tool
+/// steps instead.
 let private scriptedClient () : ScriptedClient =
     let steps = Queue<ScriptStep>()
-    steps.Enqueue(ToolCall("call-1", "scripted-echo"))
+    steps.Enqueue(ToolCall("call-1", "scripted-echo", []))
     steps.Enqueue(Text "dot scripted answer one")
     steps.Enqueue(Text "dot scripted answer two")
     new ScriptedClient(steps)
@@ -266,32 +424,44 @@ type private StaticSource(tools: IReadOnlyList<AITool>) =
 
 /// Builds the container: one UseSqlite file plus every store over it
 /// (migrations, WAL mode, and the busy timeout ride on the open), a
-/// process workspace over the working directory, the allow-all policy by
-/// default (the opt-in ask policy under --ask; the facade runner reads
-/// the container policy), the scripted echo tool, and the scripted
-/// provider. No live branches: live wiring belongs to later children.
+/// host-directory workspace over the working directory, the allow-all
+/// policy by default (the every-call ask policy under --ask; the facade
+/// runner reads the container policy), the scripted echo tool plus the
+/// dot-local coding tools bound to the session workspace, the optional
+/// mcp.json attach, and the scripted provider. No live branches: live
+/// wiring belongs to later children.
 /// <param name="services">The container to add the host to.</param>
 /// <param name="dbPath">The SQLite file path. Created with its directory on first use.</param>
-/// <param name="ask">True to ask for every tool call instead of allowing all.</param>
-let private buildServices (services: IServiceCollection) (dbPath: string) (ask: bool) : unit =
+/// <param name="start">The start plan: ask policy and MCP config path.</param>
+let private buildServices (services: IServiceCollection) (dbPath: string) (start: DotStart) : unit =
     SqliteServiceCollectionExtensions.UseSqlite(services, dbPath) |> ignore
 
     LegateServiceCollectionExtensions.AddLegate(
         services,
         Action<LegateBuilder>(fun builder ->
-            let workspaceOptions = ProcessWorkspaceRuntimeOptions()
+            let workspaceOptions = HostDirectoryWorkspaceRuntimeOptions()
             workspaceOptions.Root <- Environment.CurrentDirectory
 
-            builder.Workspace.UseRuntime(ProcessWorkspaceRuntime(workspaceOptions, null, null))
+            builder.Workspace.UseRuntime(HostDirectoryWorkspaceRuntime(workspaceOptions, null, null))
             |> ignore
 
-            if ask then
+            if start.Ask then
                 builder.Permissions.UsePolicy(AskAllPolicy()) |> ignore
             else
                 builder.Permissions.UsePolicy(AllowAllPermissionPolicy()) |> ignore
 
             builder.Tools.AddSource(StaticSource(ResizeArray<AITool>([| scriptedEchoTool () |])))
-            |> ignore)
+            |> ignore
+
+            builder.Tools.AddSource<CodingTools.CodingToolSource>() |> ignore
+
+            match start.McpPath with
+            | null -> ()
+            | path ->
+                if File.Exists(path) then
+                    builder.Tools.AddMcpServersFromConfig(path) |> ignore
+                else
+                    raise (InvalidOperationException($"The --mcp path '{path}' does not exist.")))
     )
     |> ignore
 
@@ -301,6 +471,22 @@ let private buildServices (services: IServiceCollection) (dbPath: string) (ask: 
     |> ignore
 
     services.AddSingleton<IChatClient>(client :> IChatClient) |> ignore
+
+/// Stops the MCP lifecycle sources so subprocess servers exit with dot.
+/// Mirrors the samples/LegateCli precedent; host-local, like the scripted
+/// client.
+/// <param name="provider">The built container.</param>
+let private stopToolSources (provider: IServiceProvider) : Task =
+    task {
+        for source in provider.GetServices<IToolSource>() do
+            match source with
+            | :? IToolSourceLifecycle as lifecycle ->
+                try
+                    do! lifecycle.StopAsync(CancellationToken.None)
+                with _ ->
+                    ()
+            | _ -> ()
+    }
 
 /// Lists the stored sessions newest-first with title and state.
 /// <param name="client">The session client.</param>
@@ -346,7 +532,7 @@ let main (argv: string[]) : int =
     let runAsync (start: DotStart) (dbPath: string) : Task<int> =
         task {
             let application = Host.CreateApplicationBuilder()
-            buildServices application.Services dbPath start.Ask
+            buildServices application.Services dbPath start
 
             use host = application.Build()
 
@@ -379,6 +565,7 @@ let main (argv: string[]) : int =
                             return 1
                     }
 
+                do! stopToolSources host.Services
                 do! host.StopAsync(CancellationToken.None)
                 return exit
             with
