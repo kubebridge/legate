@@ -1362,6 +1362,77 @@ let ``Export writes JSONL and HTML and refuses escape`` () =
             ()
 
 [<Fact>]
+let ``Export refuses symlink escape and allows in-workspace links`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+    let outsideDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName())
+
+    try
+        Directory.CreateDirectory(outsideDir) |> ignore
+        Directory.CreateDirectory(Path.Combine(workdir, "real")) |> ignore
+
+        let linksReady =
+            try
+                Directory.CreateSymbolicLink(Path.Combine(workdir, "link-escape"), outsideDir)
+                |> ignore
+
+                Directory.CreateSymbolicLink(Path.Combine(workdir, "link-ok"), Path.Combine(workdir, "real"))
+                |> ignore
+
+                true
+            with
+            | :? UnauthorizedAccessException -> false
+            | :? IOException -> false
+            | :? PlatformNotSupportedException -> false
+
+        if linksReady then
+            let exit, stdout, stderr =
+                runDot
+                    dotDll
+                    [ "--scripted" ]
+                    (script
+                        [
+                            "hello"
+                            "/export link-escape/escaped.jsonl"
+                            "/export link-ok/ok.jsonl"
+                            "/quit"
+                        ])
+                    workdir
+                    dbPath
+
+            let output = stdout + Environment.NewLine + stderr
+
+            exit |> should equal 0
+            // The link escape is refused with the inside-workspace error;
+            // the ERROR line is expected here, so no checkNoErrors.
+            check output "ERROR The /export target must stay inside the working directory"
+            // The in-workspace link resolves to its target, so the EXPORTED
+            // line names the resolved file, not the link path.
+            check output "EXPORTED "
+            check output "ok.jsonl"
+
+            if File.Exists(Path.Combine(outsideDir, "escaped.jsonl")) then
+                failwith $"The symlinked export landed outside the workdir. Full output:{Environment.NewLine}{output}"
+
+            if File.Exists(Path.Combine(workdir, "link-escape", "escaped.jsonl")) then
+                failwith $"The symlinked export landed through the link. Full output:{Environment.NewLine}{output}"
+
+            let ok = probeFile output (Path.Combine(workdir, "link-ok", "ok.jsonl"))
+
+            for line in ok.Split([| '\n' |], StringSplitOptions.RemoveEmptyEntries) do
+                check line "$type"
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+        try
+            Directory.Delete(outsideDir, true)
+        with _ ->
+            ()
+
+[<Fact>]
 let ``Session reports counts and tokens without prices`` () =
     let dotDll = sampleDll "Dot" "Dot.dll"
     let workdir, dbPath = freshWorkdir ()
