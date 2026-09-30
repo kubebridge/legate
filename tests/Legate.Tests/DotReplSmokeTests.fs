@@ -7,8 +7,8 @@ open System.IO
 open FsUnit.Xunit
 open Xunit
 
-// Dot REPL smoke test (issues 304, 306, 307): runs the built dot binary
-// as a subprocess on scripted transports (no live keys, no external
+// Dot REPL smoke test (issues 304, 306, 307, 308): runs the built dot
+// binary as a subprocess on scripted transports (no live keys, no external
 // services) through the interactive loop over piped stdin: prompt/stream/
 // settle with assistant text, /new, store-backed /sessions, /resume
 // continuing context across processes on one DOT_DB_PATH file, /model
@@ -21,10 +21,16 @@ open Xunit
 // outside-root fence, exec, --help text, and the --mcp attach. Issue 307
 // adds --provider/--model parsing and startup selection coverage: dummy
 // env keys register the live providers with no network (selection only,
-// the REPL quits before any turn), so unknown providers name the known
+// the REPL quits before any turn runs), so unknown providers name the known
 // ids, a provider without its key names the env var, an unparsable model
 // names the known providers, and one key without --provider just works.
-// Mirrors the LegateCli smoke precedent; each run gets its own temp
+// Issue 308 adds steering over the slow slow-steer probe (slow-echo tool):
+// /steer interrupts (prior RESULT Aborted plus the new turn), /follow
+// folds in (Inject, one Completed settle), plain input queues (Queue, two
+// Completed settles), /tree lists journal positions and /fork branches the
+// prefix leaving the source untouched (plus a free /clone at the tail),
+// and /abort//compact behave mid-turn and idle with the Deferred compact
+// path. Mirrors the LegateCli smoke precedent; each run gets its own temp
 // database file.
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -233,7 +239,7 @@ let ``Repl streams turns serves slash commands and prints usage for unknown`` ()
 
         check
             output
-            "Commands: /new [title], /sessions, /resume <id-or-index>, /model [provider[/model]], /abort, /compact, /quit."
+            "Commands: /new [title], /sessions, /resume <id-or-index>, /model [provider[/model]], /steer <text>, /follow <text>, /abort, /compact, /tree, /fork <sequence>, /clone, /quit."
 
         checkNoErrors output
     finally
@@ -882,6 +888,280 @@ let ``Model lists options and switches mid-session`` () =
         // The failed switch reports without killing the REPL: the ERROR
         // line is expected here, so no checkNoErrors on this run.
         check output "ERROR Unknown provider 'nope'"
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+// ──────────────────────────────────────────────────────────────────────────
+// Steering, follow-ups, tree, and fork (issue 308): every path proves
+// itself against the slow slow-steer probe (slow-echo tool, three seconds
+// under allow-all), so the piped steering line lands while the turn still
+// runs.
+
+[<Fact>]
+let ``Steer interrupts the slow turn and starts the new turn`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+
+    try
+        let exit, stdout, stderr =
+            runDot
+                dotDll
+                [ "--scripted" ]
+                (script
+                    [
+                        "slow-steer start"
+                        "/steer steered hello"
+                        "/quit"
+                    ])
+                workdir
+                dbPath
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 0
+        // The pre-empted turn settles visibly as Aborted, never silently,
+        // then the steering turn completes.
+        check output "RESULT Aborted"
+        check output "RESULT Completed"
+        check output "END-RESULT"
+        checkNoErrors output
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+[<Fact>]
+let ``Follow folds into the slow turn without interrupting`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+
+    try
+        let exit, stdout, stderr =
+            runDot
+                dotDll
+                [ "--scripted" ]
+                (script
+                    [
+                        "slow-steer start"
+                        "/follow extra context"
+                        "/quit"
+                    ])
+                workdir
+                dbPath
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 0
+        // Inject folds at the next iteration boundary: one settle, Completed.
+        check output "RESULT Completed"
+        checkAbsent output "RESULT Aborted"
+        checkOnce output "RESULT Completed"
+        checkNoErrors output
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+[<Fact>]
+let ``Plain input queues behind the slow turn`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+
+    try
+        let exit, stdout, stderr =
+            runDot
+                dotDll
+                [ "--scripted" ]
+                (script
+                    [
+                        "slow-steer start"
+                        "second hello"
+                        "/quit"
+                    ])
+                workdir
+                dbPath
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 0
+        // Queue waits for the turn to finish: two settles, both Completed.
+        checkAbsent output "RESULT Aborted"
+
+        if countOccurrences output "RESULT Completed" <> 2 then
+            failwith $"The dot smoke output misses the queued second settle. Full output:{Environment.NewLine}{output}"
+
+        checkNoErrors output
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+[<Fact>]
+let ``Tree lists positions and fork carries the prefix`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+
+    try
+        let exit, stdout, stderr =
+            runDot
+                dotDll
+                [ "--scripted" ]
+                (script
+                    [
+                        "hello"
+                        "/tree"
+                        "/fork 1"
+                        "/tree"
+                        "/sessions"
+                        "/quit"
+                    ])
+                workdir
+                dbPath
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 0
+        check output "RESULT Completed"
+        check output "TREE "
+        check output "FORKED "
+        check output "RESUMED "
+        check output "SESSIONS 2"
+        checkNoErrors output
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+[<Fact>]
+let ``Clone duplicates the active branch`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+
+    try
+        let exit, stdout, stderr =
+            runDot
+                dotDll
+                [ "--scripted" ]
+                (script
+                    [
+                        "hello"
+                        "/clone"
+                        "/sessions"
+                        "/quit"
+                    ])
+                workdir
+                dbPath
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 0
+        check output "FORKED "
+        check output "RESUMED "
+        check output "SESSIONS 2"
+        checkNoErrors output
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+[<Fact>]
+let ``Abort settles the slow turn visibly`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+
+    try
+        let exit, stdout, stderr =
+            runDot
+                dotDll
+                [ "--scripted" ]
+                (script
+                    [
+                        "slow-steer start"
+                        "/abort"
+                        "/quit"
+                    ])
+                workdir
+                dbPath
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 0
+        check output "ABORTED"
+        check output "RESULT Aborted"
+        checkNoErrors output
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+[<Fact>]
+let ``Compact defers mid-turn and completes idle`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+
+    try
+        let exit, stdout, stderr =
+            runDot
+                dotDll
+                [ "--scripted" ]
+                (script
+                    [
+                        "slow-steer start"
+                        "/compact"
+                        "/quit"
+                    ])
+                workdir
+                dbPath
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 0
+        check output "COMPACT deferred"
+        check output "RESULT Completed"
+        checkNoErrors output
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+[<Fact>]
+let ``Steering commands need text and fork needs a sequence`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+
+    try
+        let exit, stdout, stderr =
+            runDot
+                dotDll
+                [ "--scripted" ]
+                (script
+                    [
+                        "/steer"
+                        "/follow"
+                        "/fork"
+                        "/fork nope"
+                        "/quit"
+                    ])
+                workdir
+                dbPath
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 0
+        check output "ERROR /steer needs text"
+        check output "ERROR /follow needs text"
+        check output "ERROR /fork needs a sequence"
+        check output "is not a number"
     finally
         try
             Directory.Delete(workdir, true)

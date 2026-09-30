@@ -14,8 +14,30 @@ one dot process may open the file: a second process exits with a locked
 error naming the path.
 
 REPL commands: `/new [title]`, `/sessions`, `/resume <id-or-index>`,
-`/model [provider[/model]]`, `/abort`, `/compact`, `/quit`. Unknown slash
+`/model [provider[/model]]`, `/steer <text>`, `/follow <text>`, `/abort`,
+`/compact`, `/tree`, `/fork <sequence>`, `/clone`, `/quit`. Unknown slash
 commands reprint the usage.
+
+## Steering, follow-ups, and branches
+
+While a turn runs the loop stays foreground with one turn in flight, so
+the next line steers it: `/steer <text>` interrupts (`Interrupt`) and
+starts the new turn, settling the pre-empted turn visibly as `Aborted`;
+`/follow <text>` folds in (`Inject`) at the next iteration boundary
+without interrupting; plain input queues (`Queue`) behind the running
+turn. The settle waiter is queued before each prompt lands, so the
+pre-empted turn still prints its `RESULT Aborted` line, never silently.
+`/abort` and `/compact` work mid-turn and while idle, including the
+deferred-compact path for running turns.
+
+`/tree` lists the journal positions to branch from (sequence plus
+event-type detail) and `/fork <sequence>` opens a new session carrying
+that prefix through `ForkAsync`: the fork is registered and made current
+while the source row and journal stay untouched. Beyond-tail cursors clamp
+to the full journal and a cursor below the first sequence forks an empty
+transcript. `/clone` duplicates the active branch (a tail fork) when that
+falls out for free. No `Alt+Enter` key handling; console commands are the
+interface.
 
 ## Providers and models
 
