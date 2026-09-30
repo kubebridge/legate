@@ -21,23 +21,26 @@ open Microsoft.Extensions.Hosting
 // process exit for list (newest-first) and resume. The interactive
 // slash-command REPL (#304) drives each turn as waiter-queued-before-prompt
 // plus Subscribe streaming with inline permission/question replies, over
-// the /new, /sessions, /resume, /model, /abort, /compact, and /quit
-// commands. Live providers (#307) register only when their env key is
-// present (Anthropic through the OpenAI-compatible preset under id
-// anthropic, OpenAI, Google), with keys flowing from the environment
-// through IConfiguration binding only, never printed or persisted; with
-// exactly one key set dot just works, with several --provider picks, else
-// the default order anthropic, openai, google wins, and --model overrides
-// the model. Mid-session /model switches through SetAgentAsync against a
-// model-carrying agent row, so the transcript and workspace binding
-// survive. Mirrors the samples/Headless scripted precedent; scripted
-// support stays host-local, never a Legate.Testing reference (test-only
-// package). The workspace is the working directory through the
-// host-directory runtime with the dot-local coding tools (#306): read_file,
-// write_file, list_files, edit_file, glob, grep, and exec under a
-// pi-faithful allow-all default, with the opt-in --ask policy the REPL
-// answers inline (allow-once / allow-for-session / deny). Root fencing
-// stays on in every policy mode. Steering commands belong to #308.
+// the /new, /sessions, /resume, /model, /steer, /follow, /abort, /compact,
+// /tree, /fork, /clone, and /quit commands. Live providers (#307) register
+// only when their env key is present (Anthropic through the OpenAI-compatible
+// preset under id anthropic, OpenAI, Google), with keys flowing from the
+// environment through IConfiguration binding only, never printed or
+// persisted; with exactly one key set dot just works, with several
+// --provider picks, else the default order anthropic, openai, google wins,
+// and --model overrides the model. Mid-session /model switches through
+// SetAgentAsync against a model-carrying agent row, so the transcript and
+// workspace binding survive. Steering (#308) stays foreground while one
+// turn runs in flight: /steer interrupts (Interrupt) and /follow folds in
+// (Inject) with plain input queuing (Queue), /tree lists journal positions
+// and /fork branches the prefix through ForkAsync. Mirrors the
+// samples/Headless scripted precedent; scripted support stays host-local,
+// never a Legate.Testing reference (test-only package). The workspace is
+// the working directory through the host-directory runtime with the
+// dot-local coding tools (#306): read_file, write_file, list_files,
+// edit_file, glob, grep, and exec under a pi-faithful allow-all default,
+// with the opt-in --ask policy the REPL answers inline (allow-once /
+// allow-for-session / deny). Root fencing stays on in every policy mode.
 
 // ──────────────────────────────────────────────────────────────────────────
 // Database path
@@ -306,6 +309,11 @@ let private probeScript (marker: string) : ScriptStep list =
             )
             Text "coding-exec done"
         ]
+    | "slow-steer" ->
+        [
+            ToolCall("call-slow-steer", "slow-echo", [])
+            Text "slow-steer done"
+        ]
     | _ -> []
 
 /// Minimal inline scripted chat client: serves the queued steps, then a
@@ -331,6 +339,7 @@ type private ScriptedClient(steps: Queue<ScriptStep>) =
             "coding-two"
             "coding-outside"
             "coding-exec"
+            "slow-steer"
         ]
 
     /// True when any incoming message mentions the marker.
@@ -450,6 +459,24 @@ let private scriptedEchoTool () : AITool =
     )
     :> AITool
 
+/// Creates the slow echo tool for the steering probe: one three-second
+/// call the mid-turn /steer, /follow, /abort, and /compact lines overlap,
+/// so piped stdin deterministically steers a still-running turn under the
+/// default --wait-minutes bound.
+let private slowEchoTool () : AITool =
+    let method =
+        System.Func<string>(fun () ->
+            System.Threading.Thread.Sleep(3000)
+            "slow tool ok")
+
+    AIFunctionFactory.Create(
+        method,
+        "slow-echo",
+        "Slow echo for the steering smoke run: sleeps before answering.",
+        null
+    )
+    :> AITool
+
 /// Fixed inline tool source: the scripted echo tool for scripted mode.
 type private StaticSource(tools: IReadOnlyList<AITool>) =
     do ArgumentNullException.ThrowIfNull(tools)
@@ -559,7 +586,16 @@ let private buildServices
             else
                 builder.Permissions.UsePolicy(AllowAllPermissionPolicy()) |> ignore
 
-            builder.Tools.AddSource(StaticSource(ResizeArray<AITool>([| scriptedEchoTool () |])))
+            builder.Tools.AddSource(
+                StaticSource(
+                    ResizeArray<AITool>(
+                        [|
+                            scriptedEchoTool ()
+                            slowEchoTool ()
+                        |]
+                    )
+                )
+            )
             |> ignore
 
             builder.Tools.AddSource<CodingTools.CodingToolSource>() |> ignore

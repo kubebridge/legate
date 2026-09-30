@@ -7,9 +7,10 @@ open System.Threading
 open System.Threading.Tasks
 open Legate
 
-// REPL engine over the session client facade for the dot host: prompt
-// loop, Subscribe streaming to the writer, permission/question console
-// replies, and the /new, /sessions, /resume, /model, /abort, /compact, and
+// REPL engine over the session client facade for the dot host: foreground
+// prompt loop with one turn in flight, Subscribe streaming to the writer,
+// permission/question console replies, and the /new, /sessions, /resume,
+// /model, /steer, /follow, /abort, /compact, /tree, /fork, /clone, and
 // /quit commands over the SQLite session store. Modeled on
 // samples/LegateCli/CliEngine.fs: the settle waiter is queued before the
 // prompt lands (a settle with no waiter only records), each event renders
@@ -20,17 +21,21 @@ open Legate
 // rejects turns for missing agents, while CliEngine's InMemory catalog
 // authorizes); opened sessions carry a title but no timeout, so the
 // settle-wait bound reports a deadline without killing the turn; there is
-// no /agent stub (steering belongs to #308); /model switches the session
-// through SetAgentAsync against a model-carrying agent row, so the journal
-// transcript and workspace binding survive; unknown commands reprint the
-// command usage; and a settle wait that outruns its bound reports
-// DEADLINE while the turn keeps running. Transport-agnostic: the host
-// wires the chat client, tools, and policy. Reads and writes through the
-// given reader/writer so scripted transports drive it without a console.
+// no /agent stub; /model switches the session through SetAgentAsync
+// against a model-carrying agent row, so the journal transcript and
+// workspace binding survive; /steer interrupts (Interrupt), /follow folds
+// in (Inject, waiter-free while a turn runs so the folded turn settles
+// once), and plain input queues (Queue); /tree pages ReadEventsAsync and
+// /fork branches the prefix through ForkAsync (plus a free /clone at the
+// tail); unknown commands reprint the command usage; and a settle wait
+// that outruns its bound reports DEADLINE while the turn keeps running.
+// Transport-agnostic: the host wires the chat client, tools, and policy.
+// Reads and writes through the given reader/writer so scripted transports
+// drive it without a console.
 
 /// The command usage reprinted on startup and for unknown commands.
 let private commandsUsage =
-    "Commands: /new [title], /sessions, /resume <id-or-index>, /model [provider[/model]], /abort, /compact, /quit."
+    "Commands: /new [title], /sessions, /resume <id-or-index>, /model [provider[/model]], /steer <text>, /follow <text>, /abort, /compact, /tree, /fork <sequence>, /clone, /quit."
 
 // ──────────────────────────────────────────────────────────────────────────
 // Provider and model selection (issue 307)
@@ -231,6 +236,15 @@ type private ReplSession =
         mutable Cursor: int64
     }
 
+/// One queued turn: the session it runs in, the settle waiter queued
+/// before its prompt landed, and the waiter CTS the drain disposes.
+type private PendingTurn =
+    {
+        Session: ReplSession
+        WaitTask: Task<TurnResult>
+        WaitCts: CancellationTokenSource
+    }
+
 /// Ensures the model-carrying agent exists in the agent store: the
 /// runtime's authority check rejects turns for missing agents. One enabled
 /// row per provider/model, shared across sessions: the first session
@@ -343,10 +357,37 @@ type Engine
     let sessions = ResizeArray<ReplSession>()
     let mutable current = -1
     let mutable currentModel = initialModel
+    let lineGate = obj ()
+    let pendingGate = obj ()
+    let pendingQueue = Queue<PendingTurn>()
+    let mutable drainTask: Task option = None
+    let approvalGate = obj ()
+    let mutable approvalCount = 0
 
     let line (text: string) : unit =
-        writer.WriteLine(text)
-        writer.Flush()
+        lock lineGate (fun () ->
+            writer.WriteLine(text)
+            writer.Flush())
+
+    /// True while the drain loop owns a live turn.
+    let isDrainRunning () : bool =
+        lock pendingGate (fun () ->
+            match drainTask with
+            | Some running when not running.IsCompleted -> true
+            | Some _
+            | None -> false)
+
+    /// Marks one inline approval wait as pending.
+    let markApproval () : unit =
+        lock approvalGate (fun () -> approvalCount <- approvalCount + 1)
+
+    /// Clears one inline approval wait.
+    let clearApproval () : unit =
+        lock approvalGate (fun () -> approvalCount <- max 0 (approvalCount - 1))
+
+    /// True while a permission or question answer owns the reader.
+    let isApprovalPending () : bool =
+        lock approvalGate (fun () -> approvalCount > 0)
 
     let currentSession () : ReplSession =
         if current < 0 || current >= sessions.Count then
@@ -370,10 +411,11 @@ type Engine
             else
                 -1
 
-    /// Renders one journaled event as a stable single line.
+    /// Renders one journaled event with the given line prefix.
+    /// <param name="prefix">The line prefix: EVENT for the live stream, TREE for /tree.</param>
     /// <param name="evt">The event to render.</param>
     /// <returns>The rendered line.</returns>
-    let renderEvent (evt: SessionEvent) : string =
+    let renderWith (prefix: string) (evt: SessionEvent) : string =
         let sequence =
             if evt.Sequence.HasValue then
                 evt.Sequence.Value.ToString()
@@ -397,39 +439,54 @@ type Engine
             | :? UserMessageEvent -> " user-message"
             | _ -> ""
 
-        $"EVENT seq={sequence} {evt.GetType().Name}{detail}"
+        $"{prefix} seq={sequence} {evt.GetType().Name}{detail}"
+
+    /// Renders one journaled event as a stable single line.
+    /// <param name="evt">The event to render.</param>
+    /// <returns>The rendered line.</returns>
+    let renderEvent (evt: SessionEvent) : string = renderWith "EVENT" evt
+
+    /// Renders one journaled event for /tree output.
+    /// <param name="evt">The event to render.</param>
+    /// <returns>The rendered line.</returns>
+    let renderTree (evt: SessionEvent) : string = renderWith "TREE" evt
 
     /// Answers one permission request from the console.
     /// <param name="asked">The pending permission request.</param>
     /// <param name="cancellationToken">Abandons the reply.</param>
     let answerPermission (asked: PermissionRequestedEvent) (cancellationToken: CancellationToken) : Task =
         task {
-            line $"PERMISSION tool={asked.ToolName} id={asked.RequestId} [a]llow once, allow for [s]ession, [d]eny:"
+            markApproval ()
 
-            let! rawChoice = reader.ReadLineAsync()
+            try
+                line $"PERMISSION tool={asked.ToolName} id={asked.RequestId} [a]llow once, allow for [s]ession, [d]eny:"
 
-            let choiceText =
-                match rawChoice with
-                | null -> ""
-                | text -> text.Trim().ToLowerInvariant()
+                let! rawChoice = reader.ReadLineAsync()
 
-            let decision =
-                match choiceText with
-                | "s"
-                | "session" -> PermissionDecisionKind.AllowForSession
-                | "d"
-                | "deny" -> PermissionDecisionKind.Deny
-                | _ -> PermissionDecisionKind.AllowOnce
+                let choiceText =
+                    match rawChoice with
+                    | null -> ""
+                    | text -> text.Trim().ToLowerInvariant()
 
-            let! _ =
-                SessionClientOperations.ReplyAsync(
-                    client,
-                    asked.SessionId,
-                    PermissionDecision(asked.RequestId, decision),
-                    cancellationToken
-                )
+                let decision =
+                    match choiceText with
+                    | "s"
+                    | "session" -> PermissionDecisionKind.AllowForSession
+                    | "d"
+                    | "deny" -> PermissionDecisionKind.Deny
+                    | _ -> PermissionDecisionKind.AllowOnce
 
-            ()
+                let! _ =
+                    SessionClientOperations.ReplyAsync(
+                        client,
+                        asked.SessionId,
+                        PermissionDecision(asked.RequestId, decision),
+                        cancellationToken
+                    )
+
+                ()
+            finally
+                clearApproval ()
         }
 
     /// Answers one agent question from the console.
@@ -437,25 +494,30 @@ type Engine
     /// <param name="cancellationToken">Abandons the reply.</param>
     let answerQuestion (asked: QuestionAskedEvent) (cancellationToken: CancellationToken) : Task =
         task {
-            line $"QUESTION id={asked.QuestionId}: {asked.Question}"
-            line "ANSWER:"
+            markApproval ()
 
-            let! rawAnswer = reader.ReadLineAsync()
+            try
+                line $"QUESTION id={asked.QuestionId}: {asked.Question}"
+                line "ANSWER:"
 
-            let answer =
-                match rawAnswer with
-                | null -> ""
-                | text -> text
+                let! rawAnswer = reader.ReadLineAsync()
 
-            let! _ =
-                SessionClientOperations.ReplyAsync(
-                    client,
-                    asked.SessionId,
-                    QuestionAnswer(asked.QuestionId, answer),
-                    cancellationToken
-                )
+                let answer =
+                    match rawAnswer with
+                    | null -> ""
+                    | text -> text
 
-            ()
+                let! _ =
+                    SessionClientOperations.ReplyAsync(
+                        client,
+                        asked.SessionId,
+                        QuestionAnswer(asked.QuestionId, answer),
+                        cancellationToken
+                    )
+
+                ()
+            finally
+                clearApproval ()
         }
 
     /// Streams one turn's events until the subscriber is cancelled,
@@ -502,56 +564,320 @@ type Engine
                     ()
         }
 
-    /// Prompts the current session and streams the turn to the result.
-    /// A settle wait that outruns its bound reports DEADLINE while the
-    /// turn keeps running.
-    /// <param name="session">The session to prompt.</param>
-    /// <param name="text">The user text.</param>
-    /// <param name="cancellationToken">Abandons the turn.</param>
-    member private this.PromptFlowAsync
-        (session: ReplSession, text: string, cancellationToken: CancellationToken)
-        : Task =
+    /// Runs one queued turn: streams its events from the cursor, awaits
+    /// its waiter, and prints the settle. A settle wait that outruns its
+    /// bound reports DEADLINE while the turn keeps running. The stream is
+    /// cancelled on settle and joined best-effort, so a stuck stream never
+    /// blocks the drain.
+    /// <param name="pending">The queued turn.</param>
+    /// <param name="cancellationToken">Abandons the drain.</param>
+    member private this.RunPendingAsync(pending: PendingTurn, cancellationToken: CancellationToken) : Task =
         task {
-            // Queue the settle waiter before the prompt lands: a settle
-            // with no waiter only records.
-            let wait =
-                SessionClientOperations.WaitForSettleAsync(client, session.Id, waitBound, cancellationToken)
-
-            let! _ =
-                SessionClientOperations.PromptAsync(
-                    client,
-                    session.Id,
-                    UserMessage.Text text,
-                    DeliveryMode.Queue,
-                    cancellationToken
-                )
-
             use streamCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
-            let stream = this.StreamAsync(session, streamCts.Token)
+            let stream = this.StreamAsync(pending.Session, streamCts.Token)
 
             try
                 try
-                    let! result = wait
+                    let! result = pending.WaitTask
                     line $"RESULT {result.Status}"
 
                     if not (String.IsNullOrEmpty result.AssistantText) then
                         line result.AssistantText
 
                     line "END-RESULT"
-                with :? DeadlineExceededException as exceeded ->
-                    line $"DEADLINE {exceeded.Message}"
+                with
+                | :? DeadlineExceededException as exceeded -> line $"DEADLINE {exceeded.Message}"
+                | :? OperationCanceledException -> ()
             finally
+                try
+                    pending.WaitCts.Dispose()
+                with _ ->
+                    ()
+
                 try
                     streamCts.Cancel()
                 with _ ->
                     ()
 
-                // Best-effort join: the cancel above already unwinds the
-                // enumerator, so a stuck stream never blocks the REPL.
                 try
                     stream.Wait(TimeSpan.FromSeconds 5.0) |> ignore
                 with _ ->
                     ()
+        }
+
+    /// Drains the pending queue in order on one task: the single in-flight
+    /// turn task the foreground loop stays responsive beside. Each entry
+    /// keeps its own waiter-before-prompt ordering, so a pre-empted turn's
+    /// waiter still completes and its RESULT Aborted line prints instead of
+    /// going silent. Cursor-advanced Subscribe keeps the stream gap-free
+    /// with no duplicates across turns.
+    /// <param name="cancellationToken">Abandons the drain.</param>
+    member private this.DrainLoopAsync(cancellationToken: CancellationToken) : Task =
+        task {
+            let mutable go = true
+
+            while go do
+                let next: PendingTurn option =
+                    lock pendingGate (fun () ->
+                        if pendingQueue.Count > 0 then
+                            Some(pendingQueue.Dequeue())
+                        else
+                            None)
+
+                match next with
+                | None ->
+                    lock pendingGate (fun () -> drainTask <- None)
+                    go <- false
+                | Some pending -> do! this.RunPendingAsync(pending, cancellationToken)
+        }
+
+    /// Starts the drain loop when none runs.
+    /// <param name="cancellationToken">Abandons the drain.</param>
+    member private this.EnsureDrain(cancellationToken: CancellationToken) : unit =
+        lock pendingGate (fun () ->
+            let running =
+                match drainTask with
+                | Some running when not running.IsCompleted -> true
+                | Some _
+                | None -> false
+
+            if not running then
+                drainTask <- Some(this.DrainLoopAsync(cancellationToken)))
+
+    /// Waits for the in-flight drain to empty: /quit and end-of-input exit
+    /// only after every queued turn settles visibly.
+    /// <param name="cancellationToken">Abandons the wait.</param>
+    member private _.DrainAsync(_cancellationToken: CancellationToken) : Task =
+        task {
+            let running: Task option = lock pendingGate (fun () -> drainTask)
+
+            match running with
+            | None -> ()
+            | Some active ->
+                try
+                    do! active
+                with _ ->
+                    ()
+        }
+
+    /// Prompts with its own waiter: queues the settle waiter before the
+    /// prompt lands (a settle with no waiter only records), appends the
+    /// turn to the drain, and returns to the foreground loop at once.
+    /// <param name="session">The session to prompt.</param>
+    /// <param name="text">The user text.</param>
+    /// <param name="delivery">How the message is delivered to a running turn.</param>
+    /// <param name="cancellationToken">Abandons the turn.</param>
+    member private this.EnqueueTurnAsync
+        (session: ReplSession, text: string, delivery: DeliveryMode, cancellationToken: CancellationToken)
+        : Task =
+        task {
+            // Queue the waiter and the drain entry synchronously, then send
+            // the prompt without awaiting it: PromptAsync only answers once
+            // the actor accepts, which rides behind a running turn, so an
+            // await here would block the foreground loop until the turn
+            // settles and mid-turn steering could never land in time. The
+            // waiter is already queued before the prompt is sent, so the
+            // pre-empted turn still settles visibly.
+            let waitCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
+
+            let waitTask =
+                SessionClientOperations.WaitForSettleAsync(client, session.Id, waitBound, waitCts.Token)
+
+            lock pendingGate (fun () ->
+                pendingQueue.Enqueue(
+                    {
+                        Session = session
+                        WaitTask = waitTask
+                        WaitCts = waitCts
+                    }
+                ))
+
+            this.EnsureDrain(cancellationToken)
+
+            let message: UserMessage option =
+                try
+                    Some(UserMessage.Text text)
+                with error ->
+                    line $"ERROR {error.Message}"
+                    None
+
+            match message with
+            | None ->
+                try
+                    waitCts.Cancel()
+                with _ ->
+                    ()
+            | Some userMessage ->
+                try
+                    let promptTask =
+                        SessionClientOperations.PromptAsync(
+                            client,
+                            session.Id,
+                            userMessage,
+                            delivery,
+                            cancellationToken
+                        )
+
+                    promptTask.ContinueWith(fun (completed: Task<InboxEntry>) ->
+                        if not completed.IsCompletedSuccessfully then
+                            let error =
+                                match completed.Exception with
+                                | null -> Exception("The prompt failed.")
+                                | aggregate when aggregate.InnerExceptions.Count > 0 -> aggregate.InnerExceptions[0]
+                                | aggregate -> aggregate :> exn
+
+                            try
+                                waitCts.Cancel()
+                            with _ ->
+                                ()
+
+                            line $"ERROR {error.Message}")
+                    |> ignore
+                with error ->
+                    try
+                        waitCts.Cancel()
+                    with _ ->
+                        ()
+
+                    line $"ERROR {error.Message}"
+        }
+
+    /// Folds follow-up text into the running turn without its own waiter:
+    /// Inject appends and folds at the next iteration boundary without
+    /// starting a new turn, so the in-flight waiter settles the folded
+    /// turn once as Completed.
+    /// <param name="session">The session to prompt.</param>
+    /// <param name="text">The user text.</param>
+    /// <param name="cancellationToken">Abandons the prompt.</param>
+    member private _.InjectAsync(session: ReplSession, text: string, cancellationToken: CancellationToken) : Task =
+        task {
+            let message: UserMessage option =
+                try
+                    Some(UserMessage.Text text)
+                with error ->
+                    line $"ERROR {error.Message}"
+                    None
+
+            match message with
+            | None -> ()
+            | Some userMessage ->
+                try
+                    let promptTask =
+                        SessionClientOperations.PromptAsync(
+                            client,
+                            session.Id,
+                            userMessage,
+                            DeliveryMode.Inject,
+                            cancellationToken
+                        )
+
+                    promptTask.ContinueWith(fun (completed: Task<InboxEntry>) ->
+                        if not completed.IsCompletedSuccessfully then
+                            let error =
+                                match completed.Exception with
+                                | null -> Exception("The prompt failed.")
+                                | aggregate when aggregate.InnerExceptions.Count > 0 -> aggregate.InnerExceptions[0]
+                                | aggregate -> aggregate :> exn
+
+                            line $"ERROR {error.Message}")
+                    |> ignore
+                with error ->
+                    line $"ERROR {error.Message}"
+        }
+
+    /// Lists the current session journal positions to branch from: paged
+    /// ReadEventsAsync with sequence plus event-type detail.
+    /// <param name="session">The session whose journal to list.</param>
+    /// <param name="cancellationToken">Abandons the read.</param>
+    member private _.TreeAsync(session: ReplSession, cancellationToken: CancellationToken) : Task =
+        task {
+            try
+                let collected = ResizeArray<SessionEvent>()
+                let mutable cursor = 0L
+                let mutable paging = true
+
+                while paging do
+                    let! page =
+                        SessionClientOperations.ReadEventsAsync(client, session.Id, cursor, 100, cancellationToken)
+
+                    if isNull (box page) || page.Count = 0 then
+                        paging <- false
+                    else
+                        for evt in page do
+                            if not (isNull (box evt)) then
+                                collected.Add(evt)
+
+                                if evt.Sequence.HasValue && evt.Sequence.Value > cursor then
+                                    cursor <- evt.Sequence.Value
+
+                        if page.Count < 100 then
+                            paging <- false
+
+                line $"TREE {collected.Count} events"
+
+                for evt in collected do
+                    line (renderTree evt)
+            with error ->
+                line $"ERROR {error.Message}"
+        }
+
+    /// Branches the current session prefix through ForkAsync: the new
+    /// session is registered and made current, the source row and journal
+    /// are untouched, beyond-tail cursors clamp to the full journal, and a
+    /// cursor below the first sequence forks an empty transcript.
+    /// <param name="session">The source session.</param>
+    /// <param name="argument">The sequence text the user typed.</param>
+    /// <param name="cancellationToken">Abandons the fork.</param>
+    member private _.ForkAsync(session: ReplSession, argument: string, cancellationToken: CancellationToken) : Task =
+        task {
+            let text = argument.Trim()
+
+            if text = "" then
+                line "ERROR /fork needs a sequence: /fork <sequence>"
+            else
+                match Int64.TryParse(text) with
+                | false, _ -> line $"ERROR /fork needs a sequence: '{text}' is not a number."
+                | true, sequence ->
+                    try
+                        let! forked = SessionClientOperations.ForkAsync(client, session.Id, sequence, cancellationToken)
+
+                        sessions.Add(
+                            {
+                                Id = forked.Id
+                                Title = forked.Title
+                                Cursor = 0L
+                            }
+                        )
+
+                        current <- sessions.Count - 1
+                        line $"FORKED {forked.Id} from {session.Id} up-to {sequence}"
+                        line $"RESUMED {forked.Id}"
+                    with error ->
+                        line $"ERROR {error.Message}"
+        }
+
+    /// Duplicates the active branch into a new session: ForkAsync at the
+    /// tail, free because the facade clamps beyond-tail cursors.
+    /// <param name="session">The source session.</param>
+    /// <param name="cancellationToken">Abandons the fork.</param>
+    member private _.CloneAsync(session: ReplSession, cancellationToken: CancellationToken) : Task =
+        task {
+            try
+                let! forked = SessionClientOperations.ForkAsync(client, session.Id, Int64.MaxValue, cancellationToken)
+
+                sessions.Add(
+                    {
+                        Id = forked.Id
+                        Title = forked.Title
+                        Cursor = 0L
+                    }
+                )
+
+                current <- sessions.Count - 1
+                line $"FORKED {forked.Id} from {session.Id} up-to tail"
+                line $"RESUMED {forked.Id}"
+            with error ->
+                line $"ERROR {error.Message}"
         }
 
     /// Opens a session and makes it current. Permissions stay null so the
@@ -624,13 +950,17 @@ type Engine
         }
 
     /// Handles one input line. Returns false when the REPL should exit.
+    /// End of input drains the in-flight turn first, so a pre-empted turn
+    /// settles visibly instead of going silent.
     /// <param name="inputLine">The line read, or null at end of input.</param>
     /// <param name="cancellationToken">Abandons the turn.</param>
     /// <returns>False when the REPL should exit.</returns>
     member private this.HandleAsync(inputLine: string | null, cancellationToken: CancellationToken) : Task<bool> =
         task {
             match inputLine with
-            | null -> return false
+            | null ->
+                do! this.DrainAsync(cancellationToken)
+                return false
             | line -> return! this.HandleLineAsync(line, cancellationToken)
         }
 
@@ -645,6 +975,7 @@ type Engine
             if text = "" then
                 return true
             elif text = "/quit" || text = "/exit" then
+                do! this.DrainAsync(cancellationToken)
                 return false
             elif text = "/compact" then
                 try
@@ -784,20 +1115,59 @@ type Engine
                     line $"ERROR {error.Message}"
 
                 return true
+            elif
+                text.StartsWith("/steer", StringComparison.Ordinal)
+                && (text.Length = "/steer".Length || Char.IsWhiteSpace(text["/steer".Length]))
+            then
+                let arg = text.Substring("/steer".Length).Trim()
+
+                if arg = "" then
+                    line "ERROR /steer needs text: /steer <text>"
+                else
+                    do! this.EnqueueTurnAsync(currentSession (), arg, DeliveryMode.Interrupt, cancellationToken)
+
+                return true
+            elif
+                text.StartsWith("/follow", StringComparison.Ordinal)
+                && (text.Length = "/follow".Length || Char.IsWhiteSpace(text["/follow".Length]))
+            then
+                let arg = text.Substring("/follow".Length).Trim()
+
+                if arg = "" then
+                    line "ERROR /follow needs text: /follow <text>"
+                elif isDrainRunning () then
+                    do! this.InjectAsync(currentSession (), arg, cancellationToken)
+                else
+                    do! this.EnqueueTurnAsync(currentSession (), arg, DeliveryMode.Inject, cancellationToken)
+
+                return true
+            elif text = "/tree" then
+                do! this.TreeAsync(currentSession (), cancellationToken)
+                return true
+            elif
+                text.StartsWith("/fork", StringComparison.Ordinal)
+                && (text.Length = "/fork".Length || Char.IsWhiteSpace(text["/fork".Length]))
+            then
+                let arg = text.Substring("/fork".Length).Trim()
+                do! this.ForkAsync(currentSession (), arg, cancellationToken)
+                return true
+            elif text = "/clone" then
+                do! this.CloneAsync(currentSession (), cancellationToken)
+                return true
             elif text.StartsWith("/", StringComparison.Ordinal) then
                 line $"UNKNOWN-COMMAND {text}"
                 line commandsUsage
                 return true
             else
-                try
-                    do! this.PromptFlowAsync(currentSession (), text, cancellationToken)
-                with error ->
-                    line $"ERROR {error.Message}"
-
+                do! this.EnqueueTurnAsync(currentSession (), text, DeliveryMode.Queue, cancellationToken)
                 return true
         }
 
-    /// Runs the REPL until /quit or end of input.
+    /// Runs the REPL until /quit or end of input. The loop stays
+    /// foreground while one turn runs in flight: a suspension grace keeps
+    /// piped approval answers on the stream reader (the stream owns the
+    /// reader while a permission or question pends), and steering lines
+    /// are read while the turn still runs.
     /// <param name="resume">The session id to attach at startup, or null to open.</param>
     /// <param name="cancellationToken">Abandons the REPL.</param>
     /// <returns>The process exit code.</returns>
@@ -819,12 +1189,56 @@ type Engine
             let mutable go = true
 
             while go do
-                writer.Write("> ")
-                writer.Flush()
+                let approvalWait = isDrainRunning () && isApprovalPending ()
 
-                let! inputLine = reader.ReadLineAsync()
-                let! keepGoing = this.HandleAsync(inputLine, cancellationToken)
-                go <- keepGoing
+                if approvalWait then
+                    try
+                        do! Task.Delay(50, cancellationToken)
+                    with :? OperationCanceledException ->
+                        ()
+
+                if cancellationToken.IsCancellationRequested then
+                    go <- false
+                elif isDrainRunning () && isApprovalPending () then
+                    ()
+                elif isDrainRunning () then
+                    let mutable waited = 0
+                    let mutable waiting = true
+
+                    while waiting do
+                        if
+                            waited >= 300
+                            || not (isDrainRunning ())
+                            || isApprovalPending ()
+                            || cancellationToken.IsCancellationRequested
+                        then
+                            waiting <- false
+                        else
+                            try
+                                do! Task.Delay(20, cancellationToken)
+                            with :? OperationCanceledException ->
+                                ()
+
+                            waited <- waited + 20
+
+                    if isApprovalPending () || cancellationToken.IsCancellationRequested then
+                        ()
+                    else
+                        lock lineGate (fun () ->
+                            writer.Write("> ")
+                            writer.Flush())
+
+                        let! inputLine = reader.ReadLineAsync()
+                        let! keepGoing = this.HandleAsync(inputLine, cancellationToken)
+                        go <- keepGoing
+                else
+                    lock lineGate (fun () ->
+                        writer.Write("> ")
+                        writer.Flush())
+
+                    let! inputLine = reader.ReadLineAsync()
+                    let! keepGoing = this.HandleAsync(inputLine, cancellationToken)
+                    go <- keepGoing
 
             return 0
         }
