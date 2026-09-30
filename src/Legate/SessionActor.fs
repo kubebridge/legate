@@ -2498,6 +2498,43 @@ module internal SessionActor =
             with _ ->
                 ()
 
+        /// Settles the prompt turn's prime claim at quiescence (issue 313):
+        /// the Completed-to-Idle path releases the facade (spawn or
+        /// re-prime) prime exactly once through the fenced settle,
+        /// synthesizing the claim from the row's CurrentTurnId stamp plus
+        /// the live journal token cell (the settlePrimedNow precedent), so
+        /// the settle needs no plumbed claim object and survives restarts.
+        /// A live prime settles (settled or already-settled); a stale
+        /// claim (a takeover winner holds the turn) verifies fenced-out
+        /// with zero effects. Total: the outcome is advisory (quiescence
+        /// needs no branch), so every failure is swallowed.
+        let settleCompletedPrimeNow () : unit =
+            try
+                match currentTurnSnapshot () with
+                | None -> ()
+                | Some turnId ->
+                    let claim =
+                        {
+                            TurnId = turnId
+                            Token = journalToken
+                            Owner = ""
+                            ExpiresAt = DateTimeOffset.MinValue
+                            Attempt = 1
+                        }
+
+                    awaitTask (
+                        ClaimFence.settleTurnAsync
+                            props.Store
+                            props.Tenant
+                            claim
+                            TurnStatus.Completed
+                            null
+                            CancellationToken.None
+                    )
+                    |> ignore
+            with _ ->
+                ()
+
         let failInterruptedTurn (liveId: TurnId option) (entryOpt: InboxEntry option) : unit =
             let result =
                 {
@@ -3681,6 +3718,25 @@ module internal SessionActor =
                     with _ ->
                         ()
 
+        /// Restores the live journal prime when quiescence settled it
+        /// (issue 313): a Completed turn settles its prime at Idle, so the
+        /// next fresh turn re-primes through the spawn wiring and adopts
+        /// the fresh token before appending, keeping the in-call marker
+        /// and the suspend/resolve writes live. Skips when a live turn is
+        /// snapshotted (drain chains keep their prime) or the inbox is
+        /// non-empty (a prime claim would consume the head entry), and
+        /// when the re-prime fails (a takeover-held claim or a prime
+        /// fault): the turn then starts on the snapshot as before, fenced
+        /// exactly like today.
+        let ensurePrimedNow () : unit =
+            match currentTurnSnapshot () with
+            | Some _ -> ()
+            | None ->
+                if inboxEmptyNow () then
+                    match reprimeNow () with
+                    | None -> ()
+                    | Some fresh -> swapJournal fresh
+
         /// Drains the next fresh turn after an authority refusal: applies a
         /// recorded rebind when quiescent, then gates the oldest drainable
         /// entry. Authorized entries start (the session returns to Running);
@@ -3743,6 +3799,12 @@ module internal SessionActor =
                         // leaves the inbox as found, so the drain below
                         // sees only real entries.
                         tryApplyPendingWhenIdle ()
+
+                        // A prime settled at quiescence is restored before
+                        // appending (issue 313): the fresh turn re-primes
+                        // while the inbox is still empty, so its marker and
+                        // suspend/resolve writes fence live.
+                        ensurePrimedNow ()
 
                         let appended =
                             awaitTask (
@@ -3826,6 +3888,12 @@ module internal SessionActor =
                         // leaves the inbox as found, so the drain below
                         // sees only real entries.
                         tryApplyPendingWhenIdle ()
+
+                        // A prime settled at quiescence is restored before
+                        // appending (issue 313): the fresh turn re-primes
+                        // while the inbox is still empty, so its marker and
+                        // suspend/resolve writes fence live.
+                        ensurePrimedNow ()
 
                         let appended =
                             awaitTask (
@@ -3913,6 +3981,12 @@ module internal SessionActor =
                         // leaves the inbox as found, so the drain below
                         // sees only real entries.
                         tryApplyPendingWhenIdle ()
+
+                        // A prime settled at quiescence is restored before
+                        // appending (issue 313): the fresh turn re-primes
+                        // while the inbox is still empty, so its marker and
+                        // suspend/resolve writes fence live.
+                        ensurePrimedNow ()
 
                         let appended =
                             awaitTask (
@@ -4115,6 +4189,21 @@ module internal SessionActor =
                                         settleAuthorityRefusal following failure reason
                                         drainAfterRefusal ()
                                 | [] ->
+                                    // Completed-turn prime settle (issue
+                                    // 313): release the facade prime exactly
+                                    // once at quiescence through the fenced
+                                    // settle, so a later prompt (or a
+                                    // respawn prime after a restart) claims
+                                    // anew instead of observing
+                                    // TurnLeaseMissing. Aborted and Failed
+                                    // results keep their prime, like the
+                                    // fault path; a stale (taken-over) token
+                                    // settles nothing. The terminal event
+                                    // above already journaled under the live
+                                    // token, so the settle lands after it.
+                                    if result.Status = TurnStatus.Completed then
+                                        settleCompletedPrimeNow ()
+
                                     awaitTask (
                                         props.Store.UpdateSessionState(
                                             props.Tenant,

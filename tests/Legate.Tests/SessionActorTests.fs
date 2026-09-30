@@ -5270,3 +5270,127 @@ let ``Suspended turn journals nothing until the resumed turn settles under the o
         terminals[0].TurnId |> should equal seen[0]
     finally
         stopSystem system
+
+// ──────────────────────────────────────────────────────────────────────────
+// Completed-turn prime settle (issue 313)
+//
+// A prompt turn completing to Idle releases the facade prime claim through
+// the fenced settle, so a later prompt — in-process or after a restart —
+// claims anew instead of observing TurnLeaseMissing while the prime lease
+// is still live.
+
+[<Fact>]
+let ``Completed prompt turn settles the prime claim so the session prompts again`` () : Task =
+    task {
+        let client =
+            suspendScripted
+                [
+                    ScriptStep.Text "first"
+                    ScriptStep.Text "second"
+                ]
+
+        use! harness = SessionHarness.CreateAsync(client, suspendSourced [])
+
+        let! first = harness.PromptAndSettleAsync("one", CancellationToken.None)
+        first.Status |> should equal TurnStatus.Completed
+        first.AssistantText |> should equal "first"
+
+        // The Completed-to-Idle settle released the prime: the row carries
+        // no live turn, so a later prime (a respawn after a restart, or the
+        // next prompt's re-prime) claims anew instead of observing a
+        // TurnLeaseMissing against the still-live prime.
+        let! stored = harness.GetSessionAsync(CancellationToken.None)
+        stored.State |> should equal SessionState.Idle
+        stored.CurrentTurnId.HasValue |> should equal false
+
+        // The in-process follow-up starts a new turn normally and settles
+        // it the same way: no bootstrap leaked, no prompt stolen.
+        let! second = harness.PromptAndSettleAsync("two", CancellationToken.None)
+        second.Status |> should equal TurnStatus.Completed
+        second.AssistantText |> should equal "second"
+
+        let! rest = harness.GetSessionAsync(CancellationToken.None)
+        rest.State |> should equal SessionState.Idle
+        rest.CurrentTurnId.HasValue |> should equal false
+
+        harness.SettledResults.Count |> should equal 2
+
+        (pendingEntries harness.Store harness.Tenant harness.SessionId).Count
+        |> should equal 0
+    }
+
+[<Fact>]
+let ``Completed settle with a stale prime token settles nothing`` () =
+    // The takeover edge for the quiescence settle (issue 313): the prime
+    // lapses, a rival wins the turn, and the loser still completes its
+    // in-flight turn. The fenced settle verifies the stale token out, so
+    // the winner's claim and turn survive with zero loser effects, while
+    // the loser still reports its own verdict.
+    let clock = TestClock()
+    let database = InMemoryDatabase(clock)
+    let store = InMemorySessionStore(database) :> ISessionStore
+    let journal = InMemorySessionEventStore(database) :> ISessionEventStore
+    let created = createSession store
+    appendStored store created.Id "prime" |> ignore
+
+    let _primeTurn, primeToken =
+        claimProbeTurn store created.Id (TimeSpan.FromMinutes 5.0)
+
+    let runner = EchoTurnRunner(completed "done")
+    let settled = ResizeArray<TurnResult>()
+
+    use system = createSystem ()
+
+    let session =
+        spawnProbe system store journal created.Id primeToken runner.Func None preEra settled
+
+    try
+        // The prime lapses and the rival wins the turn under a fresh id.
+        clock.Advance(TimeSpan.FromHours 1.0)
+        appendStored store created.Id "rival" |> ignore
+
+        let rival =
+            match
+                store.ClaimNextTurn(tenant, created.Id, "owner-b", TimeSpan.FromMinutes 5.0, CancellationToken.None)
+                |> fun task -> task.GetAwaiter().GetResult()
+            with
+            | :? TurnLeaseRenewed as renewed -> renewed.Claim
+            | _ -> failwith "Expected the rival claim."
+
+        // The loser runs under the winner's turn id with its stale token
+        // and completes: the terminal journal write fences out and the
+        // quiescence settle verifies out, leaving the winner intact.
+        promptSuspendable store created.Id session "loser" |> ignore
+
+        let finished =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () ->
+                settled.Count = 1 && (storedOf store created.Id).State = SessionState.Idle)
+
+        finished |> should equal true
+        settled[0].Status |> should equal TurnStatus.Completed
+
+        // The winner's turn and lease survived the loser's settle: the row
+        // still names the rival turn and the rival claim still verifies
+        // live.
+        (storedOf store created.Id).CurrentTurnId.Value |> should equal rival.TurnId
+
+        match
+            store.VerifyClaim(tenant, rival, CancellationToken.None)
+            |> fun task -> task.GetAwaiter().GetResult()
+        with
+        | :? TurnLeaseHeld -> ()
+        | _ -> failwith "Expected the rival claim to stay live."
+
+        // Loser zero effects: the journal holds no terminal row for the
+        // winner's turn id.
+        let terminals =
+            collectJournal journal tenant created.Id
+            |> List.filter (fun event ->
+                event.TurnId.Equals(rival.TurnId)
+                && (event :? TurnCompletedEvent
+                    || event :? TurnFailedEvent
+                    || event :? TurnAbortedEvent))
+
+        terminals.Length |> should equal 0
+    finally
+        stopSystem system
