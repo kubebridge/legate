@@ -3,6 +3,8 @@ module Legate.Tests.SessionPermissionsTests
 
 open System
 open System.Collections.Generic
+open System.IO
+open System.Text
 open System.Threading
 open System.Threading.Tasks
 open FsUnit.Xunit
@@ -927,5 +929,156 @@ let ``Facade turns journal cumulative UsageEvents replayable after resume`` () =
 
         let last = freshUsages[freshUsages.Length - 1]
         (last.InputTokens, last.OutputTokens) |> should equal (13L, 7L)
+    finally
+        stopService service
+
+// ──────────────────────────────────────────────────────────────────────────
+// Skill loads (issue 321 revision): facade turns journal through rebinding
+
+/// Builds an async package-entry sequence from path/text pairs.
+let private packageEntries (pairs: (string * string) list) : IAsyncEnumerable<AgentPackageEntry> =
+    let prepared =
+        pairs
+        |> List.map (fun (path, text) -> AgentPackageEntry(path, new MemoryStream(Encoding.UTF8.GetBytes text)))
+        |> List.toArray
+
+    { new IAsyncEnumerable<AgentPackageEntry> with
+        member _.GetAsyncEnumerator(_: CancellationToken) =
+            let mutable index = -1
+
+            { new IAsyncEnumerator<AgentPackageEntry> with
+                member _.MoveNextAsync() =
+                    index <- index + 1
+                    ValueTask<bool>(index < prepared.Length)
+
+                member _.Current: AgentPackageEntry = prepared[index]
+
+                member _.DisposeAsync() : ValueTask = ValueTask()
+            }
+    }
+
+[<Fact>]
+let ``Facade turns journal SkillLoadedEvents through the rebound skill tool`` () =
+    let store, journal = createStores TimeProvider.System
+    let created = createSession store
+
+    // One skill package for this session's agent: the pre-built tool binds
+    // a stale turn id on purpose, so the journaled event proves the runner
+    // re-keyed it under the running turn.
+    let packages =
+        InMemoryStoreFactory.packageStore (InMemoryDatabase(TimeProvider.System))
+
+    packages
+        .UploadPackage(
+            tenant,
+            created.AgentId,
+            "1.0.0",
+            "permissions-skill-tests",
+            packageEntries
+                [
+                    ".agent/skills/deploy/SKILL.md", "# Deploy\nDeploys things.\n"
+                    ".agent/skills/deploy/refs/api.md", "api"
+                ],
+            CancellationToken.None
+        )
+        .GetAwaiter()
+        .GetResult()
+    |> ignore
+
+    let hostSeen = ResizeArray<SkillLoadedEvent>()
+
+    let hostOnLoaded =
+        Func<SkillLoadedEvent, Task>(fun loaded ->
+            hostSeen.Add(loaded)
+            Task.CompletedTask)
+
+    let staleTurnId = TurnId.New()
+
+    let skillTool =
+        SkillTool.Create(packages, tenant, created.AgentId, created.Id, staleTurnId, hostOnLoaded)
+
+    let tools = makeTools [ SkillTool.ToolName, skillTool ]
+
+    let args = Dictionary<string, obj>() :> IDictionary<string, obj>
+    args["name"] <- "deploy" :> obj
+
+    let skillCalls =
+        ResizeArray<ScriptToolCall>(
+            [|
+                ScriptToolCall("c1", SkillTool.ToolName, args)
+            |]
+        )
+        :> IReadOnlyList<ScriptToolCall>
+
+    let client =
+        scripted
+            [
+                ScriptStep.ToolCalls(skillCalls)
+                ScriptStep.Text("done")
+            ]
+
+    let service =
+        startService store journal (productionRunner store client tools null) (TimeSpan.FromHours 1.0)
+
+    try
+        let child = resolveChild service created.Id
+        promptLive store created.Id child "run"
+
+        let settled =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () -> (storedOf store created.Id).State = SessionState.Idle)
+
+        settled |> should equal true
+        client.Calls |> should equal 2
+
+        // The host callback still ran through the chained rebinding.
+        hostSeen.Count |> should equal 1
+        hostSeen[0].SkillName |> should equal "deploy"
+
+        let events = collectJournal journal created.Id
+
+        let skills =
+            events
+            |> Seq.choose (fun event ->
+                match event with
+                | :? SkillLoadedEvent as skill when not (isNull (box skill)) -> Some skill
+                | _ -> None)
+            |> List.ofSeq
+
+        skills.Length |> should equal 1
+        skills[0].SkillName |> should equal "deploy"
+        skills[0].SessionId |> should equal created.Id
+
+        skills[0].Companions
+        |> List.ofSeq
+        |> should equal [ ".agent/skills/deploy/refs/api.md" ]
+
+        // Re-keyed under the running turn, never the stale tool bind.
+        skills[0].TurnId |> should not' (equal staleTurnId)
+
+        let markers =
+            events
+            |> Seq.choose (fun event ->
+                match event with
+                | :? TurnStartedEvent as marker when not (isNull (box marker)) -> Some marker
+                | _ -> None)
+            |> List.ofSeq
+
+        markers.Length |> should equal 1
+        skills[0].TurnId |> should equal markers[0].TurnId
+
+        // Fresh reader over the same store (the simulated resume): replay
+        // alone surfaces the skill load.
+        let fresh = collectJournal journal created.Id
+
+        let freshSkills =
+            fresh
+            |> Seq.choose (fun event ->
+                match event with
+                | :? SkillLoadedEvent as skill when not (isNull (box skill)) -> Some skill
+                | _ -> None)
+            |> List.ofSeq
+
+        freshSkills.Length |> should equal 1
+        freshSkills[0].SkillName |> should equal "deploy"
     finally
         stopService service

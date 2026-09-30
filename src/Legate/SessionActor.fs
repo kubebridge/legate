@@ -269,6 +269,109 @@ type internal SessionActorProps =
 // ──────────────────────────────────────────────────────────────────────────
 // Behaviour
 
+/// The fenced journal appends for facade-driven turns (issue 321):
+/// testable wrappers around the fenced writer mirroring
+/// journalTurnStartedAsync. Extracted so wrapper-level fencing tests drive
+/// the same mapping the live actor uses: a stale-token rejection raises
+/// TurnLeaseLostException so the takeover loser stops with zero effects; a
+/// failed write returns silently and the turn proceeds (best-effort
+/// observability).
+module internal SessionJournal =
+
+    /// Journals one cumulative usage checkpoint for a facade-driven turn
+    /// (issue 321): a UsageEvent carrying the turn's accumulated totals
+    /// under the given journal token through the fenced writer.
+    /// <param name="eventStore">The journal the checkpoint appends to.</param>
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="sessionId">The session whose journal appends.</param>
+    /// <param name="token">The journal token snapshot fencing the write.</param>
+    /// <param name="turnId">The turn the usage was checkpointed for.</param>
+    /// <param name="inputTokens">The input tokens the turn had consumed.</param>
+    /// <param name="outputTokens">The output tokens the turn had produced.</param>
+    /// <param name="cancellationToken">Abandons the append.</param>
+    let journalUsageAsync
+        (eventStore: ISessionEventStore)
+        (tenant: TenantId)
+        (sessionId: SessionId)
+        (token: string)
+        (turnId: TurnId)
+        (inputTokens: int64)
+        (outputTokens: int64)
+        (cancellationToken: CancellationToken)
+        : Task<unit> =
+        task {
+            let checkpoint =
+                UsageEvent(
+                    sessionId,
+                    turnId,
+                    Unchecked.defaultof<Nullable<int64>>,
+                    DateTimeOffset.UtcNow,
+                    inputTokens,
+                    outputTokens
+                )
+                :> SessionEvent
+
+            let batch =
+                ResizeArray<SessionEvent>([| checkpoint |]) :> IReadOnlyList<SessionEvent>
+
+            match! JournalWriter.appendWithTokenAsync eventStore tenant sessionId token batch cancellationToken with
+            | JournalWriter.JournalAppended _ -> ()
+            | JournalWriter.JournalRejected _ -> return raise (TurnLoop.TurnLeaseLostException())
+            | JournalWriter.JournalFailed _ -> ()
+        }
+
+    /// Journals one skill load for a facade-driven turn (issue 321): the
+    /// SkillLoadedEvent the SkillTool's onLoaded carried, re-keyed under
+    /// the running turn when the tool was bound with a stale id, through
+    /// the fenced writer.
+    /// <param name="eventStore">The journal the event appends to.</param>
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="sessionId">The session whose journal appends.</param>
+    /// <param name="token">The journal token snapshot fencing the write.</param>
+    /// <param name="turnId">The running turn the load ran inside.</param>
+    /// <param name="loaded">The loaded event the tool reported.</param>
+    /// <param name="cancellationToken">Abandons the append.</param>
+    let journalSkillLoadedAsync
+        (eventStore: ISessionEventStore)
+        (tenant: TenantId)
+        (sessionId: SessionId)
+        (token: string)
+        (turnId: TurnId)
+        (loaded: SkillLoadedEvent)
+        (cancellationToken: CancellationToken)
+        : Task<unit> =
+        task {
+            let companions =
+                if isNull (box loaded) || isNull (box loaded.Companions) then
+                    ResizeArray<string>() :> IReadOnlyList<string>
+                else
+                    loaded.Companions
+
+            let skillName =
+                if isNull (box loaded) || isNull (box loaded.SkillName) then
+                    ""
+                else
+                    loaded.SkillName
+
+            let event =
+                SkillLoadedEvent(
+                    sessionId,
+                    turnId,
+                    Unchecked.defaultof<Nullable<int64>>,
+                    DateTimeOffset.UtcNow,
+                    skillName,
+                    companions
+                )
+                :> SessionEvent
+
+            let batch = ResizeArray<SessionEvent>([| event |]) :> IReadOnlyList<SessionEvent>
+
+            match! JournalWriter.appendWithTokenAsync eventStore tenant sessionId token batch cancellationToken with
+            | JournalWriter.JournalAppended _ -> ()
+            | JournalWriter.JournalRejected _ -> return raise (TurnLoop.TurnLeaseLostException())
+            | JournalWriter.JournalFailed _ -> ()
+        }
+
 /// The session actor behaviour and its client boundary. Internal so no Akka
 /// type ever crosses the public API.
 module internal SessionActor =
@@ -3080,113 +3183,6 @@ module internal SessionActor =
                 | JournalWriter.JournalFailed _ -> ()
             }
 
-        /// Journals one cumulative usage checkpoint for a facade-driven turn
-        /// (issue 321): a UsageEvent carrying the turn's accumulated totals
-        /// under the given journal token through the fenced writer, mirroring
-        /// journalTurnStartedAsync. The caller snapshots the live token at
-        /// turn start and passes the snapshot, so a takeover between snapshot
-        /// and append still fences out. A stale-token rejection raises
-        /// TurnLeaseLostException so the takeover loser stops with zero
-        /// further effects; a failed write returns silently and the turn
-        /// proceeds (best-effort observability, last-wins summation tolerates
-        /// the gap). Zero-zero checkpoints never reach here: the TurnLoop
-        /// boundary skips them, so absence reads zero.
-        /// <param name="eventStore">The journal the checkpoint appends to.</param>
-        /// <param name="tenant">The tenant the session belongs to.</param>
-        /// <param name="sessionId">The session whose journal appends.</param>
-        /// <param name="token">The journal token snapshot fencing the write.</param>
-        /// <param name="turnId">The turn the usage was checkpointed for.</param>
-        /// <param name="inputTokens">The input tokens the turn had consumed.</param>
-        /// <param name="outputTokens">The output tokens the turn had produced.</param>
-        /// <param name="cancellationToken">Abandons the append.</param>
-        let journalUsageAsync
-            (eventStore: ISessionEventStore)
-            (tenant: TenantId)
-            (sessionId: SessionId)
-            (token: string)
-            (turnId: TurnId)
-            (inputTokens: int64)
-            (outputTokens: int64)
-            (cancellationToken: CancellationToken)
-            : Task<unit> =
-            task {
-                let checkpoint =
-                    UsageEvent(
-                        sessionId,
-                        turnId,
-                        Unchecked.defaultof<Nullable<int64>>,
-                        DateTimeOffset.UtcNow,
-                        inputTokens,
-                        outputTokens
-                    )
-                    :> SessionEvent
-
-                let batch =
-                    ResizeArray<SessionEvent>([| checkpoint |]) :> IReadOnlyList<SessionEvent>
-
-                match! JournalWriter.appendWithTokenAsync eventStore tenant sessionId token batch cancellationToken with
-                | JournalWriter.JournalAppended _ -> ()
-                | JournalWriter.JournalRejected _ -> return raise (TurnLoop.TurnLeaseLostException())
-                | JournalWriter.JournalFailed _ -> ()
-            }
-
-        /// Journals one skill load for a facade-driven turn (issue 321): the
-        /// SkillLoadedEvent the SkillTool's onLoaded carried, re-keyed under
-        /// the running turn when the tool was bound with a stale id, through
-        /// the fenced writer mirroring journalTurnStartedAsync. The caller
-        /// snapshots the live token at turn start; a stale-token rejection
-        /// raises TurnLeaseLostException so the takeover loser journals
-        /// nothing; a failed write returns silently and the turn proceeds
-        /// (best-effort observability). The bus fans the landed event to live
-        /// subscribers; replay surfaces it to fresh readers.
-        /// <param name="eventStore">The journal the event appends to.</param>
-        /// <param name="tenant">The tenant the session belongs to.</param>
-        /// <param name="sessionId">The session whose journal appends.</param>
-        /// <param name="token">The journal token snapshot fencing the write.</param>
-        /// <param name="turnId">The running turn the load ran inside.</param>
-        /// <param name="loaded">The loaded event the tool reported.</param>
-        /// <param name="cancellationToken">Abandons the append.</param>
-        let journalSkillLoadedAsync
-            (eventStore: ISessionEventStore)
-            (tenant: TenantId)
-            (sessionId: SessionId)
-            (token: string)
-            (turnId: TurnId)
-            (loaded: SkillLoadedEvent)
-            (cancellationToken: CancellationToken)
-            : Task<unit> =
-            task {
-                let companions =
-                    if isNull (box loaded) || isNull (box loaded.Companions) then
-                        ResizeArray<string>() :> IReadOnlyList<string>
-                    else
-                        loaded.Companions
-
-                let skillName =
-                    if isNull (box loaded) || isNull (box loaded.SkillName) then
-                        ""
-                    else
-                        loaded.SkillName
-
-                let event =
-                    SkillLoadedEvent(
-                        sessionId,
-                        turnId,
-                        Unchecked.defaultof<Nullable<int64>>,
-                        DateTimeOffset.UtcNow,
-                        skillName,
-                        companions
-                    )
-                    :> SessionEvent
-
-                let batch = ResizeArray<SessionEvent>([| event |]) :> IReadOnlyList<SessionEvent>
-
-                match! JournalWriter.appendWithTokenAsync eventStore tenant sessionId token batch cancellationToken with
-                | JournalWriter.JournalAppended _ -> ()
-                | JournalWriter.JournalRejected _ -> return raise (TurnLoop.TurnLeaseLostException())
-                | JournalWriter.JournalFailed _ -> ()
-            }
-
         let journalSuspend (suspension: TurnLoop.TurnLoopSuspension) : JournalWriter.JournalWriteResult =
             let turnId = TurnId.New()
             let stamp = DateTimeOffset.UtcNow
@@ -3528,7 +3524,7 @@ module internal SessionActor =
             // no marker (see resumeSuspendable).
             let onUsageCheckpoint: TurnLoop.UsageCheckpointHook option =
                 Some(fun inputTokens outputTokens cancellationToken ->
-                    journalUsageAsync
+                    SessionJournal.journalUsageAsync
                         suspend.EventStore
                         props.Tenant
                         props.SessionId
@@ -3540,7 +3536,7 @@ module internal SessionActor =
 
             let onSkillLoaded: TurnLoop.SkillLoadedHook option =
                 Some(fun loaded cancellationToken ->
-                    journalSkillLoadedAsync
+                    SessionJournal.journalSkillLoadedAsync
                         suspend.EventStore
                         props.Tenant
                         props.SessionId
@@ -3625,7 +3621,7 @@ module internal SessionActor =
 
             let onUsageResumed: TurnLoop.UsageCheckpointHook option =
                 Some(fun inputTokens outputTokens cancellationToken ->
-                    journalUsageAsync
+                    SessionJournal.journalUsageAsync
                         suspend.EventStore
                         props.Tenant
                         props.SessionId
@@ -3637,7 +3633,7 @@ module internal SessionActor =
 
             let onSkillResumed: TurnLoop.SkillLoadedHook option =
                 Some(fun loaded cancellationToken ->
-                    journalSkillLoadedAsync
+                    SessionJournal.journalSkillLoadedAsync
                         suspend.EventStore
                         props.Tenant
                         props.SessionId

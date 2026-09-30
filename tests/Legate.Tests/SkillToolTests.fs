@@ -957,3 +957,70 @@ let ``A fenced-out loser appends zero usage and skill events`` () =
         |> List.ofSeq
 
     forbidden.Length |> should equal 0
+
+// ───────────────────────────────────────────────────────────────────────────
+// Issue 321 revision: the SessionJournal wrappers fence the loser directly
+
+[<Fact>]
+let ``SessionJournal wrappers reject a stale token with zero effects`` () =
+    let clock, sessions, events = createStores ()
+    let session = createSession sessions
+    appendUser sessions session.Id "first"
+    appendUser sessions session.Id "second"
+
+    let loser = claimTurn sessions session.Id "owner-a"
+    clock.Advance(TimeSpan.FromSeconds 121.0)
+    let _winner = claimTurn sessions session.Id "owner-b"
+
+    // The usage wrapper maps a stale-token rejection to lease loss.
+    let mutable usageLost = false
+
+    try
+        SessionJournal.journalUsageAsync events tenant session.Id loser.Token loser.TurnId 10L 5L CancellationToken.None
+        |> fun task -> task.GetAwaiter().GetResult()
+    with :? TurnLoop.TurnLeaseLostException ->
+        usageLost <- true
+
+    usageLost |> should equal true
+
+    // The skill wrapper maps the same rejection the same way.
+    let loaded =
+        SkillLoadedEvent(
+            session.Id,
+            loser.TurnId,
+            Unchecked.defaultof<Nullable<int64>>,
+            stamp,
+            "deploy",
+            ResizeArray<string>() :> IReadOnlyList<string>
+        )
+
+    let mutable skillLost = false
+
+    try
+        SessionJournal.journalSkillLoadedAsync
+            events
+            tenant
+            session.Id
+            loser.Token
+            loser.TurnId
+            loaded
+            CancellationToken.None
+        |> fun task -> task.GetAwaiter().GetResult()
+    with :? TurnLoop.TurnLeaseLostException ->
+        skillLost <- true
+
+    skillLost |> should equal true
+
+    // Zero effects: neither wrapper landed an event.
+    let replayed = collectJournal events session.Id
+
+    let forbidden =
+        replayed
+        |> Seq.filter (fun event ->
+            match event with
+            | :? UsageEvent -> true
+            | :? SkillLoadedEvent -> true
+            | _ -> false)
+        |> List.ofSeq
+
+    forbidden.Length |> should equal 0
