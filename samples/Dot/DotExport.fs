@@ -56,6 +56,43 @@ let private validateTarget (target: string) : string =
 
     target
 
+/// Resolves one link component to an absolute path when the path is a
+/// symbolic link, or null when it is not a link, does not exist, or cannot
+/// be resolved (mirrors the CodingTools link-target walk: DotExport
+/// compiles before CodingTools, so the helper is duplicated here rather
+/// than called).
+/// <param name="path">The absolute component path to inspect.</param>
+/// <returns>The absolute link target, or null when there is none.</returns>
+let private resolveLinkTarget (path: string) : string | null =
+    let absolutize (linkPath: string) (target: string) =
+        if Path.IsPathRooted target then
+            Path.GetFullPath target
+        else
+            let parent: string | null = Path.GetDirectoryName linkPath
+
+            let baseDir =
+                match parent with
+                | null -> linkPath
+                | dir -> dir
+
+            Path.GetFullPath(Path.Combine(baseDir, target))
+
+    try
+        let rawTarget: string | null =
+            if Directory.Exists path then
+                (DirectoryInfo path).LinkTarget
+            elif File.Exists path then
+                (FileInfo path).LinkTarget
+            else
+                null
+
+        match rawTarget with
+        | null -> null
+        | target -> absolutize path target
+    with
+    | :? IOException -> null
+    | :? UnauthorizedAccessException -> null
+
 /// Resolves an export target under the working directory, refusing escape:
 /// the resolved path must stay inside the resolved root.
 /// <param name="workingDirectory">The working directory exports land under.</param>
@@ -68,7 +105,6 @@ let resolveExportPath (workingDirectory: string) (target: string) : Result<strin
         try
             let relative = validateTarget target
             let resolvedRoot = Path.GetFullPath workingDirectory
-            let fullPath = Path.GetFullPath(Path.Combine(resolvedRoot, relative))
 
             let comparison =
                 if OperatingSystem.IsWindows() then
@@ -76,13 +112,45 @@ let resolveExportPath (workingDirectory: string) (target: string) : Result<strin
                 else
                     StringComparison.Ordinal
 
-            let inside =
-                fullPath.StartsWith(resolvedRoot + string Path.DirectorySeparatorChar, comparison)
+            let escapeMessage =
+                "The /export target must stay inside the working directory: the resolved path escapes it."
 
-            if inside then
-                Ok fullPath
+            let isInside (fullPath: string) =
+                fullPath.Equals(resolvedRoot, comparison)
+                || fullPath.StartsWith(resolvedRoot + string Path.DirectorySeparatorChar, comparison)
+
+            let mutable current = resolvedRoot
+            let mutable escaped = false
+
+            for segment in relative.Split('/') do
+                if not escaped then
+                    current <- Path.Combine(current, segment)
+
+                    if not (isInside current) then
+                        escaped <- true
+                    else
+                        let mutable hops = 0
+                        let mutable settled = false
+
+                        while not settled && not escaped do
+                            match resolveLinkTarget current with
+                            | null -> settled <- true
+                            | linkTarget ->
+                                hops <- hops + 1
+
+                                if hops > 40 then escaped <- true
+                                elif not (isInside linkTarget) then escaped <- true
+                                else current <- linkTarget
+
+            if escaped then
+                Error escapeMessage
             else
-                Error "The /export target must stay inside the working directory: the resolved path escapes it."
+                let fullPath = Path.GetFullPath current
+
+                if isInside fullPath then
+                    Ok fullPath
+                else
+                    Error escapeMessage
         with :? ArgumentException as invalid ->
             Error $"The /export target is invalid: {invalid.Message}"
 
