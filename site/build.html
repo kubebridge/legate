@@ -3,144 +3,154 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Build deep dive: hosts, packages, proof</title>
+<title>Add Legate to your .NET application | Legate</title>
+<meta name="description" content="Start with a working Legate sample, choose storage and workspaces, configure application policies, and select the .NET packages you need.">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 30 30'%3E%3Crect width='30' height='30' rx='7' fill='%236ea8ff'/%3E%3Crect x='13' y='6' width='4' height='18' fill='white'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="styles.css">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 </head>
 <body>
-<header style="position:sticky;top:0;z-index:20;background:oklch(14.1% 0.014 286 / 0.97);backdrop-filter:blur(10px);border-bottom:1px solid oklch(27.4% 0.013 286)">
-<div style="max-width:1200px;margin:0 auto;padding:0 32px;height:60px;display:flex;align-items:center;gap:32px">
-  <a href="overview.html" style="display:flex;align-items:center;gap:8px;color:#fff" aria-label="Legate home">
+<header class="nav">
+<div class="wrap">
+  <a class="brand" href="index.html" aria-label="Legate home">
     <svg width="30" height="30" viewBox="0 0 32 32" style="display:block;flex:none" aria-hidden="true"><path d="M9 6h3v21H9Z" fill="var(--ink)"/><path d="M12 7H25L23.4 9.4H12Z" fill="var(--logo-b)"/><path d="M12 10.2H22.87L21.27 12.6H12Z" fill="var(--logo-b)"/><path d="M12 13.4H21.27L22.87 15.8H12Z" fill="var(--logo-b)"/><path d="M12 16.6H23.4L25 19H12Z" fill="var(--logo-b)"/></svg>
     <span style="font-weight:700;letter-spacing:0.12em;font-size:14px">LEGATE</span>
   </a>
-  <nav style="display:flex;gap:24px;font-size:14px;flex:1;flex-wrap:wrap">
-    <a href="overview.html" style="color:oklch(87.1% 0.006 286)">Overview</a>
-    <a href="index.html" style="color:oklch(87.1% 0.006 286)">Sessions</a>
-    <a href="durability.html" style="color:oklch(87.1% 0.006 286)">Durability</a>
-    <a href="build.html" style="color:#fff;font-weight:700">Build</a>
+  <nav class="nav-links" aria-label="Main navigation">
+    <a href="index.html">Overview</a>
+    <a href="sessions.html">Sessions</a>
+    <a href="durability.html">Durability</a>
+    <a class="active" href="build.html" aria-current="page">Build</a>
   </nav>
-  <span style="font-family:'JetBrains Mono',monospace;font-size:11px;color:oklch(70.7% 0.013 286);border:1px solid oklch(27.4% 0.013 286);border-radius:4px;padding:4px 8px">v0.1.0</span>
-  <button class="theme-btn" type="button" aria-label="Switch color theme" title="Switch color theme" style="width:32px;height:32px;display:grid;place-items:center;background:transparent;border:1px solid oklch(37% 0.013 286);border-radius:6px;color:oklch(87.1% 0.006 286);cursor:pointer;padding:0;flex:none"></button>
-  <a class="gh-btn" href="https://github.com/kubebridge/legate" style="font-size:13px;font-weight:600;color:#fff;border:1px solid oklch(37% 0.013 286);border-radius:6px;padding:7px 12px;white-space:nowrap">GitHub</a>
+  <span class="ver-pill">v0.1.0</span>
+  <button class="theme-btn" type="button" aria-label="Switch color theme" title="Switch color theme"></button>
+  <a class="github-btn" href="https://github.com/kubebridge/legate">GitHub</a>
 </div>
 </header>
 
+<main>
 <div class="wrap hero">
-  <span class="kicker">03 / Build deep dive</span>
-  <h1 class="hero-title">Business rules enter at the edges</h1>
-  <p class="lede">The <a href="overview.html">overview</a> compares the two hosts. This page is the builder reference: the six host hooks, the samples that exercise them, the package map, and the proof behind the release.</p>
-  <div class="stats">
-    <div class="stat"><div class="num">2189</div><div class="lbl">tests in Legate.Tests</div></div>
-    <div class="stat"><div class="num">16</div><div class="lbl">packages in the layout</div></div>
-    <div class="stat"><div class="num">41</div><div class="lbl">versioned wire manifests</div></div>
-    <div class="stat"><div class="num">15</div><div class="lbl">ms local cold start</div></div>
-  </div>
+  <span class="kicker">03 / Build</span>
+  <h1 class="hero-title">Add Legate to your .NET application</h1>
+  <p class="lede">Legate runs inside an ASP.NET Core application, a .NET Generic Host, or a CLI. Register it with <code>AddLegate</code>, configure a model provider, storage, and a workspace, then use <code>SessionClient</code> to open and prompt sessions.</p>
+  <p class="lede">The runtime is written in F# and exposes a C#-friendly API using .NET tasks and async event streams.</p>
 </div>
 
-<section class="block"><div class="wrap">
+<section class="block" aria-labelledby="samples"><div class="wrap">
   <div class="sec-head">
-    <div><span class="sec-no cy">Host hooks</span>
-      <h2 class="sec-title">Six seams, nothing else</h2></div>
-    <p class="sec-sub">Host hooks are the only places a host's business rules enter the runtime. Legate reports tokens; it never prices them.</p>
+    <div><span class="sec-no cy">Getting started</span>
+      <h2 class="sec-title" id="samples">Start with a working sample</h2></div>
+    <p class="sec-sub">The samples show how to configure the runtime and drive a session from application code. From a checkout, with the .NET 10 SDK installed, build the solution and run the scripted CLI.</p>
   </div>
-  <div class="card" style="padding:8px 20px">
+  <div class="content-stack">
+<pre class="code"><code>dotnet fsi build.fsx
+dotnet run --project samples/LegateCli -- --scripted</code></pre>
+    <p class="body-copy">Scripted mode exercises the CLI without provider keys or network calls. To use a live model, follow the <a href="https://github.com/kubebridge/legate/blob/main/Docs/getting-started-cli.md">CLI guide</a> to configure a provider.</p>
+  </div>
+  <div class="card table-card" tabindex="0" role="region" aria-label="Application samples">
     <table class="spec">
-      <tr><th>Hook</th><th>What the host decides</th></tr>
-      <tr><td>ISessionAdmissionPolicy</td><td>Whether a session may start or prompt at all</td></tr>
-      <tr><td>IUsageObserver</td><td>What to record about token usage per turn</td></tr>
-      <tr><td>IModelPolicy</td><td>Which model serves which call</td></tr>
-      <tr><td>IToolSource</td><td>Where custom tools come from (MCP servers plug in here)</td></tr>
-      <tr><td>IPermissionPolicy</td><td>Which tool calls need approval, and from whom</td></tr>
-      <tr><td>IWorkspaceRuntime</td><td>Where tools act: host directory, Docker sandbox, or scratch</td></tr>
+      <thead><tr><th scope="col">Sample</th><th scope="col">What it demonstrates</th></tr></thead>
+      <tbody>
+        <tr><td><a href="https://github.com/kubebridge/legate/tree/main/samples/LegateCli">LegateCli</a></td><td>An interactive terminal interface with prompts, approval handling, and session commands. It currently uses in-memory storage.</td></tr>
+        <tr><td><a href="https://github.com/kubebridge/legate/tree/main/samples/CSharpHost">CSharpHost</a></td><td>A C# console application using the .NET Generic Host, including event subscription and a tool-approval round trip.</td></tr>
+        <tr><td><a href="https://github.com/kubebridge/legate/tree/main/samples/MinimalHost">MinimalHost</a></td><td>HTTP endpoints for session operations and an SSE event stream that reconnects using <code>Last-Event-ID</code>.</td></tr>
+        <tr><td><a href="https://github.com/kubebridge/legate/tree/main/samples/Headless">Headless</a></td><td>An unattended session with automatic closure and a signed completion webhook.</td></tr>
+        <tr><td><a href="https://github.com/kubebridge/legate/tree/main/samples/cluster-compose">cluster-compose</a></td><td>Three nodes sharing Postgres and Redis, including a process-kill recovery test.</td></tr>
+      </tbody>
     </table>
-  </div>
-  <div class="grid c3" style="margin-top:14px">
-    <div class="card accent-top cy"><h3>LegateCli</h3><p>The agentic CLI: approvals mid-turn, SQLite journal, your working directory.</p></div>
-    <div class="card accent-top am"><h3>CSharpHost</h3><p>Embedding from C#: sessions inside an ASP.NET host.</p></div>
-    <div class="card accent-top"><h3>Headless</h3><p>AutoClose sessions with completion webhooks for pipelines.</p></div>
   </div>
 </div></section>
 
-<section class="block alt"><div class="wrap">
+<section class="block alt" aria-labelledby="storage"><div class="wrap">
+  <div class="sec-head">
+    <div><span class="sec-no cy">Storage and execution</span>
+      <h2 class="sec-title" id="storage">Choose storage and a workspace</h2></div>
+    <p class="sec-sub">Storage keeps session state and events. The workspace determines where tools run and which files they can access. Choose each for your deployment.</p>
+  </div>
+  <div class="grid c3">
+    <div class="card"><h3><span class="dsq" style="background:var(--c)" aria-hidden="true"></span>Local applications</h3><p>Use SQLite for sessions and events in a local database file. Use <code>Legate.Workspace.HostDirectory</code> when tools should work in a selected host directory.</p></div>
+    <div class="card"><h3><span class="dsq" style="background:var(--a)" aria-hidden="true"></span>Hosted services</h3><p>Use Postgres for shared session state and events. Add S3 for blobs and agent packages, and Docker workspaces when tool execution needs container isolation.</p></div>
+    <div class="card"><h3><span class="dsq" style="background:var(--vb)" aria-hidden="true"></span>Tests and experiments</h3><p>Use in-memory stores and a process workspace. This configuration requires no database server or container runtime. Its session data lasts for the process lifetime.</p></div>
+  </div>
+</div></section>
+
+<section class="block" aria-labelledby="policies"><div class="wrap">
+  <div class="sec-head">
+    <div><span class="sec-no cy">Host integration</span>
+      <h2 class="sec-title" id="policies">Configure your application's policies</h2></div>
+    <p class="sec-sub">The host decides who can use the agent, which tools it can call, and where those tools run. Register implementations of these interfaces to connect Legate to your application.</p>
+  </div>
+  <div class="card table-card" tabindex="0" role="region" aria-label="Host policy interfaces">
+    <table class="spec">
+      <thead><tr><th scope="col">Interface</th><th scope="col">What it controls</th></tr></thead>
+      <tbody>
+        <tr><td><code>ISessionAdmissionPolicy</code></td><td>Whether to accept a session open or prompt.</td></tr>
+        <tr><td><code>IPermissionPolicy</code></td><td>Whether a tool call is allowed, denied, or requires approval.</td></tr>
+        <tr><td><code>IModelPolicy</code></td><td>Which model to use for a call.</td></tr>
+        <tr><td><code>IToolSource</code></td><td>Which additional tools are available. The MCP integration uses this interface.</td></tr>
+        <tr><td><code>IWorkspaceRuntime</code></td><td>Where tool execution and file operations take place.</td></tr>
+        <tr><td><code>IUsageObserver</code></td><td>How your application records token-usage checkpoints and settled usage.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="content-stack">
+    <p class="body-copy">Legate reports token counts. Your application can use those counts for metering or billing.</p>
+    <p class="body-copy">Additional interfaces cover <code>ISessionCompletionSink</code> for completion notifications and <code>IArtifactQuota</code> for artifact quotas.</p>
+  </div>
+</div></section>
+
+<section class="block alt" aria-labelledby="packages"><div class="wrap">
   <div class="sec-head">
     <div><span class="sec-no cy">Packages</span>
-      <h2 class="sec-title">Inward references only</h2></div>
-    <p class="sec-sub">Everything depends on <code>Legate.Abstractions</code>, which depends on nothing in the solution and never touches Akka. New packages land under <code>src/&lt;PackageName&gt;/</code> and join <code>Legate.slnx</code>.</p>
+      <h2 class="sec-title" id="packages">Select the packages you need</h2></div>
+    <p class="sec-sub"><code>Legate</code> contains the session runtime. <code>Legate.Abstractions</code> contains the public contracts and has no Akka dependency. Provider, storage, and workspace integrations are separate packages.</p>
   </div>
-  <div class="pills">
-    <span class="hot">Legate.Abstractions</span><span>Legate</span><span>Legate.Llm.*</span>
-    <span>Storage.Postgres · SQLite · InMemory · S3</span><span>Coordination.Redis</span>
-    <span>Workspace.*</span><span>Cluster.Kubernetes</span><span>Mcp</span><span>Testing</span>
-  </div>
-  <div class="card" style="margin-top:14px;padding:8px 20px">
+  <div class="card table-card" tabindex="0" role="region" aria-label="Package selection">
     <table class="spec">
-      <tr><th>Need</th><th>Reach for</th><th>Notes</th></tr>
-      <tr><td>Local CLI, no server</td><td>SQLite + HostDirectory</td><td>One file holds sessions, inbox, turns, journal.</td></tr>
-      <tr><td>Hosted multi-tenant</td><td>Postgres + S3 + Docker</td><td>Tenant-scoped everything, additive-only migrations.</td></tr>
-      <tr><td>Tests and samples</td><td>InMemory + Process</td><td>Core builds and tests with zero external services.</td></tr>
-      <tr><td>Agent packages</td><td>S3 / FileSystem blob + package stores</td><td>Skills and sub-agents load from packages.</td></tr>
+      <thead><tr><th scope="col">Area</th><th scope="col">Packages</th></tr></thead>
+      <tbody>
+        <tr><td>Model providers</td><td><ul class="package-list"><li><code>Legate.Llm.OpenAI</code></li><li><code>Legate.Llm.Anthropic</code></li><li><code>Legate.Llm.Google</code></li></ul></td></tr>
+        <tr><td>Session storage</td><td><ul class="package-list"><li><code>Legate.Storage.Sqlite</code></li><li><code>Legate.Storage.Postgres</code></li><li><code>Legate.Storage.InMemory</code></li></ul></td></tr>
+        <tr><td>Blobs and agent packages</td><td><ul class="package-list"><li><code>Legate.Storage.FileSystem</code></li><li><code>Legate.Storage.S3</code></li></ul></td></tr>
+        <tr><td>Workspaces</td><td><ul class="package-list"><li><code>Legate.Workspace.HostDirectory</code></li><li><code>Legate.Workspace.Process</code></li><li><code>Legate.Workspace.Docker</code></li></ul></td></tr>
+        <tr><td>MCP tools</td><td><code>Legate.Mcp</code></td></tr>
+        <tr><td>Distributed LLM admission</td><td><code>Legate.Coordination.Redis</code></td></tr>
+        <tr><td>Kubernetes discovery</td><td><code>Legate.Cluster.Kubernetes</code></td></tr>
+        <tr><td>Test support</td><td><code>Legate.Testing</code></td></tr>
+      </tbody>
     </table>
   </div>
+  <p class="body-copy">Local mode is the default. Add clustering when your deployment needs multiple nodes.</p>
 </div></section>
 
-<section class="block"><div class="wrap">
+<section class="block" aria-labelledby="build-source"><div class="wrap">
   <div class="sec-head">
-    <div><span class="sec-no cy">Proof</span>
-      <h2 class="sec-title">Tested like infrastructure</h2></div>
-    <p class="sec-sub">Store conformance across all three session stores, wire golden files, Testcontainers proofs for Redis, Postgres, and S3, and the live three-node kill smoke in CI.</p>
+    <div><span class="sec-no cy">Development</span>
+      <h2 class="sec-title" id="build-source">Build and test from source</h2></div>
+    <p class="sec-sub">The core test suite runs without external services. Integration suites use Postgres, Redis, S3-compatible storage, and Docker where needed. CI also runs the sample applications, the cluster recovery test, and package creation.</p>
   </div>
-  <div class="timeline">
-    <div class="tl-item shipped"><b>Extracted, not invented</b><span>Legate generalizes the BridgeMCP agent engine from a job model to a session model, with <code>Docs/ARCHITECTURE.md</code> as the normative target.</span></div>
-    <div class="tl-item shipped"><b>Waves 1 to 3</b><span>Domain, stores, turn loop, tools, permissions, LLM providers, workspaces, MCP: the single-node harness end to end.</span></div>
-    <div class="tl-item shipped"><b>Wave 4: cluster</b><span>Runtime, distributed event bus, Redis admission, Kubernetes bootstrap, wire format, and the crash-resume proof.</span></div>
-    <div class="tl-item shipped"><b>v0.1.0 on NuGet</b><span>First public release published. The surface is still growing, so expect movement between 0.x releases.</span></div>
+<pre class="code"><code>dotnet fsi build.fsx
+dotnet fsi build.fsx -t Test
+dotnet fsi build.fsx -t CheckFormat</code></pre>
+  <p class="body-copy">Legate is currently on the <code>0.x</code> release line. Public APIs may change between releases.</p>
+  <div class="resource-links">
+    <a href="https://github.com/kubebridge/legate/blob/main/Docs/getting-started-cli.md">CLI guide</a>
+    <a href="https://github.com/kubebridge/legate/blob/main/Docs/getting-started-hosted.md">Hosted-service guide</a>
+    <a href="https://github.com/kubebridge/legate/blob/main/Docs/configuration.md">Configuration reference</a>
+    <a href="https://github.com/kubebridge/legate">GitHub</a>
   </div>
-  <div class="card" style="margin-top:20px">
-    <h3>Get running</h3>
-<pre class="code" style="margin-top:12px"><span class="c"># needs the .NET 10 SDK</span>
-dotnet fsi build.fsx -- -t Build   <span class="c"># restore + build</span>
-dotnet fsi build.fsx -- -t Test    <span class="c"># build + run all tests</span>
-dotnet run --project samples/LegateCli   <span class="c"># talk to a session</span></pre>
-  </div>
-  <div class="pager" style="margin-top:20px">
-    <a class="btn" href="durability.html">02 / Durability deep dive</a>
-    <a class="btn primary" href="overview.html">Overview</a>
+  <div class="pager">
+    <a class="btn" href="durability.html">02 / Durability</a>
+    <a class="btn primary" href="index.html">Overview</a>
   </div>
 </div></section>
+</main>
 
 <footer><div class="wrap">
-  <a class="brand" href="overview.html" style="font-size:12px"><svg width="20" height="20" viewBox="0 0 32 32" aria-hidden="true"><path d="M9 6h3v21H9Z" fill="var(--ink)"/><path d="M12 7H25L23.4 9.4H12Z" fill="var(--logo-b)"/><path d="M12 10.2H22.87L21.27 12.6H12Z" fill="var(--logo-b)"/><path d="M12 13.4H21.27L22.87 15.8H12Z" fill="var(--logo-b)"/><path d="M12 16.6H23.4L25 19H12Z" fill="var(--logo-b)"/></svg>LEGATE</a>
-  <span class="spacer">A <a href="https://kubebridge.com">kubebridge</a> project · Apache 2.0</span>
+  <a class="brand" href="index.html" style="font-size:12px"><svg width="20" height="20" viewBox="0 0 32 32" aria-hidden="true"><path d="M9 6h3v21H9Z" fill="var(--ink)"/><path d="M12 7H25L23.4 9.4H12Z" fill="var(--logo-b)"/><path d="M12 10.2H22.87L21.27 12.6H12Z" fill="var(--logo-b)"/><path d="M12 13.4H21.27L22.87 15.8H12Z" fill="var(--logo-b)"/><path d="M12 16.6H23.4L25 19H12Z" fill="var(--logo-b)"/></svg>LEGATE</a>
+  <span class="spacer">A <a href="https://kubebridge.com">Kubebridge</a> project · Apache 2.0</span>
   <nav><a href="https://github.com/kubebridge/legate">GitHub</a><a href="https://www.nuget.org/packages/Legate">NuGet</a></nav>
 </div></footer>
-<script>
-(function(){
-var SUN='<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"></path></svg>';
-var MOON='<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"></path></svg>';
-var root=document.documentElement;
-function osLight(){return window.matchMedia&&window.matchMedia('(prefers-color-scheme: light)').matches;}
-function apply(){
-  var pref='auto';
-  try{var s=localStorage.getItem('legate-theme');if(s)pref=s;}catch(e){}
-  var resolved=pref==='auto'?(osLight()?'light':'dark'):pref;
-  if(pref==='auto')root.removeAttribute('data-theme');else root.setAttribute('data-theme',resolved);
-  var dark=resolved==='dark';
-  document.querySelectorAll('.theme-btn').forEach(function(b){
-    b.setAttribute('aria-label',dark?'Switch to light mode':'Switch to dark mode');
-    b.setAttribute('title',dark?'Switch to light mode':'Switch to dark mode');
-    b.innerHTML=dark?SUN:MOON;
-  });
-}
-document.querySelectorAll('.theme-btn').forEach(function(b){b.addEventListener('click',function(){
-  var cur=root.getAttribute('data-theme')||(osLight()?'light':'dark');
-  try{localStorage.setItem('legate-theme',cur==='dark'?'light':'dark');}catch(e){}
-  apply();
-});});
-if(window.matchMedia)window.matchMedia('(prefers-color-scheme: light)').addEventListener('change',apply);
-apply();
-})();
-</script>
+<script src="theme.js"></script>
 </body>
 </html>
