@@ -787,3 +787,173 @@ let ``A fenced-out claim never invokes the skill tool`` () =
 
     fencedOut |> should equal true
     journaled.Count |> should equal 0
+
+// ───────────────────────────────────────────────────────────────────────────
+// Issue 321: skill loads surface via replay and the loser journals nothing
+
+/// Collects the session journal in sequence order, paging from the first
+/// event: the fresh-reader path a resumed process replays.
+let private collectJournal (journal: ISessionEventStore) (sessionId: SessionId) : IReadOnlyList<SessionEvent> =
+    let call =
+        task {
+            let collected = ResizeArray<SessionEvent>()
+            let mutable cursor = 0L
+            let mutable go = true
+
+            while go do
+                let! outcome = journal.Replay(tenant, sessionId, cursor, 100, CancellationToken.None)
+
+                match outcome with
+                | :? EventReplayPage as page when not (isNull (box page)) ->
+                    if not (isNull (box page.Events)) then
+                        collected.AddRange(page.Events)
+
+                    if page.NextCursor.HasValue then
+                        cursor <- page.NextCursor.Value
+                    else
+                        go <- false
+                | _ -> go <- false
+
+            return collected :> IReadOnlyList<SessionEvent>
+        }
+
+    call.GetAwaiter().GetResult()
+
+[<Fact>]
+let ``A journaled SkillLoadedEvent replays for fresh readers`` () =
+    let _clock, sessions, events = createStores ()
+    let session = createSession sessions
+    appendUser sessions session.Id "first"
+    let claim = claimTurn sessions session.Id "owner-a"
+
+    let packages = InMemoryStoreFactory.packageStore (InMemoryDatabase())
+
+    let agentId =
+        upload
+            packages
+            [
+                ".agent/skills/deploy/SKILL.md", "# Deploy\n"
+                ".agent/skills/deploy/refs/api.md", "api"
+            ]
+
+    let outcome =
+        SkillLoader.loadAsync
+            {
+                Store = packages
+                Tenant = tenant
+                AgentId = agentId
+                SessionId = session.Id
+                TurnId = claim.TurnId
+                Timestamp = stamp
+                SkillName = "deploy"
+            }
+            CancellationToken.None
+        |> fun task -> task.GetAwaiter().GetResult()
+
+    let loaded =
+        match outcome.LoadedEvent with
+        | Some event -> event
+        | None -> failwith "expected a journaled event"
+
+    let written =
+        JournalWriter.appendAsync
+            sessions
+            events
+            tenant
+            session.Id
+            claim
+            (ResizeArray<SessionEvent>([| loaded :> SessionEvent |]) :> IReadOnlyList<SessionEvent>)
+            CancellationToken.None
+        |> fun task -> task.GetAwaiter().GetResult()
+
+    match written with
+    | JournalWriter.JournalAppended _ -> ()
+    | JournalWriter.JournalRejected reason -> failwith (sprintf "expected the append to land, rejected: %s" reason)
+    | JournalWriter.JournalFailed reason -> failwith (sprintf "expected the append to land, failed: %s" reason)
+
+    // Fresh reader over the same store (the simulated resume): replay alone
+    // surfaces the skill load with its companions. The bus fans the same
+    // landed journal to live subscribers (SessionEventBus is a live fan-out
+    // of the journal, proven by its own gap-free tests), so Subscribe
+    // observes it too.
+    let replayed = collectJournal events session.Id
+
+    let skills =
+        replayed
+        |> Seq.choose (fun event ->
+            match event with
+            | :? SkillLoadedEvent as skill when not (isNull (box skill)) -> Some skill
+            | _ -> None)
+        |> List.ofSeq
+
+    skills.Length |> should equal 1
+    skills[0].SkillName |> should equal "deploy"
+
+    skills[0].Companions
+    |> List.ofSeq
+    |> should equal [ ".agent/skills/deploy/refs/api.md" ]
+
+[<Fact>]
+let ``A fenced-out loser appends zero usage and skill events`` () =
+    let clock, sessions, events = createStores ()
+    let session = createSession sessions
+    appendUser sessions session.Id "first"
+    appendUser sessions session.Id "second"
+
+    let loser = claimTurn sessions session.Id "owner-a"
+    clock.Advance(TimeSpan.FromSeconds 121.0)
+    let _winner = claimTurn sessions session.Id "owner-b"
+
+    // The loser presents its stale token: the store rejects with zero
+    // writes for both kinds, so a takeover loser performs zero effects.
+    let usage =
+        UsageEvent(session.Id, loser.TurnId, Unchecked.defaultof<Nullable<int64>>, stamp, 10L, 5L) :> SessionEvent
+
+    let usageBatch =
+        ResizeArray<SessionEvent>([| usage |]) :> IReadOnlyList<SessionEvent>
+
+    let usageWritten =
+        JournalWriter.appendWithTokenAsync events tenant session.Id loser.Token usageBatch CancellationToken.None
+        |> fun task -> task.GetAwaiter().GetResult()
+
+    match usageWritten with
+    | JournalWriter.JournalRejected _ -> ()
+    | JournalWriter.JournalAppended _ -> failwith "expected the loser usage append to reject"
+    | JournalWriter.JournalFailed reason -> failwith (sprintf "expected rejection, failed: %s" reason)
+
+    let skill =
+        SkillLoadedEvent(
+            session.Id,
+            loser.TurnId,
+            Unchecked.defaultof<Nullable<int64>>,
+            stamp,
+            "deploy",
+            ResizeArray<string>() :> IReadOnlyList<string>
+        )
+        :> SessionEvent
+
+    let skillBatch =
+        ResizeArray<SessionEvent>([| skill |]) :> IReadOnlyList<SessionEvent>
+
+    let skillWritten =
+        JournalWriter.appendWithTokenAsync events tenant session.Id loser.Token skillBatch CancellationToken.None
+        |> fun task -> task.GetAwaiter().GetResult()
+
+    match skillWritten with
+    | JournalWriter.JournalRejected _ -> ()
+    | JournalWriter.JournalAppended _ -> failwith "expected the loser skill append to reject"
+    | JournalWriter.JournalFailed reason -> failwith (sprintf "expected rejection, failed: %s" reason)
+
+    // Zero effects: the journal holds no usage or skill events from the loser.
+    let replayed = collectJournal events session.Id
+
+    let forbidden =
+        replayed
+        |> Seq.filter (fun event ->
+            match event with
+            | :? UsageEvent -> true
+            | :? SkillLoadedEvent -> true
+            | _ -> false)
+        |> List.ofSeq
+
+    forbidden.Length |> should equal 0

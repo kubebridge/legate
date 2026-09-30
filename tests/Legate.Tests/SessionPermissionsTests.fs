@@ -714,7 +714,7 @@ let ``Crash seed carries the resumption note into the runner history input`` () 
         :> IList<ChatMessage>
 
     let fresh =
-        runner entry 1 (HashSet<string>()) None None (Some seed) CancellationToken.None None (TurnId.New())
+        runner entry 1 (HashSet<string>()) None None (Some seed) CancellationToken.None None None None (TurnId.New())
         |> fun task -> task.GetAwaiter().GetResult()
 
     fresh.Result.AssistantText |> should equal "done"
@@ -733,6 +733,8 @@ let ``Crash seed carries the resumption note into the runner history input`` () 
             (Some(PermissionDecision("req-1", PermissionDecisionKind.AllowOnce) :> Reply))
             (Some seed)
             CancellationToken.None
+            None
+            None
             None
             (TurnId.New())
         |> fun task -> task.GetAwaiter().GetResult()
@@ -768,7 +770,7 @@ let ``spawnSuspendFactory rejects invalid wiring`` () =
     let _, journal = createStores TimeProvider.System
 
     let runner: SessionActor.SuspendableRunner =
-        fun _ _ _ _ _ _ _ _ _ -> Task.FromResult(Unchecked.defaultof<TurnLoop.TurnLoopCompletion>)
+        fun _ _ _ _ _ _ _ _ _ _ _ -> Task.FromResult(Unchecked.defaultof<TurnLoop.TurnLoopCompletion>)
 
     let store = InMemorySessionStore(InMemoryDatabase()) :> ISessionStore
 
@@ -854,3 +856,76 @@ let ``spawnSuspendFactory rejects invalid wiring`` () =
             Unchecked.defaultof<TenantId -> SessionId -> CancellationToken -> Task<bool>>
         |> ignore)
     |> should throw typeof<ArgumentNullException>
+
+// ──────────────────────────────────────────────────────────────────────────
+// Usage checkpoints (issue 321): facade turns journal cumulative totals
+
+[<Fact>]
+let ``Facade turns journal cumulative UsageEvents replayable after resume`` () =
+    let store, journal = createStores TimeProvider.System
+    let created = createSession store
+    let invocations = ref []
+
+    let tools =
+        makeTools
+            [
+                "exec", stubTool "exec" "out" invocations
+            ]
+
+    let firstCalls =
+        ResizeArray<ScriptToolCall>([| ScriptToolCall("c1", "exec") |]) :> IReadOnlyList<ScriptToolCall>
+
+    let client =
+        scripted
+            [
+                ScriptStep.ToolCalls(firstCalls, 10L, 5L)
+                ScriptStep.Text("done", 3L, 2L)
+            ]
+
+    let service =
+        startService store journal (productionRunner store client tools null) (TimeSpan.FromHours 1.0)
+
+    try
+        let child = resolveChild service created.Id
+        promptLive store created.Id child "run"
+
+        let settled =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () -> (storedOf store created.Id).State = SessionState.Idle)
+
+        settled |> should equal true
+        invocations.Value.Length |> should equal 1
+        client.Calls |> should equal 2
+
+        let events = collectJournal journal created.Id
+
+        let usages =
+            events
+            |> Seq.choose (fun event ->
+                match event with
+                | :? UsageEvent as usage when not (isNull (box usage)) -> Some usage
+                | _ -> None)
+            |> List.ofSeq
+
+        // One boundary checkpoint plus one settle checkpoint, cumulative.
+        usages.Length |> should equal 2
+        (usages[0].InputTokens, usages[0].OutputTokens) |> should equal (10L, 5L)
+        (usages[1].InputTokens, usages[1].OutputTokens) |> should equal (13L, 7L)
+
+        // Simulated resume in a fresh reader over the same store: replay
+        // alone yields the real totals, with no in-process accumulation.
+        let fresh = collectJournal journal created.Id
+
+        let freshUsages =
+            fresh
+            |> Seq.choose (fun event ->
+                match event with
+                | :? UsageEvent as usage when not (isNull (box usage)) -> Some usage
+                | _ -> None)
+            |> List.ofSeq
+
+        freshUsages.Length |> should equal 2
+
+        let last = freshUsages[freshUsages.Length - 1]
+        (last.InputTokens, last.OutputTokens) |> should equal (13L, 7L)
+    finally
+        stopService service

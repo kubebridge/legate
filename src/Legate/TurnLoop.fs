@@ -76,6 +76,34 @@ module internal TurnLoop =
     /// turn id; resume and post-nested continuations never refire it.
     type TurnStartedHook = TurnId -> CancellationToken -> Task<unit>
 
+    /// Cumulative usage-checkpoint hook (issue 321): invoked with the turn's
+    /// accumulated input/output totals at iteration boundaries and at settle,
+    /// carrying the iteration's linked token for cancellation. The session
+    /// actor journals a fenced UsageEvent here, so journal replay alone
+    /// yields real token totals after a simulated resume in a fresh process;
+    /// None on TurnLoopOptions journals nothing. A hook failure propagates:
+    /// a fenced-out loser raises TurnLeaseLostException instead of calling
+    /// the model, mirroring OnTurnStarted. Checkpoints are cumulative with
+    /// last-wins summation, so duplicates from crash-resume or nested folds
+    /// stay at-least-once tolerant. Fires only in runSuspendableAsync (the
+    /// facade-driven path); the harness-only runAsync path journals nothing.
+    /// Resume and post-nested continuations carry it (unlike OnTurnStarted,
+    /// which never refires), so post-resume work checkpoints; nested runs
+    /// inherit it and fold their spend into the parent's totals.
+    type UsageCheckpointHook = int64 -> int64 -> CancellationToken -> Task<unit>
+
+    /// Skill-load journal hook (issue 321): the fenced journal callback the
+    /// runner binds as SkillTool's onLoaded, so each successful load lands a
+    /// SkillLoadedEvent observable via Subscribe and replay, not just the
+    /// host log. The skill bypass path triggers it indirectly: the loop
+    /// invokes the skill tool, the tool calls this hook with the loaded
+    /// event, and the hook journals it under the turn claim; None journals
+    /// nothing (hosts keep log-only onLoaded). A hook failure propagates
+    /// like OnTurnStarted, so a fenced-out loser stops with zero effects.
+    /// Carries the iteration's linked token for cancellation; the claim
+    /// token rides the closure, mirroring OnTurnStarted.
+    type SkillLoadedHook = SkillLoadedEvent -> CancellationToken -> Task<unit>
+
     /// What one settled tool invocation looked like: the name the model
     /// called it by, the call id the result answers, the appended result
     /// text, and the failure when the invocation raised instead of
@@ -146,6 +174,16 @@ module internal TurnLoop =
             /// nothing. Fires once before the first provider call of a fresh
             /// run; continuations never refire it (see runSuspendableAsync).
             OnTurnStarted: TurnStartedHook option
+            /// The cumulative usage-checkpoint hook (issue 321), or None to
+            /// journal nothing. Fires at iteration boundaries with the
+            /// current totals and at settle with the final totals; resumes
+            /// carry it so post-resume work checkpoints.
+            OnUsageCheckpoint: UsageCheckpointHook option
+            /// The skill-load journal hook (issue 321), or None to journal
+            /// nothing. Bound by the runner as SkillTool's onLoaded; the
+            /// skill bypass path triggers it indirectly via the tool
+            /// invocation. Resumes carry it so post-resume loads journal.
+            OnSkillLoaded: SkillLoadedHook option
             /// The task-tool nested runner, or None when the turn offers no
             /// task tool.
             TaskNested: TaskNestedRun option
@@ -178,6 +216,8 @@ module internal TurnLoop =
                 AskUser = None
                 OnToolCall = None
                 OnTurnStarted = None
+                OnUsageCheckpoint = None
+                OnSkillLoaded = None
                 TaskNested = None
                 StructuredOutcome = false
                 Logger = null
@@ -2019,6 +2059,11 @@ module internal TurnLoop =
                         raise (TurnLeaseLostException())
 
                     if timeoutCts.IsCancellationRequested then
+                        match options.OnUsageCheckpoint with
+                        | Some hook when roundInput <> 0L || roundOutput <> 0L ->
+                            do! hook roundInput roundOutput linkedToken
+                        | _ -> ()
+
                         return Some(failedCompletion roundIterations roundInput roundOutput TimeoutExceededMessage)
                     else
                         match options.VerifyClaim with
@@ -2048,6 +2093,11 @@ module internal TurnLoop =
                                 appendToolResult history call.CallId summary
                                 do! observeToolCallAsync options call summary None
 
+                                match options.OnUsageCheckpoint with
+                                | Some hook when roundInput <> 0L || roundOutput <> 0L ->
+                                    do! hook roundInput roundOutput linkedToken
+                                | _ -> ()
+
                                 return
                                     Some(
                                         {
@@ -2076,6 +2126,11 @@ module internal TurnLoop =
                             | Some error when not (String.IsNullOrWhiteSpace error) ->
                                 appendToolResult history call.CallId error
                                 do! observeToolCallAsync options call error None
+
+                                match options.OnUsageCheckpoint with
+                                | Some hook when roundInput <> 0L || roundOutput <> 0L ->
+                                    do! hook roundInput roundOutput linkedToken
+                                | _ -> ()
 
                                 return
                                     Some(
@@ -2128,6 +2183,11 @@ module internal TurnLoop =
                                     do! observeToolCallAsync options call canned None
                                     return! runTools roundIterations roundInput roundOutput rest
                                 | _ ->
+                                    match options.OnUsageCheckpoint with
+                                    | Some hook when roundInput <> 0L || roundOutput <> 0L ->
+                                        do! hook roundInput roundOutput linkedToken
+                                    | _ -> ()
+
                                     return
                                         Some(
                                             failedCompletion
@@ -2137,6 +2197,11 @@ module internal TurnLoop =
                                                 AskUserCannedMissingMessage
                                         )
                             | Some _ ->
+                                match options.OnUsageCheckpoint with
+                                | Some hook when roundInput <> 0L || roundOutput <> 0L ->
+                                    do! hook roundInput roundOutput linkedToken
+                                | _ -> ()
+
                                 return
                                     Some(
                                         failedCompletion
@@ -2241,8 +2306,20 @@ module internal TurnLoop =
                 if not (isLeaseValid ()) then
                     return! Task.FromException<TurnLoopCompletion>(TurnLeaseLostException())
                 elif iterations >= options.MaxIterations then
+                    // Settle checkpoint (issue 321): journal the final totals
+                    // before settling, skipping zero-zero (absence reads zero).
+                    match options.OnUsageCheckpoint with
+                    | Some hook when inputTokens <> 0L || outputTokens <> 0L ->
+                        do! hook inputTokens outputTokens linkedToken
+                    | _ -> ()
+
                     return failedCompletion iterations inputTokens outputTokens MaxIterationsExceededMessage
                 elif timeoutCts.IsCancellationRequested then
+                    match options.OnUsageCheckpoint with
+                    | Some hook when inputTokens <> 0L || outputTokens <> 0L ->
+                        do! hook inputTokens outputTokens linkedToken
+                    | _ -> ()
+
                     return failedCompletion iterations inputTokens outputTokens TimeoutExceededMessage
                 else
                     foldInjects ()
@@ -2256,6 +2333,16 @@ module internal TurnLoop =
                         | None -> Task.FromResult((inputTokens, outputTokens))
 
                     try
+                        // Usage boundary checkpoint (issue 321): cumulative
+                        // totals at each iteration boundary, skipping
+                        // zero-zero. Inside the try so a deadline firing
+                        // mid-append settles as the timeout like an
+                        // in-flight provider call.
+                        match options.OnUsageCheckpoint with
+                        | Some hook when compactedInput <> 0L || compactedOutput <> 0L ->
+                            do! hook compactedInput compactedOutput linkedToken
+                        | _ -> ()
+
                         // In-call marker (issue 284): once, before the first
                         // provider call of a fresh run. Inside the try so a
                         // deadline firing mid-append settles as the timeout
@@ -2276,6 +2363,11 @@ module internal TurnLoop =
                         let mutable nextOutput = compactedOutput
 
                         if isNull response then
+                            match options.OnUsageCheckpoint with
+                            | Some hook when nextInput <> 0L || nextOutput <> 0L ->
+                                do! hook nextInput nextOutput linkedToken
+                            | _ -> ()
+
                             return completedCompletion nextIterations nextInput nextOutput ""
                         else
                             addUsage &nextInput &nextOutput response.Usage
@@ -2294,6 +2386,11 @@ module internal TurnLoop =
                             if calls.IsEmpty then
                                 let assistantText = if isNull response.Text then "" else response.Text
 
+                                match options.OnUsageCheckpoint with
+                                | Some hook when nextInput <> 0L || nextOutput <> 0L ->
+                                    do! hook nextInput nextOutput linkedToken
+                                | _ -> ()
+
                                 return completedCompletion nextIterations nextInput nextOutput assistantText
                             else
                                 let! toolOutcome = runTools nextIterations nextInput nextOutput calls
@@ -2302,6 +2399,11 @@ module internal TurnLoop =
                                 | Some suspended -> return suspended
                                 | None -> return! loop nextIterations nextInput nextOutput
                     with :? OperationCanceledException when isTimeout () ->
+                        match options.OnUsageCheckpoint with
+                        | Some hook when inputTokens <> 0L || outputTokens <> 0L ->
+                            do! hook inputTokens outputTokens linkedToken
+                        | _ -> ()
+
                         return failedCompletion iterations inputTokens outputTokens TimeoutExceededMessage
             }
 

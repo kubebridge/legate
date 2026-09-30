@@ -148,7 +148,7 @@ module internal SessionPermissions =
                 with _ ->
                     ()
 
-        fun entry _attempt allowed cursor reply seed runnerToken onTurnStarted turnId ->
+        fun entry _attempt allowed cursor reply seed runnerToken onTurnStarted onUsageCheckpoint onSkillLoaded turnId ->
             let tools, loopOptions = resolveInputs entry
 
             // Fail fast outside the task computation: a null tool set or
@@ -205,9 +205,13 @@ module internal SessionPermissions =
                                 history
                                 tools
                                 // Fresh runs mark at the first provider-call
-                                // entry through the behavior-supplied hook.
+                                // entry through the behavior-supplied hook and
+                                // checkpoint usage plus skill loads through
+                                // the fenced journal hooks (issue 321).
                                 { loopOptions with
                                     OnTurnStarted = onTurnStarted
+                                    OnUsageCheckpoint = onUsageCheckpoint
+                                    OnSkillLoaded = onSkillLoaded
                                 }
                                 loopDelay
                                 runnerToken
@@ -243,9 +247,14 @@ module internal SessionPermissions =
                                 live.HistorySnapshot
                                 tools
                                 // Resumes already marked before they
-                                // suspended: never mark on resume.
+                                // suspended: never mark on resume, but carry
+                                // the usage and skill hooks so post-resume
+                                // work checkpoints and loads journal (issue
+                                // 321).
                                 { loopOptions with
                                     OnTurnStarted = None
+                                    OnUsageCheckpoint = onUsageCheckpoint
+                                    OnSkillLoaded = onSkillLoaded
                                 }
                                 loopDelay
                                 runnerToken
@@ -261,9 +270,14 @@ module internal SessionPermissions =
                                 live.HistorySnapshot
                                 tools
                                 // Resumes already marked before they
-                                // suspended: never mark on resume.
+                                // suspended: never mark on resume, but carry
+                                // the usage and skill hooks so post-resume
+                                // work checkpoints and loads journal (issue
+                                // 321).
                                 { loopOptions with
                                     OnTurnStarted = None
+                                    OnUsageCheckpoint = onUsageCheckpoint
+                                    OnSkillLoaded = onSkillLoaded
                                 }
                                 loopDelay
                                 runnerToken
@@ -282,9 +296,12 @@ module internal SessionPermissions =
                                 history
                                 tools
                                 // Retries run under the supplied turn id: mark
-                                // at the first provider-call entry.
+                                // at the first provider-call entry and carry
+                                // the usage and skill hooks (issue 321).
                                 { loopOptions with
                                     OnTurnStarted = onTurnStarted
+                                    OnUsageCheckpoint = onUsageCheckpoint
+                                    OnSkillLoaded = onSkillLoaded
                                 }
                                 loopDelay
                                 runnerToken

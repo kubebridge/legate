@@ -457,7 +457,7 @@ type SessionHarness
                 let runner: SessionActor.SuspendableRunner =
                     // The harness journals through its own fenced observer,
                     // never the in-call marker: no marker hook on any path.
-                    fun entry _attempt allowed cursor reply seed runnerToken _ turnId ->
+                    fun entry _attempt allowed cursor reply seed runnerToken _ _ _ turnId ->
                         task {
                             match cursor, reply with
                             | None, None ->
