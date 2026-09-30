@@ -2,6 +2,7 @@
 module Dot.Program
 
 open System
+open System.Collections.Generic
 open System.IO
 open System.Threading
 open System.Threading.Tasks
@@ -14,13 +15,16 @@ open Microsoft.Extensions.Hosting
 
 // Dot host with durable SQLite sessions: one UseSqlite file under the
 // per-user dot config dir (DOT_DB_PATH overrides), so transcripts survive
-// process exit for list (newest-first) and resume. Mirrors the
-// samples/Headless scripted precedent; scripted support stays host-local,
-// never a Legate.Testing reference (test-only package). Live-provider
-// wiring belongs to later children: there are no live branches here. The
-// interactive slash-command REPL itself belongs to #304: this host keeps
-// only the minimal startup, list, and resume surface needed to verify
-// cross-process durability.
+// process exit for list (newest-first) and resume. The interactive
+// slash-command REPL (#304) drives each turn as waiter-queued-before-prompt
+// plus Subscribe streaming with inline permission/question replies, over
+// the /new, /sessions, /resume, /abort, /compact, and /quit commands.
+// Mirrors the samples/Headless scripted precedent; scripted support stays
+// host-local, never a Legate.Testing reference (test-only package).
+// Live-provider wiring belongs to later children: there are no live
+// branches here. Approval UX polish belongs to #306 (this host only wires
+// the opt-in ask policy the REPL already answers inline); steering
+// commands belong to #308.
 
 // ──────────────────────────────────────────────────────────────────────────
 // Database path
@@ -63,23 +67,27 @@ let private storageHelp (dbPath: string) : string =
 /// How dot was asked to start.
 type DotStart =
     {
-        /// The single prompt text.
-        Prompt: string
         /// Scripted transports instead of live providers (always true:
         /// live wiring belongs to later children, so the flag is accepted
         /// for forward compatibility with the smoke invocation).
         Scripted: bool
-        /// Session id to resume and prompt, or null to open a new session.
+        /// Session id to attach at REPL startup, or null to open.
         Resume: string | null
-        /// List stored sessions newest-first instead of prompting.
+        /// List stored sessions newest-first instead of entering the REPL.
         ListSessions: bool
+        /// Settle wait bound in minutes: must be positive. A turn that
+        /// outruns it reports DEADLINE while the turn keeps running.
+        WaitMinutes: float
+        /// Ask for every tool call instead of allowing all: the opt-in
+        /// ask policy the REPL answers inline.
+        Ask: bool
     }
 
 /// Builds the --help text over the resolved database path.
 /// <param name="dbPath">The resolved database file path.</param>
 /// <returns>The usage text.</returns>
 let private helpText (dbPath: string) : string =
-    "Usage: Dot [--prompt <text>] [--resume <session-id>] [--sessions|--list] [--scripted] "
+    "Usage: Dot [--resume <session-id>] [--sessions|--list] [--scripted] [--wait-minutes <n>] [--ask] "
     + storageHelp dbPath
 
 /// Parses the dot arguments into a start plan. Unknown flags fail with a
@@ -87,10 +95,11 @@ let private helpText (dbPath: string) : string =
 /// <param name="argv">The process arguments.</param>
 /// <returns>The start plan.</returns>
 let parseArgs (argv: string[]) : DotStart =
-    let mutable prompt = "hi"
     let mutable scripted = true
     let mutable resume: string | null = null
     let mutable listSessions = false
+    let mutable waitMinutes = 5.0
+    let mutable ask = false
 
     let mutable index = 0
 
@@ -104,19 +113,25 @@ let parseArgs (argv: string[]) : DotStart =
 
     while index < argv.Length do
         match argv[index] with
-        | "--prompt" -> prompt <- take "--prompt"
         | "--resume" -> resume <- take "--resume"
         | "--sessions"
         | "--list" -> listSessions <- true
         | "--scripted" -> scripted <- true
+        | "--wait-minutes" ->
+            let raw = take "--wait-minutes"
+
+            match Double.TryParse(raw) with
+            | true, minutes when minutes > 0.0 -> waitMinutes <- minutes
+            | _ ->
+                raise (
+                    ArgumentException("The --wait-minutes flag needs a positive number of minutes.", "--wait-minutes")
+                )
+        | "--ask" -> ask <- true
         | "--help"
         | "-h" -> raise (ArgumentException(helpText (resolveDbPath ()), "--help"))
         | unknown -> raise (ArgumentException($"Unknown flag '{unknown}'.", unknown))
 
         index <- index + 1
-
-    if not listSessions && String.IsNullOrWhiteSpace prompt then
-        raise (ArgumentException("The --prompt flag needs a non-empty prompt.", "--prompt"))
 
     let resumeValue: string | null =
         match resume with
@@ -126,31 +141,67 @@ let parseArgs (argv: string[]) : DotStart =
         | raw -> raw.Trim()
 
     {
-        Prompt = prompt.Trim()
         Scripted = scripted
         Resume = resumeValue
         ListSessions = listSessions
+        WaitMinutes = waitMinutes
+        Ask = ask
     }
 
 // ──────────────────────────────────────────────────────────────────────────
 // Scripted transports (no keys, no external services)
 
-/// Minimal inline scripted chat client: serves one queued answer, then
-/// fails loudly. Mirrors the samples/Headless precedent; scripted support
-/// stays host-local, never a Legate.Testing reference (test-only package).
-type private ScriptedClient(answer: string) =
-    let mutable served = false
+// Asks for every tool call: the opt-in ask policy, so every agent tool
+// call meets a console approval before it runs. Approval UX polish
+// belongs to #306; this is only the policy the REPL answers inline.
+type private AskAllPolicy() =
+    interface IPermissionPolicy with
+        member _.Evaluate(_) = PermissionVerdict.Ask
+
+/// One scripted model step: assistant text or one tool call.
+type private ScriptStep =
+    | Text of string
+    | ToolCall of callId: string * toolName: string
+
+/// Minimal inline scripted chat client: serves the queued steps, then a
+/// canned answer forever so the open-ended REPL never runs dry. Mirrors
+/// the samples/Headless precedent; scripted support stays host-local,
+/// never a Legate.Testing reference (test-only package). A prompt naming
+/// "slow-turn" waits a second before answering: a scripted verification
+/// aid for the settle-deadline path, so a tiny --wait-minutes bound
+/// deterministically outruns the turn while it keeps running.
+type private ScriptedClient(steps: Queue<ScriptStep>) =
+    do ArgumentNullException.ThrowIfNull(steps)
+
+    /// True when the incoming messages ask for the slow-turn probe.
+    /// <param name="messages">The chat messages.</param>
+    /// <returns>True when the turn should wait before answering.</returns>
+    let isSlowTurn (messages: ChatMessage seq) : bool =
+        messages
+        |> Seq.exists (fun message ->
+            not (isNull (box message))
+            && not (isNull (box message.Text))
+            && message.Text.Contains("slow-turn", StringComparison.Ordinal))
 
     interface IChatClient with
-        member _.GetResponseAsync(_, _, cancellationToken) =
+        member _.GetResponseAsync(messages, _, cancellationToken) =
             task {
                 cancellationToken.ThrowIfCancellationRequested()
 
-                if served then
-                    return raise (InvalidOperationException("The scripted client already served its answer."))
+                if isSlowTurn messages then
+                    do! Task.Delay(TimeSpan.FromSeconds(1.0), cancellationToken)
+
+                if steps.Count = 0 then
+                    return ChatResponse(ChatMessage(ChatRole.Assistant, "dot scripted answer"))
                 else
-                    served <- true
-                    return ChatResponse(ChatMessage(ChatRole.Assistant, answer))
+                    match steps.Dequeue() with
+                    | Text text -> return ChatResponse(ChatMessage(ChatRole.Assistant, text))
+                    | ToolCall(callId, toolName) ->
+                        let call =
+                            FunctionCallContent(callId, toolName, Dictionary<string, obj>() :> IDictionary<string, obj>)
+                            :> AIContent
+
+                        return ChatResponse(ChatMessage(ChatRole.Assistant, ResizeArray<AIContent>([| call |])))
             }
 
         member _.GetStreamingResponseAsync(_, _, _) =
@@ -181,32 +232,48 @@ type private StubScriptedProvider(client: IChatClient) =
 
         member _.CreateChatClient(_model: ModelReference, _options: LlmProviderOptions | null) = client
 
-// ──────────────────────────────────────────────────────────────────────────
-// Exit codes
+/// Creates the scripted chat client: one permission-gated echo call under
+/// the ask policy, then plain answers. Under allow-all the echo call is
+/// auto-approved and the turn completes with the first answer.
+let private scriptedClient () : ScriptedClient =
+    let steps = Queue<ScriptStep>()
+    steps.Enqueue(ToolCall("call-1", "scripted-echo"))
+    steps.Enqueue(Text "dot scripted answer one")
+    steps.Enqueue(Text "dot scripted answer two")
+    new ScriptedClient(steps)
 
-/// The exit code for a settled turn result: 0 when the turn completed, 2
-/// when the host aborted it, 1 when it failed, 3 for anything else.
-let private exitFor (status: TurnStatus) : int =
-    match status with
-    | TurnStatus.Completed -> 0
-    | TurnStatus.Aborted -> 2
-    | TurnStatus.Failed -> 1
-    | TurnStatus.Pending
-    | TurnStatus.Running
-    | TurnStatus.Suspended
-    | _ -> 3
+/// Creates the scripted echo tool.
+let private scriptedEchoTool () : AITool =
+    let method = System.Func<string>(fun () -> "scripted tool ok")
+
+    AIFunctionFactory.Create(
+        method,
+        "scripted-echo",
+        "Echoes a canned acknowledgement for the scripted smoke run.",
+        null
+    )
+    :> AITool
+
+/// Fixed inline tool source: the scripted echo tool for scripted mode.
+type private StaticSource(tools: IReadOnlyList<AITool>) =
+    do ArgumentNullException.ThrowIfNull(tools)
+
+    interface IToolSource with
+        member _.GetTools(_) = Task.FromResult(tools)
 
 // ──────────────────────────────────────────────────────────────────────────
 // Host building
 
 /// Builds the container: one UseSqlite file plus every store over it
 /// (migrations, WAL mode, and the busy timeout ride on the open), a
-/// process workspace over the working directory, allow-all permissions
-/// (the facade runner reads the container policy), and the scripted
+/// process workspace over the working directory, the allow-all policy by
+/// default (the opt-in ask policy under --ask; the facade runner reads
+/// the container policy), the scripted echo tool, and the scripted
 /// provider. No live branches: live wiring belongs to later children.
 /// <param name="services">The container to add the host to.</param>
 /// <param name="dbPath">The SQLite file path. Created with its directory on first use.</param>
-let private buildServices (services: IServiceCollection) (dbPath: string) : unit =
+/// <param name="ask">True to ask for every tool call instead of allowing all.</param>
+let private buildServices (services: IServiceCollection) (dbPath: string) (ask: bool) : unit =
     SqliteServiceCollectionExtensions.UseSqlite(services, dbPath) |> ignore
 
     LegateServiceCollectionExtensions.AddLegate(
@@ -218,88 +285,22 @@ let private buildServices (services: IServiceCollection) (dbPath: string) : unit
             builder.Workspace.UseRuntime(ProcessWorkspaceRuntime(workspaceOptions, null, null))
             |> ignore
 
-            builder.Permissions.UsePolicy(AllowAllPermissionPolicy()) |> ignore)
+            if ask then
+                builder.Permissions.UsePolicy(AskAllPolicy()) |> ignore
+            else
+                builder.Permissions.UsePolicy(AllowAllPermissionPolicy()) |> ignore
+
+            builder.Tools.AddSource(StaticSource(ResizeArray<AITool>([| scriptedEchoTool () |])))
+            |> ignore)
     )
     |> ignore
 
-    let client = new ScriptedClient("dot scripted answer")
+    let client = scriptedClient ()
 
     services.AddSingleton<ILlmProvider>(StubScriptedProvider(client) :> ILlmProvider)
     |> ignore
 
     services.AddSingleton<IChatClient>(client :> IChatClient) |> ignore
-
-/// Ensures the session's agent exists in the SQLite agent store: the
-/// runtime's authority check rejects turns for missing agents, while a
-/// null catalog (the InMemory skeleton precedent) authorizes. Dot is the
-/// first SQLite host, so it provisions one enabled scripted agent per
-/// session on open; resumed sessions reuse the stored agent row.
-/// <param name="agents">The SQLite agent store.</param>
-/// <param name="tenant">The tenant the session belongs to.</param>
-/// <param name="agentId">The agent the session opens with.</param>
-/// <param name="cancellationToken">Abandons the upsert.</param>
-let private ensureDotAgentAsync
-    (agents: IAgentStore)
-    (tenant: TenantId)
-    (agentId: AgentId)
-    (cancellationToken: CancellationToken)
-    : Task =
-    task {
-        let now = DateTimeOffset.UtcNow
-
-        let agent: Agent =
-            {
-                Id = agentId
-                Tenant = tenant
-                Name = "dot"
-                Description = null
-                Model = ModelReference.Parse("scripted/scripted")
-                SystemPrompt = ""
-                EnvironmentVariables = null
-                PermissionDefaults = null
-                ToolSelection = null
-                PackageReference = null
-                Enabled = true
-                Schedule = null
-                RowVersion = 0UL
-                CreatedAt = now
-                UpdatedAt = now
-            }
-
-        let! _ = agents.UpdateIfUnchanged(tenant, agent, 0UL, cancellationToken)
-        ()
-    }
-
-/// Opens the dot session with the smoke bound. Permissions stay null so
-/// the session uses the container allow-all policy: a concrete policy on
-/// SessionOptions does not survive the SQLite JSON round-trip.
-let private openDotAsync
-    (client: SessionClient)
-    (agents: IAgentStore)
-    (bound: TimeSpan)
-    (cancellationToken: CancellationToken)
-    : Task<Session> =
-    task {
-        let agentId = AgentId.New()
-        do! ensureDotAgentAsync agents TenantId.Default agentId cancellationToken
-
-        let options = SessionOptions()
-        options.Title <- "dot"
-        options.Timeout <- Nullable<TimeSpan>(bound)
-
-        return! SessionClientOperations.OpenSessionAsync(client, agentId, options, cancellationToken)
-    }
-
-/// Prints one settled turn result and maps it to a process exit code.
-/// <param name="result">The settled turn result.</param>
-/// <returns>The process exit code.</returns>
-let private reportResult (result: TurnResult) : int =
-    Console.Out.WriteLine($"RESULT {result.Status}")
-
-    if not (String.IsNullOrEmpty result.AssistantText) then
-        Console.Out.WriteLine($"TEXT {result.AssistantText}")
-
-    exitFor result.Status
 
 /// Lists the stored sessions newest-first with title and state.
 /// <param name="client">The session client.</param>
@@ -326,47 +327,6 @@ let private listSessionsAsync (client: SessionClient) (cancellationToken: Cancel
         return 0
     }
 
-/// Resumes one stored session by id and prompts it, so the follow-up turn
-/// observes the prior transcript. Unknown ids print a clean error naming
-/// the id, never a stack trace.
-/// <param name="client">The session client.</param>
-/// <param name="rawId">The session id text from --resume.</param>
-/// <param name="promptText">The follow-up prompt text.</param>
-/// <param name="cancellationToken">Abandons the resume.</param>
-/// <returns>The process exit code.</returns>
-let private resumeAndPromptAsync
-    (client: SessionClient)
-    (rawId: string)
-    (promptText: string)
-    (cancellationToken: CancellationToken)
-    : Task<int> =
-    task {
-        let mutable parsed = Unchecked.defaultof<SessionId>
-
-        if not (SessionId.TryParse(rawId, &parsed)) then
-            Console.Error.WriteLine($"dot: no session {rawId}.")
-            return 1
-        else
-            try
-                // Probe the journal: unknown sessions throw
-                // SessionNotFoundException here.
-                let! _ = SessionClientOperations.ReadEventsAsync(client, parsed, 0L, 1, cancellationToken)
-                Console.Out.WriteLine($"RESUMED {parsed}")
-
-                let! result =
-                    SessionClientExtensions.PromptAndWaitAsync(
-                        client,
-                        parsed,
-                        UserMessage.Text promptText,
-                        cancellationToken
-                    )
-
-                return reportResult result
-            with :? SessionNotFoundException ->
-                Console.Error.WriteLine($"dot: no session {parsed}.")
-                return 1
-    }
-
 /// Prints the second-process locked error naming the database path.
 /// <param name="dbPath">The resolved database file path.</param>
 /// <param name="locked">The typed locked error.</param>
@@ -386,7 +346,7 @@ let main (argv: string[]) : int =
     let runAsync (start: DotStart) (dbPath: string) : Task<int> =
         task {
             let application = Host.CreateApplicationBuilder()
-            buildServices application.Services dbPath
+            buildServices application.Services dbPath start.Ask
 
             use host = application.Build()
 
@@ -405,25 +365,11 @@ let main (argv: string[]) : int =
                             if start.ListSessions then
                                 return! listSessionsAsync client CancellationToken.None
                             else
-                                match start.Resume with
-                                | null ->
-                                    let bound = TimeSpan.FromMinutes(5.0)
+                                let waitBound = TimeSpan.FromMinutes(start.WaitMinutes)
 
-                                    let! session = openDotAsync client agents bound CancellationToken.None
+                                let engine = ReplEngine.Engine(client, agents, Console.In, Console.Out, waitBound)
 
-                                    Console.Out.WriteLine($"SESSION {session.Id}")
-
-                                    let! result =
-                                        SessionClientExtensions.PromptAndWaitAsync(
-                                            client,
-                                            session.Id,
-                                            UserMessage.Text start.Prompt,
-                                            CancellationToken.None
-                                        )
-
-                                    return reportResult result
-                                | raw ->
-                                    return! resumeAndPromptAsync client (raw.Trim()) start.Prompt CancellationToken.None
+                                return! engine.RunAsync(start.Resume, CancellationToken.None)
                         with
                         | :? SqliteLockedException as locked ->
                             reportLocked dbPath locked

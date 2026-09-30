@@ -121,6 +121,7 @@
     <Compile Include="PromptAndWaitTests.fs" />
     <Compile Include="SessionClientFacadeTests.fs" />
     <Compile Include="LegateCliSmokeTests.fs" />
+    <Compile Include="DotReplSmokeTests.fs" />
     <Compile Include="MigrationTests.fs" />
     <Compile Include="SqliteTestFixture.fs" />
     <Compile Include="SqliteSessionStoreTests.fs" />

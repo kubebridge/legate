@@ -1,0 +1,331 @@
+// SPDX-License-Identifier: Apache-2.0
+module Legate.Tests.DotReplSmokeTests
+
+open System
+open System.Diagnostics
+open System.IO
+open FsUnit.Xunit
+open Xunit
+
+// Dot REPL smoke test (issue 304): runs the built dot binary as a
+// subprocess on scripted transports (no live keys, no external services)
+// through the interactive loop over piped stdin: prompt/stream/settle
+// with assistant text, /new, store-backed /sessions, /resume continuing
+// context across processes on one DOT_DB_PATH file, /abort, /compact,
+// /quit, unknown-command usage, the opt-in ask policy with inline
+// permission approval, and the settle-deadline report path. Mirrors the
+// LegateCli smoke precedent; each run gets its own temp database file.
+
+// ──────────────────────────────────────────────────────────────────────────
+// Helpers
+
+/// Infers Debug/Release from the test assembly's own directory.
+let private configurationName () : string =
+    let directory = AppContext.BaseDirectory
+
+    if directory.Contains("Release", StringComparison.OrdinalIgnoreCase) then
+        "Release"
+    else
+        "Debug"
+
+/// Locates a built sample DLL, failing with the searched path.
+let private sampleDll (project: string) (assembly: string) : string =
+    let root =
+        Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", ".."))
+
+    let config = configurationName ()
+
+    let candidate =
+        Path.Combine(root, "samples", project, "bin", config, "net10.0", assembly)
+
+    if File.Exists(candidate) then
+        candidate
+    else
+        failwith $"Expected the built sample at '{candidate}': build the solution first."
+
+/// Runs dot with piped stdin on one database file, returning exit code,
+/// stdout, and stderr.
+let private runDot
+    (dotDll: string)
+    (arguments: string list)
+    (stdin: string)
+    (workdir: string)
+    (dbPath: string)
+    : int * string * string =
+    let info = ProcessStartInfo("dotnet")
+    info.ArgumentList.Add(dotDll)
+
+    for argument in arguments do
+        info.ArgumentList.Add(argument)
+
+    info.RedirectStandardInput <- true
+    info.RedirectStandardOutput <- true
+    info.RedirectStandardError <- true
+    info.UseShellExecute <- false
+    info.WorkingDirectory <- workdir
+    info.Environment["Logging__LogLevel__Default"] <- "None"
+    info.Environment["DOTNET_NOLOGO"] <- "1"
+    info.Environment["DOT_DB_PATH"] <- dbPath
+
+    match Process.Start(info) with
+    | null -> failwith "Could not start the dot process."
+    | child ->
+        use _ = child
+
+        try
+            child.StandardInput.Write(stdin)
+            child.StandardInput.Close()
+
+            let finished = child.WaitForExit(int (TimeSpan.FromMinutes(3.0).TotalMilliseconds))
+
+            if not finished then
+                try
+                    child.Kill(true)
+                with _ ->
+                    ()
+
+                failwith "The dot smoke run timed out after three minutes."
+
+            let stdout = child.StandardOutput.ReadToEnd()
+            let stderr = child.StandardError.ReadToEnd()
+            (child.ExitCode, stdout, stderr)
+        finally
+            try
+                child.StandardInput.Dispose()
+            with _ ->
+                ()
+
+/// Joins script lines into piped stdin with a trailing newline.
+let private script (lines: string list) : string =
+    String.Join(Environment.NewLine, lines) + Environment.NewLine
+
+/// Creates a fresh temp workdir with its own database file path.
+let private freshWorkdir () : string * string =
+    let workdir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName())
+    Directory.CreateDirectory(workdir) |> ignore
+    (workdir, Path.Combine(workdir, "dot.db"))
+
+/// Fails unless the combined output carries the marker.
+let private check (output: string) (marker: string) : unit =
+    if not (output.Contains(marker, StringComparison.Ordinal)) then
+        failwith $"The dot smoke output misses '{marker}'. Full output:{Environment.NewLine}{output}"
+
+/// Fails when the combined output carries an ERROR line.
+let private checkNoErrors (output: string) : unit =
+    if output.Contains("ERROR ", StringComparison.Ordinal) then
+        failwith $"The dot smoke output carries an error line. Full output:{Environment.NewLine}{output}"
+
+/// Reads the session id from the run's SESSION line.
+let private sessionIdOf (output: string) : string =
+    output.Split([| Environment.NewLine |], StringSplitOptions.RemoveEmptyEntries)
+    |> Array.tryFind (fun line -> line.StartsWith("SESSION ", StringComparison.Ordinal))
+    |> function
+        | None -> failwith $"The dot smoke output has no SESSION line. Full output:{Environment.NewLine}{output}"
+        | Some line ->
+            let parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries)
+
+            if parts.Length < 2 then
+                failwith $"The dot SESSION line carries no id. Full output:{Environment.NewLine}{output}"
+            else
+                parts[1]
+
+[<Fact>]
+let ``Repl streams turns serves slash commands and prints usage for unknown`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+
+    try
+        let exit, stdout, stderr =
+            runDot
+                dotDll
+                [ "--scripted" ]
+                (script
+                    [
+                        "hello"
+                        "/sessions"
+                        "/new second"
+                        "/sessions"
+                        "/resume 1"
+                        "/resume nonsense-id"
+                        "/compact"
+                        "/abort"
+                        "/bogus-command"
+                        "again"
+                        "/quit"
+                    ])
+                workdir
+                dbPath
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 0
+        check output "Dot REPL"
+        check output "SESSION "
+        check output "EVENT "
+        check output "RESULT Completed"
+        check output "dot scripted answer"
+        check output "END-RESULT"
+        check output "SESSIONS 1"
+        check output "SESSIONS 2"
+        check output "RESUMED "
+        check output "RESUME-FAILED 'nonsense-id'"
+        check output "COMPACT "
+        check output "ABORTED"
+        check output "UNKNOWN-COMMAND /bogus-command"
+        check output "Commands: /new [title], /sessions, /resume <id-or-index>, /abort, /compact, /quit."
+        checkNoErrors output
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+[<Fact>]
+let ``Ask policy suspends for inline permission approval`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+
+    try
+        let exit, stdout, stderr =
+            runDot dotDll [ "--scripted"; "--ask" ] (script [ "hello"; "allow"; "/quit" ]) workdir dbPath
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 0
+        check output "PermissionRequestedEvent tool=scripted-echo"
+        check output "PERMISSION tool=scripted-echo"
+        check output "PermissionResolvedEvent"
+        check output "RESULT Completed"
+        check output "dot scripted answer"
+        checkNoErrors output
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+[<Fact>]
+let ``Settle deadline reports while the turn keeps running`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+
+    try
+        // The slow-turn probe waits a second in the scripted client while
+        // the 60ms settle bound lapses: the REPL reports DEADLINE and
+        // keeps running into /quit with the turn left to settle alone.
+        let exit, stdout, stderr =
+            runDot
+                dotDll
+                [
+                    "--scripted"
+                    "--wait-minutes"
+                    "0.001"
+                ]
+                (script [ "slow-turn probe"; "/quit" ])
+                workdir
+                dbPath
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 0
+        check output "DEADLINE"
+        checkNoErrors output
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+[<Fact>]
+let ``Stored sessions resume across processes and list`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+
+    try
+        let _, firstOut, _ =
+            runDot dotDll [ "--scripted" ] (script [ "first hello"; "/quit" ]) workdir dbPath
+
+        let created = sessionIdOf (firstOut + Environment.NewLine)
+        check firstOut "RESULT Completed"
+
+        let exit, resumeOut, resumeErr =
+            runDot dotDll [ "--scripted"; "--resume"; created ] (script [ "second hello"; "/quit" ]) workdir dbPath
+
+        let resumeOutput = resumeOut + Environment.NewLine + resumeErr
+
+        exit |> should equal 0
+        check resumeOutput $"RESUMED {created}"
+        check resumeOutput "RESULT Completed"
+        check resumeOutput "dot scripted answer"
+        checkNoErrors resumeOutput
+
+        let listExit, listOut, listErr =
+            runDot dotDll [ "--scripted"; "--sessions" ] "" workdir dbPath
+
+        let listOutput = listOut + Environment.NewLine + listErr
+
+        listExit |> should equal 0
+        check listOutput "SESSIONS 1"
+        check listOutput created
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+[<Fact>]
+let ``Unknown startup resume falls back to a fresh session`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+
+    try
+        let exit, stdout, stderr =
+            runDot
+                dotDll
+                [
+                    "--scripted"
+                    "--resume"
+                    "not-a-session-id"
+                ]
+                (script [ "/quit" ])
+                workdir
+                dbPath
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 0
+        check output "RESUME-FAILED 'not-a-session-id'"
+        check output "SESSION "
+        checkNoErrors output
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+[<Fact>]
+let ``Bad flags fail with usage`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+
+    try
+        let boundExit, boundOut, boundErr =
+            runDot dotDll [ "--scripted"; "--wait-minutes"; "0" ] (script [ "/quit" ]) workdir dbPath
+
+        let boundOutput = boundOut + Environment.NewLine + boundErr
+
+        boundExit |> should equal 2
+        check boundOutput "positive"
+
+        let unknownExit, unknownOut, unknownErr =
+            runDot dotDll [ "--scripted"; "--bogus" ] (script [ "/quit" ]) workdir dbPath
+
+        let unknownOutput = unknownOut + Environment.NewLine + unknownErr
+
+        unknownExit |> should equal 2
+        check unknownOutput "Unknown flag '--bogus'"
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
