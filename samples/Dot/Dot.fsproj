@@ -10,6 +10,10 @@
 
   <!-- Compile order is explicit: register every new file here, in dependency order. -->
   <ItemGroup>
+    <Compile Include="DotContext.fs" />
+    <Compile Include="DotSkills.fs" />
+    <Compile Include="DotTemplates.fs" />
+    <Compile Include="DotExport.fs" />
     <Compile Include="ReplEngine.fs" />
     <Compile Include="CodingTools.fs" />
     <Compile Include="Program.fs" />

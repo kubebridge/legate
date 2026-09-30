@@ -10,8 +10,9 @@ open Legate
 // REPL engine over the session client facade for the dot host: foreground
 // prompt loop with one turn in flight, Subscribe streaming to the writer,
 // permission/question console replies, and the /new, /sessions, /resume,
-// /model, /steer, /follow, /abort, /compact, /tree, /fork, /clone, and
-// /quit commands over the SQLite session store. Modeled on
+// /model, /steer, /follow, /abort, /compact, /tree, /fork, /clone,
+// /session, /export, /<template>, and /quit commands over the SQLite
+// session store. Modeled on
 // samples/LegateCli/CliEngine.fs: the settle waiter is queued before the
 // prompt lands (a settle with no waiter only records), each event renders
 // as a stable single line, and permission/question suspensions are
@@ -35,7 +36,7 @@ open Legate
 
 /// The command usage reprinted on startup and for unknown commands.
 let private commandsUsage =
-    "Commands: /new [title], /sessions, /resume <id-or-index>, /model [provider[/model]], /steer <text>, /follow <text>, /abort, /compact, /tree, /fork <sequence>, /clone, /quit."
+    "Commands: /new [title], /sessions, /resume <id-or-index>, /model [provider[/model]], /steer <text>, /follow <text>, /abort, /compact, /tree, /fork <sequence>, /clone, /session, /export <file>, /<template>, /quit."
 
 // ──────────────────────────────────────────────────────────────────────────
 // Provider and model selection (issue 307)
@@ -251,13 +252,17 @@ type private PendingTurn =
 /// inserts it (expected 0) and later sessions reuse it, so /model switches
 /// and restarts converge instead of multiplying rows. The transcript lives
 /// on the session row and the workspace binds from it, so both survive a
-/// SetAgentAsync rebind.
+/// SetAgentAsync rebind. The ensure also uploads dot's sample review skill
+/// package idempotently and records its version on the agent row's
+/// PackageReference (opaque host bookkeeping the runtime never reads).
 /// <param name="agents">The agent store.</param>
+/// <param name="packages">The package store the sample skill uploads to.</param>
 /// <param name="reference">The model the agent carries.</param>
 /// <param name="cancellationToken">Abandons the upsert.</param>
 /// <returns>The agent id conversing under the model.</returns>
 let private ensureModelAgentAsync
     (agents: IAgentStore)
+    (packages: IAgentPackageStore)
     (reference: ModelReference)
     (cancellationToken: CancellationToken)
     : Task<AgentId> =
@@ -271,59 +276,98 @@ let private ensureModelAgentAsync
             else
                 listed |> Seq.tryFind isMatch
 
-        let! listed = agents.ListAgents(TenantId.Default, cancellationToken)
+        let findById (listed: IReadOnlyList<Agent>) (id: AgentId) : Agent option =
+            if isNull (box listed) then
+                None
+            else
+                listed
+                |> Seq.tryFind (fun agent -> not (isNull (box agent)) && agent.Id.Equals(id))
 
-        match findMatch listed with
-        | Some agent -> return agent.Id
-        | None ->
-            let now = DateTimeOffset.UtcNow
+        // Records the sample package version on the agent row when it
+        // differs: advisory host bookkeeping, so a conflict or an
+        // unexpected outcome keeps the ensured id instead of failing.
+        let stampPackageReferenceAsync (agentId: AgentId) : Task =
+            task {
+                let! listed = agents.ListAgents(TenantId.Default, cancellationToken)
 
-            let agent: Agent =
-                {
-                    Id = AgentId.New()
-                    Tenant = TenantId.Default
-                    Name = $"dot {reference.Value}"
-                    Description = null
-                    Model = reference
-                    SystemPrompt = ""
-                    EnvironmentVariables = null
-                    PermissionDefaults = null
-                    ToolSelection = null
-                    PackageReference = null
-                    Enabled = true
-                    Schedule = null
-                    RowVersion = 0UL
-                    CreatedAt = now
-                    UpdatedAt = now
-                }
+                match findById listed agentId with
+                | None -> ()
+                | Some found when
+                    String.Equals(found.PackageReference, DotSkills.sampleVersion, StringComparison.Ordinal)
+                    ->
+                    ()
+                | Some found ->
+                    let stamped: Agent =
+                        { found with
+                            PackageReference = DotSkills.sampleVersion
+                        }
 
-            let! outcome = agents.UpdateIfUnchanged(TenantId.Default, agent, 0UL, cancellationToken)
+                    let! _ = agents.UpdateIfUnchanged(TenantId.Default, stamped, found.RowVersion, cancellationToken)
+                    ()
+            }
 
-            match outcome with
-            | :? AgentUpdated as updated -> return updated.Agent.Id
-            | :? AgentUpdateConflict as conflict ->
-                // Fresh ids never collide: the conflict branch is defensive
-                // (a concurrent insert of the same model), so re-list and
-                // reuse the winner's row.
-                let! relisted = agents.ListAgents(TenantId.Default, cancellationToken)
+        let! agentId =
+            task {
+                let! listed = agents.ListAgents(TenantId.Default, cancellationToken)
 
-                match findMatch relisted with
-                | Some found -> return found.Id
+                match findMatch listed with
+                | Some agent -> return agent.Id
                 | None ->
-                    match conflict.Agent with
-                    | null ->
+                    let now = DateTimeOffset.UtcNow
+
+                    let agent: Agent =
+                        {
+                            Id = AgentId.New()
+                            Tenant = TenantId.Default
+                            Name = $"dot {reference.Value}"
+                            Description = null
+                            Model = reference
+                            SystemPrompt = ""
+                            EnvironmentVariables = null
+                            PermissionDefaults = null
+                            ToolSelection = null
+                            PackageReference = DotSkills.sampleVersion
+                            Enabled = true
+                            Schedule = null
+                            RowVersion = 0UL
+                            CreatedAt = now
+                            UpdatedAt = now
+                        }
+
+                    let! outcome = agents.UpdateIfUnchanged(TenantId.Default, agent, 0UL, cancellationToken)
+
+                    match outcome with
+                    | :? AgentUpdated as updated -> return updated.Agent.Id
+                    | :? AgentUpdateConflict as conflict ->
+                        // Fresh ids never collide: the conflict branch is defensive
+                        // (a concurrent insert of the same model), so re-list and
+                        // reuse the winner's row.
+                        let! relisted = agents.ListAgents(TenantId.Default, cancellationToken)
+
+                        match findMatch relisted with
+                        | Some found -> return found.Id
+                        | None ->
+                            match conflict.Agent with
+                            | null ->
+                                return
+                                    raise (
+                                        InvalidOperationException(
+                                            $"The agent for model '{reference.Value}' could not be provisioned."
+                                        )
+                                    )
+                            | current -> return current.Id
+                    | _ ->
                         return
                             raise (
                                 InvalidOperationException(
                                     $"The agent for model '{reference.Value}' could not be provisioned."
                                 )
                             )
-                    | current -> return current.Id
-            | _ ->
-                return
-                    raise (
-                        InvalidOperationException($"The agent for model '{reference.Value}' could not be provisioned.")
-                    )
+            }
+
+        do! DotSkills.uploadSamplePackageAsync packages TenantId.Default agentId cancellationToken
+        do! stampPackageReferenceAsync agentId
+        return agentId
     }
 
 /// The REPL engine: drives one current session through prompt, stream,
@@ -332,6 +376,7 @@ type Engine
     (
         client: SessionClient,
         agents: IAgentStore,
+        packages: IAgentPackageStore,
         reader: System.IO.TextReader,
         writer: System.IO.TextWriter,
         waitBound: TimeSpan,
@@ -342,6 +387,7 @@ type Engine
     do
         ArgumentNullException.ThrowIfNull(client)
         ArgumentNullException.ThrowIfNull(agents)
+        ArgumentNullException.ThrowIfNull(packages)
         ArgumentNullException.ThrowIfNull(reader)
         ArgumentNullException.ThrowIfNull(writer)
 
@@ -363,6 +409,8 @@ type Engine
     let mutable drainTask: Task option = None
     let approvalGate = obj ()
     let mutable approvalCount = 0
+    let usageGate = obj ()
+    let usageTotals = Dictionary<SessionId, int64 * int64>()
 
     let line (text: string) : unit =
         lock lineGate (fun () ->
@@ -388,6 +436,31 @@ type Engine
     /// True while a permission or question answer owns the reader.
     let isApprovalPending () : bool =
         lock approvalGate (fun () -> approvalCount > 0)
+
+    /// Adds one settled turn's token usage to the session's running total:
+    /// the journal carries no UsageEvents on this path, so the REPL
+    /// accumulates what WaitForSettleAsync reports per turn instead. Only
+    /// this process's settles accumulate; the journal sums stay durable.
+    /// <param name="sessionId">The session the turn settled in.</param>
+    /// <param name="usage">The settled turn's usage.</param>
+    let recordUsage (sessionId: SessionId) (usage: UsageSummary) : unit =
+        if not (isNull (box usage)) then
+            lock usageGate (fun () ->
+                let input, output =
+                    match usageTotals.TryGetValue sessionId with
+                    | true, (previousInput, previousOutput) -> previousInput, previousOutput
+                    | false, _ -> 0L, 0L
+
+                usageTotals[sessionId] <- (input + usage.InputTokens, output + usage.OutputTokens))
+
+    /// Reads the session's accumulated token usage in this process.
+    /// <param name="sessionId">The session to read.</param>
+    /// <returns>Accumulated input and output tokens, zeros when no turn settled here.</returns>
+    let readUsage (sessionId: SessionId) : int64 * int64 =
+        lock usageGate (fun () ->
+            match usageTotals.TryGetValue sessionId with
+            | true, totals -> totals
+            | false, _ -> 0L, 0L)
 
     let currentSession () : ReplSession =
         if current < 0 || current >= sessions.Count then
@@ -579,6 +652,7 @@ type Engine
             try
                 try
                     let! result = pending.WaitTask
+                    recordUsage pending.Session.Id result.Usage
                     line $"RESULT {result.Status}"
 
                     if not (String.IsNullOrEmpty result.AssistantText) then
@@ -821,6 +895,58 @@ type Engine
                 line $"ERROR {error.Message}"
         }
 
+    /// Reports one session's counts and token usage: messages (accepted
+    /// prompts plus folded follow-ups) and completed turns over a single
+    /// journal pass, plus the token sums (the journal's UsageEvents, if any,
+    /// with this process's settled-turn accumulation on top: the runtime
+    /// journals no usage on this path). Never prices: the runtime carries
+    /// no cost by construction. Per-call tool counts are not reported: the
+    /// runtime journals no per-call tool events for facade-driven turns.
+    /// <param name="session">The session to report on.</param>
+    /// <param name="cancellationToken">Abandons the read.</param>
+    member private _.SessionAsync(session: ReplSession, cancellationToken: CancellationToken) : Task =
+        task {
+            try
+                let! events = DotExport.readAllEventsAsync client session.Id cancellationToken
+                let messages, turns, journalInput, journalOutput = DotExport.summarize events
+                let liveInput, liveOutput = readUsage session.Id
+
+                line
+                    $"SESSION {session.Id} messages={messages} turns={turns} input-tokens={journalInput + liveInput} output-tokens={journalOutput + liveOutput}"
+            with error ->
+                line $"ERROR {error.Message}"
+        }
+
+    /// Exports one session's journal to a file under the working directory:
+    /// JSONL (one $type-polymorphic event per line), or escaped static HTML
+    /// for an .html target. Escape outside the working directory is refused;
+    /// overwrite mirrors write_file.
+    /// <param name="session">The session whose journal to export.</param>
+    /// <param name="argument">The file target the user typed.</param>
+    /// <param name="cancellationToken">Abandons the export.</param>
+    member private _.ExportAsync(session: ReplSession, argument: string, cancellationToken: CancellationToken) : Task =
+        task {
+            let target = argument.Trim()
+
+            if target = "" then
+                line "ERROR /export needs a file: /export <file>"
+            else
+                match DotExport.resolveExportPath Environment.CurrentDirectory target with
+                | Error reason -> line $"ERROR {reason}"
+                | Ok path ->
+                    try
+                        let! events = DotExport.readAllEventsAsync client session.Id cancellationToken
+
+                        if target.EndsWith(".html", StringComparison.OrdinalIgnoreCase) then
+                            do! DotExport.writeHtmlAsync path events cancellationToken
+                        else
+                            do! DotExport.writeJsonlAsync path events cancellationToken
+
+                        line $"EXPORTED {events.Count} events to {path}"
+                    with error ->
+                        line $"ERROR {error.Message}"
+        }
+
     /// Branches the current session prefix through ForkAsync: the new
     /// session is registered and made current, the source row and journal
     /// are untouched, beyond-tail cursors clamp to the full journal, and a
@@ -885,15 +1011,18 @@ type Engine
     /// under --ask): a concrete policy on SessionOptions does not survive
     /// the SQLite JSON round-trip. No timeout is set, so the settle-wait
     /// bound reports a deadline without killing the turn. The session opens
-    /// with the current model-carrying agent row.
+    /// with the current model-carrying agent row, and carries the resolved
+    /// context files (SYSTEM.md first, then the AGENTS.md chain) the
+    /// runtime re-reads every turn.
     /// <param name="title">The session title.</param>
     /// <param name="cancellationToken">Abandons the open.</param>
     member private _.OpenAsync(title: string, cancellationToken: CancellationToken) : Task =
         task {
-            let! agentId = ensureModelAgentAsync agents currentModel cancellationToken
+            let! agentId = ensureModelAgentAsync agents packages currentModel cancellationToken
 
             let options = SessionOptions()
             options.Title <- title
+            options.HostInstructionFiles <- DotContext.resolveHostInstructionFiles Environment.CurrentDirectory
 
             let! created = SessionClientOperations.OpenSessionAsync(client, agentId, options, cancellationToken)
 
@@ -1100,7 +1229,7 @@ type Engine
                             line $"MODEL already {reference.Value}"
                         else
                             let session = currentSession ()
-                            let! agentId = ensureModelAgentAsync agents reference cancellationToken
+                            let! agentId = ensureModelAgentAsync agents packages reference cancellationToken
 
                             let! rebound =
                                 SessionClientOperations.SetAgentAsync(client, session.Id, agentId, cancellationToken)
@@ -1154,10 +1283,75 @@ type Engine
             elif text = "/clone" then
                 do! this.CloneAsync(currentSession (), cancellationToken)
                 return true
-            elif text.StartsWith("/", StringComparison.Ordinal) then
-                line $"UNKNOWN-COMMAND {text}"
-                line commandsUsage
+            elif text = "/session" then
+                do! this.SessionAsync(currentSession (), cancellationToken)
                 return true
+            elif
+                text.StartsWith("/export", StringComparison.Ordinal)
+                && (text.Length = "/export".Length || Char.IsWhiteSpace(text["/export".Length]))
+            then
+                let arg = text.Substring("/export".Length).Trim()
+                do! this.ExportAsync(currentSession (), arg, cancellationToken)
+                return true
+            elif text.StartsWith("/", StringComparison.Ordinal) then
+                // Prompt templates (issue 309): /<name> expands
+                // <cwd>/.agent/templates/<name>.md verbatim as the next
+                // prompt (idle starts a turn, running queues behind it, like
+                // plain input). Known commands win above, so a template only
+                // serves names no command owns. Unknown names error listing
+                // the available names, keeping the UNKNOWN-COMMAND shape the
+                // earlier smokes pin.
+                let name =
+                    let rest = text.Substring(1)
+                    let space = rest.IndexOfAny([| ' '; '\t' |])
+
+                    if space < 0 then
+                        rest.Trim()
+                    else
+                        rest.Substring(0, space).Trim()
+
+                let trailing =
+                    let rest = text.Substring(1)
+
+                    if name = "" then
+                        rest
+                    elif rest.Length > name.Length then
+                        rest.Substring(name.Length).Trim()
+                    else
+                        ""
+
+                if name = "" || trailing <> "" || not (DotTemplates.isValidName name) then
+                    line $"UNKNOWN-COMMAND {text}"
+                    line commandsUsage
+
+                    let available = DotTemplates.listTemplates Environment.CurrentDirectory
+
+                    match available with
+                    | [] -> line "TEMPLATES none"
+                    | names ->
+                        let joined = String.Join(", ", names)
+                        line $"TEMPLATES {joined}"
+
+                    return true
+                else
+                    match DotTemplates.tryReadTemplate Environment.CurrentDirectory name with
+                    | Some content when not (String.IsNullOrWhiteSpace content) ->
+                        line $"TEMPLATE {name}"
+                        do! this.EnqueueTurnAsync(currentSession (), content, DeliveryMode.Queue, cancellationToken)
+                        return true
+                    | _ ->
+                        line $"UNKNOWN-COMMAND {text}"
+                        line commandsUsage
+
+                        let available = DotTemplates.listTemplates Environment.CurrentDirectory
+
+                        match available with
+                        | [] -> line "TEMPLATES none"
+                        | names ->
+                            let joined = String.Join(", ", names)
+                            line $"TEMPLATES {joined}"
+
+                        return true
             else
                 do! this.EnqueueTurnAsync(currentSession (), text, DeliveryMode.Queue, cancellationToken)
                 return true
