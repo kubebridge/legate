@@ -14,7 +14,26 @@ one dot process may open the file: a second process exits with a locked
 error naming the path.
 
 REPL commands: `/new [title]`, `/sessions`, `/resume <id-or-index>`,
-`/abort`, `/compact`, `/quit`. Unknown slash commands reprint the usage.
+`/model [provider[/model]]`, `/abort`, `/compact`, `/quit`. Unknown slash
+commands reprint the usage.
+
+## Providers and models
+
+`anthropic`, `openai`, and `google` register only when `ANTHROPIC_API_KEY`,
+`OPENAI_API_KEY`, or `GOOGLE_API_KEY` is set (keys flow from the
+environment through `Legate:Llm:Providers:<id>:ApiKey` binding only, never
+printed or persisted; `Legate__Llm__Providers__<id>__ApiKey` already set
+wins). Anthropic rides the OpenAI-compatible preset under id `anthropic`.
+With exactly one key set dot just works; with several, `--provider` picks,
+else the default order `anthropic, openai, google` wins; `--model
+<provider/model>` overrides the model (`--provider`/`--model` apply to
+live mode; `--scripted` pins the scripted transport).
+
+`/model` lists the registered providers with their defaults (marking the
+current one) and `/model <provider[/model]>` switches mid-session through
+`SetAgentAsync` against a model-carrying agent row: the transcript and
+workspace binding survive the switch. Unknown providers and unparsable
+references fail naming the known ids; a missing key names its env var.
 
 ## Workspace and tools
 
@@ -50,7 +69,7 @@ the process.
 
 ## Modes
 
-Dot runs on scripted transports (`--scripted`, the default): no keys, no
-network, a canned model for exercising the loop, the slash commands, the
-permissions, and the tools. Live-provider wiring belongs to a later
-change; there are no live branches here.
+Dot runs on scripted transports when no provider key is set (or under
+`--scripted`): no keys, no network, a canned model for exercising the
+loop, the slash commands, the permissions, and the tools. With a provider
+key set dot runs live on the selected provider and model (see above).

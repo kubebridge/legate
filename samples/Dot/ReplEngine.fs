@@ -9,8 +9,8 @@ open Legate
 
 // REPL engine over the session client facade for the dot host: prompt
 // loop, Subscribe streaming to the writer, permission/question console
-// replies, and the /new, /sessions, /resume, /abort, /compact, and /quit
-// commands over the SQLite session store. Modeled on
+// replies, and the /new, /sessions, /resume, /model, /abort, /compact, and
+// /quit commands over the SQLite session store. Modeled on
 // samples/LegateCli/CliEngine.fs: the settle waiter is queued before the
 // prompt lands (a settle with no waiter only records), each event renders
 // as a stable single line, and permission/question suspensions are
@@ -20,7 +20,9 @@ open Legate
 // rejects turns for missing agents, while CliEngine's InMemory catalog
 // authorizes); opened sessions carry a title but no timeout, so the
 // settle-wait bound reports a deadline without killing the turn; there is
-// no /agent stub (steering belongs to #308); unknown commands reprint the
+// no /agent stub (steering belongs to #308); /model switches the session
+// through SetAgentAsync against a model-carrying agent row, so the journal
+// transcript and workspace binding survive; unknown commands reprint the
 // command usage; and a settle wait that outruns its bound reports
 // DEADLINE while the turn keeps running. Transport-agnostic: the host
 // wires the chat client, tools, and policy. Reads and writes through the
@@ -28,7 +30,198 @@ open Legate
 
 /// The command usage reprinted on startup and for unknown commands.
 let private commandsUsage =
-    "Commands: /new [title], /sessions, /resume <id-or-index>, /abort, /compact, /quit."
+    "Commands: /new [title], /sessions, /resume <id-or-index>, /model [provider[/model]], /abort, /compact, /quit."
+
+// ──────────────────────────────────────────────────────────────────────────
+// Provider and model selection (issue 307)
+
+/// One provider dot can converse through: its id, its default model text,
+/// and the env var enabling it (null for the scripted transport).
+type ProviderOption =
+    {
+        /// The provider id, matching the model reference segment.
+        Id: string
+        /// The default model text: bare or full.
+        DefaultModel: string
+        /// The env var carrying the key, or null for scripted.
+        EnvVar: string | null
+    }
+
+/// The provider ids in default priority order when several keys are set
+/// and --provider is absent.
+let defaultProviderOrder = [ "anthropic"; "openai"; "google" ]
+
+/// The env var carrying the provider key, or null for unknown ids.
+let private providerEnvVar (id: string) : string | null =
+    match id.ToLowerInvariant() with
+    | "anthropic" -> "ANTHROPIC_API_KEY"
+    | "openai" -> "OPENAI_API_KEY"
+    | "google" -> "GOOGLE_API_KEY"
+    | _ -> null
+
+/// Snapshots the registered providers for selection and /model listing.
+/// <param name="providers">The registered providers. Must not be null.</param>
+/// <returns>One option per registered provider.</returns>
+let describeProviders (providers: ILlmProvider seq) : ProviderOption list =
+    ArgumentNullException.ThrowIfNull(providers)
+
+    providers
+    |> Seq.filter (fun candidate -> not (isNull (box candidate)))
+    |> Seq.map (fun candidate ->
+        {
+            Id = candidate.Id
+            DefaultModel = candidate.DefaultModel
+            EnvVar = providerEnvVar candidate.Id
+        })
+    |> List.ofSeq
+
+/// Names the registered provider ids for error messages.
+/// <param name="options">The registered provider options.</param>
+/// <returns>The comma-joined ids.</returns>
+let private knownIds (options: ProviderOption list) : string =
+    options |> List.map (fun option -> option.Id) |> String.concat ", "
+
+/// Finds a registered provider by id, case-insensitively.
+/// <param name="options">The registered provider options.</param>
+/// <param name="id">The id to find.</param>
+/// <returns>The matching option, or None.</returns>
+let private findOption (options: ProviderOption list) (id: string) : ProviderOption option =
+    options
+    |> List.tryFind (fun option -> String.Equals(option.Id, id, StringComparison.OrdinalIgnoreCase))
+
+/// Raises the unknown-provider error naming the known ids, plus the env
+/// var when the asked id is a live provider missing its key.
+let private raiseUnknown (asked: string) (options: ProviderOption list) : 'T =
+    let trimmed = asked.Trim()
+
+    match providerEnvVar trimmed with
+    | null -> raise (InvalidOperationException($"Unknown provider '{trimmed}' (known: {knownIds options})."))
+    | env ->
+        raise (
+            InvalidOperationException(
+                $"Unknown provider '{trimmed}' (known: {knownIds options}): set {env} to enable it."
+            )
+        )
+
+/// Picks the provider when --provider is absent: the single registered
+/// one, else the default order, else the first registered.
+let private pickDefault (options: ProviderOption list) : ProviderOption =
+    match options with
+    | [] ->
+        raise (
+            InvalidOperationException(
+                "No provider is registered (known: anthropic, openai, google). Set ANTHROPIC_API_KEY, OPENAI_API_KEY, or GOOGLE_API_KEY."
+            )
+        )
+    | [ single ] -> single
+    | _ ->
+        defaultProviderOrder
+        |> List.tryPick (findOption options)
+        |> Option.defaultValue options.Head
+
+/// Renders the provider default as a full reference: the configured text
+/// when it already carries a slash, else id plus the bare default.
+/// <param name="option">The provider option.</param>
+/// <returns>The full reference text.</returns>
+let private defaultReferenceText (option: ProviderOption) : string =
+    if String.IsNullOrWhiteSpace option.DefaultModel then
+        raise (
+            InvalidOperationException($"Provider '{option.Id}' has no default model: pass --model <provider/model>.")
+        )
+    elif option.DefaultModel.Contains("/") then
+        option.DefaultModel.Trim()
+    else
+        $"{option.Id}/{option.DefaultModel.Trim()}"
+
+/// Resolves the model reference from the --provider/--model flags (the
+/// /model argument maps onto them): --provider picks a registered id,
+/// --model overrides the model, and a lone --model naming a registered
+/// provider selects it. Unknown providers and unparsable references fail
+/// naming the known ids; a reference naming an unregistered live provider
+/// names its env var.
+/// <param name="options">The registered provider options. Must not be empty.</param>
+/// <param name="providerFlag">The --provider value, or null for automatic.</param>
+/// <param name="modelFlag">The --model value, or null for the provider default.</param>
+/// <returns>The resolved model reference.</returns>
+let selectReference
+    (options: ProviderOption list)
+    (providerFlag: string | null)
+    (modelFlag: string | null)
+    : ModelReference =
+    if options.IsEmpty then
+        raise (
+            InvalidOperationException(
+                "No provider is registered (known: anthropic, openai, google). Set ANTHROPIC_API_KEY, OPENAI_API_KEY, or GOOGLE_API_KEY."
+            )
+        )
+
+    let providerText =
+        match providerFlag with
+        | null -> null
+        | text when String.IsNullOrWhiteSpace text -> null
+        | text -> text.Trim()
+
+    let modelText =
+        match modelFlag with
+        | null -> null
+        | text when String.IsNullOrWhiteSpace text -> null
+        | text -> text.Trim()
+
+    let explicit =
+        match providerText with
+        | null -> None
+        | asked -> findOption options asked
+
+    match explicit with
+    | Some _ -> ()
+    | None ->
+        match providerText with
+        | null -> ()
+        | asked -> raiseUnknown asked options
+
+    let mutable parsed = Unchecked.defaultof<ModelReference>
+
+    let modelProvider =
+        match modelText with
+        | null -> null
+        | text when ModelReference.TryParse(text, &parsed) -> parsed.Provider
+        | _ -> null
+
+    let selected =
+        match explicit with
+        | Some option -> option
+        | None ->
+            let fromModel =
+                match modelProvider with
+                | null -> None
+                | id -> findOption options id
+
+            match fromModel with
+            | Some option -> option
+            | None -> pickDefault options
+
+    match modelText with
+    | null -> ModelReference.Parse(defaultReferenceText selected)
+    | text ->
+        if not (ModelReference.TryParse(text, &parsed)) then
+            raise (
+                ArgumentException(
+                    $"The model '{text}' is not a <provider/model> reference (known providers: {knownIds options}).",
+                    "model"
+                )
+            )
+
+        if String.Equals(parsed.Provider, selected.Id, StringComparison.OrdinalIgnoreCase) then
+            parsed
+        else
+            match findOption options parsed.Provider with
+            | Some other ->
+                raise (
+                    InvalidOperationException(
+                        $"The model '{text}' names provider '{parsed.Provider}', not the selected '{selected.Id}': pass --provider {other.Id} to use it."
+                    )
+                )
+            | None -> raiseUnknown parsed.Provider options
 
 /// One REPL session: its id, title, and event cursor.
 type private ReplSession =
@@ -38,44 +231,85 @@ type private ReplSession =
         mutable Cursor: int64
     }
 
-/// Ensures the session's agent exists in the SQLite agent store: the
-/// runtime's authority check rejects turns for missing agents. Dot
-/// provisions one enabled scripted agent per session on open; resumed
-/// sessions reuse the stored agent row.
-/// <param name="agents">The SQLite agent store.</param>
-/// <param name="tenant">The tenant the session belongs to.</param>
-/// <param name="agentId">The agent the session opens with.</param>
+/// Ensures the model-carrying agent exists in the agent store: the
+/// runtime's authority check rejects turns for missing agents. One enabled
+/// row per provider/model, shared across sessions: the first session
+/// inserts it (expected 0) and later sessions reuse it, so /model switches
+/// and restarts converge instead of multiplying rows. The transcript lives
+/// on the session row and the workspace binds from it, so both survive a
+/// SetAgentAsync rebind.
+/// <param name="agents">The agent store.</param>
+/// <param name="reference">The model the agent carries.</param>
 /// <param name="cancellationToken">Abandons the upsert.</param>
-let private ensureAgentAsync
+/// <returns>The agent id conversing under the model.</returns>
+let private ensureModelAgentAsync
     (agents: IAgentStore)
-    (tenant: TenantId)
-    (agentId: AgentId)
+    (reference: ModelReference)
     (cancellationToken: CancellationToken)
-    : Task =
+    : Task<AgentId> =
     task {
-        let now = DateTimeOffset.UtcNow
+        let isMatch (agent: Agent) : bool =
+            not (isNull (box agent)) && agent.Enabled && agent.Model.Equals(reference)
 
-        let agent: Agent =
-            {
-                Id = agentId
-                Tenant = tenant
-                Name = "dot"
-                Description = null
-                Model = ModelReference.Parse("scripted/scripted")
-                SystemPrompt = ""
-                EnvironmentVariables = null
-                PermissionDefaults = null
-                ToolSelection = null
-                PackageReference = null
-                Enabled = true
-                Schedule = null
-                RowVersion = 0UL
-                CreatedAt = now
-                UpdatedAt = now
-            }
+        let findMatch (listed: IReadOnlyList<Agent>) : Agent option =
+            if isNull (box listed) then
+                None
+            else
+                listed |> Seq.tryFind isMatch
 
-        let! _ = agents.UpdateIfUnchanged(tenant, agent, 0UL, cancellationToken)
-        ()
+        let! listed = agents.ListAgents(TenantId.Default, cancellationToken)
+
+        match findMatch listed with
+        | Some agent -> return agent.Id
+        | None ->
+            let now = DateTimeOffset.UtcNow
+
+            let agent: Agent =
+                {
+                    Id = AgentId.New()
+                    Tenant = TenantId.Default
+                    Name = $"dot {reference.Value}"
+                    Description = null
+                    Model = reference
+                    SystemPrompt = ""
+                    EnvironmentVariables = null
+                    PermissionDefaults = null
+                    ToolSelection = null
+                    PackageReference = null
+                    Enabled = true
+                    Schedule = null
+                    RowVersion = 0UL
+                    CreatedAt = now
+                    UpdatedAt = now
+                }
+
+            let! outcome = agents.UpdateIfUnchanged(TenantId.Default, agent, 0UL, cancellationToken)
+
+            match outcome with
+            | :? AgentUpdated as updated -> return updated.Agent.Id
+            | :? AgentUpdateConflict as conflict ->
+                // Fresh ids never collide: the conflict branch is defensive
+                // (a concurrent insert of the same model), so re-list and
+                // reuse the winner's row.
+                let! relisted = agents.ListAgents(TenantId.Default, cancellationToken)
+
+                match findMatch relisted with
+                | Some found -> return found.Id
+                | None ->
+                    match conflict.Agent with
+                    | null ->
+                        return
+                            raise (
+                                InvalidOperationException(
+                                    $"The agent for model '{reference.Value}' could not be provisioned."
+                                )
+                            )
+                    | current -> return current.Id
+            | _ ->
+                return
+                    raise (
+                        InvalidOperationException($"The agent for model '{reference.Value}' could not be provisioned.")
+                    )
     }
 
 /// The REPL engine: drives one current session through prompt, stream,
@@ -86,7 +320,9 @@ type Engine
         agents: IAgentStore,
         reader: System.IO.TextReader,
         writer: System.IO.TextWriter,
-        waitBound: TimeSpan
+        waitBound: TimeSpan,
+        initialModel: ModelReference,
+        providerOptions: ProviderOption list
     ) =
 
     do
@@ -98,8 +334,15 @@ type Engine
         if waitBound <= TimeSpan.Zero then
             raise (ArgumentOutOfRangeException(nameof waitBound, "The settle wait bound must be positive."))
 
+        if isNull (box providerOptions) then
+            raise (ArgumentNullException(nameof providerOptions))
+
+        if providerOptions.IsEmpty then
+            raise (ArgumentException("At least one provider option is required.", nameof providerOptions))
+
     let sessions = ResizeArray<ReplSession>()
     let mutable current = -1
+    let mutable currentModel = initialModel
 
     let line (text: string) : unit =
         writer.WriteLine(text)
@@ -315,13 +558,13 @@ type Engine
     /// session uses the container policy (allow-all by default, ask-all
     /// under --ask): a concrete policy on SessionOptions does not survive
     /// the SQLite JSON round-trip. No timeout is set, so the settle-wait
-    /// bound reports a deadline without killing the turn.
+    /// bound reports a deadline without killing the turn. The session opens
+    /// with the current model-carrying agent row.
     /// <param name="title">The session title.</param>
     /// <param name="cancellationToken">Abandons the open.</param>
     member private _.OpenAsync(title: string, cancellationToken: CancellationToken) : Task =
         task {
-            let agentId = AgentId.New()
-            do! ensureAgentAsync agents TenantId.Default agentId cancellationToken
+            let! agentId = ensureModelAgentAsync agents currentModel cancellationToken
 
             let options = SessionOptions()
             options.Title <- title
@@ -487,6 +730,56 @@ type Engine
                 try
                     let! _ = this.AttachAsync(target, cancellationToken)
                     ()
+                with error ->
+                    line $"ERROR {error.Message}"
+
+                return true
+            elif text = "/model" then
+                try
+                    line $"MODEL {currentModel.Value}"
+
+                    for option in providerOptions do
+                        let marker =
+                            if String.Equals(option.Id, currentModel.Provider, StringComparison.OrdinalIgnoreCase) then
+                                "*"
+                            else
+                                " "
+
+                        line $"{marker} {option.Id} default {defaultReferenceText option}"
+                with error ->
+                    line $"ERROR {error.Message}"
+
+                return true
+            elif
+                text.StartsWith("/model", StringComparison.Ordinal)
+                && (text.Length = "/model".Length || Char.IsWhiteSpace(text["/model".Length]))
+            then
+                let arg = text.Substring("/model".Length).Trim()
+
+                try
+                    if arg = "" then
+                        line $"MODEL {currentModel.Value}"
+                    else
+                        let flags: (string | null) * (string | null) =
+                            if arg.Contains("/") then null, arg else arg, null
+
+                        let reference = selectReference providerOptions (fst flags) (snd flags)
+
+                        if reference.Equals(currentModel) then
+                            line $"MODEL already {reference.Value}"
+                        else
+                            let session = currentSession ()
+                            let! agentId = ensureModelAgentAsync agents reference cancellationToken
+
+                            let! rebound =
+                                SessionClientOperations.SetAgentAsync(client, session.Id, agentId, cancellationToken)
+
+                            currentModel <- reference
+
+                            if rebound.AgentId.Equals(agentId) then
+                                line $"MODEL-SWITCHED {reference.Value} applied at once"
+                            else
+                                line $"MODEL-SWITCHED {reference.Value} pending: applies when the turn settles"
                 with error ->
                     line $"ERROR {error.Message}"
 

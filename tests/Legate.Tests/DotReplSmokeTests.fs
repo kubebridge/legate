@@ -7,18 +7,25 @@ open System.IO
 open FsUnit.Xunit
 open Xunit
 
-// Dot REPL smoke test (issues 304, 306): runs the built dot binary as a
-// subprocess on scripted transports (no live keys, no external services)
-// through the interactive loop over piped stdin: prompt/stream/settle
-// with assistant text, /new, store-backed /sessions, /resume continuing
-// context across processes on one DOT_DB_PATH file, /abort, /compact,
-// /quit, unknown-command usage, the opt-in ask policy with inline
-// permission approval, and the settle-deadline report path. The issue 306
-// coding probes run the dot-local tools over the smoke workdir (the
-// process working directory): writes and edits with zero friction under
-// the default policy, deny/session answers under --ask, the outside-root
-// fence, exec, --help text, and the --mcp attach. Mirrors the
-// LegateCli smoke precedent; each run gets its own temp database file.
+// Dot REPL smoke test (issues 304, 306, 307): runs the built dot binary
+// as a subprocess on scripted transports (no live keys, no external
+// services) through the interactive loop over piped stdin: prompt/stream/
+// settle with assistant text, /new, store-backed /sessions, /resume
+// continuing context across processes on one DOT_DB_PATH file, /model
+// listing and mid-session switching with transcript survival, /abort,
+// /compact, /quit, unknown-command usage, the opt-in ask policy with
+// inline permission approval, and the settle-deadline report path. The
+// issue 306 coding probes run the dot-local tools over the smoke workdir
+// (the process working directory): writes and edits with zero friction
+// under the default policy, deny/session answers under --ask, the
+// outside-root fence, exec, --help text, and the --mcp attach. Issue 307
+// adds --provider/--model parsing and startup selection coverage: dummy
+// env keys register the live providers with no network (selection only,
+// the REPL quits before any turn), so unknown providers name the known
+// ids, a provider without its key names the env var, an unparsable model
+// names the known providers, and one key without --provider just works.
+// Mirrors the LegateCli smoke precedent; each run gets its own temp
+// database file.
 
 // ──────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -49,12 +56,13 @@ let private sampleDll (project: string) (assembly: string) : string =
 
 /// Runs dot with piped stdin on one database file, returning exit code,
 /// stdout, and stderr.
-let private runDot
+let private runDotEnv
     (dotDll: string)
     (arguments: string list)
     (stdin: string)
     (workdir: string)
     (dbPath: string)
+    (extraEnv: (string * string) list)
     : int * string * string =
     let info = ProcessStartInfo("dotnet")
     info.ArgumentList.Add(dotDll)
@@ -70,6 +78,9 @@ let private runDot
     info.Environment["Logging__LogLevel__Default"] <- "None"
     info.Environment["DOTNET_NOLOGO"] <- "1"
     info.Environment["DOT_DB_PATH"] <- dbPath
+
+    for key, value in extraEnv do
+        info.Environment[key] <- value
 
     match Process.Start(info) with
     | null -> failwith "Could not start the dot process."
@@ -98,6 +109,17 @@ let private runDot
                 child.StandardInput.Dispose()
             with _ ->
                 ()
+
+/// Runs dot with piped stdin on one database file and no extra
+/// environment, returning exit code, stdout, and stderr.
+let private runDot
+    (dotDll: string)
+    (arguments: string list)
+    (stdin: string)
+    (workdir: string)
+    (dbPath: string)
+    : int * string * string =
+    runDotEnv dotDll arguments stdin workdir dbPath []
 
 /// Joins script lines into piped stdin with a trailing newline.
 let private script (lines: string list) : string =
@@ -208,7 +230,11 @@ let ``Repl streams turns serves slash commands and prints usage for unknown`` ()
         check output "COMPACT "
         check output "ABORTED"
         check output "UNKNOWN-COMMAND /bogus-command"
-        check output "Commands: /new [title], /sessions, /resume <id-or-index>, /abort, /compact, /quit."
+
+        check
+            output
+            "Commands: /new [title], /sessions, /resume <id-or-index>, /model [provider[/model]], /abort, /compact, /quit."
+
         checkNoErrors output
     finally
         try
@@ -620,6 +646,242 @@ let ``Empty mcp config attaches and stays green`` () =
         check output "RESULT Completed"
         check output "dot scripted answer"
         checkNoErrors output
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+// ──────────────────────────────────────────────────────────────────────────
+// Provider and model selection (issue 307): dummy env keys register the
+// live providers with no network behind them (selection and session open
+// only; the REPL quits before any turn runs).
+
+[<Fact>]
+let ``Help documents the provider flags and default order`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+
+    try
+        let exit, stdout, stderr =
+            runDot dotDll [ "--help" ] (script [ "/quit" ]) workdir dbPath
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 2
+        check output "--provider"
+        check output "--model"
+        check output "anthropic, openai, google"
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+[<Fact>]
+let ``Unknown provider fails naming the known ids`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+
+    try
+        let exit, stdout, stderr =
+            runDotEnv
+                dotDll
+                [ "--provider"; "nope" ]
+                (script [ "/quit" ])
+                workdir
+                dbPath
+                [
+                    "ANTHROPIC_API_KEY", "dummy-anthropic"
+                    "OPENAI_API_KEY", "dummy-openai"
+                ]
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 1
+        check output "Unknown provider 'nope'"
+        check output "anthropic"
+        check output "openai"
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+[<Fact>]
+let ``Provider without a key names its env var`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+
+    try
+        let exit, stdout, stderr =
+            runDotEnv
+                dotDll
+                [ "--provider"; "google" ]
+                (script [ "/quit" ])
+                workdir
+                dbPath
+                [
+                    "ANTHROPIC_API_KEY", "dummy-anthropic"
+                ]
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 1
+        check output "Unknown provider 'google'"
+        check output "GOOGLE_API_KEY"
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+[<Fact>]
+let ``Unparsable model fails naming the known providers`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+
+    try
+        let exit, stdout, stderr =
+            runDotEnv
+                dotDll
+                [ "--model"; "noslash" ]
+                (script [ "/quit" ])
+                workdir
+                dbPath
+                [
+                    "ANTHROPIC_API_KEY", "dummy-anthropic"
+                ]
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 1
+        check output "noslash"
+        check output "known providers: anthropic"
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+[<Fact>]
+let ``Provider and model flags need values`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+
+    try
+        let providerExit, providerOut, providerErr =
+            runDot dotDll [ "--scripted"; "--provider" ] (script [ "/quit" ]) workdir dbPath
+
+        let providerOutput = providerOut + Environment.NewLine + providerErr
+
+        providerExit |> should equal 2
+        check providerOutput "--provider"
+
+        let modelExit, modelOut, modelErr =
+            runDot dotDll [ "--scripted"; "--model" ] (script [ "/quit" ]) workdir dbPath
+
+        let modelOutput = modelOut + Environment.NewLine + modelErr
+
+        modelExit |> should equal 2
+        check modelOutput "--model"
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+[<Fact>]
+let ``One key without a provider pick just works`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+
+    try
+        let exit, stdout, stderr =
+            runDotEnv
+                dotDll
+                []
+                (script [ "/quit" ])
+                workdir
+                dbPath
+                [
+                    "ANTHROPIC_API_KEY", "dummy-anthropic"
+                ]
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 0
+        check output "SESSION "
+        checkNoErrors output
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+[<Fact>]
+let ``Explicit provider pick starts`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+
+    try
+        let exit, stdout, stderr =
+            runDotEnv
+                dotDll
+                [ "--provider"; "openai" ]
+                (script [ "/quit" ])
+                workdir
+                dbPath
+                [
+                    "ANTHROPIC_API_KEY", "dummy-anthropic"
+                    "OPENAI_API_KEY", "dummy-openai"
+                ]
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 0
+        check output "SESSION "
+        checkNoErrors output
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+[<Fact>]
+let ``Model lists options and switches mid-session`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+
+    try
+        let exit, stdout, stderr =
+            runDot
+                dotDll
+                [ "--scripted" ]
+                (script
+                    [
+                        "hello"
+                        "/model"
+                        "/model scripted/round-two"
+                        "second hello"
+                        "/model nope/x"
+                        "/quit"
+                    ])
+                workdir
+                dbPath
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 0
+        check output "MODEL scripted/scripted"
+        check output "MODEL-SWITCHED scripted/round-two applied at once"
+        // Both turns ran under one session across the switch: the canned
+        // queue advanced through the pre- and post-switch prompts.
+        check output "dot scripted answer one"
+        check output "dot scripted answer two"
+        // The failed switch reports without killing the REPL: the ERROR
+        // line is expected here, so no checkNoErrors on this run.
+        check output "ERROR Unknown provider 'nope'"
     finally
         try
             Directory.Delete(workdir, true)
