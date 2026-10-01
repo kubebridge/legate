@@ -369,6 +369,8 @@ let dotTuiHeadlessSmoke () : unit =
 
         checkSmokeContains stdout "dot fullscreen"
         checkSmokeContains stdout "session "
+        checkSmokeContains stdout "dot scripted answer"
+        checkSmokeContains stdout "END-RESULT"
         checkSmokeContains stderr "TUI-SMOKE ok"
 
         if stdout.Contains("\u001b[?1049") then

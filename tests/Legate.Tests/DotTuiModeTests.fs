@@ -6,6 +6,16 @@ open Dot.DotTuiMode
 open FsUnit.Xunit
 open Xunit
 
+// The env-var test below mutates process environment and xunit runs
+// collections in parallel, so it owns a dedicated non-parallel collection.
+// The guard matters beyond this file: DotReplSmokeTests spawns dot children
+// that inherit the testhost environment, so a DOT_TUI_SMOKE="1" window would
+// flip a parallel REPL smoke into the headless path. A DisableParallelization
+// collection never overlaps any other test, so serializing this single writer
+// is sufficient with no changes to the smoke suites.
+[<CollectionDefinition("DotTuiEnv", DisableParallelization = true)>]
+type DotTuiEnvCollection() = class end
+
 // Selector proofs (issue 335): the pure DotTuiMode fullscreen/plain matrix
 // (--no-tui, redirected stdout, NO_COLOR, TERM dumb/empty/unknown, CI
 // markers including the CI=false nuance), the reason priority order, and
@@ -118,18 +128,24 @@ let ``Marker reads set non-empty and not the literal false`` () =
     isMarkerSet "true" |> should equal true
     isMarkerSet "CI" |> should equal true
 
-[<Fact>]
-let ``Headless smoke trigger follows the marker rule`` () =
-    let previous = Environment.GetEnvironmentVariable("DOT_TUI_SMOKE")
+// ──────────────────────────────────────────────────────────────────────────
+// Env vars (dedicated collection: mutates process environment)
 
-    try
-        Environment.SetEnvironmentVariable("DOT_TUI_SMOKE", "1")
-        isHeadlessSmokeRequested () |> should equal true
+[<Collection("DotTuiEnv")>]
+type EnvTriggerTests() =
 
-        Environment.SetEnvironmentVariable("DOT_TUI_SMOKE", "false")
-        isHeadlessSmokeRequested () |> should equal false
+    [<Fact>]
+    member _.``Headless smoke trigger follows the marker rule``() =
+        let previous = Environment.GetEnvironmentVariable("DOT_TUI_SMOKE")
 
-        Environment.SetEnvironmentVariable("DOT_TUI_SMOKE", null)
-        isHeadlessSmokeRequested () |> should equal false
-    finally
-        Environment.SetEnvironmentVariable("DOT_TUI_SMOKE", previous)
+        try
+            Environment.SetEnvironmentVariable("DOT_TUI_SMOKE", "1")
+            isHeadlessSmokeRequested () |> should equal true
+
+            Environment.SetEnvironmentVariable("DOT_TUI_SMOKE", "false")
+            isHeadlessSmokeRequested () |> should equal false
+
+            Environment.SetEnvironmentVariable("DOT_TUI_SMOKE", null)
+            isHeadlessSmokeRequested () |> should equal false
+        finally
+            Environment.SetEnvironmentVariable("DOT_TUI_SMOKE", previous)

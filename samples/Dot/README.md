@@ -124,8 +124,9 @@ plain output instead. The plain REPL names its mode on startup as
 
 The piped path loads no TUI code and stays byte-identical: `-p` output
 under `--no-tui`, `NO_COLOR=1`, `TERM=dumb`, or `CI=true` matches the plain
-run exactly (including `--mode json`), and stdout never carries
-alternate-screen escapes (`ESC[?1049`).
+run exactly, and stdout never carries alternate-screen escapes
+(`ESC[?1049`). `--mode json` pins the `$type` event sequence instead of raw
+bytes (session ids and timestamps differ per run).
 
 Tiny terminals (narrower than 40 columns or shorter than 12 rows) show a
 `terminal too small (min 40x12)` notice above the transcript and keep

@@ -2448,6 +2448,8 @@ let ``Headless TUI smoke boots renders one turn and exits`` () =
         check stdout "dot fullscreen"
         check stdout "session "
         check stdout "Ctrl+Q"
+        check stdout "dot scripted answer"
+        check stdout "END-RESULT"
         check output "TUI-SMOKE ok"
         checkAbsent stdout "[?1049"
     finally
