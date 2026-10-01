@@ -376,6 +376,7 @@ let private plainVar (id: string) : string =
     | "anthropic" -> "ANTHROPIC_API_KEY"
     | "openai" -> "OPENAI_API_KEY"
     | "google" -> "GOOGLE_API_KEY"
+    | "ollamacloud" -> "OLLAMA_API_KEY"
     | _ -> ""
 
 /// The compound environment variable for the bridge.
@@ -388,7 +389,13 @@ let private compoundVar (id: string) : string =
 
 /// The provider ids dot bridges.
 /// <returns>The bridged provider ids.</returns>
-let private bridgedIds () : string list = [ "anthropic"; "openai"; "google" ]
+let private bridgedIds () : string list =
+    [
+        "anthropic"
+        "openai"
+        "google"
+        "ollamacloud"
+    ]
 
 /// Reads the effective provider key: the Legate compound binding wins,
 /// else the Dot-section file value, else the plain env key.

@@ -24,6 +24,9 @@ open Xunit
 // the REPL quits before any turn runs), so unknown providers name the known
 // ids, a provider without its key names the env var, an unparsable model
 // names the known providers, and one key without --provider just works.
+// Issue 329 adds the same keyless shape for the ollamacloud preset behind
+// a dummy OLLAMA_API_KEY: explicit pick, single-key just works, unknown-id
+// names ollamacloud, missing key names OLLAMA_API_KEY, and /model lists it.
 // Issue 308 adds steering over the slow slow-steer probe (slow-echo tool):
 // /steer interrupts (prior RESULT Aborted plus the new turn), /follow
 // folds in (Inject, one Completed settle), plain input queues (Queue, two
@@ -847,6 +850,153 @@ let ``Explicit provider pick starts`` () =
 
         exit |> should equal 0
         check output "SESSION "
+        checkNoErrors output
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+// ──────────────────────────────────────────────────────────────────────────
+// Ollama Cloud (issue 329): a dummy OLLAMA_API_KEY registers the
+// ollamacloud preset with no network behind it (selection and session open
+// only; the REPL quits before any turn runs).
+
+[<Fact>]
+let ``Ollamacloud provider pick starts with a dummy key`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+
+    try
+        let exit, stdout, stderr =
+            runDotEnv
+                dotDll
+                [ "--provider"; "ollamacloud" ]
+                (script [ "/quit" ])
+                workdir
+                dbPath
+                [ "OLLAMA_API_KEY", "dummy-ollama" ]
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 0
+        check output "SESSION "
+        checkNoErrors output
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+[<Fact>]
+let ``One ollamacloud key without a provider pick just works`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+
+    try
+        let exit, stdout, stderr =
+            runDotEnv dotDll [] (script [ "/quit" ]) workdir dbPath [ "OLLAMA_API_KEY", "dummy-ollama" ]
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 0
+        check output "SESSION "
+        checkNoErrors output
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+[<Fact>]
+let ``Unknown provider names ollamacloud among the known ids`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+
+    try
+        let exit, stdout, stderr =
+            runDotEnv
+                dotDll
+                [ "--provider"; "nope" ]
+                (script [ "/quit" ])
+                workdir
+                dbPath
+                [
+                    "ANTHROPIC_API_KEY", "dummy-anthropic"
+                    "OPENAI_API_KEY", "dummy-openai"
+                    "GOOGLE_API_KEY", "dummy-google"
+                    "OLLAMA_API_KEY", "dummy-ollama"
+                ]
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 1
+        check output "Unknown provider 'nope'"
+        check output "ollamacloud"
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+[<Fact>]
+let ``Ollamacloud without a key names its env var`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+
+    try
+        let exit, stdout, stderr =
+            runDotEnv
+                dotDll
+                [ "--provider"; "ollamacloud" ]
+                (script [ "/quit" ])
+                workdir
+                dbPath
+                [
+                    "ANTHROPIC_API_KEY", "dummy-anthropic"
+                    // Empty neutralizes an ambient OLLAMA_API_KEY (dev
+                    // machines may carry one; CI carries none), so the
+                    // missing-key path stays deterministic: blank reads as
+                    // absent and ollamacloud stays unregistered.
+                    "OLLAMA_API_KEY", ""
+                ]
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 1
+        check output "Unknown provider 'ollamacloud'"
+        check output "OLLAMA_API_KEY"
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+[<Fact>]
+let ``Model lists ollamacloud with dummy keys`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+
+    try
+        let exit, stdout, stderr =
+            runDotEnv
+                dotDll
+                []
+                (script [ "/model"; "/quit" ])
+                workdir
+                dbPath
+                [
+                    "ANTHROPIC_API_KEY", "dummy-anthropic"
+                    "OPENAI_API_KEY", "dummy-openai"
+                    "GOOGLE_API_KEY", "dummy-google"
+                    "OLLAMA_API_KEY", "dummy-ollama"
+                ]
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 0
+        check output "ollamacloud"
+        check output "llama3.1"
         checkNoErrors output
     finally
         try
