@@ -544,3 +544,82 @@ let ``Colorless viewport strips every escape`` () =
 let ``Toggling an unknown card keeps state`` () =
     toggleExpanded empty "missing" |> should equal empty
     toggleExpanded empty null |> should equal empty
+
+// ──────────────────────────────────────────────────────────────────────────
+// TUI ring fold and long-running progress (issue 334): the drain ring
+// drops only live EVENT lines (they duplicate the OnEvent journal fold);
+// TREE lines and every other diagnostic fold into the viewport, and
+// /compact plus /export paint start markers before their completion
+// lines land.
+
+[<Fact>]
+let ``Only live EVENT lines duplicate the journal fold`` () =
+    isJournalDuplicate "EVENT seq=1 TurnStartedEvent" |> should equal true
+    isJournalDuplicate "TREE 3 events" |> should equal false
+    isJournalDuplicate "TREE seq=1 TurnStartedEvent" |> should equal false
+    isJournalDuplicate "RESULT Completed" |> should equal false
+    isJournalDuplicate "COMPACT completed 1->2" |> should equal false
+    isJournalDuplicate "EXPORTED 3 events to out.jsonl" |> should equal false
+    isJournalDuplicate "" |> should equal false
+    isJournalDuplicate null |> should equal false
+
+[<Fact>]
+let ``Tree output folds into the viewport`` () =
+    let state =
+        addLines
+            empty
+            [
+                "TREE 2 events"
+                "TREE seq=1 TurnStartedEvent"
+            ]
+
+    let lines = toViewportLines state
+
+    lines
+    |> List.exists (fun line -> line.Contains("TREE 2 events", StringComparison.Ordinal))
+    |> should equal true
+
+    lines
+    |> List.exists (fun line -> line.Contains("TREE seq=1", StringComparison.Ordinal))
+    |> should equal true
+
+[<Fact>]
+let ``Compact progress paints before its completion line`` () =
+    let state = markCompactRunning empty
+    let lines = toViewportLines state
+
+    lines
+    |> List.exists (fun line -> line.Contains("compact running", StringComparison.Ordinal))
+    |> should equal true
+
+[<Fact>]
+let ``Export progress names its target`` () =
+    let state = markExportRunning empty "out.jsonl"
+    let lines = toViewportLines state
+
+    lines
+    |> List.exists (fun line -> line.Contains("export running... out.jsonl", StringComparison.Ordinal))
+    |> should equal true
+
+    let bare = markExportRunning empty null
+    let bareLines = toViewportLines bare
+
+    bareLines
+    |> List.exists (fun line -> line.Contains("export running...", StringComparison.Ordinal))
+    |> should equal true
+
+    let blank = markExportRunning empty "   "
+    let blankLines = toViewportLines blank
+
+    blankLines
+    |> List.exists (fun line -> line = "export running...")
+    |> should equal true
+
+[<Fact>]
+let ``Progress markers keep the diagnostics tail window`` () =
+    let mutable state = empty
+
+    for _ in 1 .. (maxMetaLines + 50) do
+        state <- markCompactRunning state
+
+    state.Diagnostics.Length |> should equal maxMetaLines

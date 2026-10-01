@@ -80,6 +80,15 @@ Keybindings (also summarized in the input region's hint bar):
 | `Backspace`/`Delete`, `Ctrl+W`/`Ctrl+U`/`Ctrl+K` | Delete and kill (kill ring edits the line only). |
 | `Esc` on empty input, `Ctrl+Q`, `/quit` | Quit (drains in-flight turns first; bare `q` types). |
 
+While a picker is open it owns the keys and the editor stays suspended:
+
+| Keys | Effect |
+|------|--------|
+| `Up`/`Down` | Move the cursor (wraps past the ends). |
+| `Enter` | Select the cursor row (routes `/resume <id>`, `/model <id>`, or `/fork <sequence>` verbatim). |
+| `Esc` | Close the picker with no routing. |
+| Typing, `Backspace` | Filter the rows (case-insensitive substring over id, name, and detail). |
+
 History lives for the session only and is never written to disk.
 Slash hints list the matching commands (plus prompt template names) with
 one-line descriptions, at most five rows. Pasted multi-line text and long
@@ -87,6 +96,19 @@ single lines clamp to the terminal width with a `>` marker instead of
 corrupting the layout. Piped stdout, `NO_COLOR`, `TERM` dumb/empty/unknown,
 any `CI` marker, or `--no-tui` never enters the shell and runs the plain
 REPL instead, byte-identically: the fallback path loads no TUI code.
+
+Every slash command works fullscreen with identical semantics to the
+plain REPL: the TUI routes each submitted line through the same handlers
+verbatim (same delivery modes, same acceptance rules, same error text).
+Bare `/sessions` and `/resume` open one shared session picker (attach on
+select), bare `/model` lists and opens the provider picker (switch on
+select), and bare `/tree` lists while bare `/fork` opens the journal
+sequence picker (branch on select); lines carrying arguments route
+verbatim with no picker, and `Esc` dismisses any picker. Long-running
+`/compact` and `/export` paint a `compact running...` / `export
+running...` marker and route without blocking, so input stays routable
+and `/abort` still lands while they run; blank question answers resume
+`""` verbatim like the REPL.
 
 ## One-shot print
 

@@ -187,3 +187,76 @@ let renderFrameWithInput
 /// <returns>The rendered frame.</returns>
 let renderFrame (width: int) (height: int) (useColor: bool) (transcript: string list) (status: string) : string =
     renderFrameWithInput width height useColor transcript status []
+
+// ──────────────────────────────────────────────────────────────────────────
+// Picker overlay (issue 334)
+
+/// The keys the picker overlay owns while open (the editor stays
+/// suspended): Up/Down navigate, Enter selects, Esc cancels, typing
+/// filters, Backspace edits the filter.
+let pickerHint = "Up/Down navigate | Enter select | Esc cancel | type to filter"
+
+/// Clamps one overlay row to the width with the trim marker.
+/// <param name="width">The console width in columns.</param>
+/// <param name="row">The row to clamp.</param>
+/// <returns>The clamped row.</returns>
+let private clampOverlayRow (width: int) (row: string) : string =
+    let safeWidth = max 20 (min 240 width)
+
+    if isNull (box row) then ""
+    elif row.Length <= safeWidth then row
+    else row.Substring(0, safeWidth - 1) + ">"
+
+/// Renders the picker overlay as input-region rows plus the cursor screen
+/// position: the served-command header, the filter row, and the visible
+/// item rows with the cursor marker, capped to the overlay budget with a
+/// "more" marker. Pure over width so narrow windows truncate with a
+/// marker and useColor=false strips every escape except the layout
+/// newlines, exactly like the input region.
+/// <param name="width">The console width in columns.</param>
+/// <param name="useColor">True to highlight the cursor row.</param>
+/// <param name="picker">The picker state to paint.</param>
+/// <returns>The rows and the zero-based (row, column) cursor position.</returns>
+let renderPickerOverlay (width: int) (useColor: bool) (picker: DotPicker.PickerState) : string list * (int * int) =
+    let safeWidth = max 20 (min 240 width)
+
+    let header = $"pick {DotPicker.headerText picker.Kind} ({pickerHint})"
+    let filterRow = $"> {picker.Filter}"
+
+    let visible = DotPicker.visibleItems picker
+
+    let rows =
+        visible
+        |> List.truncate DotPicker.maxVisibleRows
+        |> List.mapi (fun index item ->
+            let marker = if index = picker.Cursor then "> " else "  "
+
+            let detail =
+                if String.IsNullOrWhiteSpace item.Detail then
+                    ""
+                else
+                    $" {item.Detail.Trim()}"
+
+            let row = $"{marker}{item.Key} {item.Label}{detail}"
+
+            if useColor && index = picker.Cursor then
+                "\u001b[7m" + row + "\u001b[0m"
+            else
+                row)
+
+    let more =
+        if visible.Length > DotPicker.maxVisibleRows then
+            [
+                $"  ... {visible.Length - DotPicker.maxVisibleRows} more (type to filter)"
+            ]
+        elif visible.IsEmpty then
+            [ "  (no matches)" ]
+        else
+            []
+
+    let painted =
+        [ header; filterRow ] @ rows @ more |> List.map (clampOverlayRow safeWidth)
+
+    let cursorCol = min (2 + picker.Filter.Length) (safeWidth - 1)
+
+    painted, (1, cursorCol)

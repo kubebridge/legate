@@ -2292,3 +2292,94 @@ let ``Ask policy prompts for the yaml fixture tool`` () =
         checkNoErrors output
     finally
         deleteSmokeDirs workdir configBase
+
+// ──────────────────────────────────────────────────────────────────────────
+// TUI command parity (issue 334): the fullscreen TUI is a second skin
+// over ReplEngine.HandleLineAsync verbatim (DotPicker.pickerForBare opens
+// pickers only on exact bare names, DotPicker.commandLineFor resolves a
+// pick to the line typing the id would send, and DotTui routes everything
+// else unchanged, all proven by the DotPicker unit tests). This smoke
+// runs that exact verbatim script through the plain REPL, so identical
+// routing plus identical outcomes here proves no command regressed
+// fullscreen: same results, same errors, same steer/follow/queue
+// delivery (covered above against the slow-steer probe).
+
+[<Fact>]
+let ``Tui parity walks every slash command with identical outcomes`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+    let templates = Path.Combine(workdir, ".agent", "templates")
+
+    try
+        Directory.CreateDirectory(templates) |> ignore
+        File.WriteAllText(Path.Combine(templates, "parity.md"), "hello")
+
+        let exit, stdout, stderr =
+            runDot
+                dotDll
+                [ "--scripted" ]
+                (script
+                    [
+                        "hello"
+                        "/sessions"
+                        "/new second"
+                        "/sessions"
+                        "/resume 1"
+                        "/model"
+                        "/tree"
+                        "/fork 1"
+                        "/clone"
+                        "/sessions"
+                        "/session"
+                        "/export transcript.jsonl"
+                        "/parity"
+                        "/steer"
+                        "/follow"
+                        "/fork"
+                        "/fork nope"
+                        "/abort"
+                        "/compact"
+                        "/bogus-command"
+                        "/quit"
+                    ])
+                workdir
+                dbPath
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 0
+        // Plain prompt plus the template expansion turn.
+        check output "dot scripted answer"
+        check output "TEMPLATE parity"
+        // Session lifecycle: list, open, list, attach, branch, duplicate.
+        check output "SESSIONS 1"
+        check output "SESSIONS 2"
+        check output "RESUMED "
+        check output "SESSIONS 4"
+        // Model, journal, branch, info, export markers.
+        check output "MODEL scripted/scripted"
+        check output "TREE "
+        check output "FORKED "
+        check output "messages="
+        check output "turns="
+        check output "input-tokens="
+        check output "EXPORTED "
+        check output "transcript.jsonl"
+        // Usage-shaped errors stay identical fullscreen.
+        check output "ERROR /steer needs text"
+        check output "ERROR /follow needs text"
+        check output "ERROR /fork needs a sequence"
+        check output "is not a number"
+        check output "ABORTED"
+        check output "COMPACT "
+        check output "UNKNOWN-COMMAND /bogus-command"
+
+        let jsonl = probeFile output (Path.Combine(workdir, "transcript.jsonl"))
+
+        for line in jsonl.Split([| '\n' |], StringSplitOptions.RemoveEmptyEntries) do
+            check line "$type"
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()

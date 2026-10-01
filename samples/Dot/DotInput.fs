@@ -788,6 +788,18 @@ let applyKey (editor: EditorState) (history: History) (key: ConsoleKeyInfo) : Ed
     else
         editor, history, Noop
 
+/// True when the key is a plain Enter: the send key with no modifier
+/// held (Shift alone still sends; Alt+Enter and Ctrl combinations keep
+/// their newline or command meanings). The TUI uses it to resume a blank
+/// pending question answer verbatim: a blank buffer otherwise decodes to
+/// Noop (empty sends nothing), but the REPL console reader resumes ""
+/// through ReplyAsync, so plain Enter on a blank buffer with a pending
+/// question must answer, not idle.
+/// <param name="key">The console key.</param>
+/// <returns>True for a plain Enter.</returns>
+let isPlainEnter (key: ConsoleKeyInfo) : bool =
+    key.Key = ConsoleKey.Enter && isPlain key.Modifiers
+
 // ──────────────────────────────────────────────────────────────────────────
 // Input-region renderer
 

@@ -221,3 +221,106 @@ let ``Status bar sits above the quit hint`` () =
 
     (statusIndex < quitIndex) |> should equal true
     lines[lines.Length - 2] |> should equal quitHint
+
+// ──────────────────────────────────────────────────────────────────────────
+// Picker overlay (issue 334): the shared picker rows dock into the input
+// region budget while open, so the transcript shrinks instead of
+// corrupting and narrow/colorless terminals keep their contracts.
+
+let private pickerItem (key: string) (label: string) (detail: string) : Dot.DotPicker.PickerItem =
+    {
+        Dot.DotPicker.Key = key
+        Dot.DotPicker.Label = label
+        Dot.DotPicker.Detail = detail
+    }
+
+let private resumePicker () : Dot.DotPicker.PickerState =
+    Dot.DotPicker.fromItems
+        Dot.DotPicker.ResumeSession
+        [
+            pickerItem "01JAAA" "first chat" "[Active]"
+            pickerItem "01JBBB" "second chat" "[Active]"
+        ]
+
+[<Fact>]
+let ``Overlay paints the header filter and cursor-marked rows`` () =
+    let rows, (cursorRow, cursorCol) = renderPickerOverlay 80 false (resumePicker ())
+
+    rows[0].Contains("pick resume session") |> should equal true
+    rows[0].Contains("Esc cancel") |> should equal true
+    rows[1] |> should equal "> "
+    rows[2].StartsWith("> 01JAAA", StringComparison.Ordinal) |> should equal true
+
+    rows[3].StartsWith("  01JBBB", StringComparison.Ordinal) |> should equal true
+
+    cursorRow |> should equal 1
+    cursorCol |> should equal 2
+    rows |> List.forall (fun row -> row.Length <= 80) |> should equal true
+
+[<Fact>]
+let ``Overlay filter narrows rows and names the cursor`` () =
+    let picker = Dot.DotPicker.setFilter "second" (resumePicker ())
+    let rows, (_, cursorCol) = renderPickerOverlay 80 false picker
+
+    rows |> List.length |> should equal 3
+    rows[2].Contains("01JBBB") |> should equal true
+    cursorCol |> should equal (2 + "second".Length)
+
+    let missing, _ =
+        renderPickerOverlay 80 false (Dot.DotPicker.setFilter "no-such-row" (resumePicker ()))
+
+    missing
+    |> List.exists (fun row -> row.Contains("(no matches)", StringComparison.Ordinal))
+    |> should equal true
+
+[<Fact>]
+let ``Overlay caps rows with a more marker`` () =
+    let many =
+        Dot.DotPicker.fromItems
+            Dot.DotPicker.ForkAtSequence
+            [
+                for n in 1..20 -> pickerItem (string n) $"TurnCompletedEvent" $"seq={n}"
+            ]
+
+    let rows, _ = renderPickerOverlay 80 false many
+
+    rows |> List.length |> should equal (2 + Dot.DotPicker.maxVisibleRows + 1)
+
+    rows
+    |> List.last
+    |> should equal $"  ... {20 - Dot.DotPicker.maxVisibleRows} more (type to filter)"
+
+[<Fact>]
+let ``Colorless overlay strips every escape and color highlights the cursor`` () =
+    let plain, _ = renderPickerOverlay 80 false (resumePicker ())
+
+    plain |> List.exists (fun row -> row.Contains("\u001b")) |> should equal false
+
+    let colored, _ = renderPickerOverlay 80 true (resumePicker ())
+
+    colored
+    |> List.exists (fun row -> row.Contains("\u001b[7m", StringComparison.Ordinal))
+    |> should equal true
+
+[<Fact>]
+let ``Narrow overlay truncates with a marker`` () =
+    let rows, _ = renderPickerOverlay 20 false (resumePicker ())
+
+    rows |> List.forall (fun row -> row.Length <= 20) |> should equal true
+
+    rows
+    |> List.exists (fun row -> row.EndsWith(">", StringComparison.Ordinal))
+    |> should equal true
+
+[<Fact>]
+let ``Overlay rows dock into the frame input budget`` () =
+    let sid = SessionId.New()
+    let rows, _ = renderPickerOverlay 80 false (resumePicker ())
+
+    let frame =
+        renderFrameWithInput 80 24 false [ "line-1"; "line-2" ] (statusFor sid) rows
+
+    frame.Contains("pick resume session") |> should equal true
+    frame.Contains("01JAAA") |> should equal true
+    frame.Contains("line-2") |> should equal true
+    frame.Contains("\u001b") |> should equal false

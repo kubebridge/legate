@@ -486,6 +486,45 @@ let addLines (state: RendererState) (lines: string seq) : RendererState =
         (state, lines) ||> Seq.fold addLine
 
 // ──────────────────────────────────────────────────────────────────────────
+// TUI ring fold and long-running progress (issue 334)
+
+// The drain ring in DotTui folds engine lines into the viewport through
+// addLine, except lines the journal fold already carries: live EVENT
+// lines duplicate the OnEvent hook (the same Subscribe stream), so the
+// ring drops them. TREE lines have no journal equivalent (they page
+// ReadEventsAsync outside any turn), so they always fold: filtering them
+// would hide /tree output fullscreen.
+// True when an engine line duplicates the journal fold and the ring must
+// drop it.
+// <param name="line">The engine line. Null never duplicates.</param>
+// <returns>True for live EVENT lines only.</returns>
+let isJournalDuplicate (line: string | null) : bool =
+    match line with
+    | null -> false
+    | text -> text.StartsWith("EVENT ", StringComparison.Ordinal)
+
+/// Paints the /compact start marker: the key pump routes fire-and-forget
+/// so input stays routable, and this line proves the compaction started
+/// before its COMPACT completed/deferred/fenced line lands. Kept in the
+/// existing diagnostics tail window.
+/// <param name="state">The current renderer state.</param>
+/// <returns>The next renderer state.</returns>
+let markCompactRunning (state: RendererState) : RendererState = addLine state "compact running..."
+
+/// Paints the /export start marker naming the file target: the key pump
+/// routes fire-and-forget so input stays routable, and this line proves
+/// the export started before its EXPORTED line lands. Kept in the
+/// existing diagnostics tail window.
+/// <param name="state">The current renderer state.</param>
+/// <param name="target">The file target the user typed. Null or blank paints the bare marker.</param>
+/// <returns>The next renderer state.</returns>
+let markExportRunning (state: RendererState) (target: string | null) : RendererState =
+    match target with
+    | null -> addLine state "export running..."
+    | text when String.IsNullOrWhiteSpace text -> addLine state "export running..."
+    | text -> addLine state $"export running... {text.Trim()}"
+
+// ──────────────────────────────────────────────────────────────────────────
 // Markdown-lite plus truncation model.
 
 // Renders markdown-lite readable structure: headings drop their leading
