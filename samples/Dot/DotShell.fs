@@ -110,6 +110,32 @@ let alternateExit = "\u001b[?25h\u001b[?1049l"
 let homeClear = "\u001b[H\u001b[2J"
 
 // ──────────────────────────────────────────────────────────────────────────
+// Minimum size (issue 335)
+
+/// The smallest terminal the fullscreen shell lays out fully: narrower or
+/// shorter windows keep running but show the notice below instead of
+/// corrupting the frame.
+let minimumWidth = 40
+
+/// The smallest terminal height the fullscreen shell lays out fully (see
+/// minimumWidth).
+let minimumHeight = 12
+
+/// The notice tiny windows show above the transcript: names the floor and
+/// the plain escape. Never crashes: the frame keeps the banner, the tail,
+/// and the quit hint around it.
+let minimumSizeMessage =
+    "terminal too small (min 40x12): resize, or --no-tui for plain output"
+
+/// True when the window is below the minimum floor in either dimension.
+/// Raw (unclamped) inputs: 0x0 and stubbed sizes count as tiny.
+/// <param name="width">The console width in columns.</param>
+/// <param name="height">The console height in rows.</param>
+/// <returns>True when the notice applies.</returns>
+let isMinimumSize (width: int) (height: int) : bool =
+    width < minimumWidth || height < minimumHeight
+
+// ──────────────────────────────────────────────────────────────────────────
 // Frame
 
 /// Renders one fullscreen frame as plain text with optional ANSI colors:
@@ -118,7 +144,9 @@ let homeClear = "\u001b[H\u001b[2J"
 /// the status bar, the input-box rows, and the quit hint footer. Pure over
 /// width/height so resize and colorless terminals are covered without a
 /// TTY: narrow windows truncate with a marker, short windows keep the
-/// banner plus the tail, and useColor=false strips every escape except the
+/// banner plus the tail, windows below the 40x12 minimum floor show the
+/// minimum-size notice above the transcript without crashing, and
+/// useColor=false strips every escape except the
 /// layout newlines. The input rows reserve their own frame budget, so the
 /// transcript shrinks instead of corrupting when the box grows.
 /// <param name="width">The console width in columns.</param>
@@ -161,7 +189,13 @@ let renderFrameWithInput
     let header = paintBanner @ [ shellTitle ]
     let footer = [ paintStatus ] @ safeInput @ [ quitHint ]
 
-    let budget = max 1 (safeHeight - header.Length - footer.Length - 1)
+    let notice =
+        if isMinimumSize width height then
+            [ minimumSizeMessage ]
+        else
+            []
+
+    let budget = max 1 (safeHeight - header.Length - notice.Length - footer.Length - 1)
 
     let visible =
         if plainLines.Length <= budget then
@@ -175,7 +209,8 @@ let renderFrameWithInput
         else
             line.Substring(0, max 0 (safeWidth - 1)) + ">"
 
-    String.Join("\n", (header @ visible @ [ "" ] @ footer) |> List.map trim) + "\n"
+    String.Join("\n", (header @ notice @ visible @ [ "" ] @ footer) |> List.map trim)
+    + "\n"
 
 /// Renders one fullscreen frame without input rows: the layout-shell frame
 /// the spike proved, with the full height budget for the transcript.

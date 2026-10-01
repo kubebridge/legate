@@ -51,7 +51,7 @@ the usage; a `/<name>` that matches a prompt template expands it instead
 CLI flags: `--provider <id>`, `--model <provider/model>`,
 `--resume <session-id>`, `--sessions`/`--list`, `-p`/`--print <query>`,
 `--mode text|json`, `--scripted`, `--wait-minutes <n>`, `--ask`,
-`--mcp <path>`, `--print-config`, `--help`/`-h`. Missing values fail naming the flag;
+`--mcp <path>`, `--print-config`, `--no-tui`, `--help`/`-h`. Missing values fail naming the flag;
 unknown flags fail naming the flag; `--mode` accepts only `text`/`json`;
 `-p` needs a non-empty query; `--wait-minutes` needs a positive number.
 
@@ -75,6 +75,7 @@ Keybindings (also summarized in the input region's hint bar):
 | `Ctrl+O`, `Alt+Enter` | Newline (`Alt+Enter` where the terminal reports it; `Ctrl+O` everywhere). |
 | `Ctrl+S` | Steer the running turn with the buffer (`Interrupt`; a slash buffer submits verbatim). |
 | `Ctrl+C` | Abort the running turn without killing dot (the buffer is preserved). |
+| `Ctrl+T` | Expand the first truncated tool card (no-op when none are truncated). |
 | `Up`/`Down`, `Ctrl+P`/`Ctrl+N` | Browse session history (`Up`/`Down` move inside multiline text; history is in-memory only). |
 | `Alt+B`/`Alt+F`, `Ctrl+A`/`Ctrl+E`, `Home`/`End`, arrows | Word-wise and line-wise navigation. |
 | `Backspace`/`Delete`, `Ctrl+W`/`Ctrl+U`/`Ctrl+K` | Delete and kill (kill ring edits the line only). |
@@ -109,6 +110,29 @@ verbatim with no picker, and `Esc` dismisses any picker. Long-running
 running...` marker and route without blocking, so input stays routable
 and `/abort` still lands while they run; blank question answers resume
 `""` verbatim like the REPL.
+
+### Display mode and fallback contract
+
+`--help` states the display mode: dot opens the fullscreen shell on a real
+terminal; `--no-tui`, piped (redirected) stdout, `NO_COLOR`,
+`TERM=dumb`/empty/`unknown`, any `CI` marker except the literal `false`
+(some agents export `CI=false` when interactive), `-p`/`--print`,
+`--mode json` with `-p`, `--sessions`/`--list`, or `--print-config` run the
+plain output instead. The plain REPL names its mode on startup as
+`plain (<reason>)` with `<reason>` one of `--no-tui`, `redirected-stdout`,
+`NO_COLOR`, `TERM=dumb`, `CI`; `fullscreen` means the TUI owns the screen.
+
+The piped path loads no TUI code and stays byte-identical: `-p` output
+under `--no-tui`, `NO_COLOR=1`, `TERM=dumb`, or `CI=true` matches the plain
+run exactly, and stdout never carries alternate-screen escapes
+(`ESC[?1049`). `--mode json` pins the `$type` event sequence instead of raw
+bytes (session ids and timestamps differ per run).
+
+Tiny terminals (narrower than 40 columns or shorter than 12 rows) show a
+`terminal too small (min 40x12)` notice above the transcript and keep
+running; resize re-reads the window every frame. Quit, abort, error, and
+Ctrl+C paths restore the cursor and the primary screen; Ctrl+C aborts the
+running turn without killing dot (the buffer is preserved).
 
 ## One-shot print
 

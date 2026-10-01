@@ -17,86 +17,12 @@ open Legate
 // a rich inline renderer, not a fullscreen shell.
 
 // ──────────────────────────────────────────────────────────────────────────
-// Fallback selector (issue 330)
+// Fallback selector (issues 330, 335)
 
-// How dot was asked to render: the --no-tui flag plus the four plain
-// conditions. Pure data so tests and the pipe smoke assert it without a
-// terminal.
-type TuiRequest =
-    {
-        /// The --no-tui flag forces plain output.
-        NoTuiFlag: bool
-        /// Console.IsOutputRedirected (pipes, CI capture) forces plain.
-        OutputRedirected: bool
-        /// NO_COLOR is set and non-empty: plain, no ANSI colors.
-        NoColor: bool
-        /// TERM=dumb (or empty): plain, the terminal cannot do fullscreen.
-        TermDumb: bool
-        /// A CI environment variable is set: plain, there is no human to see
-        /// the fullscreen shell.
-        Ci: bool
-    }
-
-/// True when dot may open the fullscreen shell: every plain condition is
-/// clear. Piped stdout never loads the TUI path.
-let shouldUseTui (request: TuiRequest) : bool =
-    not request.NoTuiFlag
-    && not request.OutputRedirected
-    && not request.NoColor
-    && not request.TermDumb
-    && not request.Ci
-
-/// Names why the selector stays on plain output, or empty for fullscreen.
-let plainReason (request: TuiRequest) : string =
-    if request.NoTuiFlag then "--no-tui"
-    elif request.OutputRedirected then "redirected-stdout"
-    elif request.NoColor then "NO_COLOR"
-    elif request.TermDumb then "TERM=dumb"
-    elif request.Ci then "CI"
-    else ""
-
-/// True when the value reads as a CI marker: set and non-empty, and not
-/// the literal "false" (some agents export CI=false when interactive).
-let private isMarkerSet (value: string | null) : bool =
-    match value with
-    | null -> false
-    | raw when String.IsNullOrWhiteSpace raw -> false
-    | raw -> not (String.Equals(raw.Trim(), "false", StringComparison.OrdinalIgnoreCase))
-
-/// True when any well-known CI environment variable marks the run.
-let isCiEnvironment () : bool =
-    isMarkerSet (Environment.GetEnvironmentVariable("CI"))
-    || isMarkerSet (Environment.GetEnvironmentVariable("GITHUB_ACTIONS"))
-    || isMarkerSet (Environment.GetEnvironmentVariable("GITLAB_CI"))
-    || isMarkerSet (Environment.GetEnvironmentVariable("JENKINS_URL"))
-    || isMarkerSet (Environment.GetEnvironmentVariable("TF_BUILD"))
-    || isMarkerSet (Environment.GetEnvironmentVariable("CONTINUOUS_INTEGRATION"))
-
-/// Reads the live selector request: the flag plus redirected stdout and
-/// the NO_COLOR / TERM / CI environment. Never throws for missing
-/// variables; a security-stubbed IsOutputRedirected falls back to plain.
-let readRequest (noTuiFlag: bool) : TuiRequest =
-    let redirected =
-        try
-            Console.IsOutputRedirected
-        with _ ->
-            true
-
-    let noColor =
-        not (String.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("NO_COLOR")))
-
-    let term =
-        match Environment.GetEnvironmentVariable("TERM") with
-        | null -> ""
-        | raw -> raw.Trim().ToLowerInvariant()
-
-    {
-        NoTuiFlag = noTuiFlag
-        OutputRedirected = redirected
-        NoColor = noColor
-        TermDumb = term = "" || term = "dumb" || term = "unknown"
-        Ci = isCiEnvironment ()
-    }
+// The pure selector lives in DotTuiMode (TuiRequest, shouldUseTui,
+// plainReason, describeSelection, readRequest): this module owns only the
+// console run loop over it, so the fallback selector stays byte-identical
+// and the pipe smoke never loads TUI code. Tests link DotTuiMode directly.
 
 // ──────────────────────────────────────────────────────────────────────────
 // Fullscreen input loop (issues 331, 332)
@@ -170,7 +96,7 @@ let runSpikeAsync
         ArgumentNullException.ThrowIfNull(packages)
         ArgumentNullException.ThrowIfNull(providerOptions)
 
-        let request = readRequest false
+        let request = DotTuiMode.readRequest false
         let useColor = not request.NoColor && not request.TermDumb
         let entered = not request.OutputRedirected
 
@@ -603,4 +529,118 @@ let runSpikeAsync
                     Console.Out.Flush()
                 with _ ->
                     ()
+    }
+
+// ──────────────────────────────────────────────────────────────────────────
+// Headless TUI smoke (issue 335)
+
+// Runs the CI-only headless TUI smoke the DOT_TUI_SMOKE environment
+// trigger selects: opens one scripted session through the shared engine,
+// paints the layout shell (banner, transcript viewport, status bar) as
+// plain frames on stdout, routes the piped stdin lines through
+// Engine.HandleLineAsync verbatim (so "hello" runs one scripted turn and
+// "/quit" exits), and exits 0. Never enters the alternate screen and never
+// reads console keys, so there is nothing to restore: stdout carries zero
+// TUI escapes and stderr names the teardown. The harness pipes at most a
+// few lines; EOF or /quit ends the run.
+let runHeadlessSmokeAsync
+    (client: SessionClient)
+    (agents: IAgentStore)
+    (packages: IAgentPackageStore)
+    (initialModel: ModelReference)
+    (providerOptions: ReplEngine.ProviderOption list)
+    (waitBound: TimeSpan)
+    (cancellationToken: CancellationToken)
+    : Task<int> =
+    task {
+        ArgumentNullException.ThrowIfNull(client)
+        ArgumentNullException.ThrowIfNull(agents)
+        ArgumentNullException.ThrowIfNull(packages)
+        ArgumentNullException.ThrowIfNull(providerOptions)
+
+        let ring = new LineRing()
+
+        let engine =
+            ReplEngine.Engine(client, agents, packages, Console.In, ring, waitBound, initialModel, providerOptions)
+
+        engine.SetTuiOwnsApprovals(true)
+
+        let rendererGate = obj ()
+        let mutable renderer = DotRender.empty
+
+        engine.SetOnEvent(Some(fun evt -> lock rendererGate (fun () -> renderer <- DotRender.apply renderer evt)))
+
+        try
+            do! engine.OpenSessionAsync("dot tui smoke", cancellationToken)
+
+            let sessionId = engine.CurrentSessionId
+
+            let drainRing () : unit =
+                try
+                    for line in ring.Drain() do
+                        if not (DotRender.isJournalDuplicate line) then
+                            lock rendererGate (fun () -> renderer <- DotRender.addLine renderer line)
+                with _ ->
+                    ()
+
+            let paint () : unit =
+                try
+                    drainRing ()
+
+                    let view = lock rendererGate (fun () -> renderer)
+
+                    let state =
+                        if DotRender.hasPendingPermission view || DotRender.hasPendingQuestion view then
+                            SessionState.WaitingForInput
+                        elif engine.IsTurnRunning then
+                            SessionState.Running
+                        else
+                            SessionState.Idle
+
+                    let frame =
+                        DotShell.renderFrameWithInput
+                            80
+                            24
+                            false
+                            (DotRender.toViewportLines view)
+                            (DotShell.statusText sessionId initialModel state)
+                            []
+
+                    Console.Out.Write(frame)
+                    Console.Out.Flush()
+                with _ ->
+                    ()
+
+            paint ()
+
+            let mutable go = true
+            let mutable seen = 0
+
+            while go && seen < 8 && not cancellationToken.IsCancellationRequested do
+                let line: string | null =
+                    try
+                        Console.In.ReadLine()
+                    with _ ->
+                        null
+
+                match line with
+                | null -> go <- false
+                | text ->
+                    seen <- seen + 1
+
+                    try
+                        let! keepGoing = engine.HandleLineAsync(text, cancellationToken)
+                        go <- go && keepGoing
+                    with _ ->
+                        ()
+
+                    paint ()
+
+            drainRing ()
+            paint ()
+            Console.Error.WriteLine("dot: TUI-SMOKE ok (booted, rendered, exited; no alternate screen entered).")
+            return 0
+        with error ->
+            Console.Error.WriteLine($"dot: TUI-SMOKE failed: {error.Message}")
+            return 1
     }
