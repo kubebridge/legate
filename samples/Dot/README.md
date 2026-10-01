@@ -220,6 +220,17 @@ Dot:
       ApiKey: sk-ant-...            # or ${ANTHROPIC_API_KEY}
     ollamacloud:
       ApiKey: ollama-...            # or ${OLLAMA_API_KEY}
+  Mcp:
+    Servers:
+      local-tools:                  # stdio server: command plus args/env
+        command: dotnet
+        args: ["/path/to/server.dll", "--stdio"]
+        env:
+          TOOL_TOKEN: ${TOOL_TOKEN}
+      crm:                          # remote server: url plus headers
+        url: https://mcp.example.com/mcp
+        headers:
+          Authorization: Bearer ${CRM_TOKEN}
 Legate:
   Llm:
     Providers:
@@ -304,10 +315,40 @@ the working directory are rejected, and writes under `input/` are refused.
 
 ## MCP servers
 
+Custom MCP servers declare under `Dot:Mcp:Servers` in either YAML scope
+using the `mcp.json` field names: stdio servers carry `command` with
+optional `args` and `env`, remote servers carry `url` with optional
+`headers`. Transport is inferred by presence: a non-empty `command` with
+no URL is stdio, a non-empty `url` with no `command` is remote, and
+both-set or neither-set fails startup naming the server and the field;
+fields for the other transport (for example `headers` on a stdio entry)
+are ignored. A remote `url` must be absolute. `${NAME}` placeholders
+expand from the process environment in every MCP value; an unset or
+empty variable fails startup naming the key and the variable. Unlike
+`mcp.json` (strict JSON types), YAML scalars coerce to text.
+
 Pass `--mcp <path>` to attach extra tools from a Claude-style `mcp.json`
-file (the `LegateCli` precedent: stdio and streamable-HTTP servers). A
-missing path fails startup naming the path. Attached servers stop with
-the process.
+file instead (the `LegateCli` precedent: stdio and streamable-HTTP
+servers). A missing path fails startup naming the path. Both sources
+compose with the `Legate:Tools:Mcp` section through one registration, so
+YAML, section, and file servers resolve together. Precedence, strongest
+first: the `--mcp` file, then `Dot:Mcp:Servers` YAML. A same-name YAML
+entry loses to the file with a logged skip naming the server
+(`shadowed by --mcp file (file wins)`); startup otherwise logs each
+server name plus its winning source on stderr, never values.
+
+A server that will not start (or list) keeps the runtime's whole-source
+degrade: zero MCP tools with a logged reason naming it, and dot continues
+with the rest of its tools. `--print-config` never attaches: remote
+servers only appear there as masked dump lines.
+
+Secrets posture: header and env values may live inline or come from
+`${VAR}` expansion like any YAML value, and the redacted dump masks
+every MCP `headers`/`env` value (names, commands, URLs, and args stay
+plaintext). Permission-gating of MCP tools rides the existing policy
+(`--ask` covers them like any tool); there is no new approval UX.
+
+Attached servers stop with the process.
 
 ## Pi-to-Legate map
 

@@ -446,8 +446,20 @@ let bridgeProviderKeys (config: IConfiguration) : unit =
 // ──────────────────────────────────────────────────────────────────────────
 // Redacted dump
 
+/// True when the key points inside an MCP credential map: every Headers,
+// Env, or EnvironmentVariables map value masks regardless of its leaf
+// name (Authorization matches no ApiKey/Secret/Token/Password pattern, so
+// name-matching alone would print it).
+/// <param name="key">The :-joined config key.</param>
+/// <returns>True when the value must be masked.</returns>
+let private isMcpCredentialMapKey (key: string) : bool =
+    key.IndexOf(":headers:", StringComparison.OrdinalIgnoreCase) >= 0
+    || key.IndexOf(":env:", StringComparison.OrdinalIgnoreCase) >= 0
+    || key.IndexOf(":environmentvariables:", StringComparison.OrdinalIgnoreCase) >= 0
+
 /// True when the key looks secret-like: it carries ApiKey, Secret, Token,
-/// or Password (case-insensitive).
+// or Password (case-insensitive), or it sits inside an MCP Headers/Env
+// credential map.
 /// <param name="key">The :-joined config key.</param>
 /// <returns>True when the value must be masked.</returns>
 let isSecretKey (key: string) : bool =
@@ -455,7 +467,8 @@ let isSecretKey (key: string) : bool =
     && (key.IndexOf("apikey", StringComparison.OrdinalIgnoreCase) >= 0
         || key.IndexOf("secret", StringComparison.OrdinalIgnoreCase) >= 0
         || key.IndexOf("token", StringComparison.OrdinalIgnoreCase) >= 0
-        || key.IndexOf("password", StringComparison.OrdinalIgnoreCase) >= 0)
+        || key.IndexOf("password", StringComparison.OrdinalIgnoreCase) >= 0
+        || isMcpCredentialMapKey key)
 
 /// Collects the Dot and Legate sections of the merged configuration.
 /// Only these prefixes dump: the full environment never does.

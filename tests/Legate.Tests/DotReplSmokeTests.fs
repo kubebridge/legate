@@ -35,6 +35,16 @@ open Xunit
 // and /abort//compact behave mid-turn and idle with the Deferred compact
 // path. Mirrors the LegateCli smoke precedent; each run gets its own temp
 // database file.
+// Issue 336 adds the Dot:Mcp:Servers YAML section in the mcp.json field
+// dialect over the McpFixture stdio server: stdio attach plus one
+// ${VAR}-sourced arg completes with no whole-source degrade at Information
+// logging (degrade warnings stay visible), remote headers stay masked in
+// --print-config with no attach, malformed entries fail fast naming the
+// server and field, same-name file entries win with a shadow log, and the
+// fixture tool prompts under --ask. Tool result text never reaches REPL
+// or export output on the facade path (the journal carries no per-call
+// tool events), so the live loop is proven by start/list success (no
+// degrade) rather than result text.
 
 // ──────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -64,8 +74,10 @@ let private sampleDll (project: string) (assembly: string) : string =
         failwith $"Expected the built sample at '{candidate}': build the solution first."
 
 /// Runs dot with piped stdin on one database file, returning exit code,
-/// stdout, and stderr.
-let private runDotEnv
+/// stdout, and stderr. The log-level override is optional: None keeps the
+/// host default (Information, so MCP degrade warnings stay visible).
+let private runDotEnvWith
+    (logLevel: string option)
     (dotDll: string)
     (arguments: string list)
     (stdin: string)
@@ -84,7 +96,11 @@ let private runDotEnv
     info.RedirectStandardError <- true
     info.UseShellExecute <- false
     info.WorkingDirectory <- workdir
-    info.Environment["Logging__LogLevel__Default"] <- "None"
+
+    match logLevel with
+    | None -> ()
+    | Some level -> info.Environment["Logging__LogLevel__Default"] <- level
+
     info.Environment["DOTNET_NOLOGO"] <- "1"
     info.Environment["DOT_DB_PATH"] <- dbPath
 
@@ -118,6 +134,18 @@ let private runDotEnv
                 child.StandardInput.Dispose()
             with _ ->
                 ()
+
+/// Runs dot with piped stdin on one database file and scripted log
+/// suppression, returning exit code, stdout, and stderr.
+let private runDotEnv
+    (dotDll: string)
+    (arguments: string list)
+    (stdin: string)
+    (workdir: string)
+    (dbPath: string)
+    (extraEnv: (string * string) list)
+    : int * string * string =
+    runDotEnvWith (Some "None") dotDll arguments stdin workdir dbPath extraEnv
 
 /// Runs dot with piped stdin on one database file and no extra
 /// environment, returning exit code, stdout, and stderr.
@@ -1969,3 +1997,298 @@ let ``Bad YAML fails naming the path`` () =
             Directory.Delete(configBase, true)
         with _ ->
             ()
+
+// ──────────────────────────────────────────────────────────────────────────
+// YAML MCP servers (issue 336): the Dot:Mcp:Servers map in the mcp.json
+// field dialect, proven against the McpFixture stdio server with no
+// network and no keys. Tool result text never reaches REPL or export
+// output on the facade path (the journal carries no per-call tool
+// events), so the live loop is proven by start/list success: the turn
+// completes with no whole-source degrade warning at Information logging.
+
+/// Runs dot --scripted with an isolated user config base and the host
+/// default Information logging, so MCP degrade warnings stay visible.
+let private runDotYamlLogged
+    (dotDll: string)
+    (arguments: string list)
+    (stdin: string)
+    (workdir: string)
+    (dbPath: string)
+    (configBase: string)
+    (extraEnv: (string * string) list)
+    : int * string * string =
+    runDotEnvWith
+        (Some "Information")
+        dotDll
+        arguments
+        stdin
+        workdir
+        dbPath
+        (("DOT_CONFIG_HOME", configBase) :: extraEnv)
+
+/// Runs dot --scripted with an isolated user config base and scripted log
+/// suppression, returning exit code, stdout, and stderr.
+let private runDotYaml
+    (dotDll: string)
+    (arguments: string list)
+    (stdin: string)
+    (workdir: string)
+    (dbPath: string)
+    (configBase: string)
+    (extraEnv: (string * string) list)
+    : int * string * string =
+    runDotEnv dotDll arguments stdin workdir dbPath (("DOT_CONFIG_HOME", configBase) :: extraEnv)
+
+/// Writes the project-scope YAML file under the smoke workdir.
+let private writeProjectYaml (workdir: string) (content: string) : unit =
+    writeYaml (Path.Combine(workdir, ".dot", "appsettings.yaml")) content
+
+/// Writes a --mcp file with one stdio server over the fixture DLL.
+let private writeFixtureJson (path: string) (serverName: string) (fixtureDll: string) : unit =
+    let dll = fixtureDll.Replace("\\", "/")
+
+    File.WriteAllText(
+        path,
+        $"{{\"mcpServers\": {{\"{serverName}\": {{\"command\": \"dotnet\", \"args\": [\"{dll}\"]}}}}}}"
+    )
+
+/// Deletes both smoke temp dirs, ignoring cleanup failures.
+let private deleteSmokeDirs (workdir: string) (configBase: string) : unit =
+    try
+        Directory.Delete(workdir, true)
+    with _ ->
+        ()
+
+    try
+        Directory.Delete(configBase, true)
+    with _ ->
+        ()
+
+[<Fact>]
+let ``Yaml mcp server attaches the fixture and completes without degrade`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let fixtureDll = sampleDll "McpFixture" "McpFixture.dll"
+    let workdir, dbPath = freshWorkdir ()
+    let configBase, _ = freshConfigBase ()
+
+    try
+        // One ${VAR}-sourced arg proves expansion inline with the attach:
+        // an unset variable would fail startup naming the key instead.
+        writeProjectYaml
+            workdir
+            "Dot:\n  Mcp:\n    Servers:\n      fixture:\n        command: dotnet\n        args:\n          - '${DOT_SMOKE_FIXTURE_336}'\n"
+
+        let exit, stdout, stderr =
+            runDotYamlLogged
+                dotDll
+                [ "--scripted" ]
+                (script [ "mcp-echo hello"; "/quit" ])
+                workdir
+                dbPath
+                configBase
+                [ "DOT_SMOKE_FIXTURE_336", fixtureDll ]
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 0
+        check output "MCP server 'fixture' attached from Dot:Mcp:Servers."
+        check output "RESULT Completed"
+        check output "mcp-echo done"
+        // Any start or list failure degrades the whole source with a
+        // warning naming the server: its absence proves the stdio server
+        // started and listed over the expanded arg.
+        checkAbsent output "degraded to zero tools"
+    finally
+        deleteSmokeDirs workdir configBase
+
+[<Fact>]
+let ``Yaml remote mcp headers stay masked in the dump without attach`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+    let configBase, _ = freshConfigBase ()
+    let inlineSecret = "inline-secret-336-AAA"
+    let envSecret = "env-secret-336-BBB"
+
+    try
+        writeProjectYaml
+            workdir
+            ("Dot:\n  Mcp:\n    Servers:\n      crm:\n        url: http://127.0.0.1:9/mcp\n        headers:\n          Authorization: 'Bearer "
+             + inlineSecret
+             + "'\n          X-From-Env: '${DOT_SMOKE_MCP_HDR_336}'\n")
+
+        let exit, stdout, stderr =
+            runPrintConfig dotDll workdir dbPath configBase [ "DOT_SMOKE_MCP_HDR_336", envSecret ] []
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 0
+        check stdout "Dot:Mcp:Servers:crm:headers:Authorization=***"
+        check stdout "Dot:Mcp:Servers:crm:headers:X-From-Env=***"
+        check stdout "Dot:Mcp:Servers:crm:url=http://127.0.0.1:9/mcp"
+        checkAbsent output inlineSecret
+        checkAbsent output envSecret
+        checkNoErrors output
+    finally
+        deleteSmokeDirs workdir configBase
+
+[<Fact>]
+let ``Yaml mcp entry with both transports fails naming the server`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+    let configBase, _ = freshConfigBase ()
+
+    try
+        writeProjectYaml
+            workdir
+            "Dot:\n  Mcp:\n    Servers:\n      badboth:\n        command: dotnet\n        url: http://127.0.0.1:9/mcp\n"
+
+        let exit, stdout, stderr =
+            runDotYaml dotDll [ "--scripted" ] (script [ "/quit" ]) workdir dbPath configBase []
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 1
+        check output "'badboth'"
+        check output "not both"
+    finally
+        deleteSmokeDirs workdir configBase
+
+[<Fact>]
+let ``Yaml mcp entry without a transport fails naming the server`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+    let configBase, _ = freshConfigBase ()
+
+    try
+        writeProjectYaml workdir "Dot:\n  Mcp:\n    Servers:\n      badneither:\n        args:\n          - dotnet\n"
+
+        let exit, stdout, stderr =
+            runDotYaml dotDll [ "--scripted" ] (script [ "/quit" ]) workdir dbPath configBase []
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 1
+        check output "'badneither'"
+        check output "exactly one transport"
+    finally
+        deleteSmokeDirs workdir configBase
+
+[<Fact>]
+let ``Yaml mcp entry with a relative url fails naming the server`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+    let configBase, _ = freshConfigBase ()
+
+    try
+        writeProjectYaml workdir "Dot:\n  Mcp:\n    Servers:\n      badurl:\n        url: not-a-uri\n"
+
+        let exit, stdout, stderr =
+            runDotYaml dotDll [ "--scripted" ] (script [ "/quit" ]) workdir dbPath configBase []
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 1
+        check output "'badurl'"
+        check output "absolute URI"
+    finally
+        deleteSmokeDirs workdir configBase
+
+[<Fact>]
+let ``Yaml mcp placeholder with an unset variable fails naming the key`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+    let configBase, _ = freshConfigBase ()
+
+    try
+        writeProjectYaml
+            workdir
+            "Dot:\n  Mcp:\n    Servers:\n      badvar:\n        command: '${DOT_SMOKE_MISSING_336}'\n"
+
+        let exit, stdout, stderr =
+            runDotYaml dotDll [ "--scripted" ] (script [ "/quit" ]) workdir dbPath configBase []
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 1
+        check output "DOT_SMOKE_MISSING_336"
+        check output "badvar"
+    finally
+        deleteSmokeDirs workdir configBase
+
+[<Fact>]
+let ``Same name yaml and file entries resolve file wins`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let fixtureDll = sampleDll "McpFixture" "McpFixture.dll"
+    let workdir, dbPath = freshWorkdir ()
+    let configBase, _ = freshConfigBase ()
+    let mcpPath = Path.Combine(workdir, "mcp.json")
+
+    try
+        // The shadowed YAML entry points at a missing binary on purpose:
+        // if it ever registered, the duplicate name would degrade the
+        // whole source (or the file would lose), and the no-degrade check
+        // below would fail.
+        writeProjectYaml
+            workdir
+            "Dot:\n  Mcp:\n    Servers:\n      fixture:\n        command: definitely-not-a-real-binary-336\n"
+
+        writeFixtureJson mcpPath "fixture" fixtureDll
+
+        let exit, stdout, stderr =
+            runDotYamlLogged
+                dotDll
+                [ "--scripted"; "--mcp"; mcpPath ]
+                (script [ "mcp-echo hello"; "/quit" ])
+                workdir
+                dbPath
+                configBase
+                []
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 0
+        check output "MCP server 'fixture' attached from --mcp file."
+        check output "shadowed by --mcp file (file wins)"
+        check output "'fixture'"
+        checkAbsent output "attached from Dot:Mcp:Servers"
+        checkAbsent output "degraded to zero tools"
+        check output "RESULT Completed"
+        check output "mcp-echo done"
+    finally
+        deleteSmokeDirs workdir configBase
+
+[<Fact>]
+let ``Ask policy prompts for the yaml fixture tool`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let fixtureDll = sampleDll "McpFixture" "McpFixture.dll"
+    let workdir, dbPath = freshWorkdir ()
+    let configBase, _ = freshConfigBase ()
+
+    try
+        let dll = fixtureDll.Replace("\\", "/")
+
+        writeProjectYaml
+            workdir
+            $"Dot:\n  Mcp:\n    Servers:\n      fixture:\n        command: dotnet\n        args:\n          - '{dll}'\n"
+
+        let exit, stdout, stderr =
+            runDotYaml
+                dotDll
+                [ "--scripted"; "--ask" ]
+                (script [ "mcp-echo hello"; "allow"; "/quit" ])
+                workdir
+                dbPath
+                configBase
+                []
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 0
+        check output "PermissionRequestedEvent tool=fixture_echo"
+        check output "PERMISSION tool=fixture_echo"
+        check output "PermissionResolvedEvent"
+        check output "RESULT Completed"
+        check output "mcp-echo done"
+        checkNoErrors output
+    finally
+        deleteSmokeDirs workdir configBase

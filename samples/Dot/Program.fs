@@ -95,6 +95,7 @@ type DotStart =
         /// ask policy the REPL answers inline.
         Ask: bool
         /// MCP config file to attach extra tools from, or null for none.
+        /// Wins over same-name Dot:Mcp:Servers YAML entries.
         McpPath: string | null
         /// One-shot query for -p|--print, or null for the REPL. Runs one
         /// Headless-shaped turn (PromptAndWaitAsync with the Headless exit
@@ -122,7 +123,7 @@ let private helpText (dbPath: string) : string =
     + " Providers anthropic, openai, google, and ollamacloud register only when ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_API_KEY, or OLLAMA_API_KEY is set (keys flow from the environment through Legate:Llm:Providers:<id>:ApiKey binding only, never printed or persisted). With exactly one key set dot just works; with several, --provider picks, else the default order anthropic, openai, google, ollamacloud wins; --model <provider/model> overrides the model (--provider/--model apply to live mode; --scripted pins the scripted transport). /model lists the options mid-session and switches without losing the transcript. "
     + " Tools run against the working directory through the host-directory runtime with no sandbox: sandbox the run in a container (as pi does) or pass --ask for per-call approval (allow once, allow for session, deny). The workspace root fence stays on in every mode. "
     + " One-shot print: -p|--print <query> runs one Headless-shaped turn (PromptAndWaitAsync under --wait-minutes with the Dot agent) instead of the REPL, printing only the final answer to stdout and exiting 0 completed, 2 aborted, 1 failed, 3 anything else (--resume attaches instead of opening; --sessions still lists). JSON stream: --mode json with -p streams session events as JSONL to stdout (one $type-polymorphic event per line, DotExport options) for scripting as dot --mode json -p \"<query>\" | <jsonl-parser>, with every human diagnostic on stderr; without -p --mode is ignored and the REPL runs in text."
-    + " Configuration: dot reads optional YAML files in order user appsettings.yaml < user appsettings.local.yaml < project ./.dot/appsettings.yaml < project ./.dot/appsettings.local.yaml (missing files are never errors), then environment variables, then CLI flags strongest; --print-config prints the effective Dot plus Legate configuration with secret values masked and exits 0. See samples/Dot/README.md for the schema."
+    + " Configuration: dot reads optional YAML files in order user appsettings.yaml < user appsettings.local.yaml < project ./.dot/appsettings.yaml < project ./.dot/appsettings.local.yaml (missing files are never errors), then environment variables, then CLI flags strongest; --print-config prints the effective Dot plus Legate configuration with secret values masked and exits 0. MCP servers declare under Dot:Mcp:Servers (stdio command/args/env, remote url/headers) or attach via --mcp <path>; a same-name YAML entry loses to the file. See samples/Dot/README.md for the schema."
 
 /// Parses the dot arguments into a start plan. Unknown flags fail with a
 /// usage error naming the flag; missing values fail naming the flag.
@@ -256,8 +257,9 @@ type private ScriptStep =
 
 /// Probe scripts keyed by the prompt marker that selects them: scripted
 /// acceptances for the coding tools over the working directory, the skill
-/// tool over the sample review package (skill-load, skill-missing), and
-/// the context-file rewrite (ctx-edit). Each probe replaces the default
+/// tool over the sample review package (skill-load, skill-missing), the
+/// context-file rewrite (ctx-edit), and the YAML MCP fixture attach
+/// (mcp-echo, served by the Dot:Mcp:Servers fixture server). Each probe replaces the default
 /// queue once per process, so the shared steps below stay byte-identical
 /// for the existing smoke runs. ctx-check is dynamic instead (see
 /// serveProbe): every mention answers with the markers the current system
@@ -370,6 +372,11 @@ let private probeScript (marker: string) : ScriptStep list =
             )
             Text "CTX-EDIT-DONE-309"
         ]
+    | "mcp-echo" ->
+        [
+            ToolCall("call-mcp-echo", "fixture_echo", [ "text", "hello-fixture-336" :> obj ])
+            Text "mcp-echo done"
+        ]
     | _ -> []
 
 /// Minimal inline scripted chat client: serves the queued steps, then a
@@ -401,6 +408,7 @@ type private ScriptedClient(steps: Queue<ScriptStep>) =
             "skill-load"
             "skill-missing"
             "ctx-edit"
+            "mcp-echo"
         ]
 
     /// True when any incoming message mentions the marker.
@@ -535,7 +543,8 @@ type private StubScriptedProvider(client: IChatClient) =
 /// auto-approved and the turn completes with the first answer. Prompts
 /// naming a coding probe (coding-write, coding-edit, coding-two,
 /// coding-outside, coding-exec), a skill probe (skill-load, skill-missing),
-/// or the context rewrite (ctx-edit) swap the queue for that probe's tool
+/// the context rewrite (ctx-edit), or the MCP fixture probe (mcp-echo,
+/// served by the Dot:Mcp:Servers fixture server) swap the queue for that probe's tool
 /// steps instead; prompts naming ctx-check answer with the context markers
 /// the current system prompt carries.
 let private scriptedClient () : ScriptedClient =
@@ -635,7 +644,8 @@ let private selectLiveClient (provider: IServiceProvider) (start: DotStart) : IC
 /// policy by default (the every-call ask policy under --ask; the facade
 /// runner reads the container policy), the scripted echo tool plus the
 /// dot-local coding tools bound to the session workspace, the optional
-/// mcp.json attach, and the scripted provider or the live providers. Live
+/// mcp.json attach plus the Dot:Mcp:Servers YAML section (a same-name YAML
+/// entry loses to the file with a logged skip), and the scripted provider or the live providers. Live
 /// providers register only when their env key is present (Anthropic rides
 /// the OpenAI-compatible preset under id anthropic: the native AddAnthropic
 /// never registers alongside it, last registration wins; Ollama Cloud rides
@@ -704,13 +714,74 @@ let private buildServices
                 if DotConfig.hasProviderKey configuration "ollamacloud" then
                     builder.Llm.AddOllamaCloud(configuration) |> ignore
 
-            match start.McpPath with
-            | null -> ()
-            | path ->
-                if File.Exists(path) then
-                    builder.Tools.AddMcpServersFromConfig(path) |> ignore
-                else
-                    raise (InvalidOperationException($"The --mcp path '{path}' does not exist.")))
+            // MCP servers (issue 336): the --mcp file loads first (CLI
+            // strongest), then the Dot:Mcp:Servers YAML section appends
+            // through AddMcp, so the Legate:Tools:Mcp section, the YAML
+            // section, and the file compose through the deferred Configure
+            // path. A same-name YAML entry loses to the file with a logged
+            // skip. Startup logs server names plus the winning source on
+            // stderr, never values; a server that will not start keeps the
+            // whole-source degrade (zero MCP tools with a logged reason
+            // naming it) and dot continues.
+            let fileKeys, hasFile =
+                match start.McpPath with
+                | null -> Set.empty, false
+                | path ->
+                    if File.Exists(path) then
+                        builder.Tools.AddMcpServersFromConfig(path) |> ignore
+                        let keys = DotMcp.fileServerKeys path
+
+                        for name in keys do
+                            Console.Error.WriteLine($"dot: MCP server '{name}' attached from --mcp file.")
+
+                        keys, true
+                    else
+                        raise (InvalidOperationException($"The --mcp path '{path}' does not exist."))
+
+            let yamlServers = DotMcp.loadYamlServers configuration
+
+            let freshYaml =
+                yamlServers
+                |> List.filter (fun server ->
+                    // loadYamlServers validates names non-empty, so the
+                    // fallback keeps a server rather than dropping it.
+                    match box server.Name with
+                    | :? string as raw when not (String.IsNullOrWhiteSpace raw) ->
+                        if fileKeys.Contains(raw) then
+                            Console.Error.WriteLine(
+                                $"dot: MCP server '{raw}' from Dot:Mcp:Servers shadowed by --mcp file (file wins)."
+                            )
+
+                            false
+                        else
+                            true
+                    | _ -> true)
+
+            for server in freshYaml do
+                Console.Error.WriteLine($"dot: MCP server '{server.Name}' attached from Dot:Mcp:Servers.")
+
+            let legateServers =
+                configuration.GetSection(McpOptions.ConfigurationSectionPath + ":Servers")
+
+            for child in legateServers.GetChildren() do
+                match Option.ofObj child["Name"] with
+                | None -> ()
+                | Some raw when String.IsNullOrWhiteSpace raw -> ()
+                | Some raw ->
+                    Console.Error.WriteLine($"dot: MCP server '{raw.Trim()}' attached from Legate:Tools:Mcp.")
+
+            if
+                hasFile
+                || not freshYaml.IsEmpty
+                || not (Seq.isEmpty (legateServers.GetChildren()))
+            then
+                builder.AddMcp(
+                    configuration,
+                    Action<McpOptions>(fun options ->
+                        for server in freshYaml do
+                            options.Servers.Add(server))
+                )
+                |> ignore)
     )
     |> ignore
 
