@@ -124,6 +124,8 @@
     <Compile Include="DotReplSmokeTests.fs" />
     <Compile Include="../../samples/Dot/DotShell.fs" Link="DotShellUnderTest.fs" />
     <Compile Include="DotShellTests.fs" />
+    <Compile Include="../../samples/Dot/DotInput.fs" Link="DotInputUnderTest.fs" />
+    <Compile Include="DotInputTests.fs" />
     <Compile Include="MigrationTests.fs" />
     <Compile Include="SqliteTestFixture.fs" />
     <Compile Include="SqliteSessionStoreTests.fs" />

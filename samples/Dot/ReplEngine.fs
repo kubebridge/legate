@@ -604,6 +604,27 @@ type Engine
                 clearApproval ()
         }
 
+    /// True while a permission or question answer owns the reader.
+    /// <returns>True while an approval answer is pending.</returns>
+    member _.IsApprovalPending: bool = isApprovalPending ()
+
+    /// The current session id for fullscreen status display.
+    /// <returns>The current session id.</returns>
+    member _.CurrentSessionId: SessionId = (currentSession ()).Id
+
+    /// True while the drain loop owns a live turn.
+    /// <returns>True while a turn is in flight.</returns>
+    member _.IsTurnRunning: bool = isDrainRunning ()
+
+    /// Opens a session and makes it current without entering the prompt
+    /// loop: the fullscreen TUI route hook (issue 332). The prompt,
+    /// stream, reply, and settle behavior stays identical: the TUI feeds
+    /// HandleLineAsync, which routes exactly as the plain REPL.
+    /// <param name="title">The session title.</param>
+    /// <param name="cancellationToken">Abandons the open.</param>
+    member this.OpenSessionAsync(title: string, cancellationToken: CancellationToken) : Task =
+        this.OpenAsync(title, cancellationToken)
+
     /// Streams one turn's events until the subscriber is cancelled,
     /// answering permission requests and questions inline.
     /// <param name="session">The session streaming.</param>
@@ -1188,10 +1209,13 @@ type Engine
         }
 
     /// Handles one trimmed input line. Returns false when the REPL should exit.
+    /// Public for the fullscreen TUI route hook (issue 332): DotTui feeds
+    /// submitted and steered lines here verbatim, so every slash command
+    /// routes exactly as in the plain REPL with no forked parser.
     /// <param name="input">The trimmed input line.</param>
     /// <param name="cancellationToken">Abandons the turn.</param>
     /// <returns>False when the REPL should exit.</returns>
-    member private this.HandleLineAsync(input: string, cancellationToken: CancellationToken) : Task<bool> =
+    member this.HandleLineAsync(input: string, cancellationToken: CancellationToken) : Task<bool> =
         task {
             let text = input.Trim()
 

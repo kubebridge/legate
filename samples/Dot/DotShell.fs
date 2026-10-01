@@ -26,13 +26,14 @@ let bannerLines =
         " \\__,_|\\___/ \\__|"
     ]
 
-/// The shell title under the banner: names the quit-only input contract
-/// and the plain-output escape (the renderer and input box are later
-/// children that paint into this frame).
-let shellTitle = "dot layout shell (q to quit, --no-tui for plain)"
+/// The shell title under the banner: names the input box and the plain
+/// output escape (the streaming renderer is a later child that paints
+/// into this frame).
+let shellTitle = "dot fullscreen (Enter sends, --no-tui for plain)"
 
-/// The quit-only input hint in the frame footer.
-let quitHint = "> [q to quit - renderer and input box land in later children]"
+/// The input-box quit hint in the frame footer: Esc on an empty buffer,
+/// Ctrl+Q, or /quit quits (bare q types now that the input box owns keys).
+let quitHint = "> [Esc on empty input, Ctrl+Q, or /quit quits]"
 
 // ──────────────────────────────────────────────────────────────────────────
 // Turn-state mapping
@@ -114,21 +115,36 @@ let homeClear = "\u001b[H\u001b[2J"
 /// Renders one fullscreen frame as plain text with optional ANSI colors:
 /// the ASCII dot banner header, the scrollable transcript viewport (the
 /// tail window over the scrollback lines, never the live cursor alone),
-/// and the status bar plus quit hint footer. Pure over width/height so
-/// resize and colorless terminals are covered without a TTY: narrow
-/// windows truncate with a marker, short windows keep the banner plus the
-/// tail, and useColor=false strips every escape except the layout
-/// newlines.
+/// the status bar, the input-box rows, and the quit hint footer. Pure over
+/// width/height so resize and colorless terminals are covered without a
+/// TTY: narrow windows truncate with a marker, short windows keep the
+/// banner plus the tail, and useColor=false strips every escape except the
+/// layout newlines. The input rows reserve their own frame budget, so the
+/// transcript shrinks instead of corrupting when the box grows.
 /// <param name="width">The console width in columns.</param>
 /// <param name="height">The console height in rows.</param>
 /// <param name="useColor">True to color the banner and status bar.</param>
 /// <param name="transcript">The scrollback lines, oldest first.</param>
 /// <param name="status">The status-bar line.</param>
+/// <param name="inputLines">The input-box rows, already width-clamped.</param>
 /// <returns>The rendered frame.</returns>
-let renderFrame (width: int) (height: int) (useColor: bool) (transcript: string list) (status: string) : string =
+let renderFrameWithInput
+    (width: int)
+    (height: int)
+    (useColor: bool)
+    (transcript: string list)
+    (status: string)
+    (inputLines: string list)
+    : string =
     let safeWidth = max 20 (min 240 width)
     let safeHeight = max 8 (min 100 height)
     let plainLines = transcript |> List.filter (fun line -> not (isNull (box line)))
+
+    let safeInput =
+        if isNull (box inputLines) then
+            []
+        else
+            inputLines |> List.filter (fun line -> not (isNull (box line)))
 
     let paintBanner =
         if useColor then
@@ -143,7 +159,7 @@ let renderFrame (width: int) (height: int) (useColor: bool) (transcript: string 
             status
 
     let header = paintBanner @ [ shellTitle ]
-    let footer = [ paintStatus; quitHint ]
+    let footer = [ paintStatus ] @ safeInput @ [ quitHint ]
 
     let budget = max 1 (safeHeight - header.Length - footer.Length - 1)
 
@@ -160,3 +176,14 @@ let renderFrame (width: int) (height: int) (useColor: bool) (transcript: string 
             line.Substring(0, max 0 (safeWidth - 1)) + ">"
 
     String.Join("\n", (header @ visible @ [ "" ] @ footer) |> List.map trim) + "\n"
+
+/// Renders one fullscreen frame without input rows: the layout-shell frame
+/// the spike proved, with the full height budget for the transcript.
+/// <param name="width">The console width in columns.</param>
+/// <param name="height">The console height in rows.</param>
+/// <param name="useColor">True to color the banner and status bar.</param>
+/// <param name="transcript">The scrollback lines, oldest first.</param>
+/// <param name="status">The status-bar line.</param>
+/// <returns>The rendered frame.</returns>
+let renderFrame (width: int) (height: int) (useColor: bool) (transcript: string list) (status: string) : string =
+    renderFrameWithInput width height useColor transcript status []
