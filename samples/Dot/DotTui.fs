@@ -99,54 +99,12 @@ let readRequest (noTuiFlag: bool) : TuiRequest =
     }
 
 // ──────────────────────────────────────────────────────────────────────────
-// Skeleton frame (Task 3)
+// Layout shell (issue 331)
 
-// The ASCII banner heading every fullscreen frame.
-let bannerLine = "     _       _   "
-
-/// Renders one fullscreen frame as plain text with optional ANSI colors:
-/// the ASCII dot banner header, the scrollable transcript lines, and the
-/// input box footer. Pure over width/height so resize and colorless
-/// terminals are covered without a TTY: narrow windows truncate, short
-/// windows keep the banner plus the tail, and useColor=false strips every
-/// escape except the layout newlines.
-let renderFrame (width: int) (height: int) (useColor: bool) (transcript: string list) : string =
-    let safeWidth = max 20 (min 240 width)
-    let safeHeight = max 8 (min 100 height)
-    let plainLines = transcript |> List.filter (fun line -> not (isNull (box line)))
-
-    let banner =
-        if useColor then
-            "\u001b[1;36m" + bannerLine + "\u001b[0m"
-        else
-            bannerLine
-
-    let header =
-        [
-            banner
-            "dot TUI spike (scripted proof, --no-tui for plain)"
-        ]
-
-    let footer =
-        [
-            "> [spike proof runs one scripted turn, then exits]"
-        ]
-
-    let budget = max 1 (safeHeight - header.Length - footer.Length - 1)
-
-    let visible =
-        if plainLines.Length <= budget then
-            plainLines
-        else
-            plainLines |> List.skip (plainLines.Length - budget)
-
-    let trim (line: string) : string =
-        if line.Length <= safeWidth then
-            line
-        else
-            line.Substring(0, max 0 (safeWidth - 1)) + ">"
-
-    String.Join("\n", (header @ visible @ [ "" ] @ footer) |> List.map trim) + "\n"
+// The pure frame lives in DotShell (banner header, transcript viewport,
+// status bar): this module owns only the console run loop over it, so the
+// fallback selector above stays byte-identical and the pipe smoke never
+// loads TUI code.
 
 /// The current console size, falling back to 80x24 when redirected or
 /// stubbed (keeps the proof renderable under pipes and tests).
@@ -174,12 +132,16 @@ let private exitFor (status: TurnStatus) : int =
     | TurnStatus.Suspended
     | _ -> 3
 
-/// Runs the spike proof: opens one durable session under the ensured
-/// scripted agent, streams exactly one scripted Subscribe turn into the
-/// alternate-screen skeleton, and exits cleanly. Resize is covered by
-/// re-reading the window size every frame; colorless terminals (NO_COLOR
-/// or TERM=dumb) render the same layout without ANSI colors; any failure
-/// restores the primary screen before returning 1.
+/// Runs the layout shell proof: opens one durable session under the
+/// ensured scripted agent, streams exactly one scripted Subscribe turn
+/// into the alternate-screen layout shell (banner, transcript viewport,
+/// status bar), and exits cleanly. Resize is covered by re-reading the
+/// window size every frame; colorless terminals (NO_COLOR or TERM=dumb)
+/// render the same layout without ANSI colors. Input is quit-only
+/// (q/Escape/Ctrl+C); the caller's cancellation token (never None) drives
+/// the turn wait and the stream. Quit, abort, crash, and failure paths all
+/// restore the cursor and the primary screen in try/finally (0 completed /
+/// 2 aborted / 1 failed / 0 clean quit / 1 anything else).
 let runSpikeAsync
     (client: SessionClient)
     (agents: IAgentStore)
@@ -196,33 +158,72 @@ let runSpikeAsync
         let useColor = not request.NoColor && not request.TermDumb
         let entered = not request.OutputRedirected
 
+        // Ctrl+C quits through the same teardown as q: cancel the turn
+        // wait and the stream, then fall through to the finally restore.
+        // Quit is cooperative: the prompt task observes turnCts, the
+        // Subscribe loop observes streamCts, and the wait loop below polls
+        // quitRequested, so every path lands in the teardown finally.
+        let mutable quitRequested = false
+
+        use turnCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
+        use streamCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
+
+        let onCancel =
+            ConsoleCancelEventHandler(fun _ args ->
+                args.Cancel <- true
+                quitRequested <- true
+
+                try
+                    turnCts.Cancel()
+                with _ ->
+                    ()
+
+                try
+                    streamCts.Cancel()
+                with _ ->
+                    ())
+
         try
+            try
+                Console.CancelKeyPress.AddHandler(onCancel)
+            with _ ->
+                ()
+
             let! agentId = ReplEngine.ensureModelAgentAsync agents packages initialModel cancellationToken
             let options = SessionOptions()
-            options.Title <- "dot tui spike"
+            options.Title <- "dot layout shell"
             options.HostInstructionFiles <- DotContext.resolveHostInstructionFiles Environment.CurrentDirectory
 
             let! session = SessionClientOperations.OpenSessionAsync(client, agentId, options, cancellationToken)
-            let query = "tui-spike-proof"
+            let query = "tui-shell-proof"
 
             if entered then
                 try
-                    Console.Out.Write("\u001b[?1049h\u001b[?25l")
+                    Console.Out.Write(DotShell.alternateEnter)
                     Console.Out.Flush()
                 with _ ->
                     ()
 
-            use streamCts = new CancellationTokenSource()
             let collected = ResizeArray<string>()
             collected.Add("BOOT seq=- TurnStarted")
+
+            let mutable phase = DotShell.initialTurnState
 
             let paint () : unit =
                 try
                     let width, height = windowSize ()
-                    let frame = renderFrame width height useColor (collected |> List.ofSeq)
+                    let current = lock collected (fun () -> phase)
+
+                    let frame =
+                        DotShell.renderFrame
+                            width
+                            height
+                            useColor
+                            (collected |> List.ofSeq)
+                            (DotShell.statusText session.Id initialModel current)
 
                     if entered then
-                        Console.Out.Write("\u001b[H\u001b[2J" + frame)
+                        Console.Out.Write(DotShell.homeClear + frame)
                         Console.Out.Flush()
                     else
                         Console.Error.Write(frame)
@@ -230,6 +231,30 @@ let runSpikeAsync
                     ()
 
             paint ()
+
+            // Quit-only input: q/Q/Escape quits the proof. Guarded by
+            // entered and KeyAvailable so piped stdin never blocks or
+            // throws out of the wait loop.
+            let pollQuit () : unit =
+                if entered && not quitRequested then
+                    try
+                        if Console.KeyAvailable then
+                            let key = Console.ReadKey(true)
+
+                            if key.KeyChar = 'q' || key.KeyChar = 'Q' || key.Key = ConsoleKey.Escape then
+                                quitRequested <- true
+
+                                try
+                                    turnCts.Cancel()
+                                with _ ->
+                                    ()
+
+                                try
+                                    streamCts.Cancel()
+                                with _ ->
+                                    ()
+                    with _ ->
+                        ()
 
             let streamTask =
                 task {
@@ -252,8 +277,12 @@ let runSpikeAsync
                                         let evt = enumerator.Current
 
                                         if not (isNull (box evt)) then
-                                            let line = $"EVENT seq={evt.Sequence} {evt.GetType().Name}"
-                                            lock collected (fun () -> collected.Add(line))
+                                            let line = ReplEngine.renderEvent evt
+
+                                            lock collected (fun () ->
+                                                collected.Add(line)
+                                                phase <- DotShell.updateTurnState phase evt)
+
                                             paint ()
 
                                             if isProofTerminal evt then
@@ -280,13 +309,17 @@ let runSpikeAsync
                                 client,
                                 session.Id,
                                 UserMessage.Text query,
-                                CancellationToken.None
+                                turnCts.Token
                             )
 
                         return Some result
-                    with error ->
-                        lock collected (fun () -> collected.Add($"TURN-FAILED {error.Message}"))
-                        paint ()
+                    with
+                    | :? OperationCanceledException when quitRequested -> return None
+                    | error ->
+                        if not quitRequested then
+                            lock collected (fun () -> collected.Add($"TURN-FAILED {error.Message}"))
+                            paint ()
+
                         return None
                 }
 
@@ -295,6 +328,8 @@ let runSpikeAsync
                 let mutable waited = false
 
                 while not waited do
+                    pollQuit ()
+
                     let terminal =
                         lock collected (fun () ->
                             collected
@@ -303,7 +338,7 @@ let runSpikeAsync
                                 || line.Contains("TurnAborted")
                                 || line.Contains("TurnFailed")))
 
-                    if terminal || DateTimeOffset.UtcNow >= deadline then
+                    if terminal || quitRequested || DateTimeOffset.UtcNow >= deadline then
                         waited <- true
                     else
                         do! Task.Delay(50)
@@ -324,11 +359,17 @@ let runSpikeAsync
 
             match settled with
             | Some result -> return exitFor result.Status
+            | None when quitRequested -> return 0
             | None -> return 1
         finally
+            try
+                Console.CancelKeyPress.RemoveHandler(onCancel)
+            with _ ->
+                ()
+
             if entered then
                 try
-                    Console.Out.Write("\u001b[?25h\u001b[?1049l")
+                    Console.Out.Write(DotShell.alternateExit)
                     Console.Out.Flush()
                 with _ ->
                     ()
