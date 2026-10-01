@@ -23,6 +23,7 @@
     <Compile Include="DotInput.fs" />
     <Compile Include="DotRender.fs" />
     <Compile Include="DotTuiMode.fs" />
+    <Compile Include="DotTuiRouting.fs" />
     <Compile Include="DotTui.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
