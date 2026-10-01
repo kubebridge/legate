@@ -94,8 +94,9 @@ History lives for the session only and is never written to disk.
 Slash hints list the matching commands (plus prompt template names) with
 one-line descriptions, at most five rows. Pasted multi-line text and long
 single lines clamp to the terminal width with a `>` marker instead of
-corrupting the layout. Piped stdout, `NO_COLOR`, `TERM` dumb/empty/unknown,
-any `CI` marker, or `--no-tui` never enters the shell and runs the plain
+corrupting the layout. Piped stdout, `NO_COLOR`, a dumb `TERM`
+(empty/`unknown` only forces plain off Windows), any `CI` marker, or
+`--no-tui` never enters the shell and runs the plain
 REPL instead, byte-identically: the fallback path loads no TUI code.
 
 Every slash command works fullscreen with identical semantics to the
@@ -114,8 +115,10 @@ and `/abort` still lands while they run; blank question answers resume
 ### Display mode and fallback contract
 
 `--help` states the display mode: dot opens the fullscreen shell on a real
-terminal; `--no-tui`, piped (redirected) stdout, `NO_COLOR`,
-`TERM=dumb`/empty/`unknown`, any `CI` marker except the literal `false`
+terminal; `--no-tui`, piped (redirected) stdout, `NO_COLOR`, explicit
+`TERM=dumb` (empty/`unknown` `TERM` forces plain only off Windows:
+Windows consoles rarely set `TERM` but support fullscreen), any `CI`
+marker except the literal `false`
 (some agents export `CI=false` when interactive), `-p`/`--print`,
 `--mode json` with `-p`, `--sessions`/`--list`, or `--print-config` run the
 plain output instead. The plain REPL names its mode on startup as
