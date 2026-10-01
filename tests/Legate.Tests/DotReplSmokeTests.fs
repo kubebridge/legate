@@ -5,6 +5,7 @@ open System
 open System.Diagnostics
 open System.IO
 open FsUnit.Xunit
+open Microsoft.Extensions.Configuration
 open Xunit
 
 // Dot REPL smoke test (issues 304, 306, 307, 308): runs the built dot
@@ -2457,3 +2458,196 @@ let ``Headless TUI smoke boots renders one turn and exits`` () =
             Directory.Delete(workdir, true)
         with _ ->
             ()
+
+// ──────────────────────────────────────────────────────────────────────────
+// User config location (issue 346): the user scope lives at ~/.config/dot
+// on every platform (%USERPROFILE%\.config\dot on Windows,
+// $XDG_CONFIG_HOME/dot else ~/.config/dot on Unix) with the
+// DOT_CONFIG_HOME override winning on top, while the Windows SQLite
+// default stays pinned at %APPDATA%/dot/dot.db so sessions never orphan.
+// The in-process facts below swap process env vars with restore: this
+// file's facts run sequentially in one collection and no other suite reads
+// these keys, so the swap cannot leak into a parallel smoke child.
+
+/// Runs a body with the named process env vars replaced, restoring every
+/// original value (or absence) afterwards.
+let private withEnv (pairs: (string * string option) list) (body: unit -> 'T) : 'T =
+    let saved =
+        pairs
+        |> List.map (fun (key, _) -> key, Option.ofObj (Environment.GetEnvironmentVariable(key)))
+
+    try
+        for key, value in pairs do
+            match value with
+            | None -> Environment.SetEnvironmentVariable(key, null)
+            | Some text -> Environment.SetEnvironmentVariable(key, text)
+
+        body ()
+    finally
+        for key, original in saved do
+            match original with
+            | None -> Environment.SetEnvironmentVariable(key, null)
+            | Some text -> Environment.SetEnvironmentVariable(key, text)
+
+/// Builds an empty merged configuration: no file or env values, so
+/// resolveDbPath falls through to its default.
+let private emptyConfig () : IConfiguration =
+    ConfigurationBuilder().Build() :> IConfiguration
+
+[<Fact>]
+let ``User config defaults under the user profile with no appdata`` () =
+    withEnv
+        [
+            "DOT_CONFIG_HOME", None
+            "XDG_CONFIG_HOME", None
+        ]
+        (fun () ->
+            let profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)
+            let expected = Path.Combine(profile, ".config", "dot")
+
+            Dot.DotConfig.userConfigDir () |> should equal expected
+
+            Dot.DotConfig.userConfigPath ()
+            |> should equal (Path.Combine(expected, "appsettings.yaml"))
+
+            Dot.DotConfig.userLocalPath ()
+            |> should equal (Path.Combine(expected, "appsettings.local.yaml"))
+
+            if OperatingSystem.IsWindows() then
+                let oldDir =
+                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "dot")
+
+                (Dot.DotConfig.userConfigDir () = oldDir) |> should equal false)
+
+[<Fact>]
+let ``XDG config home still wins on Unix and stays ignored on Windows`` () =
+    withEnv
+        [
+            "DOT_CONFIG_HOME", None
+            "XDG_CONFIG_HOME", Some "/tmp/xdg-346"
+        ]
+        (fun () ->
+            if OperatingSystem.IsWindows() then
+                let profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)
+
+                Dot.DotConfig.userConfigDir ()
+                |> should equal (Path.Combine(profile, ".config", "dot"))
+            else
+                Dot.DotConfig.userConfigDir ()
+                |> should equal (Path.Combine("/tmp/xdg-346", "dot")))
+
+[<Fact>]
+let ``DOT_CONFIG_HOME override still wins with the local sibling next to it`` () =
+    let configBase = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName())
+
+    withEnv [ "DOT_CONFIG_HOME", Some configBase ] (fun () ->
+        let userDot = Path.Combine(configBase, "dot")
+
+        Dot.DotConfig.userConfigDir () |> should equal userDot
+
+        Dot.DotConfig.userConfigPath ()
+        |> should equal (Path.Combine(userDot, "appsettings.yaml"))
+
+        Dot.DotConfig.userLocalPath ()
+        |> should equal (Path.Combine(userDot, "appsettings.local.yaml"))
+
+        let workdir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName())
+        let ordered = Dot.DotConfig.orderedPaths workdir
+
+        ordered
+        |> should
+            equal
+            [
+                Path.Combine(userDot, "appsettings.yaml")
+                Path.Combine(userDot, "appsettings.local.yaml")
+                Path.Combine(workdir, ".dot", "appsettings.yaml")
+                Path.Combine(workdir, ".dot", "appsettings.local.yaml")
+            ])
+
+[<Fact>]
+let ``Database default stays pinned on Windows while following config on Unix`` () =
+    let configBase = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName())
+
+    withEnv
+        [
+            "DOT_CONFIG_HOME", Some configBase
+            "DOT_DB_PATH", None
+        ]
+        (fun () ->
+            let config = emptyConfig ()
+
+            if OperatingSystem.IsWindows() then
+                let pinned =
+                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "dot", "dot.db")
+
+                // The config move never drags the database, even with the
+                // override set: existing sessions stay orphan-free.
+                Dot.DotConfig.defaultDbPath () |> should equal pinned
+                Dot.DotConfig.resolveDbPath config |> should equal pinned
+
+                (Dot.DotConfig.defaultDbPath () = Path.Combine(Dot.DotConfig.userConfigDir (), "dot.db"))
+                |> should equal false
+            else
+                let following = Path.Combine(configBase, "dot", "dot.db")
+                Dot.DotConfig.defaultDbPath () |> should equal following
+                Dot.DotConfig.resolveDbPath config |> should equal following)
+
+[<Fact>]
+let ``Database overrides still beat the default`` () =
+    withEnv
+        [
+            "DOT_CONFIG_HOME", None
+            "DOT_DB_PATH", Some "/tmp/env-346.db"
+        ]
+        (fun () -> Dot.DotConfig.resolveDbPath (emptyConfig ()) |> should equal "/tmp/env-346.db")
+
+    withEnv
+        [
+            "DOT_CONFIG_HOME", None
+            "DOT_DB_PATH", None
+        ]
+        (fun () ->
+            let builder = ConfigurationBuilder()
+
+            builder.AddInMemoryCollection(dict [ "Dot:DbPath", "/tmp/file-346.db" ])
+            |> ignore
+
+            let config = builder.Build() :> IConfiguration
+            Dot.DotConfig.resolveDbPath config |> should equal "/tmp/file-346.db")
+
+[<Fact>]
+let ``Help names the pinned sessions database while config moves`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, _ = freshWorkdir ()
+    let configBase, _ = freshConfigBase ()
+
+    try
+        // DOT_DB_PATH blank reads as absent, so --help prints the default;
+        // DOT_CONFIG_HOME points elsewhere, proving the Windows database
+        // default never follows the configuration.
+        let exit, stdout, stderr =
+            runDotEnv
+                dotDll
+                [ "--help" ]
+                ""
+                workdir
+                ""
+                [
+                    "DOT_CONFIG_HOME", configBase
+                    "DOT_DB_PATH", ""
+                ]
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 2
+
+        let expectedDb =
+            if OperatingSystem.IsWindows() then
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "dot", "dot.db")
+            else
+                Path.Combine(configBase, "dot", "dot.db")
+
+        check output expectedDb
+        check output "set DOT_DB_PATH to override the file"
+    finally
+        deleteSmokeDirs workdir configBase

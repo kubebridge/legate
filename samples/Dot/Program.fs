@@ -46,14 +46,13 @@ open Microsoft.Extensions.Hosting
 // Database path
 
 /// Resolves the SQLite file path: the DOT_DB_PATH override when set,
-/// else the per-user dot config dir (DotConfig.userConfigDir plus
-/// dot.db: DOT_CONFIG_HOME/dot, %APPDATA%/dot on Windows,
-/// $XDG_CONFIG_HOME/dot else ~/.config/dot on Unix).
+/// else the per-user default (DotConfig.defaultDbPath:
+/// %APPDATA%/dot/dot.db on Windows, DOT_CONFIG_HOME/dot else
+/// $XDG_CONFIG_HOME/dot else ~/.config/dot plus dot.db on Unix).
 /// Directory creation rides on SqliteDatabase.Open.
 /// <returns>The database file path.</returns>
 let resolveDbPath () : string =
-    let defaultPath () : string =
-        Path.Combine(DotConfig.userConfigDir (), "dot.db")
+    let defaultPath () : string = DotConfig.defaultDbPath ()
 
     match Environment.GetEnvironmentVariable("DOT_DB_PATH") with
     | null -> defaultPath ()

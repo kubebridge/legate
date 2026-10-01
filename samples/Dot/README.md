@@ -270,7 +270,7 @@ references fail naming the known ids; a missing key names its env var.
 ## Configuration files
 
 Dot reads two optional YAML scopes that share one schema: the user scope
-(`%APPDATA%/dot/appsettings.yaml` on Windows,
+(`%USERPROFILE%\.config\dot\appsettings.yaml` on Windows,
 `$XDG_CONFIG_HOME/dot/appsettings.yaml` else `~/.config/dot/appsettings.yaml`
 on Unix, or `DOT_CONFIG_HOME/dot/appsettings.yaml` when set) and the
 project scope (`./.dot/appsettings.yaml` under the working directory).
@@ -278,6 +278,11 @@ Each scope has an optional gitignored sibling with the same schema that
 overrides its committed counterpart: `appsettings.local.yaml` next to
 each `appsettings.yaml`. Missing files are never errors; malformed YAML
 fails startup naming the path.
+
+Upgrading on Windows: dot no longer reads `%APPDATA%\dot\appsettings.yaml`.
+Move that one file to `%USERPROFILE%\.config\dot\appsettings.yaml` (and
+`appsettings.local.yaml` next to it when you have one). The sessions
+database stays at `%APPDATA%\dot\dot.db` and does not move.
 
 Effective precedence, strongest first: CLI flags, environment variables,
 project `appsettings.local.yaml`, project `appsettings.yaml`, user

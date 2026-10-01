@@ -21,17 +21,16 @@ open YamlDotNet.RepresentationModel
 
 /// Resolves the per-user dot config directory: DOT_CONFIG_HOME/dot when
 /// set (cross-platform override, also used by the keyless smokes to point
-/// at a temp dir), else %APPDATA%/dot on Windows, else
-/// $XDG_CONFIG_HOME/dot else ~/.config/dot on Unix, mirroring the
-/// resolveDbPath base-dir logic (the database default is this dir plus
-/// dot.db).
+/// at a temp dir), else %USERPROFILE%\.config\dot on Windows, else
+/// $XDG_CONFIG_HOME/dot else ~/.config/dot on Unix. The database default
+/// no longer follows this directory on Windows (see defaultDbPath).
 /// <returns>The user config directory.</returns>
 let userConfigDir () : string =
     match Option.ofObj (Environment.GetEnvironmentVariable("DOT_CONFIG_HOME")) with
     | Some home when not (String.IsNullOrWhiteSpace home) -> Path.Combine(home.Trim(), "dot")
     | _ ->
         if OperatingSystem.IsWindows() then
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "dot")
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".config", "dot")
         else
             let baseDir =
                 match Option.ofObj (Environment.GetEnvironmentVariable("XDG_CONFIG_HOME")) with
@@ -328,19 +327,29 @@ let resolveAsk (config: IConfiguration) (flag: bool) : bool =
             | true, parsed -> parsed
             | _ -> raise (InvalidOperationException("Dot configuration value 'Dot:Ask' must be true or false."))
 
+/// Resolves the default SQLite file path before DOT_DB_PATH and
+/// Dot:DbPath overrides: %APPDATA%/dot/dot.db on Windows (pinned, never
+/// following userConfigDir or DOT_CONFIG_HOME, so moving the configuration
+/// never orphans existing sessions), else the per-user dot config dir plus
+/// dot.db (DOT_CONFIG_HOME/dot, $XDG_CONFIG_HOME/dot else ~/.config/dot on
+/// Unix).
+/// <returns>The default database file path.</returns>
+let defaultDbPath () : string =
+    if OperatingSystem.IsWindows() then
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "dot", "dot.db")
+    else
+        Path.Combine(userConfigDir (), "dot.db")
+
 /// Resolves the SQLite file path: DOT_DB_PATH wins, else the Dot:DbPath
-/// file/env value, else the per-user default.
+/// file/env value, else the per-user default (defaultDbPath).
 /// <param name="config">The merged configuration.</param>
 /// <returns>The database file path.</returns>
 let resolveDbPath (config: IConfiguration) : string =
-    let defaultPath () : string =
-        Path.Combine(userConfigDir (), "dot.db")
-
     match Option.ofObj (Environment.GetEnvironmentVariable("DOT_DB_PATH")) with
     | Some raw when not (String.IsNullOrWhiteSpace raw) -> raw.Trim()
     | _ ->
         match Option.ofObj (getNonEmpty config "Dot:DbPath") with
-        | None -> defaultPath ()
+        | None -> defaultDbPath ()
         | Some filePath -> filePath
 
 /// Resolves the workspace root: DOT_WORKSPACE_ROOT wins, else the
