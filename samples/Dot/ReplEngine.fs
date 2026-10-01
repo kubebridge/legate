@@ -379,6 +379,48 @@ let ensureModelAgentAsync
         return agentId
     }
 
+/// Renders one journaled event with the given line prefix. Module-level
+/// (moved verbatim from the former Engine closure) so the TUI shell paints
+/// the same plain transcript lines the REPL streams.
+/// <param name="prefix">The line prefix: EVENT for the live stream, TREE for /tree.</param>
+/// <param name="evt">The event to render.</param>
+/// <returns>The rendered line.</returns>
+let renderWith (prefix: string) (evt: SessionEvent) : string =
+    let sequence =
+        if evt.Sequence.HasValue then
+            evt.Sequence.Value.ToString()
+        else
+            "-"
+
+    let detail =
+        match evt with
+        | :? PermissionRequestedEvent as asked when not (isNull (box asked)) ->
+            $" tool={asked.ToolName} id={asked.RequestId}"
+        | :? PermissionResolvedEvent as resolved when not (isNull (box resolved)) ->
+            $" id={resolved.RequestId} decision={resolved.Decision}"
+        | :? QuestionAskedEvent as asked when not (isNull (box asked)) ->
+            $" id={asked.QuestionId} question={asked.Question}"
+        | :? QuestionAnsweredEvent as answered when not (isNull (box answered)) -> $" id={answered.QuestionId}"
+        | :? TurnFailedEvent as failed when not (isNull (box failed)) -> $" reason={failed.Reason}"
+        | :? TurnAbortedEvent as aborted when not (isNull (box aborted)) -> $" reason={aborted.Reason}"
+        | :? CompactedEvent as compacted when not (isNull (box compacted)) ->
+            $" before={compacted.BeforeEstimate} after={compacted.AfterEstimate}"
+        | :? CompactionFailedEvent as failed when not (isNull (box failed)) -> $" reason={failed.Reason}"
+        | :? UserMessageEvent -> " user-message"
+        | _ -> ""
+
+    $"{prefix} seq={sequence} {evt.GetType().Name}{detail}"
+
+/// Renders one journaled event as a stable single line.
+/// <param name="evt">The event to render.</param>
+/// <returns>The rendered line.</returns>
+let renderEvent (evt: SessionEvent) : string = renderWith "EVENT" evt
+
+/// Renders one journaled event for /tree output.
+/// <param name="evt">The event to render.</param>
+/// <returns>The rendered line.</returns>
+let renderTree (evt: SessionEvent) : string = renderWith "TREE" evt
+
 /// The REPL engine: drives one current session through prompt, stream,
 /// reply, and settle over the given reader/writer.
 type Engine
@@ -492,46 +534,6 @@ type Engine
                 |> Option.defaultValue -1
             else
                 -1
-
-    /// Renders one journaled event with the given line prefix.
-    /// <param name="prefix">The line prefix: EVENT for the live stream, TREE for /tree.</param>
-    /// <param name="evt">The event to render.</param>
-    /// <returns>The rendered line.</returns>
-    let renderWith (prefix: string) (evt: SessionEvent) : string =
-        let sequence =
-            if evt.Sequence.HasValue then
-                evt.Sequence.Value.ToString()
-            else
-                "-"
-
-        let detail =
-            match evt with
-            | :? PermissionRequestedEvent as asked when not (isNull (box asked)) ->
-                $" tool={asked.ToolName} id={asked.RequestId}"
-            | :? PermissionResolvedEvent as resolved when not (isNull (box resolved)) ->
-                $" id={resolved.RequestId} decision={resolved.Decision}"
-            | :? QuestionAskedEvent as asked when not (isNull (box asked)) ->
-                $" id={asked.QuestionId} question={asked.Question}"
-            | :? QuestionAnsweredEvent as answered when not (isNull (box answered)) -> $" id={answered.QuestionId}"
-            | :? TurnFailedEvent as failed when not (isNull (box failed)) -> $" reason={failed.Reason}"
-            | :? TurnAbortedEvent as aborted when not (isNull (box aborted)) -> $" reason={aborted.Reason}"
-            | :? CompactedEvent as compacted when not (isNull (box compacted)) ->
-                $" before={compacted.BeforeEstimate} after={compacted.AfterEstimate}"
-            | :? CompactionFailedEvent as failed when not (isNull (box failed)) -> $" reason={failed.Reason}"
-            | :? UserMessageEvent -> " user-message"
-            | _ -> ""
-
-        $"{prefix} seq={sequence} {evt.GetType().Name}{detail}"
-
-    /// Renders one journaled event as a stable single line.
-    /// <param name="evt">The event to render.</param>
-    /// <returns>The rendered line.</returns>
-    let renderEvent (evt: SessionEvent) : string = renderWith "EVENT" evt
-
-    /// Renders one journaled event for /tree output.
-    /// <param name="evt">The event to render.</param>
-    /// <returns>The rendered line.</returns>
-    let renderTree (evt: SessionEvent) : string = renderWith "TREE" evt
 
     /// Answers one permission request from the console.
     /// <param name="asked">The pending permission request.</param>

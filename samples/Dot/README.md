@@ -55,6 +55,18 @@ CLI flags: `--provider <id>`, `--model <provider/model>`,
 unknown flags fail naming the flag; `--mode` accepts only `text`/`json`;
 `-p` needs a non-empty query; `--wait-minutes` needs a positive number.
 
+## Fullscreen layout shell
+
+On a real terminal dot opens the stdlib-only fullscreen layout shell: an
+ASCII `dot` banner header, a transcript viewport over plain event lines,
+and a status bar naming the short session id, the current model, and the
+live turn state (Idle / Running / WaitingForInput) across the scripted
+turn. Input is quit-only (`q`, `Esc`, or Ctrl+C quits and restores the
+terminal); the renderer and input box land in later children that paint
+into this frame. Resize reflows the tail window without losing content.
+Piped stdout, `NO_COLOR`, `TERM` dumb/empty/unknown, any `CI` marker, or
+`--no-tui` never enters the shell and runs the plain REPL instead.
+
 ## One-shot print
 
 `dot -p "<query>"` (or `--print`) runs one Headless-shaped turn with the

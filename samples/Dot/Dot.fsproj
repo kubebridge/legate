@@ -18,6 +18,7 @@
     <Compile Include="ReplEngine.fs" />
     <Compile Include="CodingTools.fs" />
     <Compile Include="DotMcp.fs" />
+    <Compile Include="DotShell.fs" />
     <Compile Include="DotTui.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
