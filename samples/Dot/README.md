@@ -55,17 +55,38 @@ CLI flags: `--provider <id>`, `--model <provider/model>`,
 unknown flags fail naming the flag; `--mode` accepts only `text`/`json`;
 `-p` needs a non-empty query; `--wait-minutes` needs a positive number.
 
-## Fullscreen layout shell
+## Fullscreen input box
 
-On a real terminal dot opens the stdlib-only fullscreen layout shell: an
-ASCII `dot` banner header, a transcript viewport over plain event lines,
-and a status bar naming the short session id, the current model, and the
-live turn state (Idle / Running / WaitingForInput) across the scripted
-turn. Input is quit-only (`q`, `Esc`, or Ctrl+C quits and restores the
-terminal); the renderer and input box land in later children that paint
-into this frame. Resize reflows the tail window without losing content.
-Piped stdout, `NO_COLOR`, `TERM` dumb/empty/unknown, any `CI` marker, or
-`--no-tui` never enters the shell and runs the plain REPL instead.
+On a real terminal dot opens the stdlib-only fullscreen shell: an ASCII
+`dot` banner header, a transcript viewport over plain event lines, a
+status bar naming the short session id, the current model, and the live
+turn state (Idle / Running / WaitingForInput), and a multiline input box
+with session history and slash-command hints. The box docks into the
+layout shell's input region and routes every submitted line through the
+same handlers the REPL owns (plain text queues, every slash command
+routes verbatim), so delivery-mode and turn semantics stay identical:
+only the capture surface is new.
+
+Keybindings (also summarized in the input region's hint bar):
+
+| Keys | Effect |
+|------|--------|
+| `Enter` | Send (plain text queues behind the turn; slash routes verbatim; empty sends nothing). |
+| `Ctrl+O`, `Alt+Enter` | Newline (`Alt+Enter` where the terminal reports it; `Ctrl+O` everywhere). |
+| `Ctrl+S` | Steer the running turn with the buffer (`Interrupt`; a slash buffer submits verbatim). |
+| `Ctrl+C` | Abort the running turn without killing dot (the buffer is preserved). |
+| `Up`/`Down`, `Ctrl+P`/`Ctrl+N` | Browse session history (`Up`/`Down` move inside multiline text; history is in-memory only). |
+| `Alt+B`/`Alt+F`, `Ctrl+A`/`Ctrl+E`, `Home`/`End`, arrows | Word-wise and line-wise navigation. |
+| `Backspace`/`Delete`, `Ctrl+W`/`Ctrl+U`/`Ctrl+K` | Delete and kill (kill ring edits the line only). |
+| `Esc` on empty input, `Ctrl+Q`, `/quit` | Quit (drains in-flight turns first; bare `q` types). |
+
+History lives for the session only and is never written to disk.
+Slash hints list the matching commands (plus prompt template names) with
+one-line descriptions, at most five rows. Pasted multi-line text and long
+single lines clamp to the terminal width with a `>` marker instead of
+corrupting the layout. Piped stdout, `NO_COLOR`, `TERM` dumb/empty/unknown,
+any `CI` marker, or `--no-tui` never enters the shell and runs the plain
+REPL instead, byte-identically: the fallback path loads no TUI code.
 
 ## One-shot print
 
@@ -388,8 +409,9 @@ Attached servers stop with the process.
 - No per-turn injection extensions and no custom compaction models:
   context files plus Legate defaults cover the sample; custom hooks would
   widen the host surface.
-- No `Alt+Enter` key handling: console commands are the interface, so
-  piped stdin steers deterministically.
+- No `Ctrl+Enter` send and no `Enter`-for-newline: `Enter` sends
+  (the queue default stays discoverable) and newlines ride `Ctrl+O`
+  with `Alt+Enter` as enhancement, so no terminal key-report gamble.
 - No pricing: Legate reports tokens only, so `/session` shows tokens and
   never prices.
 - No per-call tool counts in `/session`: the runtime journals no per-call

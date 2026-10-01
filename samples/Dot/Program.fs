@@ -1271,21 +1271,25 @@ let main (argv: string[]) : int =
                                                     initialModel
                                                     CancellationToken.None
                                         else
-                                            // Spike shell (issue 330): the one-shot (-p), list, and
-                                            // config paths never touch the TUI so piped stdout stays
-                                            // byte-identical; the interactive REPL opens the
-                                            // stdlib-only fullscreen proof only when the pure
-                                            // selector clears (real TTY, no NO_COLOR/TERM=dumb/CI/
-                                            // --no-tui), else it runs the current plain REPL.
+                                            // Fullscreen shell (issues 330-332): the one-shot (-p), list,
+                                            // and config paths never touch the TUI so piped stdout stays
+                                            // byte-identical; the interactive REPL opens the stdlib-only
+                                            // fullscreen input loop only when the pure selector clears
+                                            // (real TTY, no NO_COLOR/TERM=dumb/CI/--no-tui), else it runs
+                                            // the current plain REPL.
                                             let request = DotTui.readRequest effective.NoTui
 
                                             if DotTui.shouldUseTui request then
+                                                let waitBound = TimeSpan.FromMinutes(effective.WaitMinutes)
+
                                                 return!
                                                     DotTui.runSpikeAsync
                                                         client
                                                         agents
                                                         packages
                                                         initialModel
+                                                        options
+                                                        waitBound
                                                         CancellationToken.None
                                             else
                                                 let waitBound = TimeSpan.FromMinutes(effective.WaitMinutes)
