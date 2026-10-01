@@ -112,13 +112,15 @@ module internal Presets =
         }
 
     /// The Ollama Cloud preset: the hosted Ollama OpenAI-compatible v1
-    /// endpoint serving llama3.1 by default. Local Ollama goes through the
-    /// compatible preset with a loopback base URL instead.
+    /// endpoint serving gpt-oss:120b by default (verified live against
+    /// https://ollama.com/api/tags on 2026-10-01; direct /v1 calls use
+    /// the listed name with no :cloud suffix). Local Ollama goes through
+    /// the compatible preset with a loopback base URL instead.
     let OllamaCloud =
         {
             Id = "ollamacloud"
             Endpoint = "https://ollama.com/v1"
-            DefaultModel = "llama3.1"
+            DefaultModel = "gpt-oss:120b"
             Reasoning = false
         }
 

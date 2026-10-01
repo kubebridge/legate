@@ -1390,11 +1390,23 @@ module internal TurnLoop =
                                     logLoop TimeoutExceededMessage
                                     return timedOut
                                 | None -> return! loop nextIterations nextInput nextOutput
-                    with :? OperationCanceledException when isTimeout () ->
+                    with
+                    | :? OperationCanceledException when isTimeout () ->
                         // In-flight provider or tool work died to the
                         // deadline alone: the hard-deadline stop cause.
                         logLoop TimeoutExceededMessage
                         return failedCompletion iterations inputTokens outputTokens TimeoutExceededMessage
+                    | :? ProviderException as providerFailure ->
+                        // Provider failure (issue 349): settle Failed with
+                        // the shaped provider id + status + message instead
+                        // of propagating to the actor fault fallback, so a
+                        // 401 bad key, a 404 bad model, and a network
+                        // failure stay distinguishable. Secrets never
+                        // travel: the formatter reads the structured
+                        // properties only, and the log line is redacted.
+                        let reason = ProviderFailureReason.formatProviderFailure providerFailure
+                        logLoop reason
+                        return failedCompletion iterations inputTokens outputTokens reason
             }
 
         task {
@@ -1783,6 +1795,21 @@ module internal TurnLoop =
 
         let chatOptions = ChatOptions()
         chatOptions.Tools <- ResizeArray<AITool>(tools.Values) :> IList<AITool>
+
+        let log = LoggingScopes.resolveLogger options.Logger
+
+        let scope =
+            if isNull (box options.LogScope) then
+                LoggingScopes.createScope null null null null 0 null
+            else
+                options.LogScope
+
+        /// Logs one loop point under the six canonical scopes, scoped to
+        /// the synchronous block only. Text travels redacted.
+        /// <param name="message">The fixed message.</param>
+        let logLoop (message: string) : unit =
+            use _scope = LoggingScopes.beginScope log scope
+            log.LogInformation("{Message}", LoggingScopes.redactForLog message)
 
         let foldInjects () =
             let pending = selectInjects (drainInjected ())
@@ -2398,13 +2425,25 @@ module internal TurnLoop =
                                 match toolOutcome with
                                 | Some suspended -> return suspended
                                 | None -> return! loop nextIterations nextInput nextOutput
-                    with :? OperationCanceledException when isTimeout () ->
+                    with
+                    | :? OperationCanceledException when isTimeout () ->
                         match options.OnUsageCheckpoint with
                         | Some hook when inputTokens <> 0L || outputTokens <> 0L ->
                             do! hook inputTokens outputTokens linkedToken
                         | _ -> ()
 
                         return failedCompletion iterations inputTokens outputTokens TimeoutExceededMessage
+                    | :? ProviderException as providerFailure ->
+                        // Provider failure (issue 349): settle Failed with
+                        // the shaped provider id + status + message instead
+                        // of propagating to the actor fault fallback, so a
+                        // 401 bad key, a 404 bad model, and a network
+                        // failure stay distinguishable. Secrets never
+                        // travel: the formatter reads the structured
+                        // properties only, and the log line is redacted.
+                        let reason = ProviderFailureReason.formatProviderFailure providerFailure
+                        logLoop reason
+                        return failedCompletion iterations inputTokens outputTokens reason
             }
 
         task {

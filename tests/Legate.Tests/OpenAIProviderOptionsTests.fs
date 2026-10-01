@@ -80,7 +80,7 @@ let ``OllamaCloud preset carries the cloud endpoint and model`` () =
 
     preset.Id |> should equal "ollamacloud"
     preset.Endpoint |> should equal "https://ollama.com/v1"
-    preset.DefaultModel |> should equal "llama3.1"
+    preset.DefaultModel |> should equal "gpt-oss:120b"
     preset.Reasoning |> should equal false
 
 [<Fact>]

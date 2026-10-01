@@ -258,7 +258,7 @@ environment through `Legate:Llm:Providers:<id>:ApiKey` binding only, never
 printed or persisted; `Legate__Llm__Providers__<id>__ApiKey` already set
 wins). Anthropic rides the OpenAI-compatible preset under id `anthropic`;
 Ollama Cloud rides the OpenAI-compatible preset under id `ollamacloud`
-(endpoint `https://ollama.com/v1`, default model `llama3.1`).
+(endpoint `https://ollama.com/v1`, default model `gpt-oss:120b`).
 With exactly one key set dot just works; with several, `--provider` picks,
 else the default order `anthropic, openai, google, ollamacloud` wins; `--model
 <provider/model>` overrides the model (`--provider`/`--model` apply to
@@ -324,7 +324,7 @@ Legate:
       openai:
         ApiKey: sk-...              # same binding live registration reads
       ollamacloud:
-        ApiKey: ollama-...          # endpoint https://ollama.com/v1, default llama3.1
+        ApiKey: ollama-...          # endpoint https://ollama.com/v1, default gpt-oss:120b
 ```
 
 The `Legate` subtree flows unaltered into the runtime's `UseConfiguration`
@@ -365,7 +365,7 @@ committed.
 | `ANTHROPIC_API_KEY` | Enables the `anthropic` provider (OpenAI-compatible preset). |
 | `OPENAI_API_KEY` | Enables the `openai` provider. |
 | `GOOGLE_API_KEY` | Enables the `google` provider. |
-| `OLLAMA_API_KEY` | Enables the `ollamacloud` provider (`https://ollama.com/v1`, default `llama3.1`). |
+| `OLLAMA_API_KEY` | Enables the `ollamacloud` provider (`https://ollama.com/v1`, default `gpt-oss:120b`). |
 | `Legate__Llm__Providers__<id>__ApiKey` | Direct binding already-set wins over the plain key. |
 | `XDG_CONFIG_HOME` | Unix config base when `DOT_DB_PATH` is unset. |
 | `Logging__LogLevel__Default` | Set `None` for pure `--mode json` pipes. |

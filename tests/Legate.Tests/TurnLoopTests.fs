@@ -2247,3 +2247,129 @@ let ``Usage checkpoints skip when the turn spends nothing`` () =
 
     completion.Result.Status |> should equal TurnStatus.Completed
     seen.Count |> should equal 0
+
+// ───────────────────────────────────────────────────────────────────────────
+// Issue 349: provider-call failures settle Failed with the shaped reason
+// (provider id + HTTP status or no-status + provider message) instead of
+// propagating to the actor fault fallback. Anything else still propagates.
+
+let private providerFailure (status: Nullable<int>) (message: string) : ProviderException =
+    ProviderException("ollamacloud", status, Nullable<TimeSpan>(), message)
+
+let private failedReasonOf (result: TurnResult) : string =
+    match result.Outcome with
+    | :? TurnFailed as failed when not (isNull (box failed)) -> failed.Reason
+    | _ ->
+        Assert.Fail("The failed turn carries no TurnFailed outcome.")
+        ""
+
+let private runSuspendableNoGate
+    (client: ScriptedChatClient)
+    (history: IList<ChatMessage>)
+    (options: TurnLoop.TurnLoopOptions)
+    : TurnLoop.TurnLoopCompletion =
+    TurnLoop.runSuspendableAsync
+        (client :> IChatClient)
+        history
+        (makeTools [])
+        options
+        (NeverDelay() :> ILlmDelay)
+        CancellationToken.None
+        alwaysLeased
+        (fun () -> ResizeArray<InboxEntry>() :> IReadOnlyList<InboxEntry>)
+        ignore
+        ignore
+        (Unchecked.defaultof<IPermissionPolicy>)
+        (SessionId.New())
+        (TurnId.New())
+        None
+        (HashSet<string>())
+    |> fun task -> task.GetAwaiter().GetResult()
+
+[<Fact>]
+let ``Provider 401 settles Failed with provider id, status, and message`` () =
+    let failure =
+        providerFailure (Nullable 401) "The 'ollamacloud' provider request failed with HTTP 401."
+
+    let client = scripted [ ScriptStep.Failure failure ]
+    let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+
+    let result =
+        runLoop client history (makeTools []) TurnLoop.TurnLoopOptions.Default CancellationToken.None alwaysLeased
+
+    result.Status |> should equal TurnStatus.Failed
+    result.AssistantText |> should equal ""
+
+    failedReasonOf result
+    |> should
+        equal
+        "The 'ollamacloud' provider call failed with HTTP 401: The 'ollamacloud' provider request failed with HTTP 401."
+
+[<Fact>]
+let ``Provider 404 settles Failed with provider id, status, and message`` () =
+    let failure =
+        providerFailure (Nullable 404) "The 'ollamacloud' provider request failed with HTTP 404."
+
+    let client = scripted [ ScriptStep.Failure failure ]
+    let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+
+    let result =
+        runLoop client history (makeTools []) TurnLoop.TurnLoopOptions.Default CancellationToken.None alwaysLeased
+
+    result.Status |> should equal TurnStatus.Failed
+
+    failedReasonOf result
+    |> should
+        equal
+        "The 'ollamacloud' provider call failed with HTTP 404: The 'ollamacloud' provider request failed with HTTP 404."
+
+[<Fact>]
+let ``Provider network failure settles Failed with no-status`` () =
+    let failure =
+        providerFailure (Nullable<int>()) "The 'ollamacloud' provider call failed with HttpRequestException."
+
+    let client = scripted [ ScriptStep.Failure failure ]
+    let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+
+    let result =
+        runLoop client history (makeTools []) TurnLoop.TurnLoopOptions.Default CancellationToken.None alwaysLeased
+
+    result.Status |> should equal TurnStatus.Failed
+
+    failedReasonOf result
+    |> should
+        equal
+        "The 'ollamacloud' provider call failed with no-status: The 'ollamacloud' provider call failed with HttpRequestException."
+
+[<Fact>]
+let ``Suspendable provider 404 settles Failed with the shaped reason`` () =
+    let failure =
+        providerFailure (Nullable 404) "The 'ollamacloud' provider request failed with HTTP 404."
+
+    let client = scripted [ ScriptStep.Failure failure ]
+    let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+
+    let completion =
+        runSuspendableNoGate client history TurnLoop.TurnLoopOptions.Default
+
+    completion.Result.Status |> should equal TurnStatus.Failed
+
+    failedReasonOf completion.Result
+    |> should
+        equal
+        "The 'ollamacloud' provider call failed with HTTP 404: The 'ollamacloud' provider request failed with HTTP 404."
+
+[<Fact>]
+let ``A non-provider failure still propagates instead of settling`` () =
+    let client =
+        scripted
+            [
+                ScriptStep.Failure(InvalidOperationException("boom"))
+            ]
+
+    let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
+
+    Assert.Throws<InvalidOperationException>(fun () ->
+        runLoop client history (makeTools []) TurnLoop.TurnLoopOptions.Default CancellationToken.None alwaysLeased
+        |> ignore)
+    |> ignore

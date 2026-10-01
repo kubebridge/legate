@@ -4487,11 +4487,17 @@ module internal SessionActor =
                         | None ->
                             match settling with
                             | Some tid ->
-                                let faultName =
-                                    if isNull (box error) then
-                                        "Exception"
-                                    else
-                                        error.GetType().Name
+                                // Fault detail (issue 349): a provider fault
+                                // settles with the shaped provider id +
+                                // status + message through the shared
+                                // formatter, so a 401 bad key and a 404 bad
+                                // model stay distinguishable; every other
+                                // fault keeps the type-name shape.
+                                // failedReasonOf passes the reason through
+                                // untouched. Secrets never travel: the
+                                // formatter reads ProviderException
+                                // properties only.
+                                let reason = ProviderFailureReason.formatFault error
 
                                 let failed =
                                     {
@@ -4499,7 +4505,7 @@ module internal SessionActor =
                                         Status = TurnStatus.Failed
                                         Iterations = 0
                                         Usage = { InputTokens = 0L; OutputTokens = 0L }
-                                        Outcome = TurnFailed(sprintf "The turn faulted: %s." faultName) :> TurnOutcome
+                                        Outcome = TurnFailed(reason) :> TurnOutcome
                                     }
 
                                 journalSettledCompletion tid failed

@@ -1025,7 +1025,7 @@ let ``Model lists ollamacloud with dummy keys`` () =
 
         exit |> should equal 0
         check output "ollamacloud"
-        check output "llama3.1"
+        check output "gpt-oss:120b"
         checkNoErrors output
     finally
         try
