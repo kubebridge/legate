@@ -487,3 +487,16 @@ let ``CursorLine reads the cursor row`` () =
     let editor = fromText "first\nsecond"
     cursorLine { editor with Row = 0; Col = 0 } |> should equal "first"
     cursorLine editor |> should equal "second"
+
+[<Fact>]
+let ``Plain Enter resumes a blank pending question`` () =
+    isPlainEnter enterKey |> should equal true
+
+    isPlainEnter (ConsoleKeyInfo('\r', ConsoleKey.Enter, true, false, false))
+    |> should equal true
+
+    isPlainEnter altEnterKey |> should equal false
+    isPlainEnter (ctrlKey ConsoleKey.Enter '\r') |> should equal false
+    isPlainEnter (plainKey ConsoleKey.UpArrow) |> should equal false
+    isPlainEnter (charKey 'a') |> should equal false
+    isPlainEnter escapeKey |> should equal false
