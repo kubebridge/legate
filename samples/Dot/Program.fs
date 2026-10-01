@@ -22,12 +22,12 @@ open Microsoft.Extensions.Hosting
 // slash-command REPL (#304) drives each turn as waiter-queued-before-prompt
 // plus Subscribe streaming with inline permission/question replies, over
 // the /new, /sessions, /resume, /model, /steer, /follow, /abort, /compact,
-// /tree, /fork, /clone, /session, /export, /<template>, and /quit commands. Live providers (#307) register
+// /tree, /fork, /clone, /session, /export, /<template>, and /quit commands. Live providers (#307, #329) register
 // only when their env key is present (Anthropic through the OpenAI-compatible
-// preset under id anthropic, OpenAI, Google), with keys flowing from the
+// preset under id anthropic, OpenAI, Google, Ollama Cloud), with keys flowing from the
 // environment through IConfiguration binding only, never printed or
 // persisted; with exactly one key set dot just works, with several
-// --provider picks, else the default order anthropic, openai, google wins,
+// --provider picks, else the default order anthropic, openai, google, ollamacloud wins,
 // and --model overrides the model. Mid-session /model switches through
 // SetAgentAsync against a model-carrying agent row, so the transcript and
 // workspace binding survive. Steering (#308) stays foreground while one
@@ -119,7 +119,7 @@ type DotStart =
 let private helpText (dbPath: string) : string =
     "Usage: Dot [--provider <id>] [--model <provider/model>] [--resume <session-id>] [--sessions|--list] [-p|--print <query>] [--mode text|json] [--scripted] [--wait-minutes <n>] [--ask] [--mcp <path>] [--print-config] "
     + storageHelp dbPath
-    + " Providers anthropic, openai, and google register only when ANTHROPIC_API_KEY, OPENAI_API_KEY, or GOOGLE_API_KEY is set (keys flow from the environment through Legate:Llm:Providers:<id>:ApiKey binding only, never printed or persisted). With exactly one key set dot just works; with several, --provider picks, else the default order anthropic, openai, google wins; --model <provider/model> overrides the model (--provider/--model apply to live mode; --scripted pins the scripted transport). /model lists the options mid-session and switches without losing the transcript. "
+    + " Providers anthropic, openai, google, and ollamacloud register only when ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_API_KEY, or OLLAMA_API_KEY is set (keys flow from the environment through Legate:Llm:Providers:<id>:ApiKey binding only, never printed or persisted). With exactly one key set dot just works; with several, --provider picks, else the default order anthropic, openai, google, ollamacloud wins; --model <provider/model> overrides the model (--provider/--model apply to live mode; --scripted pins the scripted transport). /model lists the options mid-session and switches without losing the transcript. "
     + " Tools run against the working directory through the host-directory runtime with no sandbox: sandbox the run in a container (as pi does) or pass --ask for per-call approval (allow once, allow for session, deny). The workspace root fence stays on in every mode. "
     + " One-shot print: -p|--print <query> runs one Headless-shaped turn (PromptAndWaitAsync under --wait-minutes with the Dot agent) instead of the REPL, printing only the final answer to stdout and exiting 0 completed, 2 aborted, 1 failed, 3 anything else (--resume attaches instead of opening; --sessions still lists). JSON stream: --mode json with -p streams session events as JSONL to stdout (one $type-polymorphic event per line, DotExport options) for scripting as dot --mode json -p \"<query>\" | <jsonl-parser>, with every human diagnostic on stderr; without -p --mode is ignored and the REPL runs in text."
     + " Configuration: dot reads optional YAML files in order user appsettings.yaml < user appsettings.local.yaml < project ./.dot/appsettings.yaml < project ./.dot/appsettings.local.yaml (missing files are never errors), then environment variables, then CLI flags strongest; --print-config prints the effective Dot plus Legate configuration with secret values masked and exits 0. See samples/Dot/README.md for the schema."
@@ -638,7 +638,8 @@ let private selectLiveClient (provider: IServiceProvider) (start: DotStart) : IC
 /// mcp.json attach, and the scripted provider or the live providers. Live
 /// providers register only when their env key is present (Anthropic rides
 /// the OpenAI-compatible preset under id anthropic: the native AddAnthropic
-/// never registers alongside it, last registration wins); keys flow from
+/// never registers alongside it, last registration wins; Ollama Cloud rides
+/// the OpenAI-compatible preset under id ollamacloud); keys flow from
 /// the environment through IConfiguration binding only (see
 /// bridgeProviderKeys), never printed or persisted.
 /// <param name="services">The container to add the host to.</param>
@@ -699,6 +700,9 @@ let private buildServices
                 if DotConfig.hasProviderKey configuration "google" then
                     Legate.Llm.GoogleServiceCollectionExtensions.AddGoogle(builder.Services, configuration)
                     |> ignore
+
+                if DotConfig.hasProviderKey configuration "ollamacloud" then
+                    builder.Llm.AddOllamaCloud(configuration) |> ignore
 
             match start.McpPath with
             | null -> ()

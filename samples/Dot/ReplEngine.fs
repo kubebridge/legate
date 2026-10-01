@@ -55,7 +55,13 @@ type ProviderOption =
 
 /// The provider ids in default priority order when several keys are set
 /// and --provider is absent.
-let defaultProviderOrder = [ "anthropic"; "openai"; "google" ]
+let defaultProviderOrder =
+    [
+        "anthropic"
+        "openai"
+        "google"
+        "ollamacloud"
+    ]
 
 /// The env var carrying the provider key, or null for unknown ids.
 let private providerEnvVar (id: string) : string | null =
@@ -63,6 +69,7 @@ let private providerEnvVar (id: string) : string | null =
     | "anthropic" -> "ANTHROPIC_API_KEY"
     | "openai" -> "OPENAI_API_KEY"
     | "google" -> "GOOGLE_API_KEY"
+    | "ollamacloud" -> "OLLAMA_API_KEY"
     | _ -> null
 
 /// Snapshots the registered providers for selection and /model listing.
@@ -116,7 +123,7 @@ let private pickDefault (options: ProviderOption list) : ProviderOption =
     | [] ->
         raise (
             InvalidOperationException(
-                "No provider is registered (known: anthropic, openai, google). Set ANTHROPIC_API_KEY, OPENAI_API_KEY, or GOOGLE_API_KEY."
+                "No provider is registered (known: anthropic, openai, google, ollamacloud). Set ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_API_KEY, or OLLAMA_API_KEY."
             )
         )
     | [ single ] -> single
@@ -157,7 +164,7 @@ let selectReference
     if options.IsEmpty then
         raise (
             InvalidOperationException(
-                "No provider is registered (known: anthropic, openai, google). Set ANTHROPIC_API_KEY, OPENAI_API_KEY, or GOOGLE_API_KEY."
+                "No provider is registered (known: anthropic, openai, google, ollamacloud). Set ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_API_KEY, or OLLAMA_API_KEY."
             )
         )
 

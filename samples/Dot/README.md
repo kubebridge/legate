@@ -169,13 +169,16 @@ overwrite mirrors `write_file`. There is no `/share` gist upload.
 
 ## Providers and models
 
-`anthropic`, `openai`, and `google` register only when `ANTHROPIC_API_KEY`,
-`OPENAI_API_KEY`, or `GOOGLE_API_KEY` is set (keys flow from the
+`anthropic`, `openai`, `google`, and `ollamacloud` register only when
+`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_API_KEY`, or `OLLAMA_API_KEY`
+is set (keys flow from the
 environment through `Legate:Llm:Providers:<id>:ApiKey` binding only, never
 printed or persisted; `Legate__Llm__Providers__<id>__ApiKey` already set
-wins). Anthropic rides the OpenAI-compatible preset under id `anthropic`.
+wins). Anthropic rides the OpenAI-compatible preset under id `anthropic`;
+Ollama Cloud rides the OpenAI-compatible preset under id `ollamacloud`
+(endpoint `https://ollama.com/v1`, default model `llama3.1`).
 With exactly one key set dot just works; with several, `--provider` picks,
-else the default order `anthropic, openai, google` wins; `--model
+else the default order `anthropic, openai, google, ollamacloud` wins; `--model
 <provider/model>` overrides the model (`--provider`/`--model` apply to
 live mode; `--scripted` pins the scripted transport).
 
@@ -215,11 +218,15 @@ Dot:
   Providers:
     anthropic:
       ApiKey: sk-ant-...            # or ${ANTHROPIC_API_KEY}
+    ollamacloud:
+      ApiKey: ollama-...            # or ${OLLAMA_API_KEY}
 Legate:
   Llm:
     Providers:
       openai:
         ApiKey: sk-...              # same binding live registration reads
+      ollamacloud:
+        ApiKey: ollama-...          # endpoint https://ollama.com/v1, default llama3.1
 ```
 
 The `Legate` subtree flows unaltered into the runtime's `UseConfiguration`
@@ -241,7 +248,7 @@ dotnet run --project samples/Dot/Dot.fsproj -- --print-config
 
 Secrets posture: API keys may live inline in either YAML file or come
 from the environment (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
-`GOOGLE_API_KEY`, or the `Legate__Llm__Providers__<id>__ApiKey` /
+`GOOGLE_API_KEY`, `OLLAMA_API_KEY`, or the `Legate__Llm__Providers__<id>__ApiKey` /
 `Dot__*` bindings). Inline files are convenient and work offline; the
 environment keeps secrets out of the filesystem. Either way, set file
 permissions you trust and never paste the dump (even redacted) next to
@@ -260,6 +267,7 @@ committed.
 | `ANTHROPIC_API_KEY` | Enables the `anthropic` provider (OpenAI-compatible preset). |
 | `OPENAI_API_KEY` | Enables the `openai` provider. |
 | `GOOGLE_API_KEY` | Enables the `google` provider. |
+| `OLLAMA_API_KEY` | Enables the `ollamacloud` provider (`https://ollama.com/v1`, default `llama3.1`). |
 | `Legate__Llm__Providers__<id>__ApiKey` | Direct binding already-set wins over the plain key. |
 | `XDG_CONFIG_HOME` | Unix config base when `DOT_DB_PATH` is unset. |
 | `Logging__LogLevel__Default` | Set `None` for pure `--mode json` pipes. |
