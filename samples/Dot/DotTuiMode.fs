@@ -20,7 +20,8 @@ type TuiRequest =
         OutputRedirected: bool
         /// NO_COLOR is set and non-empty: plain, no ANSI colors.
         NoColor: bool
-        /// TERM=dumb (or empty): plain, the terminal cannot do fullscreen.
+        /// TERM-selected plain output (see isTermDumb): explicit dumb is dumb
+        /// everywhere; empty/unknown are dumb only off Windows.
         TermDumb: bool
         /// A CI environment variable is set: plain, there is no human to see
         /// the fullscreen shell.
@@ -72,6 +73,24 @@ let isCiEnvironment () : bool =
     || isMarkerSet (Environment.GetEnvironmentVariable("TF_BUILD"))
     || isMarkerSet (Environment.GetEnvironmentVariable("CONTINUOUS_INTEGRATION"))
 
+/// True when TERM forces plain output (issue 348): an explicit "dumb" is
+/// dumb on every platform (explicit user intent wins); an empty or
+/// "unknown" TERM is dumb only off Windows (Windows consoles rarely set
+/// TERM but support fullscreen through the Win32 console API). Anything
+/// else names a capable terminal. Never throws for a missing variable.
+let isTermDumb (term: string | null, isWindows: bool) : bool =
+    let normalized =
+        match term with
+        | null -> ""
+        | raw -> raw.Trim().ToLowerInvariant()
+
+    if normalized = "dumb" then
+        true
+    elif normalized = "" || normalized = "unknown" then
+        not isWindows
+    else
+        false
+
 /// Reads the live selector request: the flag plus redirected stdout and
 /// the NO_COLOR / TERM / CI environment. Never throws for missing
 /// variables; a security-stubbed IsOutputRedirected falls back to plain.
@@ -85,16 +104,11 @@ let readRequest (noTuiFlag: bool) : TuiRequest =
     let noColor =
         not (String.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("NO_COLOR")))
 
-    let term =
-        match Environment.GetEnvironmentVariable("TERM") with
-        | null -> ""
-        | raw -> raw.Trim().ToLowerInvariant()
-
     {
         NoTuiFlag = noTuiFlag
         OutputRedirected = redirected
         NoColor = noColor
-        TermDumb = term = "" || term = "dumb" || term = "unknown"
+        TermDumb = isTermDumb (Environment.GetEnvironmentVariable("TERM"), OperatingSystem.IsWindows())
         Ci = isCiEnvironment ()
     }
 

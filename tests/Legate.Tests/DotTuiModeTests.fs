@@ -16,9 +16,9 @@ open Xunit
 [<CollectionDefinition("DotTuiEnv", DisableParallelization = true)>]
 type DotTuiEnvCollection() = class end
 
-// Selector proofs (issue 335): the pure DotTuiMode fullscreen/plain matrix
-// (--no-tui, redirected stdout, NO_COLOR, TERM dumb/empty/unknown, CI
-// markers including the CI=false nuance), the reason priority order, and
+// Selector proofs (issues 335, 348): the pure DotTuiMode fullscreen/plain matrix
+// (--no-tui, redirected stdout, NO_COLOR, TERM dumb/empty/unknown with the
+// Windows exception, CI markers including the CI=false nuance), the reason priority order, and
 // the display-mode description --help and the startup hint print. TTY-free:
 // every case runs against pure TuiRequest inputs, so mode selection is
 // proven without a terminal. The linked DotTuiMode.fs compiles here without
@@ -73,6 +73,21 @@ let ``Dumb terminal forces plain`` () =
     shouldUseTui request |> should equal false
     plainReason request |> should equal "TERM=dumb"
     describeSelection request |> should equal "plain (TERM=dumb)"
+
+// TERM matrix (issue 348): explicit dumb is dumb everywhere; empty/unknown
+// are dumb only off Windows (Windows consoles rarely set TERM but support
+// fullscreen); anything else is sane on both platforms.
+[<Theory>]
+[<InlineData("", true, false)>]
+[<InlineData("unknown", true, false)>]
+[<InlineData("dumb", true, true)>]
+[<InlineData("xterm-256color", true, false)>]
+[<InlineData("", false, true)>]
+[<InlineData("unknown", false, true)>]
+[<InlineData("dumb", false, true)>]
+[<InlineData("xterm-256color", false, false)>]
+let ``Term dumb keeps the Windows exception`` (term: string, isWindows: bool, expected: bool) =
+    isTermDumb (term, isWindows) |> should equal expected
 
 [<Fact>]
 let ``CI marker forces plain`` () =
