@@ -51,7 +51,7 @@ the usage; a `/<name>` that matches a prompt template expands it instead
 CLI flags: `--provider <id>`, `--model <provider/model>`,
 `--resume <session-id>`, `--sessions`/`--list`, `-p`/`--print <query>`,
 `--mode text|json`, `--scripted`, `--wait-minutes <n>`, `--ask`,
-`--mcp <path>`, `--help`/`-h`. Missing values fail naming the flag;
+`--mcp <path>`, `--print-config`, `--help`/`-h`. Missing values fail naming the flag;
 unknown flags fail naming the flag; `--mode` accepts only `text`/`json`;
 `-p` needs a non-empty query; `--wait-minutes` needs a positive number.
 
@@ -185,11 +185,78 @@ current one) and `/model <provider[/model]>` switches mid-session through
 workspace binding survive the switch. Unknown providers and unparsable
 references fail naming the known ids; a missing key names its env var.
 
+## Configuration files
+
+Dot reads two optional YAML scopes that share one schema: the user scope
+(`%APPDATA%/dot/appsettings.yaml` on Windows,
+`$XDG_CONFIG_HOME/dot/appsettings.yaml` else `~/.config/dot/appsettings.yaml`
+on Unix, or `DOT_CONFIG_HOME/dot/appsettings.yaml` when set) and the
+project scope (`./.dot/appsettings.yaml` under the working directory).
+Each scope has an optional gitignored sibling with the same schema that
+overrides its committed counterpart: `appsettings.local.yaml` next to
+each `appsettings.yaml`. Missing files are never errors; malformed YAML
+fails startup naming the path.
+
+Effective precedence, strongest first: CLI flags, environment variables,
+project `appsettings.local.yaml`, project `appsettings.yaml`, user
+`appsettings.local.yaml`, user `appsettings.yaml`, built-in safe defaults
+(no provider pick, no model override, the working directory as workspace
+root, the per-user `dot.db`, allow-all tools).
+
+Schema (both scopes, same keys):
+
+```yaml
+Dot:
+  Provider: anthropic        # default provider; --provider wins
+  Model: anthropic/claude-opus-4-6  # default model; --model wins
+  WorkspaceRoot: /path/to/work      # default: the working directory
+  DbPath: /path/to/dot.db           # default: the per-user dot.db; DOT_DB_PATH wins
+  Ask: false                         # default permission policy; --ask forces true
+  Providers:
+    anthropic:
+      ApiKey: sk-ant-...            # or ${ANTHROPIC_API_KEY}
+Legate:
+  Llm:
+    Providers:
+      openai:
+        ApiKey: sk-...              # same binding live registration reads
+```
+
+The `Legate` subtree flows unaltered into the runtime's `UseConfiguration`
+section, so every Legate option rides the files too. Nested maps flatten
+to `:`-joined keys and lists index by position. `${NAME}` placeholders in
+any string value expand from the process environment (`${VAR:-default}`,
+`$VAR`, and `~/tilde` never expand); an unset or empty variable fails
+startup naming the config key and the variable, and values never appear in
+error text.
+
+`--print-config` prints the effective `Dot` plus `Legate` configuration,
+one sorted `key=value` line per entry on stdout, and exits 0 without
+opening the database or the network. Keys carrying `ApiKey`, `Secret`,
+`Token`, or `Password` print as `***`:
+
+```bash
+dotnet run --project samples/Dot/Dot.fsproj -- --print-config
+```
+
+Secrets posture: API keys may live inline in either YAML file or come
+from the environment (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
+`GOOGLE_API_KEY`, or the `Legate__Llm__Providers__<id>__ApiKey` /
+`Dot__*` bindings). Inline files are convenient and work offline; the
+environment keeps secrets out of the filesystem. Either way, set file
+permissions you trust and never paste the dump (even redacted) next to
+real keys. The repo gitignores `appsettings.local.yaml`; add the same
+pattern to your own project's `.gitignore` so local overrides are never
+committed.
+
 ## Environment keys
 
 | Key | Effect |
 |-----|--------|
 | `DOT_DB_PATH` | Overrides the SQLite file (per-run temp files in smoke). |
+| `DOT_CONFIG_HOME` | Overrides the user config base dir (`<dir>/dot/appsettings.yaml`). |
+| `DOT_WORKSPACE_ROOT` | Overrides the workspace root (else `Dot:WorkspaceRoot`, else cwd). |
+| `Dot__<Section>__<Key>` | Sets any `Dot:` file value from the environment (env beats files). |
 | `ANTHROPIC_API_KEY` | Enables the `anthropic` provider (OpenAI-compatible preset). |
 | `OPENAI_API_KEY` | Enables the `openai` provider. |
 | `GOOGLE_API_KEY` | Enables the `google` provider. |

@@ -46,23 +46,14 @@ open Microsoft.Extensions.Hosting
 // Database path
 
 /// Resolves the SQLite file path: the DOT_DB_PATH override when set,
-/// else the per-user dot config dir (%APPDATA%/dot/dot.db on Windows,
-/// $XDG_CONFIG_HOME/dot/dot.db else ~/.config/dot/dot.db on Unix).
+/// else the per-user dot config dir (DotConfig.userConfigDir plus
+/// dot.db: DOT_CONFIG_HOME/dot, %APPDATA%/dot on Windows,
+/// $XDG_CONFIG_HOME/dot else ~/.config/dot on Unix).
 /// Directory creation rides on SqliteDatabase.Open.
 /// <returns>The database file path.</returns>
 let resolveDbPath () : string =
     let defaultPath () : string =
-        if OperatingSystem.IsWindows() then
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "dot", "dot.db")
-        else
-            let baseDir =
-                match Environment.GetEnvironmentVariable("XDG_CONFIG_HOME") with
-                | null -> Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".config")
-                | xdg when String.IsNullOrWhiteSpace xdg ->
-                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".config")
-                | xdg -> xdg.Trim()
-
-            Path.Combine(baseDir, "dot", "dot.db")
+        Path.Combine(DotConfig.userConfigDir (), "dot.db")
 
     match Environment.GetEnvironmentVariable("DOT_DB_PATH") with
     | null -> defaultPath ()
@@ -113,6 +104,10 @@ type DotStart =
         /// answer to stdout, "json" streams session events as JSONL to
         /// stdout with diagnostics on stderr. Ignored without -p|--print.
         Mode: string
+        /// Print the redacted effective configuration (Dot plus Legate
+        /// sections, secret values masked) to stdout and exit 0 without
+        /// opening the database or the network.
+        PrintConfig: bool
     }
 
 /// Builds the --help text over the resolved database path: usage, session
@@ -122,11 +117,12 @@ type DotStart =
 /// <param name="dbPath">The resolved database file path.</param>
 /// <returns>The usage text.</returns>
 let private helpText (dbPath: string) : string =
-    "Usage: Dot [--provider <id>] [--model <provider/model>] [--resume <session-id>] [--sessions|--list] [-p|--print <query>] [--mode text|json] [--scripted] [--wait-minutes <n>] [--ask] [--mcp <path>] "
+    "Usage: Dot [--provider <id>] [--model <provider/model>] [--resume <session-id>] [--sessions|--list] [-p|--print <query>] [--mode text|json] [--scripted] [--wait-minutes <n>] [--ask] [--mcp <path>] [--print-config] "
     + storageHelp dbPath
     + " Providers anthropic, openai, and google register only when ANTHROPIC_API_KEY, OPENAI_API_KEY, or GOOGLE_API_KEY is set (keys flow from the environment through Legate:Llm:Providers:<id>:ApiKey binding only, never printed or persisted). With exactly one key set dot just works; with several, --provider picks, else the default order anthropic, openai, google wins; --model <provider/model> overrides the model (--provider/--model apply to live mode; --scripted pins the scripted transport). /model lists the options mid-session and switches without losing the transcript. "
     + " Tools run against the working directory through the host-directory runtime with no sandbox: sandbox the run in a container (as pi does) or pass --ask for per-call approval (allow once, allow for session, deny). The workspace root fence stays on in every mode. "
     + " One-shot print: -p|--print <query> runs one Headless-shaped turn (PromptAndWaitAsync under --wait-minutes with the Dot agent) instead of the REPL, printing only the final answer to stdout and exiting 0 completed, 2 aborted, 1 failed, 3 anything else (--resume attaches instead of opening; --sessions still lists). JSON stream: --mode json with -p streams session events as JSONL to stdout (one $type-polymorphic event per line, DotExport options) for scripting as dot --mode json -p \"<query>\" | <jsonl-parser>, with every human diagnostic on stderr; without -p --mode is ignored and the REPL runs in text."
+    + " Configuration: dot reads optional YAML files in order user appsettings.yaml < user appsettings.local.yaml < project ./.dot/appsettings.yaml < project ./.dot/appsettings.local.yaml (missing files are never errors), then environment variables, then CLI flags strongest; --print-config prints the effective Dot plus Legate configuration with secret values masked and exits 0. See samples/Dot/README.md for the schema."
 
 /// Parses the dot arguments into a start plan. Unknown flags fail with a
 /// usage error naming the flag; missing values fail naming the flag.
@@ -143,6 +139,7 @@ let parseArgs (argv: string[]) : DotStart =
     let mutable mcp: string | null = null
     let mutable print: string | null = null
     let mutable mode = "text"
+    let mutable printConfig = false
 
     let mutable index = 0
 
@@ -184,6 +181,7 @@ let parseArgs (argv: string[]) : DotStart =
                 )
         | "--ask" -> ask <- true
         | "--mcp" -> mcp <- take "--mcp"
+        | "--print-config" -> printConfig <- true
         | "--help"
         | "-h" -> raise (ArgumentException(helpText (resolveDbPath ()), "--help"))
         | unknown -> raise (ArgumentException($"Unknown flag '{unknown}'.", unknown))
@@ -236,6 +234,7 @@ let parseArgs (argv: string[]) : DotStart =
         McpPath = mcpValue
         Print = printValue
         Mode = mode
+        PrintConfig = printConfig
     }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -584,35 +583,22 @@ type private StaticSource(tools: IReadOnlyList<AITool>) =
         member _.GetTools(_) = Task.FromResult(tools)
 
 // ──────────────────────────────────────────────────────────────────────────
-// Provider keys (issue 307)
+// Provider keys (issues 307, 328)
 
-/// Whether the environment carries the provider key: the registration
-/// gate, mirroring the samples/MinimalHost precedent.
-let private hasKey (name: string) : bool =
-    not (String.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(name)))
+/// Whether any live provider key is present in the effective config
+/// (YAML files, Dot-section keys, or plain env keys).
+/// <param name="config">The merged configuration.</param>
+/// <returns>True when live mode can serve.</returns>
+let private hasLiveKey (config: IConfiguration) : bool = DotConfig.hasLiveKey config
 
-/// Whether any live provider key is present.
-let private hasLiveKey () : bool =
-    hasKey "ANTHROPIC_API_KEY" || hasKey "OPENAI_API_KEY" || hasKey "GOOGLE_API_KEY"
-
-/// Bridges the plain provider env keys into the Legate provider sections
-/// before the host builds its configuration, so `export ANTHROPIC_API_KEY`
-/// satisfies the Legate:Llm:Providers:anthropic:ApiKey binding the Add*
-/// registration reads (AGENTS.md Agent Login names both sources). A
-/// Legate:Llm:Providers:<id>:ApiKey value already in the environment wins:
-/// the bridge only fills blanks. Process memory only: nothing is printed
-/// or persisted.
-let private bridgeProviderKeys () : unit =
-    let bridge (plain: string) (compound: string) : unit =
-        if String.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(compound)) then
-            let value = Environment.GetEnvironmentVariable(plain)
-
-            if not (String.IsNullOrWhiteSpace value) then
-                Environment.SetEnvironmentVariable(compound, value)
-
-    bridge "ANTHROPIC_API_KEY" "Legate__Llm__Providers__anthropic__ApiKey"
-    bridge "OPENAI_API_KEY" "Legate__Llm__Providers__openai__ApiKey"
-    bridge "GOOGLE_API_KEY" "Legate__Llm__Providers__Google__ApiKey"
+/// Bridges the plain provider env keys and Dot-section file keys into the
+/// Legate provider sections, so `export ANTHROPIC_API_KEY` satisfies the
+/// Legate:Llm:Providers:anthropic:ApiKey binding the Add* registration
+/// reads (AGENTS.md Agent Login names both sources). An explicit compound
+/// value already in the environment or files wins: the bridge only fills
+/// blanks. Process memory only: nothing is printed or persisted.
+/// <param name="config">The merged configuration.</param>
+let private bridgeProviderKeys (config: IConfiguration) : unit = DotConfig.bridgeProviderKeys config
 
 // ──────────────────────────────────────────────────────────────────────────
 // Host building
@@ -674,8 +660,10 @@ let private buildServices
     LegateServiceCollectionExtensions.AddLegate(
         services,
         Action<LegateBuilder>(fun builder ->
+            builder.UseConfiguration(configuration.GetSection("Legate")) |> ignore
+
             let workspaceOptions = HostDirectoryWorkspaceRuntimeOptions()
-            workspaceOptions.Root <- Environment.CurrentDirectory
+            workspaceOptions.Root <- DotConfig.resolveWorkspaceRoot configuration
 
             builder.Workspace.UseRuntime(HostDirectoryWorkspaceRuntime(workspaceOptions, null, null))
             |> ignore
@@ -702,13 +690,13 @@ let private buildServices
             builder.Tools.AddSource<DotSkills.SkillToolSource>() |> ignore
 
             if not useScripted then
-                if hasKey "ANTHROPIC_API_KEY" then
+                if DotConfig.hasProviderKey configuration "anthropic" then
                     builder.Llm.AddAnthropicCompatible(configuration) |> ignore
 
-                if hasKey "OPENAI_API_KEY" then
+                if DotConfig.hasProviderKey configuration "openai" then
                     builder.Llm.AddOpenAI(configuration) |> ignore
 
-                if hasKey "GOOGLE_API_KEY" then
+                if DotConfig.hasProviderKey configuration "google" then
                     Legate.Llm.GoogleServiceCollectionExtensions.AddGoogle(builder.Services, configuration)
                     |> ignore
 
@@ -1105,90 +1093,139 @@ let private reportLocked (dbPath: string) (locked: SqliteLockedException) : unit
 
 [<EntryPoint>]
 let main (argv: string[]) : int =
-    let runAsync (start: DotStart) (dbPath: string) : Task<int> =
+    let runAsync (start: DotStart) : Task<int> =
         task {
-            // Scripted unless live mode was asked for with keys to serve
-            // it: --scripted pins scripted, and no keys fall back to it.
-            let useScripted = start.Scripted || not (hasLiveKey ())
-
             let application = Host.CreateApplicationBuilder()
-            buildServices application.Services dbPath start application.Configuration useScripted
 
-            use host = application.Build()
+            // YAML scopes weakest first, then the environment again so env
+            // wins over files; CLI flags win through the effective resolve
+            // below (never through the configuration itself).
+            let configBuilder = application.Configuration :> IConfigurationBuilder
 
-            // Resolve before starting: the resolve triggers the session
-            // router wiring, which must land before the actor system spawns
-            // its router.
-            let client = host.Services.GetRequiredService<SessionClient>()
-            let agents = host.Services.GetRequiredService<IAgentStore>()
-            let packages = host.Services.GetRequiredService<IAgentPackageStore>()
+            for path in DotConfig.orderedPaths Environment.CurrentDirectory do
+                configBuilder.Add(DotConfig.yamlSource path) |> ignore
+
+            configBuilder.AddEnvironmentVariables() |> ignore
+
+            let configuration = application.Configuration :> IConfiguration
 
             try
-                do! host.StartAsync(CancellationToken.None)
+                DotConfig.bridgeProviderKeys configuration
+                // The bridge fills compound bindings into process memory
+                // after the builder already loaded the environment, so
+                // reload: the Add* registration snapshots keys from this
+                // same configuration object.
+                (application.Configuration :> IConfigurationRoot).Reload()
 
-                let! exit =
-                    task {
-                        try
-                            if start.ListSessions then
-                                return! listSessionsAsync client CancellationToken.None
-                            else
-                                let registered =
-                                    host.Services.GetServices<ILlmProvider>()
-                                    |> Seq.filter (fun candidate -> not (isNull (box candidate)))
-                                    |> List.ofSeq
+                let provider = DotConfig.resolveProvider configuration start.Provider
+                let model = DotConfig.resolveModel configuration start.Model
+                let ask = DotConfig.resolveAsk configuration start.Ask
 
-                                let initialModel, options =
-                                    if useScripted then
-                                        ModelReference.Parse("scripted/scripted"),
-                                        ([
-                                            {
-                                                Id = "scripted"
-                                                DefaultModel = "scripted"
-                                                EnvVar = null
-                                            }
-                                        ]
-                                        : ReplEngine.ProviderOption list)
-                                    else
-                                        let opts = ReplEngine.describeProviders registered
-                                        ReplEngine.selectReference opts start.Provider start.Model, opts
-
-                                if not (isNull (box start.Print)) then
-                                    return!
-                                        runPrintAsync client agents packages start initialModel CancellationToken.None
-                                else
-                                    let waitBound = TimeSpan.FromMinutes(start.WaitMinutes)
-
-                                    let engine =
-                                        ReplEngine.Engine(
-                                            client,
-                                            agents,
-                                            packages,
-                                            Console.In,
-                                            Console.Out,
-                                            waitBound,
-                                            initialModel,
-                                            options
-                                        )
-
-                                    return! engine.RunAsync(start.Resume, CancellationToken.None)
-                        with
-                        | :? SqliteLockedException as locked ->
-                            reportLocked dbPath locked
-                            return 1
-                        | error ->
-                            Console.Error.WriteLine($"dot: {error.Message}")
-                            return 1
+                let effective =
+                    { start with
+                        Provider = provider
+                        Model = model
+                        Ask = ask
                     }
 
-                do! stopToolSources host.Services
-                do! host.StopAsync(CancellationToken.None)
-                return exit
-            with
-            | :? SqliteLockedException as locked ->
-                reportLocked dbPath locked
-                return 1
-            | error ->
-                Console.Error.WriteLine($"dot: {error.Message} (path {dbPath}).")
+                if effective.PrintConfig then
+                    let dbPath = DotConfig.resolveDbPath configuration
+                    let workspaceRoot = DotConfig.resolveWorkspaceRoot configuration
+                    DotConfig.printEffective configuration provider model dbPath workspaceRoot ask
+                    return 0
+                else
+                    // Scripted unless live mode was asked for with keys to
+                    // serve it: --scripted pins scripted, and no keys fall
+                    // back to it.
+                    let useScripted = effective.Scripted || not (hasLiveKey configuration)
+                    let dbPath = DotConfig.resolveDbPath configuration
+                    buildServices application.Services dbPath effective configuration useScripted
+
+                    use host = application.Build()
+
+                    // Resolve before starting: the resolve triggers the
+                    // session router wiring, which must land before the actor
+                    // system spawns its router.
+                    let client = host.Services.GetRequiredService<SessionClient>()
+                    let agents = host.Services.GetRequiredService<IAgentStore>()
+                    let packages = host.Services.GetRequiredService<IAgentPackageStore>()
+
+                    try
+                        do! host.StartAsync(CancellationToken.None)
+
+                        let! exit =
+                            task {
+                                try
+                                    if effective.ListSessions then
+                                        return! listSessionsAsync client CancellationToken.None
+                                    else
+                                        let registered =
+                                            host.Services.GetServices<ILlmProvider>()
+                                            |> Seq.filter (fun candidate -> not (isNull (box candidate)))
+                                            |> List.ofSeq
+
+                                        let initialModel, options =
+                                            if useScripted then
+                                                ModelReference.Parse("scripted/scripted"),
+                                                ([
+                                                    {
+                                                        Id = "scripted"
+                                                        DefaultModel = "scripted"
+                                                        EnvVar = null
+                                                    }
+                                                ]
+                                                : ReplEngine.ProviderOption list)
+                                            else
+                                                let opts = ReplEngine.describeProviders registered
+
+                                                ReplEngine.selectReference opts effective.Provider effective.Model, opts
+
+                                        if not (isNull (box effective.Print)) then
+                                            return!
+                                                runPrintAsync
+                                                    client
+                                                    agents
+                                                    packages
+                                                    effective
+                                                    initialModel
+                                                    CancellationToken.None
+                                        else
+                                            let waitBound = TimeSpan.FromMinutes(effective.WaitMinutes)
+
+                                            let engine =
+                                                ReplEngine.Engine(
+                                                    client,
+                                                    agents,
+                                                    packages,
+                                                    Console.In,
+                                                    Console.Out,
+                                                    waitBound,
+                                                    initialModel,
+                                                    options
+                                                )
+
+                                            return! engine.RunAsync(effective.Resume, CancellationToken.None)
+                                with
+                                | :? SqliteLockedException as locked ->
+                                    reportLocked dbPath locked
+                                    return 1
+                                | error ->
+                                    Console.Error.WriteLine($"dot: {error.Message}")
+                                    return 1
+                            }
+
+                        do! stopToolSources host.Services
+                        do! host.StopAsync(CancellationToken.None)
+                        return exit
+                    with
+                    | :? SqliteLockedException as locked ->
+                        reportLocked dbPath locked
+                        return 1
+                    | error ->
+                        Console.Error.WriteLine($"dot: {error.Message} (path {dbPath}).")
+                        return 1
+            with error ->
+                Console.Error.WriteLine($"dot: {error.Message}")
                 return 1
         }
 
@@ -1201,9 +1238,7 @@ let main (argv: string[]) : int =
                 Environment.Exit(2)
                 Unchecked.defaultof<DotStart>
 
-        let dbPath = resolveDbPath ()
-        bridgeProviderKeys ()
-        runAsync start dbPath |> fun runner -> runner.GetAwaiter().GetResult()
+        runAsync start |> fun runner -> runner.GetAwaiter().GetResult()
     with
     | :? SqliteLockedException as locked ->
         let path =

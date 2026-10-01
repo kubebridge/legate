@@ -1501,3 +1501,321 @@ let ``Session reports counts and tokens without prices`` () =
             Directory.Delete(workdir, true)
         with _ ->
             ()
+
+// ──────────────────────────────────────────────────────────────────────────
+// YAML configuration (issue 328): --print-config smokes prove the four-file
+// precedence chain, env and flag wins, ${VAR} expansion, secret masking,
+// and startup errors. Every run is keyless: the dump exits before the
+// database opens and before any provider registers.
+
+/// Creates a fresh temp config base with an empty dot/ user dir, returning
+/// the base (for DOT_CONFIG_HOME) and the user dot dir.
+let private freshConfigBase () : string * string =
+    let baseDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName())
+    let userDot = Path.Combine(baseDir, "dot")
+    Directory.CreateDirectory(userDot) |> ignore
+    (baseDir, userDot)
+
+/// Writes a YAML file, creating its directory first.
+let private writeYaml (path: string) (content: string) : unit =
+    match Path.GetDirectoryName(path) with
+    | null -> ()
+    | dir -> Directory.CreateDirectory(dir) |> ignore
+
+    File.WriteAllText(path, content)
+
+/// Runs dot --print-config with an isolated user config base, returning
+/// exit code, stdout, and stderr.
+let private runPrintConfig
+    (dotDll: string)
+    (workdir: string)
+    (dbPath: string)
+    (configBase: string)
+    (extraEnv: (string * string) list)
+    (extraArgs: string list)
+    : int * string * string =
+    runDotEnv
+        dotDll
+        ([ "--print-config" ] @ extraArgs)
+        ""
+        workdir
+        dbPath
+        ((("DOT_CONFIG_HOME", configBase)) :: extraEnv)
+
+/// Parses key=value dump lines into a map, failing on malformed lines.
+let private dumpMap (stdout: string) : Map<string, string> =
+    stdout.Split([| '\n' |], StringSplitOptions.RemoveEmptyEntries)
+    |> Array.choose (fun line ->
+        let trimmed = line.Trim().Trim([| '\r' |])
+
+        let index = trimmed.IndexOf('=')
+
+        if index < 0 then
+            None
+        else
+            Some(trimmed.Substring(0, index), trimmed.Substring(index + 1)))
+    |> Map.ofArray
+
+/// Reads a dump value, failing with the full stdout when the key is absent.
+let private dumpValue (dump: Map<string, string>) (stdout: string) (key: string) : string =
+    match Map.tryFind key dump with
+    | None -> failwith $"The --print-config dump misses '{key}'. Full output:{Environment.NewLine}{stdout}"
+    | Some value -> value
+
+[<Fact>]
+let ``PrintConfig shows safe defaults when no files exist`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+    let configBase, _ = freshConfigBase ()
+
+    try
+        let exit, stdout, stderr = runPrintConfig dotDll workdir dbPath configBase [] []
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 0
+        // Missing files are never errors: safe hardcoded defaults win.
+        let dump = dumpMap stdout
+
+        dumpValue dump stdout "Dot:Provider" |> should equal ""
+        dumpValue dump stdout "Dot:Model" |> should equal ""
+        dumpValue dump stdout "Dot:Ask" |> should equal "false"
+        // The helper pins DOT_DB_PATH, so the env default shows; the
+        // workspace defaults to the process working directory.
+        dumpValue dump stdout "Dot:DbPath" |> should equal dbPath
+        dumpValue dump stdout "Dot:WorkspaceRoot" |> should equal workdir
+        checkNoErrors output
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+        try
+            Directory.Delete(configBase, true)
+        with _ ->
+            ()
+
+[<Fact>]
+let ``PrintConfig proves the file precedence chain with env and flag wins`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+    let configBase, userDot = freshConfigBase ()
+    let projectDot = Path.Combine(workdir, ".dot")
+
+    try
+        let userFile = Path.Combine(userDot, "appsettings.yaml")
+        let userLocal = Path.Combine(userDot, "appsettings.local.yaml")
+        let projectFile = Path.Combine(projectDot, "appsettings.yaml")
+        let projectLocal = Path.Combine(projectDot, "appsettings.local.yaml")
+
+        let dumpOf extraEnv extraArgs =
+            let exit, stdout, stderr =
+                runPrintConfig dotDll workdir dbPath configBase extraEnv extraArgs
+
+            let output = stdout + Environment.NewLine + stderr
+            exit |> should equal 0
+            (dumpMap stdout, output)
+
+        // User scope alone.
+        writeYaml userFile "Dot:\n  Provider: user-prov\n  Model: user-prov/m1\n"
+
+        let dump, _ = dumpOf [] []
+
+        dumpValue dump "" "Dot:Provider" |> should equal "user-prov"
+        dumpValue dump "" "Dot:Model" |> should equal "user-prov/m1"
+
+        // User-local beats user.
+        writeYaml userLocal "Dot:\n  Provider: userlocal-prov\n"
+
+        let dump, _ = dumpOf [] []
+
+        dumpValue dump "" "Dot:Provider" |> should equal "userlocal-prov"
+        dumpValue dump "" "Dot:Model" |> should equal "user-prov/m1"
+
+        // Project beats user-local; project Model lands too.
+        writeYaml projectFile "Dot:\n  Provider: proj-prov\n  Model: proj-prov/m2\n"
+
+        let dump, _ = dumpOf [] []
+
+        dumpValue dump "" "Dot:Provider" |> should equal "proj-prov"
+        dumpValue dump "" "Dot:Model" |> should equal "proj-prov/m2"
+
+        // Project-local beats project.
+        writeYaml projectLocal "Dot:\n  Provider: projlocal-prov\n"
+
+        let dump, _ = dumpOf [] []
+
+        dumpValue dump "" "Dot:Provider" |> should equal "projlocal-prov"
+
+        // Environment beats every file.
+        let dump, _ = dumpOf [ "Dot__Provider", "env-prov" ] []
+
+        dumpValue dump "" "Dot:Provider" |> should equal "env-prov"
+
+        // CLI flags beat the environment.
+        let dump, _ = dumpOf [ "Dot__Provider", "env-prov" ] [ "--provider"; "flag-prov" ]
+
+        dumpValue dump "" "Dot:Provider" |> should equal "flag-prov"
+
+        // The pinned DOT_DB_PATH env beats a file DbPath, and a file Ask
+        // default of true shows until --ask (already true) holds it too.
+        writeYaml projectLocal "Dot:\n  Provider: projlocal-prov\n  DbPath: /tmp/file-marker-328.db\n  Ask: true\n"
+
+        let dump, output = dumpOf [] []
+
+        dumpValue dump output "Dot:DbPath" |> should equal dbPath
+        dumpValue dump output "Dot:Ask" |> should equal "true"
+
+        let dump, _ = dumpOf [] [ "--ask" ]
+
+        dumpValue dump "" "Dot:Ask" |> should equal "true"
+        checkNoErrors output
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+        try
+            Directory.Delete(configBase, true)
+        with _ ->
+            ()
+
+[<Fact>]
+let ``PrintConfig flattens nested maps and sequences`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+    let configBase, userDot = freshConfigBase ()
+
+    try
+        writeYaml
+            (Path.Combine(userDot, "appsettings.yaml"))
+            "Dot:\n  Provider: user-prov\n  Tags:\n    - alpha\n    - beta\nLegate:\n  Test:\n    Deep: hello-328\n"
+
+        let exit, stdout, stderr = runPrintConfig dotDll workdir dbPath configBase [] []
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 0
+
+        let dump = dumpMap stdout
+
+        dumpValue dump stdout "Dot:Tags:0" |> should equal "alpha"
+        dumpValue dump stdout "Dot:Tags:1" |> should equal "beta"
+        dumpValue dump stdout "Legate:Test:Deep" |> should equal "hello-328"
+        checkNoErrors output
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+        try
+            Directory.Delete(configBase, true)
+        with _ ->
+            ()
+
+[<Fact>]
+let ``PrintConfig masks secret values`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+    let configBase, userDot = freshConfigBase ()
+    let firstSecret = "super-secret-328-ABC"
+    let secondSecret = "another-secret-328-XYZ"
+
+    try
+        writeYaml
+            (Path.Combine(userDot, "appsettings.yaml"))
+            $"Dot:\n  Providers:\n    anthropic:\n      ApiKey: {firstSecret}\nLegate:\n  Llm:\n    Providers:\n      openai:\n        ApiKey: {secondSecret}\n"
+
+        let exit, stdout, stderr = runPrintConfig dotDll workdir dbPath configBase [] []
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 0
+        check stdout "Dot:Providers:anthropic:ApiKey=***"
+        check stdout "Legate:Llm:Providers:openai:ApiKey=***"
+        checkAbsent output firstSecret
+        checkAbsent output secondSecret
+        checkNoErrors output
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+        try
+            Directory.Delete(configBase, true)
+        with _ ->
+            ()
+
+[<Fact>]
+let ``PrintConfig expands placeholders and fails on unset variables`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+    let configBase, userDot = freshConfigBase ()
+
+    try
+        // A set variable expands inline.
+        writeYaml (Path.Combine(userDot, "appsettings.yaml")) "Dot:\n  Model: 'prefix-${DOT_SMOKE_SET_328}-suffix'\n"
+
+        let exit, stdout, stderr =
+            runPrintConfig dotDll workdir dbPath configBase [ "DOT_SMOKE_SET_328", "expanded-42" ] []
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 0
+        check stdout "Dot:Model=prefix-expanded-42-suffix"
+        checkNoErrors output
+
+        // An unset variable fails startup naming the variable and the
+        // config key, without echoing any value.
+        writeYaml
+            (Path.Combine(userDot, "appsettings.yaml"))
+            "Dot:\n  Model: 'prefix-${DOT_SMOKE_MISSING_328}-suffix'\n"
+
+        let badExit, badOut, badErr = runPrintConfig dotDll workdir dbPath configBase [] []
+
+        let badOutput = badOut + Environment.NewLine + badErr
+
+        badExit |> should equal 1
+        check badOutput "DOT_SMOKE_MISSING_328"
+        check badOutput "Dot:Model"
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+        try
+            Directory.Delete(configBase, true)
+        with _ ->
+            ()
+
+[<Fact>]
+let ``Bad YAML fails naming the path`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+    let configBase, userDot = freshConfigBase ()
+    let badPath = Path.Combine(userDot, "appsettings.yaml")
+
+    try
+        writeYaml badPath "Dot: [unclosed\n  Provider: nope\n"
+
+        let exit, stdout, stderr = runPrintConfig dotDll workdir dbPath configBase [] []
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 1
+        check output badPath
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+        try
+            Directory.Delete(configBase, true)
+        with _ ->
+            ()
