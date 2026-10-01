@@ -56,6 +56,12 @@ let private route (callbacks: Callbacks) (state: State) (intent: DotInput.InputI
     task {
         let view = callbacks.SnapshotRenderer()
 
+        let suspendedPicker =
+            if DotRender.hasPendingPermission view || DotRender.hasPendingQuestion view then
+                state.Picker
+            else
+                None
+
         match DotRender.firstQuestion view with
         | Some pending when intent <> DotInput.QuitTui ->
             match intent with
@@ -100,7 +106,9 @@ let private route (callbacks: Callbacks) (state: State) (intent: DotInput.InputI
                         match DotPicker.pickerForBare line with
                         | Some kind ->
                             let! picker = callbacks.OpenPickerAsync kind
-                            state.Picker <- picker
+                            // Fallback commands retain their dispatch, but cannot
+                            // replace a picker suspended by prompt input ownership.
+                            state.Picker <- suspendedPicker |> Option.orElse picker
                         | None -> ()
                 | None -> ()
             | DotInput.SteerText text ->

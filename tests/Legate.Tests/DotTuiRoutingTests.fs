@@ -250,6 +250,60 @@ let ``permission non-answer keys keep editor fallback without mutating picker`` 
             Assert.Empty h.Dispatches
     }
 
+[<Theory>]
+[<InlineData(false)>]
+[<InlineData(true)>]
+let ``permission fallback fork submission preserves and resumes complete picker`` openerReturnsNone =
+    task {
+        let h = Harness()
+        h.State.Picker <- Some picker
+        h.Request "p-fork"
+        let opened = ResizeArray<DotPicker.PickerKind>()
+
+        let callbacks =
+            { h.Callbacks with
+                OpenPickerAsync =
+                    fun kind ->
+                        opened.Add kind
+
+                        Task.FromResult(
+                            if openerReturnsNone then
+                                None
+                            else
+                                Some(DotPicker.fromItems kind [])
+                        )
+            }
+
+        for letter in "/fork" do
+            do! handleKeyAsync callbacks h.State (character letter)
+            h.State.Picker |> should equal (Some picker)
+            h.VisiblePicker |> should equal None
+
+        Assert.Empty h.Dispatches
+        do! handleKeyAsync callbacks h.State enter
+        h.Dispatches |> should equal [ Line "/fork" ]
+        List.ofSeq opened |> should equal [ DotPicker.ForkAtSequence ]
+        h.State.Editor |> should equal DotInput.empty
+        h.State.Picker |> should equal (Some picker)
+        DotRender.hasPendingPermission h.View |> should equal true
+        h.VisiblePicker |> should equal None
+        do! h.Key(character 'a')
+        h.State.Picker |> should equal (Some picker)
+        h.Resolve "p-fork"
+        h.VisiblePicker |> should equal (Some picker)
+        do! h.Key enter
+        h.State.Picker |> should equal None
+
+        h.Dispatches
+        |> should
+            equal
+            [
+                Line "/fork"
+                Permission("p-fork", PermissionDecisionKind.AllowOnce)
+                Line "/model two"
+            ]
+    }
+
 [<Fact>]
 let ``overlapping prompts preserve permission priority first pending ids and suspension`` () =
     task {
