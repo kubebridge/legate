@@ -2383,3 +2383,75 @@ let ``Tui parity walks every slash command with identical outcomes`` () =
             Directory.Delete(workdir, true)
         with _ ->
             ()
+
+// ──────────────────────────────────────────────────────────────────────────
+// TUI hardening (issue 335): --help states the display mode and its
+// reasons, the plain REPL names its mode on startup, and the DOT_TUI_SMOKE
+// trigger boots the shell headlessly (one scripted turn, clean exit, zero
+// alternate-screen escapes on stdout).
+
+[<Fact>]
+let ``Help states the display mode and its reasons`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+
+    try
+        let exit, stdout, stderr =
+            runDot dotDll [ "--help" ] (script [ "/quit" ]) workdir dbPath
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 2
+        check output "--no-tui"
+        check output "fullscreen"
+        check output "plain ("
+        check output "redirected-stdout"
+        check output "NO_COLOR"
+        check output "TERM=dumb"
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+[<Fact>]
+let ``Plain REPL names its mode on startup`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+
+    try
+        let exit, stdout, stderr =
+            runDot dotDll [ "--scripted" ] (script [ "/quit" ]) workdir dbPath
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 0
+        check output "running plain (redirected-stdout) REPL"
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+[<Fact>]
+let ``Headless TUI smoke boots renders one turn and exits`` () =
+    let dotDll = sampleDll "Dot" "Dot.dll"
+    let workdir, dbPath = freshWorkdir ()
+
+    try
+        let exit, stdout, stderr =
+            runDotEnv dotDll [ "--scripted" ] (script [ "hello"; "/quit" ]) workdir dbPath [ "DOT_TUI_SMOKE", "1" ]
+
+        let output = stdout + Environment.NewLine + stderr
+
+        exit |> should equal 0
+        check stdout "dot fullscreen"
+        check stdout "session "
+        check stdout "Ctrl+Q"
+        check output "TUI-SMOKE ok"
+        checkAbsent stdout "[?1049"
+    finally
+        try
+            Directory.Delete(workdir, true)
+        with _ ->
+            ()

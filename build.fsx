@@ -115,7 +115,12 @@ let dotSmokeWorkdir () : string * string =
     System.IO.Directory.CreateDirectory(workdir) |> ignore
     workdir, System.IO.Path.Combine(workdir, "dot.db")
 
-let runDotCapture (arguments: string list) (dbPath: string) : int * string * string =
+let runDotCaptureEnv
+    (arguments: string list)
+    (dbPath: string)
+    (extraEnv: (string * string) list)
+    (stdin: string option)
+    : int * string * string =
     let info = System.Diagnostics.ProcessStartInfo("dotnet")
 
     for argument in
@@ -140,10 +145,26 @@ let runDotCapture (arguments: string list) (dbPath: string) : int * string * str
     info.Environment.Remove("Legate__Llm__Providers__openai__ApiKey") |> ignore
     info.Environment.Remove("Legate__Llm__Providers__Google__ApiKey") |> ignore
 
+    for key, value in extraEnv do
+        info.Environment[key] <- value
+
+    match stdin with
+    | None -> ()
+    | Some _ -> info.RedirectStandardInput <- true
+
     match System.Diagnostics.Process.Start(info) with
     | null -> failwith "Could not start the dot smoke process."
     | child ->
         use _ = child
+
+        match stdin with
+        | None -> ()
+        | Some text ->
+            try
+                child.StandardInput.Write(text)
+                child.StandardInput.Close()
+            with _ ->
+                ()
 
         let finished =
             child.WaitForExit(int (System.TimeSpan.FromMinutes(3.0).TotalMilliseconds))
@@ -159,6 +180,9 @@ let runDotCapture (arguments: string list) (dbPath: string) : int * string * str
         let stdout = child.StandardOutput.ReadToEnd()
         let stderr = child.StandardError.ReadToEnd()
         child.ExitCode, stdout, stderr
+
+let runDotCapture (arguments: string list) (dbPath: string) : int * string * string =
+    runDotCaptureEnv arguments dbPath [] None
 
 let checkSmokeContains (output: string) (marker: string) : unit =
     if not (output.Contains(marker, System.StringComparison.Ordinal)) then
@@ -224,36 +248,133 @@ let dotJsonSmoke () : unit =
         with _ ->
             ()
 
-// Pins the TUI fallback contract (issue 330): the piped one-shot path
+// Pins the TUI fallback contract (issues 330, 335): the piped one-shot path
 // never loads the TUI and stays byte-identical with --no-tui and under
-// NO_COLOR / TERM=dumb / CI. Stdout is captured redirected in every run,
-// so the selector must stay on plain; any TUI escape on stdout fails.
+// NO_COLOR / TERM=dumb / TERM empty / CI. Stdout is captured redirected in
+// every run, so the selector must stay on plain; any TUI escape on stdout
+// fails. The JSON event stream pins the same identity with --no-tui.
 let dotTuiFallbackSmoke () : unit =
     let workdir, dbPath = dotSmokeWorkdir ()
 
     try
         let _, plainStdout, _ = runDotCapture [ "--scripted"; "-p"; "smoke" ] dbPath
 
-        let exitNoTui, noTuiStdout, _ =
-            runDotCapture
+        let matrix: (string * string list * (string * string) list) list =
+            [
+                "no-tui flag",
                 [
                     "--scripted"
                     "-p"
                     "smoke"
                     "--no-tui"
+                ],
+                []
+                "NO_COLOR", [ "--scripted"; "-p"; "smoke" ], [ "NO_COLOR", "1" ]
+                "TERM=dumb", [ "--scripted"; "-p"; "smoke" ], [ "TERM", "dumb" ]
+                "TERM empty", [ "--scripted"; "-p"; "smoke" ], [ "TERM", "" ]
+                "CI", [ "--scripted"; "-p"; "smoke" ], [ "CI", "true" ]
+            ]
+
+        for name, arguments, extraEnv in matrix do
+            let exit, stdout, stderr = runDotCaptureEnv arguments dbPath extraEnv None
+
+            if exit <> 0 then
+                failwithf "The dot fallback smoke (%s) exited %d, expected 0. Stderr:\n%s" name exit stderr
+
+            if stdout <> plainStdout then
+                failwithf "The dot fallback broke byte-identity (%s).\nPlain:\n%s\nVariant:\n%s" name plainStdout stdout
+
+            if stdout.Contains("\u001b[?1049") then
+                failwithf "The piped dot output loads the TUI alternate screen (%s). Stdout:\n%s" name stdout
+
+        let _, jsonStdout, _ =
+            runDotCaptureEnv
+                [
+                    "--scripted"
+                    "--mode"
+                    "json"
+                    "-p"
+                    "smoke"
                 ]
                 dbPath
+                []
+                None
 
-        if exitNoTui <> 0 then
-            failwithf "The dot --no-tui smoke exited %d, expected 0." exitNoTui
+        let jsonExit, jsonNoTuiStdout, _ =
+            runDotCaptureEnv
+                [
+                    "--scripted"
+                    "--mode"
+                    "json"
+                    "-p"
+                    "smoke"
+                    "--no-tui"
+                ]
+                dbPath
+                []
+                None
 
-        if plainStdout <> noTuiStdout then
-            failwithf "The dot fallback broke byte-identity.\nPlain:\n%s\n--no-tui:\n%s" plainStdout noTuiStdout
+        if jsonExit <> 0 then
+            failwithf "The dot --mode json --no-tui smoke exited %d, expected 0." jsonExit
 
-        if plainStdout.Contains("\u001b[?1049") then
-            failwithf "The piped dot output loads the TUI alternate screen. Stdout:\n%s" plainStdout
+        // JSON carries fresh session ids and timestamps per run, so the run
+        // pins the event-type sequence (identical $type order) instead of
+        // raw bytes: same contract (plain path, no TUI), stable grouping.
+        let jsonTypesOf (stdout: string) : string list =
+            stdout.Split([| '\r'; '\n' |], System.StringSplitOptions.RemoveEmptyEntries)
+            |> Array.map (fun line ->
+                try
+                    use doc = System.Text.Json.JsonDocument.Parse(line)
+                    let mutable discriminator = Unchecked.defaultof<System.Text.Json.JsonElement>
 
-        printfn "Dot TUI fallback smoke passed (piped stdout byte-identical, no TUI escapes)."
+                    if doc.RootElement.TryGetProperty("$type", &discriminator) then
+                        discriminator.GetString()
+                    else
+                        failwithf "The dot JSON smoke line carries no $type: %s" line
+                with ex ->
+                    failwithf "The dot JSON smoke line is not JSON: %s (%s)" line ex.Message)
+            |> List.ofArray
+
+        if jsonTypesOf jsonStdout <> jsonTypesOf jsonNoTuiStdout then
+            failwithf
+                "The dot JSON fallback broke event identity.\nPlain:\n%s\n--no-tui:\n%s"
+                jsonStdout
+                jsonNoTuiStdout
+
+        if jsonStdout.Contains("\u001b[?1049") then
+            failwithf "The piped dot JSON output loads the TUI alternate screen. Stdout:\n%s" jsonStdout
+
+        printfn
+            "Dot TUI fallback smoke passed (piped stdout byte-identical across --no-tui/NO_COLOR/TERM/CI plus --mode json event identity, no TUI escapes)."
+    finally
+        try
+            System.IO.Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
+// Proves the shell boots headlessly (issue 335): the DOT_TUI_SMOKE trigger
+// runs the boot/render-one-turn/exit proof with piped stdin instead of the
+// fullscreen loop, so CI covers the TUI path with no TTY. Stdout carries
+// the plain layout frames (banner, status, quit hint) with zero
+// alternate-screen escapes; stderr names the clean teardown.
+let dotTuiHeadlessSmoke () : unit =
+    let workdir, dbPath = dotSmokeWorkdir ()
+
+    try
+        let exit, stdout, stderr =
+            runDotCaptureEnv [ "--scripted" ] dbPath [ "DOT_TUI_SMOKE", "1" ] (Some "hello\n/quit\n")
+
+        if exit <> 0 then
+            failwithf "The dot headless TUI smoke exited %d, expected 0. Stdout:\n%s\nStderr:\n%s" exit stdout stderr
+
+        checkSmokeContains stdout "dot fullscreen"
+        checkSmokeContains stdout "session "
+        checkSmokeContains stderr "TUI-SMOKE ok"
+
+        if stdout.Contains("\u001b[?1049") then
+            failwithf "The headless TUI smoke entered the alternate screen on stdout:\n%s" stdout
+
+        printfn "Dot headless TUI smoke passed (booted, rendered one turn, exited cleanly)."
     finally
         try
             System.IO.Directory.Delete(workdir, true)
@@ -287,7 +408,8 @@ Target.create "SmokeSamples" (fun _ ->
 
     dotPrintSmoke ()
     dotJsonSmoke ()
-    dotTuiFallbackSmoke ())
+    dotTuiFallbackSmoke ()
+    dotTuiHeadlessSmoke ())
 
 // Produces Release NuGet packages for every packable project into ./artifacts.
 // Builds in Release itself, so it does not depend on the Debug Build target.

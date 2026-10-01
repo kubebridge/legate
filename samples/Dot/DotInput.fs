@@ -812,7 +812,7 @@ let continuationPrefix = "  "
 /// The hint bar naming the key map, painted under the buffer and hints so
 /// the bindings stay discoverable fullscreen (mirrored in the README).
 let hintBarText =
-    "Enter send | Ctrl+O newline | Ctrl+S steer | Ctrl+C abort | Up/Down history | Esc-empty/Ctrl+Q quit"
+    "Enter send | Ctrl+O newline | Ctrl+S steer | Ctrl+C abort | Ctrl+T expand | Up/Down history | Esc-empty/Ctrl+Q quit"
 
 /// Clamps one row to the width with the DotShell trim marker.
 /// <param name="width">The console width in columns.</param>

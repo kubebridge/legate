@@ -127,6 +127,7 @@ let private helpText (dbPath: string) : string =
     + " Tools run against the working directory through the host-directory runtime with no sandbox: sandbox the run in a container (as pi does) or pass --ask for per-call approval (allow once, allow for session, deny). The workspace root fence stays on in every mode. "
     + " One-shot print: -p|--print <query> runs one Headless-shaped turn (PromptAndWaitAsync under --wait-minutes with the Dot agent) instead of the REPL, printing only the final answer to stdout and exiting 0 completed, 2 aborted, 1 failed, 3 anything else (--resume attaches instead of opening; --sessions still lists). JSON stream: --mode json with -p streams session events as JSONL to stdout (one $type-polymorphic event per line, DotExport options) for scripting as dot --mode json -p \"<query>\" | <jsonl-parser>, with every human diagnostic on stderr; without -p --mode is ignored and the REPL runs in text."
     + " Configuration: dot reads optional YAML files in order user appsettings.yaml < user appsettings.local.yaml < project ./.dot/appsettings.yaml < project ./.dot/appsettings.local.yaml (missing files are never errors), then environment variables, then CLI flags strongest; --print-config prints the effective Dot plus Legate configuration with secret values masked and exits 0. MCP servers declare under Dot:Mcp:Servers (stdio command/args/env, remote url/headers) or attach via --mcp <path>; a same-name YAML entry loses to the file. See samples/Dot/README.md for the schema."
+    + " Display mode: dot opens the fullscreen TUI shell on a real terminal; --no-tui, piped (redirected) stdout, NO_COLOR, TERM=dumb/empty/unknown, any CI marker, -p/--print, --mode json with -p, --sessions/--list, or --print-config run the plain output instead (the piped path loads no TUI code and stays byte-identical with no alternate-screen escapes). The plain REPL names its mode on startup as plain (<reason>) with <reason> one of --no-tui, redirected-stdout, NO_COLOR, TERM=dumb, CI; fullscreen means the TUI owns the screen. Tiny terminals (narrower than 40 columns or shorter than 12 rows) show a minimum-size notice and keep running; quit, abort, error, and Ctrl+C paths restore the terminal."
 
 /// Parses the dot arguments into a start plan. Unknown flags fail with a
 /// usage error naming the flag; missing values fail naming the flag.
@@ -1270,16 +1271,35 @@ let main (argv: string[]) : int =
                                                     effective
                                                     initialModel
                                                     CancellationToken.None
+                                        elif DotTuiMode.isHeadlessSmokeRequested () then
+                                            // CI-only headless TUI smoke (issue 335): the
+                                            // DOT_TUI_SMOKE environment trigger runs the
+                                            // boot/render-one-turn/exit proof with piped
+                                            // stdin instead of the fullscreen loop, so CI
+                                            // proves the shell without a TTY. Never a CLI
+                                            // flag: --help and the pipe contract never
+                                            // change.
+                                            let waitBound = TimeSpan.FromMinutes(effective.WaitMinutes)
+
+                                            return!
+                                                DotTui.runHeadlessSmokeAsync
+                                                    client
+                                                    agents
+                                                    packages
+                                                    initialModel
+                                                    options
+                                                    waitBound
+                                                    CancellationToken.None
                                         else
                                             // Fullscreen shell (issues 330-332): the one-shot (-p), list,
                                             // and config paths never touch the TUI so piped stdout stays
                                             // byte-identical; the interactive REPL opens the stdlib-only
                                             // fullscreen input loop only when the pure selector clears
                                             // (real TTY, no NO_COLOR/TERM=dumb/CI/--no-tui), else it runs
-                                            // the current plain REPL.
-                                            let request = DotTui.readRequest effective.NoTui
+                                            // the current plain REPL and names the reason.
+                                            let request = DotTuiMode.readRequest effective.NoTui
 
-                                            if DotTui.shouldUseTui request then
+                                            if DotTuiMode.shouldUseTui request then
                                                 let waitBound = TimeSpan.FromMinutes(effective.WaitMinutes)
 
                                                 return!
@@ -1293,6 +1313,10 @@ let main (argv: string[]) : int =
                                                         CancellationToken.None
                                             else
                                                 let waitBound = TimeSpan.FromMinutes(effective.WaitMinutes)
+
+                                                Console.Error.WriteLine(
+                                                    $"dot: running {DotTuiMode.describeSelection request} REPL (--no-tui forces plain; see --help for the mode list)."
+                                                )
 
                                                 let engine =
                                                     ReplEngine.Engine(

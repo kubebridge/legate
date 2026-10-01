@@ -208,6 +208,54 @@ let ``Teardown restores the cursor and the primary screen`` () =
     alternateEnter.Contains("?25l") |> should equal true
     homeClear.Contains("[H") |> should equal true
 
+    let cursorAt = alternateExit.IndexOf("?25h", StringComparison.Ordinal)
+
+    let screenAt = alternateExit.IndexOf("?1049l", StringComparison.Ordinal)
+
+    (cursorAt < screenAt) |> should equal true
+
+// ──────────────────────────────────────────────────────────────────────────
+// Minimum-size floor (issue 335): tiny windows show the notice above the
+// transcript and keep the banner, the tail, and the quit hint instead of
+// crashing; roomy windows show no notice.
+
+[<Fact>]
+let ``Minimum floor is forty by twelve`` () =
+    isMinimumSize 39 24 |> should equal true
+    isMinimumSize 40 11 |> should equal true
+    isMinimumSize 0 0 |> should equal true
+    isMinimumSize 40 12 |> should equal false
+    isMinimumSize 80 24 |> should equal false
+
+[<Fact>]
+let ``Tiny windows show the notice and keep the frame`` () =
+    let sid = SessionId.New()
+    let status = statusFor sid
+    let frame = renderFrame 30 8 false [ "ok" ] status
+
+    frame.Contains("terminal too small") |> should equal true
+    frame.Contains("     _       _   ") |> should equal true
+    frame.Contains("ok") |> should equal true
+    frame.Contains("Ctrl+Q") |> should equal true
+    frame.Contains("\u001b") |> should equal false
+
+[<Fact>]
+let ``Tiny windows keep the tail under the notice`` () =
+    let sid = SessionId.New()
+    let lines = [ for n in 1..50 -> $"line-%02d{n}" ]
+    let frame = renderFrame 40 10 false lines (statusFor sid)
+
+    frame.Contains("terminal too small") |> should equal true
+    frame.Contains("line-50") |> should equal true
+    frame.Contains("line-01") |> should equal false
+
+[<Fact>]
+let ``Roomy windows show no notice`` () =
+    let frame =
+        renderFrame 80 24 false [ "EVENT seq=1 TurnStartedEvent" ] (statusFor (SessionId.New()))
+
+    frame.Contains("terminal too small") |> should equal false
+
 [<Fact>]
 let ``Status bar sits above the quit hint`` () =
     let sid = SessionId.New()

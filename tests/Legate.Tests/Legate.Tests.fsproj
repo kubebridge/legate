@@ -130,6 +130,8 @@
     <Compile Include="DotInputTests.fs" />
     <Compile Include="../../samples/Dot/DotRender.fs" Link="DotRenderUnderTest.fs" />
     <Compile Include="DotRenderTests.fs" />
+    <Compile Include="../../samples/Dot/DotTuiMode.fs" Link="DotTuiModeUnderTest.fs" />
+    <Compile Include="DotTuiModeTests.fs" />
     <Compile Include="MigrationTests.fs" />
     <Compile Include="SqliteTestFixture.fs" />
     <Compile Include="SqliteSessionStoreTests.fs" />
