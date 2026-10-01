@@ -2,6 +2,7 @@
 module Legate.Tests.DotReplSmokeTests
 
 open System
+open System.Collections.Generic
 open System.Diagnostics
 open System.IO
 open FsUnit.Xunit
@@ -74,10 +75,41 @@ let private sampleDll (project: string) (assembly: string) : string =
     else
         failwith $"Expected the built sample at '{candidate}': build the solution first."
 
-/// Runs dot with piped stdin on one database file, returning exit code,
-/// stdout, and stderr. The log-level override is optional: None keeps the
-/// host default (Information, so MCP degrade warnings stay visible).
-let private runDotEnvWith
+/// Removes inherited application settings by name only, then applies fixture overrides last.
+let private prepareEnvironment
+    (environment: IDictionary<string, string | null>)
+    (configBase: string)
+    (dbPath: string)
+    (extraEnv: (string * string) list)
+    =
+    for key in environment.Keys |> Seq.toArray do
+        let name = key.Replace("__", ":").ToUpperInvariant()
+
+        if
+            name.StartsWith("DOT:", StringComparison.Ordinal)
+            || name.StartsWith("DOT_", StringComparison.Ordinal)
+            || name.StartsWith("LEGATE:", StringComparison.Ordinal)
+            || List.contains
+                name
+                [
+                    "ANTHROPIC_API_KEY"
+                    "OPENAI_API_KEY"
+                    "GOOGLE_API_KEY"
+                    "OLLAMA_API_KEY"
+                ]
+        then
+            environment.Remove(key) |> ignore
+
+    environment["DOT_CONFIG_HOME"] <- configBase
+    environment["DOT_DB_PATH"] <- dbPath
+
+    for key, value in extraEnv do
+        environment[key] <- value
+
+/// Runs dot with child-local preparation and an owned config directory on every exit path.
+let private runDotPrepared
+    (prepare: ProcessStartInfo -> unit)
+    (waitForExit: Process -> bool)
     (logLevel: string option)
     (dotDll: string)
     (arguments: string list)
@@ -86,6 +118,14 @@ let private runDotEnvWith
     (dbPath: string)
     (extraEnv: (string * string) list)
     : int * string * string =
+    let configBase = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName())
+    Directory.CreateDirectory(Path.Combine(configBase, "dot")) |> ignore
+
+    use cleanup =
+        { new IDisposable with
+            member _.Dispose() = Directory.Delete(configBase, true)
+        }
+
     let info = ProcessStartInfo("dotnet")
     info.ArgumentList.Add(dotDll)
 
@@ -103,10 +143,8 @@ let private runDotEnvWith
     | Some level -> info.Environment["Logging__LogLevel__Default"] <- level
 
     info.Environment["DOTNET_NOLOGO"] <- "1"
-    info.Environment["DOT_DB_PATH"] <- dbPath
-
-    for key, value in extraEnv do
-        info.Environment[key] <- value
+    prepare info
+    prepareEnvironment info.Environment configBase dbPath extraEnv
 
     match Process.Start(info) with
     | null -> failwith "Could not start the dot process."
@@ -117,11 +155,12 @@ let private runDotEnvWith
             child.StandardInput.Write(stdin)
             child.StandardInput.Close()
 
-            let finished = child.WaitForExit(int (TimeSpan.FromMinutes(3.0).TotalMilliseconds))
+            let finished = waitForExit child
 
             if not finished then
                 try
                     child.Kill(true)
+                    child.WaitForExit()
                 with _ ->
                     ()
 
@@ -135,6 +174,18 @@ let private runDotEnvWith
                 child.StandardInput.Dispose()
             with _ ->
                 ()
+
+let private runDotEnvWith logLevel dotDll arguments stdin workdir dbPath extraEnv =
+    runDotPrepared
+        ignore
+        (fun child -> child.WaitForExit(int (TimeSpan.FromMinutes(3.0).TotalMilliseconds)))
+        logLevel
+        dotDll
+        arguments
+        stdin
+        workdir
+        dbPath
+        extraEnv
 
 /// Runs dot with piped stdin on one database file and scripted log
 /// suppression, returning exit code, stdout, and stderr.
@@ -224,6 +275,152 @@ let private sessionIdOf (output: string) : string =
                 failwith $"The dot SESSION line carries no id. Full output:{Environment.NewLine}{output}"
             else
                 parts[1]
+
+[<Fact>]
+let ``Environment isolation removes ambient bindings and preserves explicit overrides`` () =
+    let poisonNames =
+        [
+            "DOT_CONFIG_HOME"
+            "dot_db_path"
+            "DOT_WORKSPACE_ROOT"
+            "DOT_TUI_SMOKE"
+            "ANTHROPIC_API_KEY"
+            "openai_api_key"
+            "GOOGLE_API_KEY"
+            "OLLAMA_API_KEY"
+            "dOt__Provider"
+            "Dot:Model"
+            "Dot__DbPath"
+            "Dot:WorkspaceRoot"
+            "Dot__Providers:google__ApiKey"
+            "lEgAtE:Llm__Providers:openai__ApiKey"
+            "Legate__Tools__Mcp__Servers__0__Command"
+        ]
+
+    let environment = Dictionary<string, string | null>(StringComparer.Ordinal)
+
+    for name in poisonNames do
+        environment[name] <- "synthetic-poison"
+
+    environment["RUNTIME_SENTINEL"] <- "preserved"
+    prepareEnvironment environment "owned-config" "owned.db" []
+    environment.Count |> should equal 3
+    environment["DOT_CONFIG_HOME"] |> should equal "owned-config"
+    environment["DOT_DB_PATH"] |> should equal "owned.db"
+    environment["RUNTIME_SENTINEL"] |> should equal "preserved"
+
+    let overrides =
+        [
+            "DOT_CONFIG_HOME", "fixture-config"
+            "DOT_DB_PATH", ""
+            "DOT_WORKSPACE_ROOT", "fixture-workspace"
+            "OPENAI_API_KEY", "fixture-key"
+            "Dot__Provider", "openai"
+            "Legate:Llm:Providers:openai:ApiKey", "compound-fixture-key"
+        ]
+
+    prepareEnvironment environment "other-config" "other.db" overrides
+
+    for key, value in overrides do
+        environment[key] |> should equal value
+
+    prepareEnvironment environment "owned-config" "owned.db" [ "DOT_DB_PATH", "fixture.db" ]
+    environment["DOT_DB_PATH"] |> should equal "fixture.db"
+
+[<Fact>]
+let ``Subprocess ignores synthetic ambient config and honors explicit fixture config`` () =
+    let workdir, dbPath = freshWorkdir ()
+    let ambient = Path.Combine(workdir, "ambient")
+    let owned = ResizeArray<string>()
+    Directory.CreateDirectory(Path.Combine(ambient, "dot")) |> ignore
+    File.WriteAllText(Path.Combine(ambient, "dot", "appsettings.yaml"), "Dot:\n  Model: synthetic-ambient-model\n")
+
+    let prepare (info: ProcessStartInfo) =
+        info.Environment["DOT_CONFIG_HOME"] <- ambient
+        info.Environment["DOT_DB_PATH"] <- Path.Combine(ambient, "poison.db")
+        info.Environment["Dot__Model"] <- "synthetic-env-model"
+
+    let wait (child: Process) =
+        owned.Add(child.StartInfo.Environment["DOT_CONFIG_HOME"] |> nonNull)
+        child.WaitForExit(30000)
+
+    try
+        let run overrides =
+            runDotPrepared
+                prepare
+                wait
+                (Some "None")
+                (sampleDll "Dot" "Dot.dll")
+                [ "--print-config" ]
+                ""
+                workdir
+                dbPath
+                overrides
+
+        let code, stdout, stderr = run []
+        code |> should equal 0
+        checkAbsent (stdout + stderr) "synthetic-ambient-model"
+        checkAbsent (stdout + stderr) "synthetic-env-model"
+        check stdout dbPath
+        Directory.Exists(owned[0]) |> should equal false
+        let secondCode, _, _ = run []
+        secondCode |> should equal 0
+        owned[0] = owned[1] |> should equal false
+        Directory.Exists(owned[1]) |> should equal false
+        let explicitCode, explicitOutput, _ = run [ "DOT_CONFIG_HOME", ambient ]
+        explicitCode |> should equal 0
+        check explicitOutput "synthetic-ambient-model"
+        Directory.Exists(ambient) |> should equal true
+        File.Exists(Path.Combine(ambient, "poison.db")) |> should equal false
+    finally
+        Directory.Delete(workdir, true)
+
+[<Fact>]
+let ``Owned config is removed on process startup failure and timeout`` () =
+    let workdir, dbPath = freshWorkdir ()
+    let mutable startInfo = ProcessStartInfo()
+    let mutable timeoutConfig = ""
+
+    try
+        Assert.ThrowsAny<Exception>(fun () ->
+            runDotPrepared
+                (fun info ->
+                    startInfo <- info
+                    info.FileName <- Path.Combine(workdir, "missing-executable"))
+                (fun _ -> failwith "Must not wait for failed startup")
+                (Some "None")
+                "unused.dll"
+                []
+                ""
+                workdir
+                dbPath
+                []
+            |> ignore)
+        |> ignore
+
+        Directory.Exists(startInfo.Environment["DOT_CONFIG_HOME"]) |> should equal false
+
+        let error =
+            Assert.ThrowsAny<Exception>(fun () ->
+                runDotPrepared
+                    ignore
+                    (fun child ->
+                        timeoutConfig <- child.StartInfo.Environment["DOT_CONFIG_HOME"] |> nonNull
+                        false)
+                    (Some "None")
+                    (sampleDll "Dot" "Dot.dll")
+                    [ "--scripted" ]
+                    ""
+                    workdir
+                    dbPath
+                    []
+                |> ignore)
+
+        check error.Message "timed out"
+        String.IsNullOrEmpty(timeoutConfig) |> should equal false
+        Directory.Exists(timeoutConfig) |> should equal false
+    finally
+        Directory.Delete(workdir, true)
 
 [<Fact>]
 let ``Repl streams turns serves slash commands and prints usage for unknown`` () =
