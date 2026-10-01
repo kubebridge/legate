@@ -109,6 +109,9 @@ type DotStart =
         /// sections, secret values masked) to stdout and exit 0 without
         /// opening the database or the network.
         PrintConfig: bool
+        /// Force plain console output even on a real terminal: skips the
+        /// fullscreen TUI shell and runs the REPL or one-shot path.
+        NoTui: bool
     }
 
 /// Builds the --help text over the resolved database path: usage, session
@@ -118,7 +121,7 @@ type DotStart =
 /// <param name="dbPath">The resolved database file path.</param>
 /// <returns>The usage text.</returns>
 let private helpText (dbPath: string) : string =
-    "Usage: Dot [--provider <id>] [--model <provider/model>] [--resume <session-id>] [--sessions|--list] [-p|--print <query>] [--mode text|json] [--scripted] [--wait-minutes <n>] [--ask] [--mcp <path>] [--print-config] "
+    "Usage: Dot [--provider <id>] [--model <provider/model>] [--resume <session-id>] [--sessions|--list] [-p|--print <query>] [--mode text|json] [--scripted] [--wait-minutes <n>] [--ask] [--mcp <path>] [--print-config] [--no-tui] "
     + storageHelp dbPath
     + " Providers anthropic, openai, google, and ollamacloud register only when ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_API_KEY, or OLLAMA_API_KEY is set (keys flow from the environment through Legate:Llm:Providers:<id>:ApiKey binding only, never printed or persisted). With exactly one key set dot just works; with several, --provider picks, else the default order anthropic, openai, google, ollamacloud wins; --model <provider/model> overrides the model (--provider/--model apply to live mode; --scripted pins the scripted transport). /model lists the options mid-session and switches without losing the transcript. "
     + " Tools run against the working directory through the host-directory runtime with no sandbox: sandbox the run in a container (as pi does) or pass --ask for per-call approval (allow once, allow for session, deny). The workspace root fence stays on in every mode. "
@@ -141,6 +144,7 @@ let parseArgs (argv: string[]) : DotStart =
     let mutable print: string | null = null
     let mutable mode = "text"
     let mutable printConfig = false
+    let mutable noTui = false
 
     let mutable index = 0
 
@@ -183,6 +187,7 @@ let parseArgs (argv: string[]) : DotStart =
         | "--ask" -> ask <- true
         | "--mcp" -> mcp <- take "--mcp"
         | "--print-config" -> printConfig <- true
+        | "--no-tui" -> noTui <- true
         | "--help"
         | "-h" -> raise (ArgumentException(helpText (resolveDbPath ()), "--help"))
         | unknown -> raise (ArgumentException($"Unknown flag '{unknown}'.", unknown))
@@ -236,6 +241,7 @@ let parseArgs (argv: string[]) : DotStart =
         Print = printValue
         Mode = mode
         PrintConfig = printConfig
+        NoTui = noTui
     }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -1265,21 +1271,38 @@ let main (argv: string[]) : int =
                                                     initialModel
                                                     CancellationToken.None
                                         else
-                                            let waitBound = TimeSpan.FromMinutes(effective.WaitMinutes)
+                                            // Spike shell (issue 330): the one-shot (-p), list, and
+                                            // config paths never touch the TUI so piped stdout stays
+                                            // byte-identical; the interactive REPL opens the
+                                            // stdlib-only fullscreen proof only when the pure
+                                            // selector clears (real TTY, no NO_COLOR/TERM=dumb/CI/
+                                            // --no-tui), else it runs the current plain REPL.
+                                            let request = DotTui.readRequest effective.NoTui
 
-                                            let engine =
-                                                ReplEngine.Engine(
-                                                    client,
-                                                    agents,
-                                                    packages,
-                                                    Console.In,
-                                                    Console.Out,
-                                                    waitBound,
-                                                    initialModel,
-                                                    options
-                                                )
+                                            if DotTui.shouldUseTui request then
+                                                return!
+                                                    DotTui.runSpikeAsync
+                                                        client
+                                                        agents
+                                                        packages
+                                                        initialModel
+                                                        CancellationToken.None
+                                            else
+                                                let waitBound = TimeSpan.FromMinutes(effective.WaitMinutes)
 
-                                            return! engine.RunAsync(effective.Resume, CancellationToken.None)
+                                                let engine =
+                                                    ReplEngine.Engine(
+                                                        client,
+                                                        agents,
+                                                        packages,
+                                                        Console.In,
+                                                        Console.Out,
+                                                        waitBound,
+                                                        initialModel,
+                                                        options
+                                                    )
+
+                                                return! engine.RunAsync(effective.Resume, CancellationToken.None)
                                 with
                                 | :? SqliteLockedException as locked ->
                                     reportLocked dbPath locked

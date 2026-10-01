@@ -224,6 +224,42 @@ let dotJsonSmoke () : unit =
         with _ ->
             ()
 
+// Pins the TUI fallback contract (issue 330): the piped one-shot path
+// never loads the TUI and stays byte-identical with --no-tui and under
+// NO_COLOR / TERM=dumb / CI. Stdout is captured redirected in every run,
+// so the selector must stay on plain; any TUI escape on stdout fails.
+let dotTuiFallbackSmoke () : unit =
+    let workdir, dbPath = dotSmokeWorkdir ()
+
+    try
+        let _, plainStdout, _ = runDotCapture [ "--scripted"; "-p"; "smoke" ] dbPath
+
+        let exitNoTui, noTuiStdout, _ =
+            runDotCapture
+                [
+                    "--scripted"
+                    "-p"
+                    "smoke"
+                    "--no-tui"
+                ]
+                dbPath
+
+        if exitNoTui <> 0 then
+            failwithf "The dot --no-tui smoke exited %d, expected 0." exitNoTui
+
+        if plainStdout <> noTuiStdout then
+            failwithf "The dot fallback broke byte-identity.\nPlain:\n%s\n--no-tui:\n%s" plainStdout noTuiStdout
+
+        if plainStdout.Contains("\u001b[?1049") then
+            failwithf "The piped dot output loads the TUI alternate screen. Stdout:\n%s" plainStdout
+
+        printfn "Dot TUI fallback smoke passed (piped stdout byte-identical, no TUI escapes)."
+    finally
+        try
+            System.IO.Directory.Delete(workdir, true)
+        with _ ->
+            ()
+
 Target.create "SmokeSamples" (fun _ ->
     run
         dotnet
@@ -250,7 +286,8 @@ Target.create "SmokeSamples" (fun _ ->
         rootPath
 
     dotPrintSmoke ()
-    dotJsonSmoke ())
+    dotJsonSmoke ()
+    dotTuiFallbackSmoke ())
 
 // Produces Release NuGet packages for every packable project into ./artifacts.
 // Builds in Release itself, so it does not depend on the Debug Build target.
