@@ -66,6 +66,7 @@ nunit-*.xml
 
 # Local config and secrets
 appsettings.user.*
+appsettings.local.yaml
 *.local.json
 
 # Agent harness (metaskills): worktrees and GitHub body staging files
