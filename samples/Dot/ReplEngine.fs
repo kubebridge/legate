@@ -454,6 +454,8 @@ type Engine
     let sessions = ResizeArray<ReplSession>()
     let mutable current = -1
     let mutable currentModel = initialModel
+    let mutable tuiOwnsApprovals = false
+    let mutable onEvent: (SessionEvent -> unit) option = None
     let lineGate = obj ()
     let pendingGate = obj ()
     let pendingQueue = Queue<PendingTurn>()
@@ -608,6 +610,90 @@ type Engine
     /// <returns>True while an approval answer is pending.</returns>
     member _.IsApprovalPending: bool = isApprovalPending ()
 
+    /// True when the fullscreen TUI owns approvals: the engine's stream
+    /// renders events without blocking on the console reader, and the TUI
+    /// answers through ReplyPermissionAsync/ReplyQuestionAsync over the
+    /// same ReplyAsync path. False keeps the plain REPL console reader.
+    /// <returns>True when the TUI owns approvals.</returns>
+    member _.TuiOwnsApprovals: bool = tuiOwnsApprovals
+
+    /// Takes over the #332 console-reader deferral: the TUI sets single
+    /// ownership so permission/question prompts move inline and the
+    /// engine never blocks on ReadLineAsync beside the key pump.
+    /// <param name="value">True when the TUI owns approvals.</param>
+    member _.SetTuiOwnsApprovals(value: bool) : unit = tuiOwnsApprovals <- value
+
+    /// The TUI renderer hook: invoked with every Subscribe event the
+    /// stream observes, in addition to the plain EVENT line. None keeps
+    /// the plain REPL path byte-identical; the fullscreen shell sets it
+    /// to fold the same stream into viewport blocks.
+    /// <returns>The current hook, or None.</returns>
+    member _.OnEvent: (SessionEvent -> unit) option = onEvent
+
+    /// Sets the TUI renderer hook (see OnEvent).
+    /// <param name="hook">The hook, or None to clear.</param>
+    member _.SetOnEvent(hook: (SessionEvent -> unit) option) : unit = onEvent <- hook
+
+    /// Answers one permission request without console I/O: the TUI inline
+    /// approval path over the same ReplyAsync PermissionDecision the REPL
+    /// console reader uses.
+    /// <param name="requestId">The permission request id.</param>
+    /// <param name="decision">What the host decided.</param>
+    /// <param name="cancellationToken">Abandons the reply.</param>
+    member _.ReplyPermissionAsync
+        (requestId: string, decision: PermissionDecisionKind, cancellationToken: CancellationToken)
+        : Task =
+        task {
+            let session = currentSession ()
+
+            let safeRequest =
+                match box requestId with
+                | null -> ""
+                | _ -> requestId
+
+            let! _ =
+                SessionClientOperations.ReplyAsync(
+                    client,
+                    session.Id,
+                    PermissionDecision(safeRequest, decision),
+                    cancellationToken
+                )
+
+            ()
+        }
+
+    /// Answers one agent question without console I/O: the TUI inline
+    /// answer-field path over the same ReplyAsync QuestionAnswer the REPL
+    /// console reader uses (null becomes empty, every other buffer resumes
+    /// verbatim).
+    /// <param name="questionId">The question id.</param>
+    /// <param name="answer">The submitted answer buffer.</param>
+    /// <param name="cancellationToken">Abandons the reply.</param>
+    member _.ReplyQuestionAsync(questionId: string, answer: string, cancellationToken: CancellationToken) : Task =
+        task {
+            let session = currentSession ()
+
+            let safeQuestion =
+                match box questionId with
+                | null -> ""
+                | _ -> questionId
+
+            let safeAnswer =
+                match box answer with
+                | null -> ""
+                | _ -> answer
+
+            let! _ =
+                SessionClientOperations.ReplyAsync(
+                    client,
+                    session.Id,
+                    QuestionAnswer(safeQuestion, safeAnswer),
+                    cancellationToken
+                )
+
+            ()
+        }
+
     /// The current session id for fullscreen status display.
     /// <returns>The current session id.</returns>
     member _.CurrentSessionId: SessionId = (currentSession ()).Id
@@ -654,11 +740,21 @@ type Engine
 
                                 line (renderEvent evt)
 
+                                match onEvent with
+                                | Some hook ->
+                                    try
+                                        hook evt
+                                    with _ ->
+                                        ()
+                                | None -> ()
+
                                 match evt with
                                 | :? PermissionRequestedEvent as asked when not (isNull (box asked)) ->
-                                    do! answerPermission asked cancellationToken
+                                    if not tuiOwnsApprovals then
+                                        do! answerPermission asked cancellationToken
                                 | :? QuestionAskedEvent as asked when not (isNull (box asked)) ->
-                                    do! answerQuestion asked cancellationToken
+                                    if not tuiOwnsApprovals then
+                                        do! answerQuestion asked cancellationToken
                                 | _ -> ()
                     with :? OperationCanceledException ->
                         go <- false

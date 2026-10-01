@@ -20,6 +20,7 @@
     <Compile Include="DotMcp.fs" />
     <Compile Include="DotShell.fs" />
     <Compile Include="DotInput.fs" />
+    <Compile Include="DotRender.fs" />
     <Compile Include="DotTui.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>

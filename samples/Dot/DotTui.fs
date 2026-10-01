@@ -145,12 +145,16 @@ type private LineRing() =
 /// command behaves exactly as in the plain REPL: plain text queues, Ctrl+S
 /// steers via /steer, Ctrl+C aborts the turn via /abort without killing
 /// dot, and Esc on an empty buffer, Ctrl+Q, or /quit drains and exits.
-/// Resize is covered by re-reading the window size every frame; colorless
-/// terminals (NO_COLOR or TERM=dumb) render the same layout without ANSI
-/// colors. Quit, abort, and failure paths all restore the cursor and the
-/// primary screen in try/finally (always 0: the REPL exit contract).
-/// Approval answers under --ask ride the engine's console reader until the
-/// renderer child paints them inline: prefer the plain REPL for --ask runs.
+/// The transcript viewport paints the streaming renderer blocks (issue
+/// 333): assistant markdown-lite, tool-call cards, inline permission and
+/// question widgets, and turn lifecycle markers folded from the same
+/// Subscribe stream the REPL prints. Permission answers ride ReplyAsync
+/// inline (a/s/d) and question answers ride the input box through
+/// ReplyAsync, taking over the #332 console-reader deferral. Resize is
+/// covered by re-reading the window size every frame; colorless terminals
+/// (NO_COLOR or TERM=dumb) render the same layout without ANSI colors.
+/// Quit, abort, and failure paths all restore the cursor and the primary
+/// screen in try/finally (always 0: the REPL exit contract).
 let runSpikeAsync
     (client: SessionClient)
     (agents: IAgentStore)
@@ -190,13 +194,23 @@ let runSpikeAsync
                     ())
 
         // The engine owns the session, the turn queue, and every slash
-        // handler: the TUI captures and routes only. Its line output lands
-        // in the ring the viewport paints; its console reader stays for the
-        // approval path the renderer child takes over.
+        // handler: the TUI captures and routes only. Its Subscribe events
+        // fold into the renderer viewport blocks through the OnEvent hook
+        // (single subscription, no duplicate streams); its diagnostic
+        // lines land in the ring the viewport retains for parity. The TUI
+        // owns approvals inline, so the engine never blocks on the console
+        // reader beside the key pump.
         let ring = new LineRing()
 
         let engine =
             ReplEngine.Engine(client, agents, packages, Console.In, ring, waitBound, initialModel, providerOptions)
+
+        engine.SetTuiOwnsApprovals(true)
+
+        let rendererGate = obj ()
+        let mutable renderer = DotRender.empty
+
+        engine.SetOnEvent(Some(fun evt -> lock rendererGate (fun () -> renderer <- DotRender.apply renderer evt)))
 
         let savedTreatControlC =
             try
@@ -226,15 +240,31 @@ let runSpikeAsync
                 with _ ->
                     ()
 
-            let collected = ResizeArray<string>()
             let mutable editor = DotInput.empty
             let mutable history = DotInput.emptyHistory
             let mutable go = true
 
+            let snapshotRenderer () : DotRender.RendererState = lock rendererGate (fun () -> renderer)
+
             let drainRing () : unit =
                 try
+                    let pending =
+                        try
+                            snapshotRenderer ()
+                        with _ ->
+                            DotRender.empty
+
+                    let isEventLine (line: string) : bool =
+                        not (isNull (box line))
+                        && (line.StartsWith("EVENT ", StringComparison.Ordinal)
+                            || line.StartsWith("TREE ", StringComparison.Ordinal))
+
                     for line in ring.Drain() do
-                        collected.Add(line)
+                        if not (isEventLine line) then
+                            lock rendererGate (fun () -> renderer <- DotRender.addLine renderer line)
+
+                    let _ = pending
+                    ()
                 with _ ->
                     ()
 
@@ -251,8 +281,10 @@ let runSpikeAsync
                     let inputRows, (cursorRow, cursorCol) =
                         DotInput.renderInputRegion width inputMax editor hints
 
+                    let view = snapshotRenderer ()
+
                     let state =
-                        if engine.IsApprovalPending then
+                        if DotRender.hasPendingPermission view || DotRender.hasPendingQuestion view then
                             SessionState.WaitingForInput
                         elif engine.IsTurnRunning then
                             SessionState.Running
@@ -264,7 +296,7 @@ let runSpikeAsync
                             width
                             height
                             useColor
-                            (collected |> List.ofSeq)
+                            (DotRender.toViewportLines view)
                             (DotShell.statusText sessionId initialModel state)
                             inputRows
 
@@ -283,43 +315,117 @@ let runSpikeAsync
 
             let route (intent: DotInput.InputIntent) : Task =
                 task {
-                    match intent with
-                    | DotInput.SubmitText text ->
-                        match DotInput.submitLine text with
-                        | Some line ->
-                            let! keepGoing = engine.HandleLineAsync(line, cancellationToken)
+                    let view = snapshotRenderer ()
+
+                    match DotRender.firstQuestion view with
+                    | Some pending when intent <> DotInput.QuitTui ->
+                        match intent with
+                        | DotInput.SubmitText text ->
+                            match DotInput.submitLine text with
+                            | Some _ ->
+                                let answer = DotRender.answerForSubmit text
+
+                                try
+                                    do! engine.ReplyQuestionAsync(pending.QuestionId, answer, cancellationToken)
+                                with _ ->
+                                    ()
+
+                                editor <- DotInput.empty
+                            | None -> ()
+                        | DotInput.AbortTurn ->
+                            let! _ = engine.HandleLineAsync("/abort", cancellationToken)
+                            ()
+                        | DotInput.QuitTui ->
+                            let! keepGoing = engine.HandleLineAsync("/quit", cancellationToken)
                             go <- go && keepGoing
-                        | None -> ()
-                    | DotInput.SteerText text ->
-                        match DotInput.steerLine text with
-                        | Some routed ->
-                            let! keepGoing = engine.HandleLineAsync(routed, cancellationToken)
+                        | DotInput.SteerText _
+                        | DotInput.Noop -> ()
+                    | _ ->
+                        match intent with
+                        | DotInput.SubmitText text ->
+                            match DotInput.submitLine text with
+                            | Some line ->
+                                let! keepGoing = engine.HandleLineAsync(line, cancellationToken)
+                                go <- go && keepGoing
+                            | None -> ()
+                        | DotInput.SteerText text ->
+                            match DotInput.steerLine text with
+                            | Some routed ->
+                                let! keepGoing = engine.HandleLineAsync(routed, cancellationToken)
+                                go <- go && keepGoing
+                            | None -> ()
+                        | DotInput.AbortTurn ->
+                            let! _ = engine.HandleLineAsync("/abort", cancellationToken)
+                            ()
+                        | DotInput.QuitTui ->
+                            let! keepGoing = engine.HandleLineAsync("/quit", cancellationToken)
                             go <- go && keepGoing
-                        | None -> ()
-                    | DotInput.AbortTurn ->
-                        let! _ = engine.HandleLineAsync("/abort", cancellationToken)
-                        ()
-                    | DotInput.QuitTui ->
-                        let! keepGoing = engine.HandleLineAsync("/quit", cancellationToken)
-                        go <- go && keepGoing
-                    | DotInput.Noop -> ()
+                        | DotInput.Noop -> ()
                 }
 
-            // Key pump: quit-only polling is gone (bare q types now); every
-            // key runs the pure decoder, edits stay local, and only submit,
-            // steer, abort, and quit intents touch the engine. Guarded by
-            // entered and KeyAvailable so piped stdin never blocks or throws
-            // out of the loop.
+            // True when the modifiers carry exactly Control (plus optionally
+            // Shift, which terminals report for Ctrl+Shift+letter).
+            let isCtrlOnly (modifiers: ConsoleModifiers) : bool =
+                modifiers.HasFlag(ConsoleModifiers.Control)
+                && not (modifiers.HasFlag(ConsoleModifiers.Alt))
+
+            // Key pump: inline approvals first (single owner), then the pure
+            // decoder. A pending permission answers from a/s/d without
+            // touching the editor; a pending question answers from the input
+            // box submit through ReplyAsync; Ctrl+T toggles the first
+            // truncated tool card. Everything else runs the DotInput decoder
+            // with edits local and only submit/steer/abort/quit touching the
+            // engine. Guarded by entered and KeyAvailable so piped stdin
+            // never blocks or throws out of the loop.
             let pollKeys () : Task =
                 task {
                     if entered && go && not quitRequested then
                         try
                             if Console.KeyAvailable then
                                 let key = Console.ReadKey(true)
-                                let nextEditor, nextHistory, intent = DotInput.applyKey editor history key
-                                editor <- nextEditor
-                                history <- nextHistory
-                                do! route intent
+                                let view = snapshotRenderer ()
+
+                                match DotRender.firstPermission view with
+                                | Some pending ->
+                                    match DotRender.decisionForKey key with
+                                    | Some decision ->
+                                        try
+                                            do!
+                                                engine.ReplyPermissionAsync(
+                                                    pending.RequestId,
+                                                    decision,
+                                                    cancellationToken
+                                                )
+                                        with _ ->
+                                            ()
+                                    | None ->
+                                        let nextEditor, nextHistory, intent = DotInput.applyKey editor history key
+
+                                        editor <- nextEditor
+                                        history <- nextHistory
+                                        do! route intent
+                                | None when
+                                    isCtrlOnly key.Modifiers && (key.Key = ConsoleKey.T || key.KeyChar = '\u0014')
+                                    ->
+                                    let current = snapshotRenderer ()
+
+                                    let target =
+                                        current.Order
+                                        |> List.tryFind (fun id ->
+                                            match current.Tools.TryFind id with
+                                            | Some card when card.Overflow > 0 -> true
+                                            | _ -> false)
+
+                                    match target with
+                                    | Some id ->
+                                        lock rendererGate (fun () -> renderer <- DotRender.toggleExpanded renderer id)
+                                    | None -> ()
+                                | None ->
+                                    let nextEditor, nextHistory, intent = DotInput.applyKey editor history key
+
+                                    editor <- nextEditor
+                                    history <- nextHistory
+                                    do! route intent
                         with _ ->
                             ()
                 }
