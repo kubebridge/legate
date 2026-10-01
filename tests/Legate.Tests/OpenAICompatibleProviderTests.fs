@@ -168,7 +168,7 @@ let ``Anthropic preset answers canned text through the SDK pipeline`` () =
 [<Fact>]
 let ``OllamaCloud preset answers canned text through the SDK pipeline`` () =
     let provider, handler =
-        scriptedProvider Presets.OllamaCloud (fun _ -> jsonResponse (textPayload "llama3.1" "canned cloud"))
+        scriptedProvider Presets.OllamaCloud (fun _ -> jsonResponse (textPayload "gpt-oss:120b" "canned cloud"))
 
     completeText provider Presets.OllamaCloud |> should equal "canned cloud"
 
@@ -445,7 +445,7 @@ let ``OpenAI provider reports its identity and capabilities`` () =
 [<Fact>]
 let ``OllamaCloud provider reports no reasoning`` () =
     let provider, _ =
-        scriptedProvider Presets.OllamaCloud (fun _ -> jsonResponse (textPayload "llama3.1" "x"))
+        scriptedProvider Presets.OllamaCloud (fun _ -> jsonResponse (textPayload "gpt-oss:120b" "x"))
 
     (provider :> ILlmProvider).Capabilities.Reasoning |> should equal false
 

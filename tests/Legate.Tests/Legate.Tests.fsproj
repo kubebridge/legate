@@ -21,6 +21,7 @@
     <Compile Include="TurnTests.fs" />
     <Compile Include="LlmStreamingTests.fs" />
     <Compile Include="TurnLoopTests.fs" />
+    <Compile Include="ProviderFailureReasonTests.fs" />
     <Compile Include="ExecToolTests.fs" />
     <Compile Include="TestClockTests.fs" />
     <Compile Include="InMemoryDatabaseTests.fs" />
