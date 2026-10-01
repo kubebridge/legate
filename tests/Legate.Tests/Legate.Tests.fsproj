@@ -121,6 +121,7 @@
     <Compile Include="PromptAndWaitTests.fs" />
     <Compile Include="SessionClientFacadeTests.fs" />
     <Compile Include="LegateCliSmokeTests.fs" />
+    <Compile Include="../../samples/Dot/DotConfig.fs" Link="DotConfigUnderTest.fs" />
     <Compile Include="DotReplSmokeTests.fs" />
     <Compile Include="../../samples/Dot/DotPicker.fs" Link="DotPickerUnderTest.fs" />
     <Compile Include="DotPickerTests.fs" />
