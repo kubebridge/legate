@@ -19,21 +19,22 @@ open Legate
 /// The ASCII dot banner heading every fullscreen frame.
 let bannerLines =
     [
-        "     _       _   "
-        "  __| | ___ | |_ "
-        " / _` |/ _ \\| __|"
-        "| (_| | (_) | |_ "
-        " \\__,_|\\___/ \\__|"
+        "██████╗   ██████╗  ████████╗"
+        "██╔══██╗ ██╔═══██╗ ╚══██╔══╝"
+        "██║  ██║ ██║   ██║    ██║   "
+        "██║  ██║ ██║   ██║    ██║   "
+        "██████╔╝ ╚██████╔╝    ██║   "
+        "╚═════╝   ╚═════╝     ╚═╝   "
     ]
 
 /// The shell title under the banner: names the input box and the plain
 /// output escape (the streaming renderer is a later child that paints
 /// into this frame).
-let shellTitle = "dot fullscreen (Enter sends, --no-tui for plain)"
+let shellTitle = "Your workspace. Your agent."
 
 /// The input-box quit hint in the frame footer: Esc on an empty buffer,
 /// Ctrl+Q, or /quit quits (bare q types now that the input box owns keys).
-let quitHint = "> [Esc on empty input, Ctrl+Q, or /quit quits]"
+let quitHint = "> [Ctrl+C, Ctrl+D, Ctrl+Q, or /quit quits]"
 
 // ──────────────────────────────────────────────────────────────────────────
 // Turn-state mapping
@@ -100,11 +101,11 @@ let statusText (sessionId: SessionId) (model: ModelReference) (state: SessionSta
 
 /// Enters the alternate screen with the cursor hidden: written once before
 /// the first paint.
-let alternateEnter = "\u001b[?1049h\u001b[?25l"
+let alternateEnter = "\u001b[?1049h\u001b[?25l\u001b[2J"
 
 /// Restores the cursor and the primary screen: the teardown every quit,
 /// abort, and crash path runs in try/finally.
-let alternateExit = "\u001b[?25h\u001b[?1049l"
+let alternateExit = "\u001b[0m\u001b[?25h\u001b[?1049l"
 
 /// Homes the cursor and clears the alternate screen before each repaint.
 let homeClear = "\u001b[H\u001b[2J"
@@ -137,6 +138,233 @@ let isMinimumSize (width: int) (height: int) : bool =
 
 // ──────────────────────────────────────────────────────────────────────────
 // Frame
+
+/// Removes terminal controls from untrusted transcript and editor text.
+let plainText (text: string) : string =
+    if isNull (box text) then
+        ""
+    else
+        Text.RegularExpressions.Regex.Replace(text, "\u001b\\[[0-?]*[ -/]*[@-~]", "")
+        |> Seq.filter (fun c -> not (Char.IsControl c))
+        |> Seq.toArray
+        |> String
+
+/// Keeps the current model and state visible by shortening the workspace path.
+let workspaceStatus (width: int) (directory: string) (model: ModelReference) (state: SessionState) : string =
+    let columns = max 1 (width - 1)
+    let modelText = plainText model.Value
+    let modelBudget = max 1 (columns / 3)
+
+    let modelText =
+        if modelText.Length <= modelBudget then
+            modelText
+        else
+            modelText.Substring(0, modelBudget - 1) + "…"
+
+    let suffix = $" · {modelText} · {state.ToString().ToLowerInvariant()}"
+    let pathBudget = max 0 (columns - suffix.Length)
+    let path = plainText directory
+
+    let path =
+        if path.Length <= pathBudget then
+            path
+        elif pathBudget > 1 then
+            "…" + path.Substring(path.Length - pathBudget + 1)
+        else
+            ""
+
+    path + suffix
+
+/// One laid-out terminal screen, including the absolute zero-based input cursor.
+type Screen =
+    {
+        Rows: string array
+        CursorRow: int
+        CursorCol: int
+        Width: int
+    }
+
+/// Semantic session cells; style is applied only after sanitizing and wrapping.
+type CellStyle =
+    | Plain
+    | User
+    | Assistant
+    | Reasoning
+    | Tool
+    | Error
+
+/// A complete message or a growing streaming cell in the transcript.
+type SessionCell = { Style: CellStyle; Text: string }
+
+/// Wraps at word boundaries while preserving paragraph breaks and indentation.
+let wrapText (columns: int) (text: string) : string list =
+    let columns = max 1 columns
+
+    let wrapLine (raw: string) =
+        let mutable remaining = plainText (raw.Replace("\t", "    "))
+        let rows = ResizeArray<string>()
+
+        while remaining.Length > columns do
+            let space = remaining.LastIndexOf(' ', columns, columns + 1)
+            let cut = if space > columns / 2 then space else columns
+            rows.Add(remaining.Substring(0, cut))
+            remaining <- remaining.Substring(cut + (if cut = space then 1 else 0))
+
+        rows.Add remaining
+        List.ofSeq rows
+
+    text.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n')
+    |> Array.toList
+    |> List.collect wrapLine
+
+/// Paints padded user cells, subdued reasoning, and separated assistant text.
+let renderCells (columns: int) (useColor: bool) (welcome: bool) (cells: SessionCell list) : string list =
+    let columns = max 1 columns
+
+    let paint code text =
+        if useColor then $"\u001b[{code}m{text}\u001b[0m" else text
+
+    cells
+    |> List.collect (fun cell ->
+        let inset = if columns >= 4 && cell.Style <> Plain then 1 else 0
+
+        let body =
+            wrapText (columns - 2 * inset) cell.Text
+            |> List.map (fun line -> String(' ', inset) + line)
+
+        match cell.Style with
+        | User ->
+            let shade (line: string) =
+                (line.PadRight columns) |> paint "48;2;16;39;77;38;2;224;234;248"
+
+            [ shade "" ] @ (body |> List.map shade) @ [ shade ""; "" ]
+        | Reasoning -> (body |> List.map (paint "3;38;2;148;159;164")) @ [ "" ]
+        | Assistant ->
+            DotMarkdown.render (columns - 2 * inset) useColor plainText wrapText cell.Text
+            |> List.map (fun line -> String(' ', inset) + line)
+            |> fun lines -> lines @ [ "" ]
+        | Tool -> (body |> List.map (paint DotMarkdown.softBlue)) @ [ "" ]
+        | Error -> (body |> List.map (paint "38;2;231;144;137")) @ [ "" ]
+        | Plain ->
+            body
+            |> List.map (fun line ->
+                if line.StartsWith("[") then paint DotMarkdown.softBlue line
+                elif welcome then paint "38;2;135;139;145" line
+                else line))
+
+/// Builds a fixed-height screen. The composer and status stay at the bottom;
+/// the welcome art belongs to scrollback and leaves room for conversation.
+let renderScreenWithCells
+    width
+    height
+    useColor
+    welcome
+    transcript
+    status
+    inputLines
+    (cursorRow, cursorCol)
+    scrollOffset
+    : Screen =
+    let width = max 1 (min 500 width)
+    let height = max 1 (min 200 height)
+    // Leave the last column unused to avoid terminal autowrap at the margin.
+    let columns = max 1 (width - 1)
+
+    let trim (text: string) =
+        let text = plainText text
+
+        if text.Length <= columns then
+            text
+        else
+            text.Substring(0, max 0 (columns - 1)) + "…"
+
+    let color code text =
+        if useColor && text <> "" then
+            $"\u001b[{code}m{text}\u001b[0m"
+        else
+            text
+
+    let center text =
+        String(' ', max 0 ((columns - (plainText text).Length) / 2)) + text |> trim
+
+    let input = inputLines |> List.truncate (max 1 (height - 4)) |> List.map trim
+    let input = if input.IsEmpty then [ "  " ] else input
+    let bodyHeight = max 0 (height - input.Length - 3)
+    let rule = String('─', columns) |> color DotMarkdown.blue
+
+    let header =
+        if welcome then
+            let art =
+                if width >= 40 && bodyHeight >= 14 then
+                    [ ""; "" ]
+                    @ (bannerLines |> List.map center)
+                    @ [ ""; center shellTitle; ""; "" ]
+                else
+                    [ center "Dot"; "" ]
+
+            art |> List.map (color DotMarkdown.blue)
+        else
+            []
+
+    let content = renderCells columns useColor welcome transcript
+
+    let all = header @ content
+    let offset = min (max 0 scrollOffset) (max 0 (all.Length - bodyHeight))
+    let finish = max 0 (all.Length - offset)
+    let visible = all |> List.take finish |> List.skip (max 0 (finish - bodyHeight))
+    let body = visible @ List.replicate (max 0 (bodyHeight - visible.Length)) ""
+
+    let rows =
+        body
+        @ [ rule ]
+        @ input
+        @ [
+            rule
+            trim status |> color "38;2;135;139;145"
+        ]
+
+    let rows = rows |> List.truncate height |> List.toArray
+
+    {
+        Rows = rows
+        CursorRow = min (height - 1) (bodyHeight + 1 + min (input.Length - 1) (max 0 cursorRow))
+        CursorCol = min (columns - 1) (max 0 cursorCol)
+        Width = width
+    }
+
+/// Plain-line adapter for welcome screens and headless layout tests.
+let renderScreen width height useColor welcome transcript status inputLines cursor scrollOffset : Screen =
+    let cells = transcript |> List.map (fun line -> { Style = Plain; Text = line })
+    renderScreenWithCells width height useColor welcome cells status inputLines cursor scrollOffset
+
+/// Emits only changed rows, with absolute cursor addressing and no newlines.
+/// Identical screens emit nothing, including no cursor hide/show flicker.
+let screenUpdate (previous: Screen option) (current: Screen) : string =
+    if previous = Some current then
+        ""
+    else
+        let output = Text.StringBuilder("\u001b[?2026h\u001b[?25l")
+
+        let resized =
+            previous
+            |> Option.exists (fun old -> old.Width <> current.Width || old.Rows.Length <> current.Rows.Length)
+
+        if resized then
+            output.Append("\u001b[2J") |> ignore
+
+        for index in 0 .. current.Rows.Length - 1 do
+            let unchanged =
+                not resized
+                && (previous
+                    |> Option.exists (fun old -> index < old.Rows.Length && old.Rows[index] = current.Rows[index]))
+
+            if not unchanged then
+                output.Append($"\u001b[{index + 1};1H\u001b[0m\u001b[2K").Append(current.Rows[index])
+                |> ignore
+
+        output
+            .Append($"\u001b[0m\u001b[{current.CursorRow + 1};{current.CursorCol + 1}H\u001b[?25h\u001b[?2026l")
+            .ToString()
 
 /// Renders one fullscreen frame as plain text with optional ANSI colors:
 /// the ASCII dot banner header, the scrollable transcript viewport (the
@@ -176,7 +404,7 @@ let renderFrameWithInput
 
     let paintBanner =
         if useColor then
-            bannerLines |> List.map (fun art -> "\u001b[1;36m" + art + "\u001b[0m")
+            bannerLines |> List.map (DotMarkdown.paint true ("1;" + DotMarkdown.blue))
         else
             bannerLines
 

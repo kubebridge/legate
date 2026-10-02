@@ -36,7 +36,7 @@ open Legate
 
 /// The command usage reprinted on startup and for unknown commands.
 let private commandsUsage =
-    "Commands: /new [title], /sessions, /resume <id-or-index>, /model [provider[/model]], /steer <text>, /follow <text>, /abort, /compact, /tree, /fork <sequence>, /clone, /session, /export <file>, /<template>, /quit."
+    "Commands: /new [title], /sessions, /resume <id-or-index>, /model [provider[/model]], /agents, /steer <text>, /follow <text>, /abort, /compact, /tree, /fork <sequence>, /clone, /session, /export <file>, /<template>, /quit."
 
 // ──────────────────────────────────────────────────────────────────────────
 // Provider and model selection (issue 307)
@@ -277,7 +277,10 @@ let ensureModelAgentAsync
     : Task<AgentId> =
     task {
         let isMatch (agent: Agent) : bool =
-            not (isNull (box agent)) && agent.Enabled && agent.Model.Equals(reference)
+            not (isNull (box agent))
+            && agent.Enabled
+            && agent.Name.StartsWith("dot ", StringComparison.Ordinal)
+            && agent.Model.Equals(reference)
 
         let findMatch (listed: IReadOnlyList<Agent>) : Agent option =
             if isNull (box listed) then
@@ -376,6 +379,7 @@ let ensureModelAgentAsync
 
         do! DotSkills.uploadSamplePackageAsync packages TenantId.Default agentId cancellationToken
         do! stampPackageReferenceAsync agentId
+        do! DotSkills.ensureSubAgentsAsync agents reference cancellationToken
         return agentId
     }
 
@@ -697,6 +701,9 @@ type Engine
     /// The current session id for fullscreen status display.
     /// <returns>The current session id.</returns>
     member _.CurrentSessionId: SessionId = (currentSession ()).Id
+
+    /// The currently selected model, including interactive model switches.
+    member _.CurrentModel: ModelReference = currentModel
 
     /// True while the drain loop owns a live turn.
     /// <returns>True while a turn is in flight.</returns>
@@ -1423,6 +1430,14 @@ type Engine
                         line $"{marker} {option.Id} default {defaultReferenceText option}"
                 with error ->
                     line $"ERROR {error.Message}"
+
+                return true
+            elif text = "/agents" then
+                let! available = agents.ListAgents(TenantId.Default, cancellationToken)
+
+                for agent in available do
+                    if agent.Enabled && not (String.IsNullOrWhiteSpace agent.Description) then
+                        line $"AGENT {agent.Name}: {agent.Description}"
 
                 return true
             elif

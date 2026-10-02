@@ -367,7 +367,7 @@ let dotTuiHeadlessSmoke () : unit =
         if exit <> 0 then
             failwithf "The dot headless TUI smoke exited %d, expected 0. Stdout:\n%s\nStderr:\n%s" exit stdout stderr
 
-        checkSmokeContains stdout "dot fullscreen"
+        checkSmokeContains stdout "Your workspace. Your agent."
         checkSmokeContains stdout "session "
         checkSmokeContains stdout "dot scripted answer"
         checkSmokeContains stdout "END-RESULT"

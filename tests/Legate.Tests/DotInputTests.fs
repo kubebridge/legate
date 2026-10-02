@@ -239,11 +239,11 @@ let ``Ctrl+S steers plain buffers and passes slash buffers through`` () =
     blankIntent |> should equal Noop
 
 [<Fact>]
-let ``Ctrl+C aborts without quitting and preserves the buffer`` () =
+let ``Ctrl+C quits and preserves the buffer`` () =
     let typed, _, _ = typeText "draft"
     let editor, history, intent = press typed emptyHistory (ctrlKey ConsoleKey.C '\x03')
 
-    intent |> should equal AbortTurn
+    intent |> should equal QuitTui
     toText editor |> should equal "draft"
     history.Entries |> List.isEmpty |> should equal true
 
@@ -259,6 +259,27 @@ let ``Ctrl+Q and empty Esc quit while non-empty Esc only leaves browse`` () =
     let editor, _, intent = press typed emptyHistory escapeKey
     intent |> should equal Noop
     toText editor |> should equal "draft"
+
+[<Fact>]
+let ``Ctrl+D quits with an unfinished draft`` () =
+    let draft = fromText "unfinished"
+    let editor, _, intent = press draft emptyHistory (ctrlKey ConsoleKey.D '\u0004')
+    intent |> should equal QuitTui
+    editor |> should equal draft
+
+[<Fact>]
+let ``Exit shortcuts accept raw control characters without swallowing letters`` () =
+    for control in [ '\u0003'; '\u0004'; '\u0011' ] do
+        let key = ConsoleKeyInfo(control, ConsoleKey.NoName, false, false, false)
+        isExitKey key |> should equal true
+        let _, _, intent = press empty emptyHistory key
+        intent |> should equal QuitTui
+
+    for letter in [ 'c'; 'd'; 'q' ] do
+        isExitKey (charKey letter) |> should equal false
+
+    isExitKey (ConsoleKeyInfo('\u0004', ConsoleKey.D, false, true, true))
+    |> should equal false
 
 [<Fact>]
 let ``Alt+B and Alt+F move by word regardless of KeyChar`` () =
@@ -434,12 +455,12 @@ let ``Template names match with descriptions and truncate at five`` () =
 // Renderer
 
 [<Fact>]
-let ``Rows never exceed the width and long lines carry the marker`` () =
+let ``Long input scrolls horizontally to keep the insertion point visible`` () =
     let editor = fromText (String.replicate 100 "a")
     let rows, _ = renderInputRegion 80 10 editor []
 
     rows |> List.forall (fun row -> row.Length <= 80) |> should equal true
-    rows[0] |> should equal ("> " + String.replicate 77 "a" + ">")
+    rows[0] |> should equal ("> " + String.replicate 77 "a")
     rows |> List.last |> should equal (clampRow 80 hintBarText)
 
 [<Fact>]
@@ -487,6 +508,19 @@ let ``CursorLine reads the cursor row`` () =
     let editor = fromText "first\nsecond"
     cursorLine { editor with Row = 0; Col = 0 } |> should equal "first"
     cursorLine editor |> should equal "second"
+
+[<Fact>]
+let ``Slash hints respect a short composer budget`` () =
+    let rows, (row, _) = renderInputRegion 40 3 (fromText "/") (queryHints "/" [])
+    rows.Length |> should equal 3
+    row |> should equal 0
+
+[<Fact>]
+let ``Long input shows the character being edited`` () =
+    let editor = fromText (String.replicate 120 "a" + "END")
+    let rows, (_, col) = renderInputRegion 40 5 editor []
+    rows[0].EndsWith("END", StringComparison.Ordinal) |> should equal true
+    col |> should equal 39
 
 [<Fact>]
 let ``Plain Enter resumes a blank pending question`` () =

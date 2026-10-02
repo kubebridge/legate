@@ -80,6 +80,137 @@ let private allEvents (s: SessionId) (t: TurnId) : SessionEvent list =
 // Fold: Subscribe events into viewport blocks
 
 [<Fact>]
+let ``Display keeps streaming text and tool cards in conversation order`` () =
+    let s, t = sid (), tid ()
+
+    let state =
+        addLine empty "> inspect this"
+        |> fun state ->
+            applyAll
+                state
+                [
+                    started s t
+                    delta s t "Before"
+                    callStarted s t "read-1" "read_file"
+                    delta s t "After"
+                    callCompleted s t "read-1" null
+                ]
+
+    let lines = toDisplayLines state
+    let before = lines |> List.findIndex ((=) "Before")
+    let tool = lines |> List.findIndex (fun line -> line.Contains("read_file"))
+    let after = lines |> List.findIndex ((=) "After")
+    Assert.True(before < tool && tool < after)
+    lines.Head |> should equal "> inspect this"
+
+[<Fact>]
+let ``Streamed result is not duplicated by the REPL result envelope`` () =
+    let s, t = sid (), tid ()
+    let state = applyAll empty [ started s t; delta s t "hello" ]
+
+    let state =
+        addLines
+            state
+            [
+                "RESULT Completed"
+                "hello"
+                "END-RESULT"
+            ]
+
+    toDisplayLines state
+    |> List.filter ((=) "hello")
+    |> List.length
+    |> should equal 1
+
+    let fallback =
+        addLines
+            empty
+            [
+                "RESULT Completed"
+                "hello"
+                "END-RESULT"
+            ]
+
+    toSessionCells fallback
+    |> should
+        equal
+        [
+            {
+                Dot.DotShell.Style = Dot.DotShell.Assistant
+                Dot.DotShell.Text = "hello"
+            }
+        ]
+
+[<Fact>]
+let ``User reasoning and assistant retain distinct session cell styles`` () =
+    let s, t = sid (), tid ()
+
+    let state =
+        addUserMessage empty "hi\n  keep my indentation"
+        |> fun state ->
+            applyAll
+                state
+                [
+                    started s t
+                    reasoning s t "Considering "
+                    reasoning s t "the request.\n\nReady."
+                    delta s t "Hello!"
+                ]
+
+    let cells = toSessionCells state
+
+    cells
+    |> List.map (fun cell -> cell.Style)
+    |> should
+        equal
+        [
+            Dot.DotShell.User
+            Dot.DotShell.Reasoning
+            Dot.DotShell.Assistant
+        ]
+
+    cells[0].Text |> should equal "hi\n  keep my indentation"
+    cells[1].Text |> should equal "Considering the request.\n\nReady."
+    cells[2].Text |> should equal "Hello!"
+
+[<Fact>]
+let ``Non-streamed results preserve paragraphs and code indentation`` () =
+    let state =
+        addLines
+            empty
+            [
+                "RESULT Completed"
+                "First paragraph."
+                ""
+                "    code"
+                "END-RESULT"
+            ]
+
+    let cells = toSessionCells state
+    cells.Length |> should equal 1
+    cells.Head.Style |> should equal Dot.DotShell.Assistant
+    cells.Head.Text |> should equal "First paragraph.\n\n    code"
+
+[<Fact>]
+let ``Turn errors are separate error cells`` () =
+    let s, t = sid (), tid ()
+
+    let state =
+        addUserMessage empty "hi"
+        |> fun state -> apply state (TurnFailedEvent(s, t, at 2, stamp, "unavailable"))
+
+    let cells = toSessionCells state
+
+    cells
+    |> List.map (fun cell -> cell.Style)
+    |> should
+        equal
+        [
+            Dot.DotShell.User
+            Dot.DotShell.Error
+        ]
+
+[<Fact>]
 let ``Text deltas accumulate into one assistant block`` () =
     let s, t = sid (), tid ()
 

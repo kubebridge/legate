@@ -185,6 +185,275 @@ let private collectStream
 // ──────────────────────────────────────────────────────────────────────────
 // Open
 
+type private SwitchingProvider(first: IChatClient, second: IChatClient) =
+    interface ILlmProvider with
+        member _.Id = "switch-test"
+        member _.DefaultModel = "first"
+
+        member _.Capabilities =
+            {
+                Streaming = false
+                Reasoning = false
+                ToolCalling = true
+            }
+
+        member _.CreateChatClient(model, _) =
+            if model.Model = "second" then second else first
+
+[<Fact>]
+let ``SetAgent switches the actual provider client on the next prompt`` () : Task =
+    task {
+        let first = scripted [ ScriptStep.Text "first model" ]
+        let second = scripted [ ScriptStep.Text "second model" ]
+        let database = InMemoryDatabase()
+        let services = ServiceCollection()
+
+        services.AddLegate(
+            Action<LegateBuilder>(fun builder ->
+                builder.Storage.UseSessionStore(InMemorySessionStore(database)) |> ignore
+
+                builder.Agents.Add(
+                    "first",
+                    Func<Agent, Agent>(fun agent ->
+                        { agent with
+                            Model = ModelReference.Parse("switch-test/first")
+                        })
+                )
+                |> ignore
+
+                builder.Agents.Add(
+                    "second",
+                    Func<Agent, Agent>(fun agent ->
+                        { agent with
+                            Model = ModelReference.Parse("switch-test/second")
+                        })
+                )
+                |> ignore)
+        )
+        |> ignore
+
+        services.AddSingleton<ISessionEventStore>(InMemorySessionEventStore(database))
+        |> ignore
+
+        services.AddSingleton<IChatClient>(first) |> ignore
+        services.AddSingleton<ILlmProvider>(SwitchingProvider(first, second)) |> ignore
+
+        services.AddSingleton<Func<ModelReference, IChatClient>>(
+            Func<ModelReference, IChatClient>(fun model -> if model.Model = "second" then second else first)
+        )
+        |> ignore
+
+        use provider = services.BuildServiceProvider()
+        let! agents = provider.GetRequiredService<IAgentStore>().ListAgents(TenantId.Default, CancellationToken.None)
+
+        let agent name =
+            agents |> Seq.find (fun agent -> agent.Name = name)
+
+        do!
+            withClient provider (fun client ->
+                task {
+                    let! session =
+                        SessionClientOperations.OpenSessionAsync(
+                            client,
+                            (agent "first").Id,
+                            null,
+                            CancellationToken.None
+                        )
+
+                    let! result =
+                        SessionClientExtensions.PromptAndWaitAsync(
+                            client,
+                            session.Id,
+                            UserMessage.Text "hi",
+                            CancellationToken.None
+                        )
+
+                    result.AssistantText |> should equal "first model"
+
+                    let! _ =
+                        SessionClientOperations.SetAgentAsync(
+                            client,
+                            session.Id,
+                            (agent "second").Id,
+                            CancellationToken.None
+                        )
+
+                    let! changed =
+                        SessionClientExtensions.PromptAndWaitAsync(
+                            client,
+                            session.Id,
+                            UserMessage.Text "hi again",
+                            CancellationToken.None
+                        )
+
+                    changed.AssistantText |> should equal "second model"
+                })
+    }
+
+[<Fact>]
+let ``Registered providers do not bypass the host chat pipeline without opt-in`` () : Task =
+    task {
+        let hostClient =
+            scripted
+                [
+                    ScriptStep.Text "host middleware pipeline"
+                ]
+
+        let rawClient = scripted [ ScriptStep.Text "raw provider" ]
+        let database = InMemoryDatabase()
+        let services = ServiceCollection()
+
+        services.AddLegate(
+            Action<LegateBuilder>(fun builder ->
+                builder.Storage.UseSessionStore(InMemorySessionStore(database)) |> ignore
+
+                builder.Agents.Add(
+                    "host",
+                    Func<Agent, Agent>(fun agent ->
+                        { agent with
+                            Model = ModelReference.Parse("switch-test/first")
+                        })
+                )
+                |> ignore)
+        )
+        |> ignore
+
+        services.AddSingleton<ISessionEventStore>(InMemorySessionEventStore(database))
+        |> ignore
+
+        services.AddSingleton<IChatClient>(hostClient) |> ignore
+
+        services.AddSingleton<ILlmProvider>(SwitchingProvider(rawClient, rawClient))
+        |> ignore
+
+        use provider = services.BuildServiceProvider()
+        let! agents = provider.GetRequiredService<IAgentStore>().ListAgents(TenantId.Default, CancellationToken.None)
+
+        do!
+            withClient provider (fun client ->
+                task {
+                    let! session =
+                        SessionClientOperations.OpenSessionAsync(client, agents[0].Id, null, CancellationToken.None)
+
+                    let! result =
+                        SessionClientExtensions.PromptAndWaitAsync(
+                            client,
+                            session.Id,
+                            UserMessage.Text "hi",
+                            CancellationToken.None
+                        )
+
+                    result.AssistantText |> should equal "host middleware pipeline"
+                    rawClient.Calls |> should equal 0
+                })
+    }
+
+[<Fact>]
+let ``Catalog lookup propagates cancellation and abandons an unresponsive store`` () : Task =
+    task {
+        use cts = new CancellationTokenSource()
+
+        let never =
+            TaskCompletionSource<IReadOnlyList<Agent>>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+        let mutable received = CancellationToken.None
+
+        let store =
+            { new IAgentStore with
+                member _.ListAgents(_, token) =
+                    received <- token
+                    never.Task
+
+                member _.GetAgent(_, _, _) = failwith "unused"
+                member _.UpdateIfUnchanged(_, _, _, _) = failwith "unused"
+                member _.DeleteAgent(_, _, _) = failwith "unused"
+                member _.ListAgentsWithEnabledSchedules(_, _) = failwith "unused"
+                member _.TryConsumeScheduleOccurrence(_, _, _, _, _) = failwith "unused"
+            }
+
+        let pending =
+            SessionClientWiring.agentsForEntryAsync store TenantId.Default cts.Token
+
+        received |> should equal cts.Token
+        cts.Cancel()
+        let! _ = Assert.ThrowsAnyAsync<OperationCanceledException>(Func<Task>(fun () -> pending :> Task))
+        never.TrySetResult(Array.empty<Agent>) |> ignore
+    }
+
+[<Fact>]
+let ``Facade runs a delegated sub-agent and returns to its parent`` () : Task =
+    task {
+        let args = Dictionary<string, obj>()
+        args["subagent"] <- "explore"
+        args["task"] <- "inspect the workspace"
+
+        let chat =
+            scripted
+                [
+                    ScriptStep.ToolCall("delegate", "task", args)
+                    ScriptStep.Text "nested findings"
+                    ScriptStep.Text "parent summary"
+                ]
+
+        let database = InMemoryDatabase()
+        let services = ServiceCollection()
+
+        services.AddLegate(
+            Action<LegateBuilder>(fun builder ->
+                builder.Storage.UseSessionStore(InMemorySessionStore(database)) |> ignore
+                builder.Agents.Add("parent", Func<Agent, Agent>(id)) |> ignore
+
+                builder.Agents.Add(
+                    "explore",
+                    Func<Agent, Agent>(fun agent ->
+                        { agent with
+                            Description = "Read-only explorer"
+                            SystemPrompt = "Report findings."
+                        })
+                )
+                |> ignore)
+        )
+        |> ignore
+
+        services.AddSingleton<ISessionEventStore>(InMemorySessionEventStore(database))
+        |> ignore
+
+        services.AddSingleton<IChatClient>(chat) |> ignore
+        use provider = services.BuildServiceProvider()
+        let! agents = provider.GetRequiredService<IAgentStore>().ListAgents(TenantId.Default, CancellationToken.None)
+
+        do!
+            withClient provider (fun client ->
+                task {
+                    let parent = agents |> Seq.find (fun agent -> agent.Name = "parent")
+
+                    let! session =
+                        SessionClientOperations.OpenSessionAsync(client, parent.Id, null, CancellationToken.None)
+
+                    let! result =
+                        SessionClientExtensions.PromptAndWaitAsync(
+                            client,
+                            session.Id,
+                            UserMessage.Text "delegate",
+                            CancellationToken.None
+                        )
+
+                    result.Status |> should equal TurnStatus.Completed
+                    result.AssistantText |> should equal "parent summary"
+                    chat.Calls |> should equal 3
+
+                    let nestedResult =
+                        chat.ReceivedMessages
+                        |> Seq.collect (fun message -> message.Contents)
+                        |> Seq.choose (function
+                            | :? FunctionResultContent as result -> Some(string result.Result)
+                            | _ -> None)
+                        |> String.concat "\n"
+
+                    nestedResult.Contains("nested findings") |> should equal true
+                })
+    }
+
 [<Fact>]
 let ``Open creates an Idle session row with the agent and title`` () : Task =
     task {

@@ -34,6 +34,63 @@ let sampleSkillName = "review"
 /// The package-relative SKILL.md path of the sample skill.
 let sampleSkillPath = ".agent/skills/review/SKILL.md"
 
+/// Seeds the session-shared nested runners into the durable agent catalog.
+/// Explore receives only read-only tools; general inherits the parent pool.
+let ensureSubAgentsAsync (store: IAgentStore) (model: ModelReference) (ct: CancellationToken) : Task =
+    task {
+        let! existing = store.ListAgents(TenantId.Default, ct)
+
+        for name, description, prompt, tools in
+            [
+                "explore",
+                "Read-only workspace exploration and code research.",
+                "You are a read-only exploration sub-agent. Inspect files and report findings concisely. Never modify files or execute commands.",
+                Some
+                    [
+                        "read_file"
+                        "list_files"
+                        "glob"
+                        "grep"
+                    ]
+                "general",
+                "Delegated implementation and multi-step tasks.",
+                "Carry out the delegated task with the available tools and report your outcome concisely.",
+                None
+            ] do
+            if not (existing |> Seq.exists (fun agent -> agent.Name = name)) then
+                let now = DateTimeOffset.UtcNow
+
+                let selection =
+                    match tools with
+                    | None -> null
+                    | Some names ->
+                        let value = ToolSelection()
+                        value.BuiltIns <- ResizeArray<string>(names)
+                        value
+
+                let agent: Agent =
+                    {
+                        Id = AgentId.New()
+                        Tenant = TenantId.Default
+                        Name = name
+                        Description = description
+                        Model = model
+                        SystemPrompt = prompt
+                        EnvironmentVariables = null
+                        PermissionDefaults = null
+                        ToolSelection = selection
+                        PackageReference = null
+                        Enabled = true
+                        Schedule = null
+                        RowVersion = 0UL
+                        CreatedAt = now
+                        UpdatedAt = now
+                    }
+
+                let! _ = store.UpdateIfUnchanged(TenantId.Default, agent, 0UL, ct)
+                ()
+    }
+
 /// The sample review SKILL.md text: YAML frontmatter the runtime discovery
 /// parses (name, description, read-only allowed-tools) plus a short
 /// read-only review guide. REVIEW-SKILL-309 marks the content the

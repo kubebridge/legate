@@ -149,6 +149,7 @@ let handleKeyAsync (callbacks: Callbacks) (state: State) (key: ConsoleKeyInfo) :
             let view = callbacks.SnapshotRenderer()
 
             match visiblePicker view state with
+            | _ when DotInput.isExitKey key -> state.Go <- false
             | Some shown ->
                 let next, outcome = DotPicker.applyPickerKey shown key
 

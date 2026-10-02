@@ -364,12 +364,7 @@ let ``permission fallback Enter answers a concurrent question verbatim`` text =
 [<InlineData(true)>]
 let ``explicit controls keep prompt semantics and never dismiss suspended picker`` question =
     task {
-        for input, line in
-            [
-                ctrl ConsoleKey.C, "/abort"
-                ctrl ConsoleKey.Q, "/quit"
-                key ConsoleKey.Escape, "/quit"
-            ] do
+        for input, line in [ key ConsoleKey.Escape, "/quit" ] do
             let h = Harness()
             h.State.Picker <- Some picker
             if question then h.Ask "q" else h.Request "p"
@@ -377,6 +372,26 @@ let ``explicit controls keep prompt semantics and never dismiss suspended picker
             h.Dispatches |> should equal [ Line line ]
             h.State.Picker |> should equal (Some picker)
             h.State.Go |> should equal (line <> "/quit")
+    }
+
+[<Theory>]
+[<InlineData(false)>]
+[<InlineData(true)>]
+let ``exit shortcuts bypass prompt and picker queue drains`` question =
+    task {
+        for consoleKey in
+            [
+                ConsoleKey.C
+                ConsoleKey.D
+                ConsoleKey.Q
+            ] do
+            let h = Harness()
+            h.State.Picker <- Some picker
+            if question then h.Ask "q" else h.Request "p"
+            do! h.Key(ctrl consoleKey)
+            Assert.Empty h.Dispatches
+            h.State.Go |> should equal false
+            h.State.Picker |> should equal (Some picker)
     }
 
 [<Fact>]
@@ -454,12 +469,13 @@ let ``ordinary editor blank submit steer abort and quit retain dispatch and hist
         h.State.Editor |> should equal DotInput.empty
         h.State.Editor <- DotInput.fromText "direction"
         do! h.Key(ctrl ConsoleKey.S)
-        do! h.Key(ctrl ConsoleKey.C)
+        h.State.Editor <- DotInput.fromText "/abort"
+        do! h.Key enter
         h.State.Go |> should equal true
         h.State.Editor <- DotInput.fromText "/quit"
         do! h.Key enter
         h.State.Go |> should equal false
-        h.State.History.Entries |> should equal [ " hello "; "direction" ]
+        h.State.History.Entries |> should equal [ " hello "; "direction"; "/abort" ]
 
         h.Dispatches
         |> should
@@ -498,7 +514,8 @@ let ``progress commands dispatch without blocking later abort`` () =
         |> List.exists (fun line -> line.Contains("compact"))
         |> should equal true
 
-        do! handleKeyAsync callbacks h.State (ctrl ConsoleKey.C)
+        h.State.Editor <- DotInput.fromText "/abort"
+        do! handleKeyAsync callbacks h.State enter
         List.ofSeq lines |> should equal [ "/compact"; "/abort" ]
         completion.SetResult true
     }

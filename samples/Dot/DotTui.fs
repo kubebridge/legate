@@ -6,15 +6,9 @@ open System.Threading
 open System.Threading.Tasks
 open Legate
 
-// Fullscreen TUI over the existing engine events (issues 330-332): the
-// stdlib-only fullscreen shell plus the multiline input box, over the same
-// ReplEngine handlers the plain REPL drives. No new NuGet dependencies: the
-// shell is the ANSI alternate screen plus System.Console sizing, so the
-// piped path loads zero TUI assemblies and stays byte-identical to today.
-// Scorecard verdict (issue 330): stdlib-only wins; Terminal.Gui v2 is
-// rejected for its heavy driver/dependency tail that breaks minimal-deps
-// and offline restore, and Spectre.Console live is rejected because it is
-// a rich inline renderer, not a fullscreen shell.
+// Fullscreen host over the shared REPL engine. Immutable view snapshots
+// invalidate the layout only when something changes. DotShell diffs the
+// resulting rows, so the key/resize poll never writes to an idle terminal.
 
 // ──────────────────────────────────────────────────────────────────────────
 // Fallback selector (issues 330, 335)
@@ -36,7 +30,7 @@ open Legate
 /// stubbed (keeps the proof renderable under pipes and tests).
 let private windowSize () : int * int =
     try
-        max 20 Console.WindowWidth, max 8 Console.WindowHeight
+        max 1 Console.WindowWidth, max 1 Console.WindowHeight
     with _ ->
         80, 24
 
@@ -69,8 +63,8 @@ type private LineRing() =
 /// screen, and pumps console keys through the DotInput decoder. Submitted
 /// lines route through Engine.HandleLineAsync verbatim, so every slash
 /// command behaves exactly as in the plain REPL: plain text queues, Ctrl+S
-/// steers via /steer, Ctrl+C aborts the turn via /abort without killing
-/// dot, and Esc on an empty buffer, Ctrl+Q, or /quit drains and exits.
+/// steers via /steer, /abort stops the turn, Ctrl+C/D/Q exit via bounded abort,
+/// and Esc on an empty buffer or /quit drains and exits.
 /// The transcript viewport paints the streaming renderer blocks (issue
 /// 333): assistant markdown-lite, tool-call cards, inline permission and
 /// question widgets, and turn lifecycle markers folded from the same
@@ -87,6 +81,7 @@ let runSpikeAsync
     (packages: IAgentPackageStore)
     (initialModel: ModelReference)
     (providerOptions: ReplEngine.ProviderOption list)
+    (configuration: Microsoft.Extensions.Configuration.IConfiguration)
     (waitBound: TimeSpan)
     (cancellationToken: CancellationToken)
     : Task<int> =
@@ -100,10 +95,9 @@ let runSpikeAsync
         let useColor = not request.NoColor && not request.TermDumb
         let entered = not request.OutputRedirected
 
-        // Ctrl+C aborts through the input decoder, never through process
-        // teardown: TreatControlCAsInput delivers it as a key, the decoder
-        // maps it to the abort intent, and the turn aborts while dot keeps
-        // running. The CancelKeyPress handler stays as the backup quit path
+        // TreatControlCAsInput lets the key pump handle exit consistently,
+        // including while a picker or permission widget owns focus.
+        // The CancelKeyPress handler stays as the backup quit path
         // (Ctrl+Break and runtimes without TreatControlCAsInput support).
         let mutable quitRequested = false
 
@@ -157,8 +151,6 @@ let runSpikeAsync
 
             do! engine.OpenSessionAsync("dot tui", cancellationToken)
 
-            let sessionId = engine.CurrentSessionId
-
             if entered then
                 try
                     Console.Out.Write(DotShell.alternateEnter)
@@ -167,6 +159,32 @@ let runSpikeAsync
                     ()
 
             let input = DotTuiRouting.create ()
+            let mutable scrollOffset = 0
+            let mutable previousScreen: DotShell.Screen option = None
+            let mutable lastPaintKey = None
+            let mutable templates: string list = []
+            let mutable wasSlash = false
+
+            let context =
+                DotContext.resolveHostInstructionFiles Environment.CurrentDirectory
+                |> List.ofSeq
+
+            let welcomeLines =
+                [ "[Context]" ]
+                @ (if context.IsEmpty then
+                       [ "  No project instructions" ]
+                   else
+                       context |> List.map (fun path -> "  " + path))
+                @ [
+                    ""
+                    "[Skills]"
+                    "  " + DotSkills.sampleSkillName
+                    ""
+                    "[Sub-agents]"
+                    "  explore · general (use /agents to list)"
+                    ""
+                    "Enter to send · / for commands · Ctrl+O for a new line"
+                ]
 
             // Opens the picker serving one bare command: items come from
             // the same reads the verbatim listing just printed (stored
@@ -201,18 +219,16 @@ let runSpikeAsync
 
                             return Some(DotPicker.fromItems kind items)
                         | DotPicker.SwitchModel ->
-                            let items =
-                                providerOptions
-                                |> List.map (fun option ->
-                                    {
-                                        DotPicker.Key = option.Id
-                                        DotPicker.Label = option.Id
-                                        DotPicker.Detail = $"default {option.DefaultModel}"
-                                    })
+                            let! items =
+                                DotModels.discoverAsync
+                                    configuration
+                                    providerOptions
+                                    engine.CurrentModel
+                                    cancellationToken
 
                             return Some(DotPicker.fromItems kind items)
                         | DotPicker.ForkAtSequence ->
-                            let! events = DotExport.readAllEventsAsync client sessionId cancellationToken
+                            let! events = DotExport.readAllEventsAsync client engine.CurrentSessionId cancellationToken
 
                             let items =
                                 if isNull (box events) then
@@ -257,18 +273,7 @@ let runSpikeAsync
                 try
                     let width, height = windowSize ()
 
-                    let templates = DotTemplates.listTemplates Environment.CurrentDirectory
-
-                    let hints = DotInput.queryHints (DotInput.cursorLine input.Editor) templates
-
                     let view = snapshotRenderer ()
-
-                    let inputRows, (cursorRow, cursorCol) =
-                        match DotTuiRouting.visiblePicker view input with
-                        | Some shown -> DotShell.renderPickerOverlay width useColor shown
-                        | None ->
-                            let inputMax = max 4 (min 12 (height / 3))
-                            DotInput.renderInputRegion width inputMax input.Editor hints
 
                     let state =
                         if DotRender.hasPendingPermission view || DotRender.hasPendingQuestion view then
@@ -278,25 +283,72 @@ let runSpikeAsync
                         else
                             SessionState.Idle
 
-                    let frame =
-                        DotShell.renderFrameWithInput
-                            width
-                            height
-                            useColor
-                            (DotRender.toViewportLines view)
-                            (DotShell.statusText sessionId initialModel state)
-                            inputRows
+                    let status = DotShell.statusText engine.CurrentSessionId engine.CurrentModel state
+                    let key = (width, height, input.Editor, input.Picker, view, status, scrollOffset)
 
-                    if entered then
-                        Console.Out.Write(DotShell.homeClear + frame)
+                    if lastPaintKey <> Some key then
+                        let slash =
+                            (DotInput.cursorLine input.Editor).StartsWith("/", StringComparison.Ordinal)
 
-                        // The frame ends with a newline past the quit hint:
-                        // climb back to the buffer cursor row and column.
-                        let up = 1 + (inputRows.Length - cursorRow)
-                        Console.Out.Write($"\u001b[{up}A\u001b[{cursorCol + 1}G")
-                        Console.Out.Flush()
-                    else
-                        Console.Error.Write(frame)
+                        if slash && not wasSlash then
+                            templates <- DotTemplates.listTemplates Environment.CurrentDirectory
+
+                        wasSlash <- slash
+                        let hints = DotInput.queryHints (DotInput.cursorLine input.Editor) templates
+
+                        let inputRows, cursor =
+                            match DotTuiRouting.visiblePicker view input with
+                            | Some shown -> DotShell.renderPickerOverlay (width - 1) false shown
+                            | None ->
+                                let rows, cursor =
+                                    DotInput.renderInputRegion
+                                        (width - 1)
+                                        (max 3 (min 10 (height / 3)))
+                                        input.Editor
+                                        hints
+                                // The welcome screen documents shortcuts; keep the composer quiet.
+                                rows |> List.take (max 1 (rows.Length - 1)), cursor
+
+                        let welcome = view.Display.IsEmpty && view.Lifecycle.IsEmpty && view.Order.IsEmpty
+
+                        let transcript =
+                            if welcome then
+                                welcomeLines
+                                @ (view.Diagnostics |> List.filter (fun line -> not (line.StartsWith("SESSION "))))
+                                |> List.map (fun text ->
+                                    {
+                                        DotShell.Style = DotShell.Plain
+                                        DotShell.Text = text
+                                    })
+                            else
+                                DotRender.toSessionCells view
+
+                        let status =
+                            if scrollOffset > 0 then
+                                $"↑ scrollback · End latest · {status}"
+                            else
+                                DotShell.workspaceStatus width Environment.CurrentDirectory engine.CurrentModel state
+
+                        let screen =
+                            DotShell.renderScreenWithCells
+                                width
+                                height
+                                useColor
+                                welcome
+                                transcript
+                                status
+                                inputRows
+                                cursor
+                                scrollOffset
+
+                        let update = DotShell.screenUpdate previousScreen screen
+
+                        if entered && update <> "" then
+                            Console.Out.Write(update)
+                            Console.Out.Flush()
+
+                        previousScreen <- Some screen
+                        lastPaintKey <- Some key
                 with _ ->
                     ()
 
@@ -304,7 +356,13 @@ let runSpikeAsync
                 {
                     SnapshotRenderer = snapshotRenderer
                     UpdateRenderer = fun update -> lock rendererGate (fun () -> renderer <- update renderer)
-                    HandleLineAsync = fun line -> engine.HandleLineAsync(line, cancellationToken)
+                    HandleLineAsync =
+                        fun line ->
+                            if not (line.StartsWith("/", StringComparison.Ordinal)) then
+                                scrollOffset <- 0
+                                lock rendererGate (fun () -> renderer <- DotRender.addUserMessage renderer line)
+
+                            engine.HandleLineAsync(line, cancellationToken)
                     ReplyQuestionAsync = fun id answer -> engine.ReplyQuestionAsync(id, answer, cancellationToken)
                     ReplyPermissionAsync =
                         fun id decision -> engine.ReplyPermissionAsync(id, decision, cancellationToken)
@@ -323,9 +381,27 @@ let runSpikeAsync
                 task {
                     if entered && input.Go && not quitRequested then
                         try
-                            if Console.KeyAvailable then
+                            let mutable readCount = 0
+
+                            while Console.KeyAvailable && input.Go && readCount < 256 do
+                                readCount <- readCount + 1
                                 let key = Console.ReadKey(true)
-                                do! DotTuiRouting.handleKeyAsync routing input key
+
+                                let editorFocused =
+                                    DotTuiRouting.visiblePicker (snapshotRenderer ()) input |> Option.isNone
+
+                                if DotInput.isExitKey key then
+                                    input.Go <- false
+                                    quitRequested <- true
+                                    breakCts.Cancel()
+                                elif editorFocused && key.Key = ConsoleKey.PageUp then
+                                    scrollOffset <- scrollOffset + max 1 (snd (windowSize ()) / 2)
+                                elif editorFocused && key.Key = ConsoleKey.PageDown then
+                                    scrollOffset <- max 0 (scrollOffset - max 1 (snd (windowSize ()) / 2))
+                                elif editorFocused && key.Key = ConsoleKey.End && DotInput.isBlank input.Editor then
+                                    scrollOffset <- 0
+                                else
+                                    do! DotTuiRouting.handleKeyAsync routing input key
                         with _ ->
                             ()
                 }
@@ -333,17 +409,29 @@ let runSpikeAsync
             paint ()
 
             while input.Go && not quitRequested && not cancellationToken.IsCancellationRequested do
+                do! pollKeys ()
                 drainRing ()
                 paint ()
-                do! pollKeys ()
 
                 try
-                    do! Task.Delay(50, breakCts.Token)
+                    do! Task.Delay(16, breakCts.Token)
                 with :? OperationCanceledException ->
                     ()
 
             drainRing ()
             paint ()
+
+            // Exit shortcuts must not wait for the normal /quit queue drain:
+            // a provider call or unanswered approval can keep it alive forever.
+            // Best-effort abort is bounded, then host shutdown owns teardown.
+            if quitRequested && engine.IsTurnRunning then
+                use exitCts = new CancellationTokenSource(TimeSpan.FromSeconds 2.)
+
+                try
+                    let! _ = engine.HandleLineAsync("/abort", exitCts.Token).WaitAsync(exitCts.Token)
+                    ()
+                with _ ->
+                    ()
 
             return 0
         finally

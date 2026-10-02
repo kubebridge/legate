@@ -19,6 +19,8 @@
     <Compile Include="CodingTools.fs" />
     <Compile Include="DotMcp.fs" />
     <Compile Include="DotPicker.fs" />
+    <Compile Include="DotModels.fs" />
+    <Compile Include="DotMarkdown.fs" />
     <Compile Include="DotShell.fs" />
     <Compile Include="DotInput.fs" />
     <Compile Include="DotRender.fs" />

@@ -485,7 +485,7 @@ let builtinCommands: CommandHint list =
         }
         {
             Name = "/model"
-            Description = "list providers or switch model"
+            Description = "choose a model or switch provider/model"
         }
         {
             Name = "/steer"
@@ -530,6 +530,10 @@ let builtinCommands: CommandHint list =
         {
             Name = "/exit"
             Description = "quit dot (alias)"
+        }
+        {
+            Name = "/agents"
+            Description = "list available sub-agents"
         }
     ]
 
@@ -590,9 +594,9 @@ type InputIntent =
     | SubmitText of string
     /// Steer the running turn with the buffer: Ctrl+S on non-blank.
     | SteerText of string
-    /// Abort the running turn without quitting: Ctrl+C.
+    /// Abort the running turn without quitting (the /abort command).
     | AbortTurn
-    /// Quit dot: Esc on an empty buffer, Ctrl+Q, or /quit.
+    /// Quit dot: Ctrl+C, Ctrl+D, Ctrl+Q, Esc on an empty buffer, or /quit.
     | QuitTui
     /// Edit the buffer or ignore the key: no routing.
     | Noop
@@ -661,12 +665,22 @@ let private isPlain (modifiers: ConsoleModifiers) : bool =
     not (modifiers.HasFlag(ConsoleModifiers.Control))
     && not (modifiers.HasFlag(ConsoleModifiers.Alt))
 
+/// Global exit shortcuts, recognized before picker and approval handling.
+/// Some terminals deliver control characters without the Control modifier.
+let isExitKey (key: ConsoleKeyInfo) : bool =
+    not (key.Modifiers.HasFlag(ConsoleModifiers.Alt))
+    && ((isCtrlOnly key.Modifiers
+         && (key.Key = ConsoleKey.C || key.Key = ConsoleKey.D || key.Key = ConsoleKey.Q))
+        || key.KeyChar = '\u0003'
+        || key.KeyChar = '\u0004'
+        || key.KeyChar = '\u0011')
+
 /// Decodes one console key to its pump outcome: the edited buffer, the
 /// history, and the routing intent. Pure over the key, so the key map is
 /// proven without a terminal:
 /// Enter submits (blank sends nothing); Ctrl+O and Alt+Enter (where the
-/// terminal reports it) insert a newline; Ctrl+S steers; Ctrl+C aborts
-/// without quitting; Ctrl+Q quits; Esc quits on an empty buffer and leaves
+/// terminal reports it) insert a newline; Ctrl+S steers; Ctrl+C/D/Q quit;
+/// Esc quits on an empty buffer and leaves
 /// browse mode otherwise; Up/Down browse history on the edge rows and move
 /// inside the buffer; Ctrl+P/N always browse; Alt+B/F move by word;
 /// Ctrl+A/E/Home/End move by line; Backspace/Delete remove; Ctrl+W/U/K
@@ -681,7 +695,9 @@ let applyKey (editor: EditorState) (history: History) (key: ConsoleKeyInfo) : Ed
 
     let show (text: string) : EditorState * History * InputIntent = fromText text, history, Noop
 
-    if
+    if isExitKey key then
+        editor, history, QuitTui
+    elif
         key.Key = ConsoleKey.Enter
         && key.Modifiers.HasFlag(ConsoleModifiers.Alt)
         && not (key.Modifiers.HasFlag(ConsoleModifiers.Control))
@@ -707,10 +723,6 @@ let applyKey (editor: EditorState) (history: History) (key: ConsoleKeyInfo) : Ed
             | None -> editor, history, Noop
         | SubmitText routed -> empty, appendHistory history (toText editor), SubmitText routed
         | _ -> editor, history, Noop
-    elif isCtrlOnly key.Modifiers && key.Key = ConsoleKey.C then
-        editor, history, AbortTurn
-    elif isCtrlOnly key.Modifiers && key.Key = ConsoleKey.Q then
-        editor, history, QuitTui
     elif key.Key = ConsoleKey.Escape then
         if isBlank editor then
             editor, history, QuitTui
@@ -812,7 +824,7 @@ let continuationPrefix = "  "
 /// The hint bar naming the key map, painted under the buffer and hints so
 /// the bindings stay discoverable fullscreen (mirrored in the README).
 let hintBarText =
-    "Enter send | Ctrl+O newline | Ctrl+S steer | Ctrl+C abort | Ctrl+T expand | Up/Down history | Esc-empty/Ctrl+Q quit"
+    "Enter send | Ctrl+O newline | Ctrl+S steer | /abort stop turn | Ctrl+T expand | Ctrl+C/D quit"
 
 /// Clamps one row to the width with the DotShell trim marker.
 /// <param name="width">The console width in columns.</param>
@@ -847,7 +859,7 @@ let renderInputRegion
         if isNull (box hints) then
             []
         else
-            hints |> List.truncate maxHints
+            hints |> List.truncate (min maxHints (safeRows - 2))
 
     let hintRows =
         shownHints |> List.map (fun hint -> $"  {hint.Name} - {hint.Description}")
@@ -861,6 +873,9 @@ let renderInputRegion
 
     let visible = editor.Lines |> List.skip first |> List.truncate bufferWindow
 
+    let textWidth = max 1 (min 240 (max 20 width) - promptPrefix.Length - 1)
+    let horizontalOffset = max 0 (editor.Col - textWidth)
+
     let rows =
         visible
         |> List.mapi (fun index line ->
@@ -870,7 +885,13 @@ let renderInputRegion
                 else
                     continuationPrefix
 
-            clampRow width (prefix + line))
+            let offset =
+                if first + index = cursorRow then
+                    min line.Length horizontalOffset
+                else
+                    0
+
+            clampRow width (prefix + line.Substring(offset)))
         |> fun buffer -> buffer @ (hintRows |> List.map (clampRow width))
         |> fun withHints -> withHints @ [ clampRow width hintBarText ]
 
@@ -889,6 +910,8 @@ let renderInputRegion
             else
                 continuationPrefix.Length
 
-        min (prefixLength + min (max 0 editor.Col) cursorLineLength) (max 0 ((min 240 (max 20 width)) - 1))
+        min
+            (prefixLength + min (max 0 editor.Col) cursorLineLength - horizontalOffset)
+            (max 0 ((min 240 (max 20 width)) - 1))
 
     rows, (cursorScreenRow, cursorScreenCol)
