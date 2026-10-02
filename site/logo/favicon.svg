@@ -1,0 +1,17 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="5 3 24 27">
+  <title>Legate</title>
+  <style>
+    .mast { fill: #18181b; }
+    .flag { fill: #0866ff; }
+    @media (prefers-color-scheme: dark) {
+      .mast { fill: #f4f4f5; }
+      .flag { fill: #6ea8ff; }
+    }
+  </style>
+  <path class="mast" d="M9 6h3v21H9Z"/>
+  <path class="flag" d="M12 7H25L23.4 9.4H12Z"/>
+  <path class="flag" d="M12 10.2H22.87L21.27 12.6H12Z"/>
+  <path class="flag" d="M12 13.4H21.27L22.87 15.8H12Z"/>
+  <path class="flag" d="M12 16.6H23.4L25 19H12Z"/>
+</svg>
