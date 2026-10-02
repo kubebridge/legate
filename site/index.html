@@ -3,11 +3,11 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Durable Session Agents for .NET | Legate</title>
-<meta name="description" content="Embed tool-using agents: prompt sessions, handle approvals, and stream events. Run in one process or across a cluster, with persistent state for crash recovery.">
+<title>Run Millions of Agents | Legate</title>
+<meta name="description" content="Build durable, tool-using agents on a lightweight Akka.NET runtime. Start inside your .NET application and distribute sessions across a cluster as you grow.">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 30 30'%3E%3Crect width='30' height='30' rx='7' fill='%236ea8ff'/%3E%3Crect x='13' y='6' width='4' height='18' fill='white'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="styles.css">
-<link rel="stylesheet" href="overview.css">
+<link rel="stylesheet" href="scale.css">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 </head>
 <body>
@@ -18,7 +18,8 @@
     <span>LEGATE</span>
   </a>
   <nav class="nav-links" aria-label="Main navigation">
-    <a class="active" href="index.html" aria-current="page">Overview</a>
+    <a class="active" href="index.html" aria-current="page">Home</a>
+    <a href="overview.html">Overview</a>
     <a href="sessions.html">Sessions</a>
     <a href="durability.html">Durability</a>
     <a href="build.html">Build</a>
@@ -30,242 +31,98 @@
 </header>
 
 <main>
-<section class="wrap overview-hero" id="top" aria-labelledby="overview-title">
-  <div class="hero-grid">
-    <div>
-      <span class="kicker">.NET 10 · Akka.NET · Apache 2.0</span>
-      <h1 class="hero-title" id="overview-title">Durable Session Agents for .NET</h1>
+<section class="scale-hero" aria-labelledby="scale-title">
+  <canvas class="agent-field" id="agent-field" aria-hidden="true"></canvas>
+  <div class="wrap hero-content">
+    <div class="hero-eyebrow"><span class="signal-dot" aria-hidden="true"></span> THE AGENT RUNTIME FOR .NET</div>
+    <h1 class="scale-title" id="scale-title"><span class="title-run">Run</span><span class="title-millions">Millions</span><span class="title-agents">of Agents.</span></h1>
+    <div class="memory-line">In <strong>1GB</strong> of RAM.<a class="claim-marker" href="#density-note" aria-label="Read the memory-density qualification">*</a></div>
+    <p class="hero-description">An agent for every customer. Every project. Every workflow.<br>Durable sessions on a lightweight, message-driven runtime.</p>
+    <div class="resource-links hero-actions">
+      <a class="btn primary" href="build.html">Start building <span aria-hidden="true">↗</span></a>
+      <a class="btn" href="overview.html">Inside the runtime <span aria-hidden="true">→</span></a>
     </div>
-    <div class="hero-intro">
-      <p class="lede">Embed tool-using agents: prompt sessions, handle approvals, and stream events. Run in one process or across a cluster, with persistent state for crash recovery.</p>
-      <div class="resource-links">
-        <a class="btn primary" href="build.html">Start building</a>
-        <a class="btn" href="sessions.html">Explore sessions</a>
-      </div>
-    </div>
+    <p class="hero-qualification">Built on Akka.NET's actor-density foundation. <a href="#density-note">Memory basis &amp; workload limits ↗</a></p>
+    <div class="hero-bottom"><a class="scroll-cue" href="#scale-story"><span aria-hidden="true">↓</span> ONE SESSION IS JUST THE START</a><button class="motion-toggle" type="button" aria-pressed="false" hidden>Pause motion</button></div>
   </div>
+</section>
 
-  <div class="example-block">
-  <div class="example-grid">
-    <div class="example-code content-stack">
-      <h2 class="panel-label">With your host configured</h2>
-<pre class="code"><code><span class="k">var</span> session = <span class="k">await</span> client.<span class="f">OpenSessionAsync</span>(
+<div class="foundation-strip"><div class="wrap"><span>SMALL FOOTPRINT. BIG AMBITION.</span><ul aria-label="Built with"><li>.NET 10</li><li>Akka.NET</li><li>Apache 2.0</li></ul></div></div>
+
+<section class="scale-story wrap" id="scale-story" aria-labelledby="story-title">
+  <div class="story-copy">
+    <article class="story-step" data-stage="0">
+      <span class="sec-no">01 / START WITH ONE</span>
+      <h2 id="story-title">One agent.<br>A place to begin.</h2>
+      <p>Embed Legate in your .NET application. Give a session a model, tools, and a workspace. Send a prompt and follow the work.</p>
+      <code class="story-code">services.AddLegate(...);</code>
+      <a class="story-link" href="build.html">Build your first agent <span aria-hidden="true">↗</span></a>
+    </article>
+    <article class="story-step" data-stage="1">
+      <span class="sec-no">02 / GIVE EVERYONE THEIR OWN</span>
+      <h2>A thousand stories.<br>Each with its<br>own session.</h2>
+      <p>Keep customer conversations and project work separate. Each session has its own identity, inbox, and workspace binding, without a dedicated operating-system thread.</p>
+      <a class="story-link" href="sessions.html">Explore the session model <span aria-hidden="true">↗</span></a>
+    </article>
+    <article class="story-step" data-stage="2">
+      <span class="sec-no">03 / MAKE ROOM FOR MILLIONS</span>
+      <h2>More agents.<br>Same building<br>blocks.</h2>
+      <p>Move from one process to a cluster. Akka.NET sharding distributes session entities across nodes. Your application keeps the same session-facing API.</p>
+      <p class="story-aside">Agent population and active model calls are different scales. Admission limits keep running work within provider capacity.</p>
+      <a class="story-link" href="build.html">Choose your deployment <span aria-hidden="true">↗</span></a>
+    </article>
+  </div>
+  <div class="population-sticky">
+    <div class="population-panel" role="img" aria-label="Conceptual illustration: one session grows into a population distributed across three cluster nodes. Not a live benchmark.">
+      <div class="population-top"><span><i class="signal-dot" aria-hidden="true"></i> SESSION POPULATION</span><span>ILLUSTRATION</span></div>
+      <div class="population-count" aria-hidden="true">1<span class="count-unit">session</span></div>
+      <div class="population-visual"><canvas id="population-field" aria-hidden="true"></canvas><div class="node-dividers" aria-hidden="true"><span>NODE 01</span><span>NODE 02</span><span>NODE 03</span></div></div>
+      <div class="population-bottom"><span id="population-label">One identity. One inbox.</span><span class="population-phase" aria-hidden="true">01 / 03</span></div>
+    </div>
+    <p class="population-caption">Lightweight actors. Independently addressed sessions.</p>
+  </div>
+</section>
+
+<section class="block alt durable-section" aria-labelledby="durable"><div class="wrap">
+  <div class="sec-head" data-reveal>
+    <div><span class="sec-no cy">BUILT TO KEEP GOING</span><h2 class="sec-title" id="durable">The process can stop.<br><span>The session stays.</span></h2></div>
+    <p class="sec-sub">With SQLite or Postgres storage, sessions and their event journals survive process restarts. Recovery policies determine how interrupted turns resume or fail. Your application reconnects to the session and its history.</p>
+  </div>
+  <div class="continuity-track" data-reveal aria-label="A session continues across a process restart">
+    <div><span class="continuity-icon" aria-hidden="true">01</span><strong>Prompt</strong><code>message accepted</code></div><span class="continuity-connector" aria-hidden="true"></span>
+    <div><span class="continuity-icon" aria-hidden="true">02</span><strong>Persist</strong><code>progress journaled</code></div><span class="continuity-connector restart-connector" aria-hidden="true"><span>process restarts</span></span>
+    <div><span class="continuity-icon" aria-hidden="true">03</span><strong>Reconnect</strong><code>resume from cursor</code></div>
+  </div>
+  <div class="capability-grid">
+    <article data-reveal><span class="capability-number">01</span><h3>Continue the conversation</h3><p>Queue follow-up work, add instructions during a turn, or interrupt it when priorities change.</p></article>
+    <article data-reveal><span class="capability-number">02</span><h3>Keep a record of the work</h3><p>Stored inbox messages, turn claims, and journaled events record work accepted and progress made.</p></article>
+    <article data-reveal><span class="capability-number">03</span><h3>Pick up the event stream</h3><p>Read stored events from your last sequence number, then continue receiving live updates.</p></article>
+  </div>
+  <div class="resource-links"><a href="sessions.html">Work with sessions ↗</a><a href="durability.html">See how recovery works ↗</a></div>
+</div></section>
+
+<section class="build-invitation wrap" aria-labelledby="build-title">
+  <div data-reveal><span class="sec-no">YOUR APPLICATION. YOUR AGENTS.</span><h2 id="build-title">Think in millions.<br><span>Start with one.</span></h2><p>Bring your model. Connect your tools. Open a session.</p><a class="btn primary" href="build.html">Build your first agent <span aria-hidden="true">↗</span></a></div>
+  <div class="invitation-code" data-reveal><div class="code-heading"><span>YOUR NEXT COMMIT</span><span>C#</span></div><pre class="code"><code><span class="k">var</span> session = <span class="k">await</span> client.<span class="f">OpenSessionAsync</span>(
     agentId, <span class="k">null</span>, ct);
 
 <span class="k">await</span> client.<span class="f">PromptAsync</span>(
     session.Id,
-    UserMessage.Text(<span class="s">"Review the project."</span>),
-    DeliveryMode.Queue, ct);
-
-<span class="k">await foreach</span> (<span class="k">var</span> e <span class="k">in</span> client.<span class="f">Subscribe</span>(session.Id, 0L, ct))
-    Console.WriteLine(e.GetType().Name);</code></pre>
-    </div>
-    <section class="demo event-demo" id="event-demo" aria-labelledby="event-example-title">
-      <div class="journal-heading">
-        <h2 class="panel-label" id="event-example-title">Session journal</h2>
-        <span>Example</span>
-      </div>
-      <ol class="event-list">
-        <li class="event-row"><span class="event-sequence">1</span><code>TurnStarted</code><span class="event-detail">turn_8f2c</span></li>
-        <li class="event-row" style="--event-color:var(--a)"><span class="event-sequence">2</span><code>ToolCallStarted</code><span class="event-detail">read_file</span></li>
-        <li class="event-row" style="--event-color:var(--a)"><span class="event-sequence">3</span><code>ToolCallCompleted</code><span class="event-detail">done</span></li>
-        <li class="event-row" style="--event-color:var(--g)"><span class="event-sequence">4</span><code>TurnCompleted</code><span class="event-detail">stop</span></li>
-      </ol>
-    </section>
-  </div>
-  </div>
+    UserMessage.Text(<span class="s">"Let's get to work."</span>),
+    DeliveryMode.Queue, ct);</code></pre><a href="build.html">Configure your host and get started <span aria-hidden="true">→</span></a></div>
 </section>
 
-<section class="block" id="sessions" aria-labelledby="sessions-title"><div class="wrap">
-  <div class="sec-head">
-    <div><span class="sec-no">01 / Sessions</span>
-      <h2 class="sec-title" id="sessions-title">The backend of an agentic CLI</h2></div>
-    <p class="sec-sub">Send a message to a session and follow its progress through an event stream. Answer approval requests, steer the agent, or abort while it works. The journal keeps the recorded events for replay.</p>
-  </div>
-
-  <div class="demo session-demo" id="session-demo">
-    <div class="session-flow" id="session-flow" role="region" aria-labelledby="session-flow-title">
-      <div class="demo-toolbar">
-        <h3 class="panel-label" id="session-flow-title">Session execution</h3>
-        <div class="demo-controls" hidden>
-          <button class="demo-toggle" type="button">Pause</button>
-          <button class="demo-replay" type="button">Replay</button>
-        </div>
-      </div>
-      <div class="session-flow-scroll" tabindex="0" role="region" aria-label="Animated host, session, turn, and tools diagram">
-        <div class="session-flow-canvas">
-          <div class="session-flow-track">
-            <div class="session-flow-node host"><span>Host</span><strong>CLI or service</strong><code>AddLegate(...)</code></div>
-            <div class="session-edge"><code>PromptAsync</code><div class="session-edge-line"></div></div>
-            <div class="session-flow-node session"><span>Session</span><strong>Session actor</strong><code>inbox · lease</code></div>
-            <div class="session-edge"><code>claim</code><div class="session-edge-line"></div></div>
-            <div class="session-flow-node turn"><span>Turn</span><strong>ReAct loop</strong><code>IChatClient</code></div>
-            <div class="session-edge"><code>call / result</code><div class="session-edge-line"></div></div>
-            <div class="session-flow-node tools"><span>Tools</span><strong>MCP · built-ins</strong><code>ask_user · exec</code></div>
-          </div>
-          <div class="session-edge session-return"><code>SessionEvent stream → host</code><div class="session-edge-line"></div></div>
-          <div class="session-journal">
-            <div class="session-journal-label"><span>Journaled events</span><code id="band-sequence">seq 0</code></div>
-            <div class="journal-band" id="journal-band" aria-hidden="true"></div>
-          </div>
-        </div>
-      </div>
-      <p class="demo-status" aria-live="off">Illustration of session execution and journal growth</p>
-    </div>
-
-    <div class="session-concepts" role="region" aria-labelledby="concepts-title">
-      <div class="session-concepts-heading">
-        <h3 id="concepts-title">Seven concepts</h3>
-        <p>Interactive and unattended work use the same session model.</p>
-      </div>
-      <div class="concept-grid">
-        <div class="concept-card" style="--concept-color:var(--c)"><h4>Agent</h4><p>The model configuration, system prompt, tools, skills, sub-agents, and permission defaults.</p></div>
-        <div class="concept-card" style="--concept-color:var(--v)"><h4>Session <span class="concept-core">Core</span></h4><p>A conversation with an agent. Keeps its state, transcript, inbox, and workspace binding until closed or expired.</p></div>
-        <div class="concept-card" style="--concept-color:var(--p)"><h4>UserMessage</h4><p>Text, files, or images sent by the user. A message can start a turn, join the queue, or steer running work.</p></div>
-        <div class="concept-card" style="--concept-color:var(--a)"><h4>Reply</h4><p>The host's answer to a permission request or question. Resumes the suspended turn.</p></div>
-        <div class="concept-card" style="--concept-color:var(--v)"><h4>Turn <span class="concept-core">Core</span></h4><p>One run of the model and tool loop. Ends on completion, abort, or a limit; can pause for input. Runs under a claim.</p></div>
-        <div class="concept-card" style="--concept-color:var(--g)"><h4>SessionEvent</h4><p>An event in the ordered journal, such as TurnStarted, ToolCallStarted, or TurnCompleted.</p></div>
-        <div class="concept-card" style="--concept-color:var(--c)"><h4>SessionCell</h4><p>A transcript entry derived from journaled events for conversation history and display.</p></div>
-        <div class="concept-card concept-package"><code>Legate.Abstractions</code><p>These contracts share a package with no Akka dependency.</p></div>
-      </div>
-    </div>
-
-    <div class="session-walkthrough" id="session-walkthrough" role="region" aria-labelledby="walkthrough-title">
-      <div class="demo-toolbar">
-        <h3 id="walkthrough-title">A turn, step by step</h3>
-        <div class="demo-controls" hidden>
-          <button class="demo-toggle" type="button">Pause</button>
-          <button class="demo-replay" type="button">Replay</button>
-        </div>
-      </div>
-      <div class="session-step-grid">
-        <ol class="session-step-list">
-          <li><button class="session-step" type="button" data-step="0" aria-controls="session-step-0"><span>01</span><span>Prompt enters the inbox</span></button></li>
-          <li><button class="session-step" type="button" data-step="1" aria-controls="session-step-1"><span>02</span><span>The turn is claimed under a lease</span></button></li>
-          <li><button class="session-step" type="button" data-step="2" aria-controls="session-step-2"><span>03</span><span>Workspace, agent, and model</span></button></li>
-          <li><button class="session-step" type="button" data-step="3" aria-controls="session-step-3"><span>04</span><span>Tools are assembled</span></button></li>
-          <li><button class="session-step" type="button" data-step="4" aria-controls="session-step-4"><span>05</span><span>The model and tool loop runs</span></button></li>
-          <li><button class="session-step" type="button" data-step="5" aria-controls="session-step-5"><span>06</span><span>The turn finishes</span></button></li>
-        </ol>
-        <div class="session-step-detail">
-          <span class="session-step-number" id="session-step-number" aria-hidden="true">01</span>
-          <article id="session-step-0" data-step-panel>
-            <h4>Prompt enters the inbox</h4>
-            <p>The message is appended to the session store. The dispatcher wakes the session actor, which runs locally or on a cluster node.</p>
-            <code>ISessionStore</code>
-          </article>
-          <article id="session-step-1" data-step-panel>
-            <h4>The turn is claimed under a lease</h4>
-            <p>The store grants one worker the claim. The runtime checks its token before invoking tools, and the stores reject writes from expired or replaced claims.</p>
-            <code>ClaimNextTurn</code>
-          </article>
-          <article id="session-step-2" data-step-panel>
-            <h4>Workspace, agent, and model</h4>
-            <p>The runtime binds the workspace, loads the agent's instructions and skills, and prepares the model client with the configured model policy and call limits.</p>
-            <code>IChatClient</code>
-          </article>
-          <article id="session-step-3" data-step-panel>
-            <h4>Tools are assembled</h4>
-            <p>The agent receives its configured built-ins, custom tools, and tools from registered sources such as MCP servers. Calls pass through the permission policy.</p>
-            <code>IPermissionPolicy</code>
-          </article>
-          <article id="session-step-4" data-step-panel>
-            <h4>The model and tool loop runs</h4>
-            <p>The agent calls the model, executes permitted tool calls, and returns results to the model. Recorded events reach subscribers, and injected messages join at iteration boundaries.</p>
-            <code>SessionEvent</code>
-          </article>
-          <article id="session-step-5" data-step-panel>
-            <h4>The turn finishes</h4>
-            <p>Usage is checkpointed and the turn settles. An interactive session returns to idle. AutoClose sessions close after their run and notify a configured completion sink.</p>
-            <code>Idle</code>
-          </article>
-        </div>
-      </div>
-      <p class="demo-status" aria-live="off">Select a step to read at your own pace.</p>
-    </div>
-  </div>
-  <a class="text-link" href="sessions.html">Read about sessions and delivery modes</a>
-</div></section>
-
-<section class="block alt" id="durability" aria-labelledby="durability-title"><div class="wrap">
-  <div class="sec-head">
-    <div><span class="sec-no pk">02 / Durability</span>
-      <h2 class="sec-title" id="durability-title">Recover after a node failure</h2></div>
-    <p class="sec-sub">Each turn runs under a renewable claim. If a node stops, another can take over after the lease expires. The session's recovery policy either starts a new attempt or records the interruption as a failure.</p>
-  </div>
-
-  <div class="demo recovery-demo" id="recovery-demo" role="region" aria-label="Node failure recovery example using FailAttempt">
-    <div class="recovery-nodes">
-      <div class="node-card" data-node="owner" data-state="stopped"><div class="node-heading"><code>legate-1</code><span class="node-dot" aria-hidden="true"></span></div><strong data-node-status>Stopped</strong><p>Original turn owner</p></div>
-      <div class="node-card" data-node="survivor" data-state="ready"><div class="node-heading"><code>legate-2</code><span class="node-dot" aria-hidden="true"></span></div><strong data-node-status>Failure recorded</strong><p>Handles recovery</p></div>
-      <div class="node-card" data-state="available"><div class="node-heading"><code>legate-3</code><span class="node-dot" aria-hidden="true"></span></div><strong>Available</strong><p>Cluster member</p></div>
-      <div class="recovery-journal">
-        <div class="journal-heading"><h3 class="panel-label">Journal</h3><span>FailAttempt</span></div>
-        <ol class="event-list">
-          <li class="event-row"><span class="event-sequence">1</span><code>TurnStarted</code></li>
-          <li class="event-row" data-terminal><span class="event-sequence">2</span><code>TurnFailed</code></li>
-        </ol>
-      </div>
-    </div>
-    <div class="recovery-footer">
-      <div class="recovery-progress" aria-hidden="true"></div>
-      <p class="recovery-caption" aria-live="off">The interrupted turn is recorded as failed. The session is ready for another prompt.</p>
-      <div class="demo-controls" hidden>
-        <button class="demo-toggle" type="button">Pause</button>
-        <button class="demo-replay" type="button">Replay</button>
-      </div>
-    </div>
-  </div>
-  <div class="durability-facts">
-    <div><h3>Claim-protected writes</h3><p>The store checks the current claim before accepting checkpoints, journal appends, or settlement. An expired or replaced claim is rejected.</p></div>
-    <div><h3>Atomic store updates</h3><p>Inbox appends, claims, renewals, usage checkpoints, and turn settlement are each applied atomically.</p></div>
-    <div><h3>Tenant-scoped storage</h3><p>Every store operation includes a <code>TenantId</code>. Storage providers scope reads and writes to that tenant.</p></div>
-  </div>
-  <a class="text-link" href="durability.html">Read about claims, recovery, and event replay</a>
-</div></section>
-
-<section class="block" id="build" aria-labelledby="deployment-title"><div class="wrap">
-  <div class="sec-head">
-    <div><span class="sec-no cy">03 / Build</span>
-      <h2 class="sec-title" id="deployment-title">Choose how to host it</h2></div>
-    <p class="sec-sub">Register Legate in your application's dependency injection container. Choose the model providers, tools, storage, and workspace that fit your deployment.</p>
-  </div>
-  <div class="grid c2 deployment-options">
-    <div class="card">
-      <h3><span class="dsq" style="background:var(--c)" aria-hidden="true"></span>CLI harness</h3>
-      <p>Run in one process with no database server. Use SQLite for persistent sessions and a host-directory workspace for tools that work on local files.</p>
-      <p>The <a href="https://github.com/kubebridge/legate/tree/main/samples/LegateCli">LegateCli</a> sample demonstrates interactive approvals with in-memory storage. <a href="https://github.com/kubebridge/legate/tree/main/samples/CSharpHost">CSharpHost</a> shows the session API in a C# Generic Host.</p>
-    </div>
-    <div class="card">
-      <h3><span class="dsq" style="background:var(--a)" aria-hidden="true"></span>Hosted service</h3>
-      <p>Use Postgres for shared session state, S3 for blobs, and Docker workspaces for container isolation. Add clustering when the service needs multiple nodes.</p>
-      <p><a href="https://github.com/kubebridge/legate/tree/main/samples/MinimalHost">MinimalHost</a> exposes HTTP endpoints and an SSE event stream. <a href="https://github.com/kubebridge/legate/tree/main/samples/Headless">Headless</a> demonstrates AutoClose with a completion webhook.</p>
-    </div>
-  </div>
-  <a class="text-link" href="build.html">Choose packages and configure your host</a>
-</div></section>
-
-<section class="block alt" id="try" aria-labelledby="try-title"><div class="wrap">
-  <div class="sec-head">
-    <div><span class="sec-no cy">Try it locally</span>
-      <h2 class="sec-title" id="try-title">Try the CLI without a provider key</h2></div>
-    <p class="sec-sub">From a checkout, with the .NET 10 SDK installed, build the solution and run the scripted sample. It exercises prompts, tool approvals, and session commands without calling an external model.</p>
-  </div>
-<pre class="code"><code><span class="s" aria-hidden="true">$ </span>dotnet fsi build.fsx
-<span class="s" aria-hidden="true">$ </span>dotnet run --project samples/LegateCli -- --scripted</code></pre>
-  <div class="resource-links">
-    <a class="btn primary" href="https://github.com/kubebridge/legate">Get the source</a>
-    <a class="btn" href="build.html#samples">Browse the samples</a>
-  </div>
-</div></section>
+<aside class="wrap density-note" id="density-note" aria-label="Memory-density qualification">
+  <p><strong>* Memory-density basis.</strong> <a href="https://getakka.net/">Akka.NET documents approximately 2.5 million actors per GB of heap.</a> The headline refers to that lightweight actor foundation, rather than a measured capacity for complete Legate agents. Session state, conversation history, active model calls, tools, workspaces, and host overhead add memory; actual agent capacity depends on the workload. This is not a Legate benchmark or a claim of millions of simultaneous model calls.</p>
+</aside>
 </main>
 
 <footer><div class="wrap">
-  <a class="brand" href="index.html" style="font-size:12px"><svg width="20" height="20" viewBox="0 0 32 32" aria-hidden="true"><path d="M9 6h3v21H9Z" fill="var(--ink)"/><path d="M12 7H25L23.4 9.4H12Z" fill="var(--logo-b)"/><path d="M12 10.2H22.87L21.27 12.6H12Z" fill="var(--logo-b)"/><path d="M12 13.4H21.27L22.87 15.8H12Z" fill="var(--logo-b)"/><path d="M12 16.6H23.4L25 19H12Z" fill="var(--logo-b)"/></svg>LEGATE</a>
+  <a class="brand" href="index.html"><svg width="20" height="20" viewBox="0 0 32 32" aria-hidden="true"><path d="M9 6h3v21H9Z" fill="var(--ink)"/><path d="M12 7H25L23.4 9.4H12Z" fill="var(--logo-b)"/><path d="M12 10.2H22.87L21.27 12.6H12Z" fill="var(--logo-b)"/><path d="M12 13.4H21.27L22.87 15.8H12Z" fill="var(--logo-b)"/><path d="M12 16.6H23.4L25 19H12Z" fill="var(--logo-b)"/></svg>LEGATE</a>
   <span class="spacer">A <a href="https://kubebridge.com">Kubebridge</a> project · Apache 2.0</span>
   <nav><a href="https://github.com/kubebridge/legate">GitHub</a><a href="https://www.nuget.org/packages/Legate">NuGet</a></nav>
 </div></footer>
 <script src="theme.js"></script>
-<script src="overview.js"></script>
+<script src="scale.js"></script>
 </body>
 </html>
