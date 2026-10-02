@@ -137,6 +137,9 @@ module internal SessionPermissions =
         /// <param name="injected">The folded entry to consume.</param>
         let consumeInjected (entry: InboxEntry) (injected: InboxEntry) : unit =
             if not (isNull (box injected)) then
+                if not (ControlAdmission.check ()) then
+                    raise (TurnLoop.TurnLeaseLostException())
+
                 let positions = [| injected.Position |] :> IReadOnlyList<int64>
 
                 try

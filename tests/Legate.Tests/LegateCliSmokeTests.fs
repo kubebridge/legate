@@ -151,7 +151,7 @@ let ``Scripted run streams events approves tools calls the fixture and resumes``
         check "PERMISSION tool=fixture_echo"
         check "fixture says hi"
         check "COMPACT not-needed"
-        check "ABORTED"
+        check "ABORT NoCurrentTurn"
         check "AGENT-STUBBED my-agent"
         check "RESUMED "
         check "SESSIONS 2"

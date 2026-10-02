@@ -236,6 +236,7 @@ let private spawnGated
             Delay = TurnLoopTests.NeverDelay() :> ILlmDelay
             AskTimeout = TimeSpan.FromMinutes 5.0
             JournalToken = "test-token"
+            PrimeClaim = None
             RunSuspendable = runner
             ReprimeJournal = None
             RefreshCompact = None

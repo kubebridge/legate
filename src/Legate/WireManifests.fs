@@ -103,7 +103,9 @@ module internal WireManifests =
     /// resolve; entity rows cover the suspendable protocol and its replies.
     let cases: WireCase list =
         [
-            row ActorFamily "AbortSession" typeof<WireDtos.AbortSessionDto> LargeWireBytes
+            { row ActorFamily "AbortSession" typeof<WireDtos.AbortSessionDto> LargeWireBytes with
+                Version = 2
+            }
             row ActorFamily "CloseSession" typeof<WireDtos.CloseSessionDto> SmallWireBytes
             row ActorFamily "CompactCompleted" typeof<WireDtos.CompactCompletedDto> SmallWireBytes
             row ActorFamily "CompactDeferred" typeof<WireDtos.CompactDeferredDto> SmallWireBytes
@@ -129,7 +131,9 @@ module internal WireManifests =
             row EntityFamily "SetAgentPending" typeof<WireDtos.SetAgentPendingDto> LargeWireBytes
             row EntityFamily "SetAgentRejected" typeof<WireDtos.SetAgentRejectedDto> SmallWireBytes
             row EntityFamily "SuspendTimedOut" typeof<WireDtos.SuspendTimedOutDto> SmallWireBytes
-            row EntityFamily "SuspendableAbortSession" typeof<WireDtos.SuspendableAbortSessionDto> LargeWireBytes
+            { row EntityFamily "SuspendableAbortSession" typeof<WireDtos.SuspendableAbortSessionDto> LargeWireBytes with
+                Version = 2
+            }
             row EntityFamily "SuspendableCheckInbox" typeof<WireDtos.SuspendableCheckInboxDto> SmallWireBytes
             row EntityFamily "SuspendableCloseSession" typeof<WireDtos.SuspendableCloseSessionDto> SmallWireBytes
             row EntityFamily "SuspendableCompactSession" typeof<WireDtos.SuspendableCompactSessionDto> SmallWireBytes

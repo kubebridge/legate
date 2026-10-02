@@ -120,6 +120,10 @@ type internal LegateStartupValidation(serviceProvider: IServiceProvider) =
 
             if isNull (box (serviceProvider.GetService<ISessionStore>())) then
                 missing.Add "a session store (ISessionStore): call Storage.UseSessionStore"
+            else
+                match serviceProvider.GetService<ISessionStore>() with
+                | :? ISessionAbortControlStore -> ()
+                | _ -> missing.Add "ISessionAbortControlStore on the configured session store"
 
             if isNull (box (serviceProvider.GetService<IWorkspaceRuntime>())) then
                 missing.Add "a workspace runtime (IWorkspaceRuntime): call Workspace.UseRuntime"

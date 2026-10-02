@@ -463,7 +463,7 @@ let ``Repl streams turns serves slash commands and prints usage for unknown`` ()
         check output "RESUMED "
         check output "RESUME-FAILED 'nonsense-id'"
         check output "COMPACT "
-        check output "ABORTED"
+        check output "ABORT NoCurrentTurn"
         check output "UNKNOWN-COMMAND /bogus-command"
 
         check
@@ -1515,8 +1515,8 @@ let ``Abort settles the slow turn visibly`` () =
 
         let output = stdout + Environment.NewLine + stderr
 
-        exit |> should equal 0
-        check output "ABORTED"
+        Assert.True((exit = 0), output)
+        check output "ABORT Accepted:"
         check output "RESULT Aborted"
         checkNoErrors output
     finally
@@ -2568,7 +2568,7 @@ let ``Tui parity walks every slash command with identical outcomes`` () =
         check output "ERROR /follow needs text"
         check output "ERROR /fork needs a sequence"
         check output "is not a number"
-        check output "ABORTED"
+        check output "ABORT NoCurrentTurn"
         check output "COMPACT "
         check output "UNKNOWN-COMMAND /bogus-command"
 

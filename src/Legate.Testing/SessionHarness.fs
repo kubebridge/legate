@@ -576,6 +576,11 @@ type SessionHarness
                         Delay = askDelay
                         AskTimeout = resolved.AskTimeout
                         JournalToken = token
+                        PrimeClaim =
+                            match claimed with
+                            | :? TurnLeaseRenewed as lease -> Some lease.Claim
+                            | :? TurnLeaseHeld as lease -> Some lease.Claim
+                            | _ -> None
                         RunSuspendable = runner
                         ReprimeJournal = Some reprime
                         RefreshCompact = None

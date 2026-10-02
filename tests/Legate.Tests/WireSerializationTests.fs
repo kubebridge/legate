@@ -162,7 +162,7 @@ let private everyLiveMessage () : obj list =
         InjectPrompt(entry.Payload, CancellationToken.None) :> obj
         InterruptPrompt(entry.Payload, CancellationToken.None) :> obj
         CloseSession(CancellationToken.None) :> obj
-        AbortSession(StopCause.ExplicitAbort, "host abort", CancellationToken.None) :> obj
+        ObserveHostAbort(session.Tenant, session.Id, TurnId.Parse("01ARZ3NDEKTSV4RRFFQ69G5FAX")) :> obj
         CompactSession(CancellationToken.None) :> obj
         GetSnapshot :> obj
         SessionTurnSettled(entry, completedResult ()) :> obj
@@ -177,7 +177,8 @@ let private everyLiveMessage () : obj list =
         SessionActor.SuspendableGetSnapshot :> obj
         SessionActor.SuspendTimedOut("req-1") :> obj
         SessionActor.SuspendableCloseSession(CancellationToken.None) :> obj
-        SessionActor.SuspendableAbortSession(StopCause.HostShutdown, "shutting down", CancellationToken.None) :> obj
+        SessionActor.SuspendableObserveHostAbort(session.Tenant, session.Id, TurnId.Parse("01ARZ3NDEKTSV4RRFFQ69G5FAX"))
+        :> obj
         SessionActor.SuspendableCompactSession(CancellationToken.None) :> obj
         SessionActor.SuspendableCheckInbox :> obj
         SessionActor.SuspendableSetAgent(agentId, CancellationToken.None) :> obj
@@ -279,7 +280,7 @@ let private toWireBytes (serializer: WireSerializer) (message: obj) : byte[] * s
 // ────────────────── Manifest table ──────────────────
 
 [<Fact>]
-let ``Manifest table carries one unique legate manifest per wire case at v1`` () =
+let ``Manifest table versions only the targeted abort payloads at v2`` () =
     let manifests = WireManifests.cases |> List.map WireManifests.manifestOf
 
     manifests.Length |> should equal 41
@@ -288,13 +289,44 @@ let ``Manifest table carries one unique legate manifest per wire case at v1`` ()
     for wireCase in WireManifests.cases do
         let manifest = WireManifests.manifestOf wireCase
         manifest.StartsWith("legate.", StringComparison.Ordinal) |> should equal true
-        manifest.EndsWith(".v1", StringComparison.Ordinal) |> should equal true
-        wireCase.Version |> should equal 1
+
+        let version =
+            if wireCase.Name = "AbortSession" || wireCase.Name = "SuspendableAbortSession" then
+                2
+            else
+                1
+
+        manifest.EndsWith($".v{version}", StringComparison.Ordinal) |> should equal true
+        wireCase.Version |> should equal version
         (wireCase.MaxBytes >= 1) |> should equal true
         wireCase.DtoType.IsClass |> should equal true
 
     let dtoTypes = WireManifests.cases |> List.map (fun wireCase -> wireCase.DtoType)
     dtoTypes |> List.distinct |> List.length |> should equal dtoTypes.Length
+
+[<Fact>]
+let ``Legacy untargeted abort manifests and missing targeted versions fail closed`` () =
+    use system = createWireSystem ()
+    let serializer = envelopeSerializerOf system
+
+    let bytes =
+        System.Text.Encoding.UTF8.GetBytes("{\"Cause\":0,\"Reason\":\"old abort\"}")
+
+    for manifest in
+        [
+            "legate.actor.AbortSession.v1"
+            "legate.entity.SuspendableAbortSession.v1"
+        ] do
+        Assert.ThrowsAny<Exception>(fun () -> serializer.FromBinary(bytes, manifest) |> ignore)
+        |> ignore
+
+    Assert.Throws<InvalidOperationException>(fun () -> WireDtos.ofWire (WireDtos.AbortSessionDto()) |> ignore)
+    |> ignore
+
+    Assert.Throws<InvalidOperationException>(fun () ->
+        WireDtos.toWire (AbortSession(StopCause.ExplicitAbort, "local", CancellationToken.None))
+        |> ignore)
+    |> ignore
 
 [<Fact>]
 let ``No manifests stay reserved after the subscription promotion`` () =
@@ -366,21 +398,23 @@ let ``Prompt DTO round-trips its payload and drops its token`` () =
     | other -> failwith $"Expected a SessionActorMessage but rebuilt '{other.GetType().Name}'."
 
 [<Fact>]
-let ``Abort DTO carries its cause and reason`` () =
-    let dto =
-        WireDtos.toWire (AbortSession(StopCause.HostShutdown, "shutting down", CancellationToken.None))
-        :?> WireDtos.AbortSessionDto
+let ``Abort wake DTO carries exact tenant session and target without authority`` () =
+    let session = SessionId.New()
+    let turn = TurnId.New()
 
-    dto.Cause |> should equal StopCause.HostShutdown
-    dto.Reason |> should equal "shutting down"
+    let dto =
+        WireDtos.toWire (ObserveHostAbort(TenantId.Default, session, turn)) :?> WireDtos.AbortSessionDto
+
+    dto.ControlVersion |> should equal 2
+    dto.TargetTurnId |> should equal turn
 
     match WireDtos.ofWire dto with
     | :? SessionActorMessage as message ->
         match message with
-        | AbortSession(cause, reason, token) ->
-            cause |> should equal StopCause.HostShutdown
-            reason |> should equal "shutting down"
-            token |> should equal CancellationToken.None
+        | ObserveHostAbort(tenant, receivedSession, receivedTurn) ->
+            tenant |> should equal TenantId.Default
+            receivedSession |> should equal session
+            receivedTurn |> should equal turn
         | other -> failwith $"Expected AbortSession but rebuilt '{other.GetType().Name}'."
     | other -> failwith $"Expected a SessionActorMessage but rebuilt '{other.GetType().Name}'."
 

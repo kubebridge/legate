@@ -1133,6 +1133,7 @@ let private spawnSuspendable
             Delay = delay
             AskTimeout = askTimeout
             JournalToken = "test-token"
+            PrimeClaim = None
             RunSuspendable = runner.Func
             ReprimeJournal = None
             RefreshCompact = None
@@ -3394,6 +3395,7 @@ let private spawnSuspendableOver
             Delay = (TurnLoopTests.NeverDelay() :> ILlmDelay)
             AskTimeout = TimeSpan.FromMinutes 5.0
             JournalToken = token
+            PrimeClaim = None
             RunSuspendable = runner.Func
             ReprimeJournal = None
             RefreshCompact = None
@@ -3705,6 +3707,7 @@ let ``Kill mid-turn restarts exactly once with the journal prefix intact`` () =
                 Delay = (TurnLoopTests.NeverDelay() :> ILlmDelay)
                 AskTimeout = TimeSpan.FromMinutes 5.0
                 JournalToken = token
+                PrimeClaim = None
                 RunSuspendable = runner.Func
                 ReprimeJournal = None
                 RefreshCompact = None
@@ -3828,6 +3831,7 @@ let ``Running with empty inbox and marker-only journal settles Failed instead of
             Delay = (TurnLoopTests.NeverDelay() :> ILlmDelay)
             AskTimeout = TimeSpan.FromMinutes 5.0
             JournalToken = token
+            PrimeClaim = None
             RunSuspendable = runner.Func
             ReprimeJournal = None
             RefreshCompact = None
@@ -3983,6 +3987,7 @@ let ``Orphan fail takeover loser journals nothing under the fresh token`` () =
                 Delay = (TurnLoopTests.NeverDelay() :> ILlmDelay)
                 AskTimeout = TimeSpan.FromMinutes 5.0
                 JournalToken = token
+                PrimeClaim = None
                 RunSuspendable = runner.Func
                 ReprimeJournal = None
                 RefreshCompact = None
@@ -4258,6 +4263,7 @@ let private spawnReprimeable
             Delay = (TurnLoopTests.NeverDelay() :> ILlmDelay)
             AskTimeout = TimeSpan.FromMinutes 5.0
             JournalToken = token
+            PrimeClaim = None
             RunSuspendable = runner.Func
             ReprimeJournal = Some(reprimeFor store tenantId sessionId "owner-a")
             RefreshCompact = refresh
@@ -4651,6 +4657,7 @@ let private spawnProbe
             Delay = (TurnLoopTests.NeverDelay() :> ILlmDelay)
             AskTimeout = TimeSpan.FromMinutes 5.0
             JournalToken = token
+            PrimeClaim = None
             RunSuspendable = runner
             ReprimeJournal = reprime
             RefreshCompact = None
@@ -5165,7 +5172,8 @@ let ``Faulted turn journals one terminal event and settles Idle`` () =
                 && journal.Appended.Count = 2)
 
         faultSettled |> should equal true
-        settled.Count |> should equal 1
+        settled.Count |> should equal 2
+        settled[1].Status |> should equal TurnStatus.Failed
         seen.Count |> should equal 2
 
         let failed =

@@ -44,6 +44,7 @@ type PromptRequest =
 [<CLIMutable>]
 type AbortRequest =
     {
+        ExpectedTurnId: string
         Cause: string | null
         Reason: string | null
     }
@@ -66,10 +67,6 @@ type InboxResponse =
         Position: int64
         Delivery: string
     }
-
-/// What abort returns: the session id text and the acknowledgement.
-[<CLIMutable>]
-type AbortResponse = { SessionId: string; Aborted: bool }
 
 /// What every typed failure returns: the message plus the exception name.
 [<CLIMutable>]
@@ -251,8 +248,7 @@ let private replyHandler (sessionText: string) : HttpHandler =
                 return! mapError ex next ctx
         })
 
-/// Aborts the session's running turn: Idle and WaitingForInput no-op with
-/// the same acknowledgement.
+/// Accepts exact-target durable stop intent, not terminal completion.
 let private abortHandler (sessionText: string) : HttpHandler =
     bindJson<AbortRequest> (fun body next ctx ->
         task {
@@ -268,19 +264,32 @@ let private abortHandler (sessionText: string) : HttpHandler =
                     | candidate when String.IsNullOrWhiteSpace(candidate) -> "minimalhost abort"
                     | candidate -> candidate.Trim()
 
-                do! SessionClientOperations.AbortAsync(client, sessionId, cause, reason, ctx.RequestAborted)
+                let! receipt =
+                    SessionClientOperations.AbortAsync(
+                        client,
+                        sessionId,
+                        TurnId.Parse(body.ExpectedTurnId),
+                        cause,
+                        reason,
+                        ctx.RequestAborted
+                    )
 
-                return!
-                    json
-                        {
-                            SessionId = sessionId.ToString()
-                            Aborted = true
-                        }
-                        next
-                        ctx
+                return! json receipt next ctx
             with ex ->
                 return! mapError ex next ctx
         })
+
+/// Read-only exact control attribution, using the sample's existing trusted host tenant.
+let private abortTargetHandler (sessionText: string) : HttpHandler =
+    fun next ctx ->
+        task {
+            try
+                let client = ctx.RequestServices.GetRequiredService<SessionClient>()
+                let! target = client.ReadAbortTargetAsync(parseSessionId sessionText, ctx.RequestAborted)
+                return! json target next ctx
+            with ex ->
+                return! mapError ex next ctx
+        }
 
 // ──────────────────────────────────────────────────────────────────────────
 // SSE stream
@@ -408,6 +417,7 @@ let webApp: HttpHandler =
             >=> choose
                     [
                         route "/healthz" >=> healthHandler
+                        routef "/sessions/%s/abort-target" abortTargetHandler
                         routef "/sessions/%s/events" sseHandler
                     ]
             failure 404 "No such route." "NotFound"

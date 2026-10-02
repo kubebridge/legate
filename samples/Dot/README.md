@@ -231,6 +231,9 @@ turn. The settle waiter is queued before each prompt lands, so the
 pre-empted turn still prints its `RESULT Aborted` line, never silently.
 `/abort` and `/compact` work mid-turn and while idle, including the
 deferred-compact path for running turns.
+`/abort` prints `ABORT Accepted` for durable exact-target intent and `ABORT NoCurrentTurn`
+while idle. `RESULT Aborted`, when a live owner can settle, remains a separate result.
+Suspended turns refuse new host abort requests. Already-admitted calls cannot be recalled.
 
 `/tree` lists the journal positions to branch from (sequence plus
 event-type detail) and `/fork <sequence>` opens a new session carrying

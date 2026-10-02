@@ -60,6 +60,7 @@ type InMemoryDatabase(timeProvider: TimeProvider, options: InMemoryStoreOptions)
 
     // Sessions keyed by (tenant, session id).
     let sessions = Dictionary<(TenantId * SessionId), Session>()
+    let controlStates = Dictionary<(TenantId * SessionId), string>()
 
     // Inbox rows per (tenant, session id), append-ordered.
     let inboxes = Dictionary<(TenantId * SessionId), List<InboxEntry>>()
@@ -135,6 +136,7 @@ type InMemoryDatabase(timeProvider: TimeProvider, options: InMemoryStoreOptions)
     /// The session rows, keyed by (tenant, session id). Internal: stores
     /// mutate through the gate only.
     member internal _.Sessions = sessions
+    member internal _.ControlStates = controlStates
 
     /// The inbox rows per (tenant, session id), in append order.
     member internal _.Inboxes = inboxes

@@ -338,14 +338,17 @@ let ``Takeover loser journals nothing and never reaches the provider`` () : Task
                             CancellationToken.None
                         )
 
-                    let! _ =
-                        SessionClientOperations.PromptAsync(
-                            client,
-                            created.Id,
-                            UserMessage.Text "loser turn",
-                            DeliveryMode.Queue,
-                            CancellationToken.None
-                        )
+                    let! refused =
+                        Assert.ThrowsAsync<InvalidSessionStateException>(fun () ->
+                            SessionClientOperations.PromptAsync(
+                                client,
+                                created.Id,
+                                UserMessage.Text "loser turn",
+                                DeliveryMode.Queue,
+                                CancellationToken.None
+                            ))
+
+                    Assert.Equal("controlPending", refused.CurrentState)
 
                     let settled =
                         waitFor (TimeSpan.FromSeconds 10.0) (fun () ->
@@ -373,7 +376,7 @@ let ``Takeover loser journals nothing and never reaches the provider`` () : Task
 
                     let! pending = client.Store.ReadPendingInbox(client.Tenant, created.Id, CancellationToken.None)
 
-                    pending.Count |> should equal 0
+                    pending.Count |> should equal 1
                 })
     }
 

@@ -8,6 +8,7 @@ open System.Text.Json
 open System.Threading
 open System.Threading.Tasks
 open Legate
+open Legate.Storage
 open Npgsql
 open PostgresSql
 
@@ -56,6 +57,43 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
     member private _.TurnsTable = qualified options "turns"
     member private this.OutboxTable = qualified options "outbox"
     member private this.EraTable = qualified options "turn_completion_era"
+    member private _.ControlTable = qualified options "session_control"
+
+    member private this.Control(tenant, sessionId, ct, operation) =
+        this.EnsureMigrated()
+
+        let result =
+            transact options (fun connection transaction ->
+                RelationalControlTarget.invoke
+                    connection
+                    transaction
+                    this.SessionsTable
+                    this.InboxTable
+                    this.TurnsTable
+                    this.ControlTable
+                    true
+                    tenant
+                    sessionId
+                    (fun () -> this.UtcNow)
+                    ct
+                    operation)
+
+        ct.ThrowIfCancellationRequested()
+        Task.FromResult result
+
+    member private this.RequireNoControlBinding(connection, transaction, tenant, sessionId) =
+        RelationalControlTarget.requireNoBinding connection transaction this.ControlTable tenant sessionId
+
+    member private this.LockClaimSession(connection, transaction, tenant, claim: TurnClaim) =
+        use cmd =
+            command connection transaction $"SELECT session_id FROM {this.TurnsTable} WHERE tenant=@t AND turn_id=@tid"
+
+        textParam cmd "t" (tenant.ToString())
+        textParam cmd "tid" (claim.TurnId.ToString())
+        let value = cmd.ExecuteScalar()
+
+        if not (isNull value) && value <> box DBNull.Value then
+            this.RequireSession(connection, transaction, tenant, SessionId.Parse(string value))
 
     /// Marks the session era-marked (issue 289): an idempotent upsert
     /// over the turn_completion_era table. Internal: the registration
@@ -407,6 +445,51 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
         reader.Close()
         entry
 
+    interface ISessionAbortControlStore with
+        member this.ReadAbortTarget(tenant, sessionId, ct) =
+            this.Control(tenant, sessionId, ct, fun context state -> ControlTargetProtocol.read context state, state)
+
+        member this.RequestHostAbort(tenant, sessionId, turn, cause, reason, ct) =
+            this.Control(
+                tenant,
+                sessionId,
+                ct,
+                fun context state -> ControlTargetProtocol.request context state turn cause reason
+            )
+
+        member this.BindControlTarget(tenant, sessionId, turn, position, claim, ct) =
+            this.Control(
+                tenant,
+                sessionId,
+                ct,
+                fun context state -> ControlTargetProtocol.bind context state turn position claim
+            )
+
+        member this.CheckControlTarget(tenant, sessionId, turn, position, claim, ct) =
+            this.Control(
+                tenant,
+                sessionId,
+                ct,
+                fun context state -> ControlTargetProtocol.check context state turn position claim, state
+            )
+
+        member this.TryDecideControlTarget(tenant, sessionId, turn, position, claim, id, status, cause, reason, ct) =
+            this.Control(
+                tenant,
+                sessionId,
+                ct,
+                fun context state ->
+                    ControlTargetProtocol.decide context state turn position claim id status cause reason
+            )
+
+        member this.RetireControlTarget(tenant, sessionId, turn, position, claim, id, ct) =
+            this.Control(
+                tenant,
+                sessionId,
+                ct,
+                fun context state -> ControlTargetProtocol.retire context state turn position claim id
+            )
+
     interface ISessionStore with
 
         member this.CreateSession(tenant, session, _) =
@@ -470,6 +553,7 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
                 textParam insertCmd "options" (serialize<SessionOptions> stored.Options)
                 textParam insertCmd "grants" (serialize<List<string>> (List<string>(grants)))
                 insertCmd.ExecuteNonQuery() |> ignore
+                RelationalControlTarget.initialize connection transaction this.ControlTable tenant stored.Id
 
                 stored)
             |> Task.FromResult
@@ -611,6 +695,18 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
 
                 lockReader.Close()
 
+                if not (isNull (box current)) then
+                    ControlTargetProtocol.requireTransition
+                        sessionId
+                        state
+                        (RelationalControlTarget.load connection transaction this.ControlTable tenant sessionId)
+
+                if
+                    not (isNull (box current))
+                    && (state = SessionState.Idle || state = SessionState.Closed)
+                then
+                    this.RequireNoControlBinding(connection, transaction, tenant, sessionId)
+
                 if isNull (box current) then
                     raise (
                         SessionNotFoundException(
@@ -672,6 +768,7 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
 
                 let session = this.ReadSession(lockReader)
                 lockReader.Close()
+                this.RequireNoControlBinding(connection, transaction, tenant, sessionId)
 
                 if session.State = SessionState.Closed then
                     session
@@ -989,6 +1086,7 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
 
             transact options (fun connection transaction ->
                 this.RequireSession(connection, transaction, tenant, sessionId)
+                this.RequireNoControlBinding(connection, transaction, tenant, sessionId)
 
                 let now = this.UtcNow
                 let nowText = stamp now
@@ -1272,6 +1370,7 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
             this.EnsureMigrated()
 
             transact options (fun connection transaction ->
+                this.LockClaimSession(connection, transaction, tenant, claim)
                 let nowText = stamp this.UtcNow
 
                 // The guard runs inside the transaction, so the typed
@@ -1315,6 +1414,7 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
 
                 match this.ResolveClaim(connection, transaction, tenant, claim, nowText) with
                 | Choice1Of3(sessionId, _) ->
+                    this.RequireNoControlBinding(connection, transaction, tenant, sessionId)
                     // The token still fences: the first settle wins, and a
                     // lapsed-but-uncontested lease does not unseat it (a
                     // settle is terminal; nothing can take over a turn the
@@ -1394,10 +1494,12 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
             this.EnsureMigrated()
 
             transact options (fun connection transaction ->
+                this.LockClaimSession(connection, transaction, tenant, claim)
                 let nowText = stamp this.UtcNow
 
                 match this.ResolveClaim(connection, transaction, tenant, claim, nowText) with
                 | Choice1Of3(sessionId, live) ->
+                    this.RequireNoControlBinding(connection, transaction, tenant, sessionId)
                     // Abort settles Aborted and releases the lease; a
                     // later settle observes the applied settlement.
                     this.ApplySettlement(

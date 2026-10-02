@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
-// Cluster crash-resume smoke for the compose harness (issue 145).
+// Cluster targeted-stop/crash smoke for the compose harness (issues 145 and 393).
+// The current control format blocks a durably stopped dormant target before
+// recovery priming. This smoke accepts canonical live-owner Aborted settlement
+// or an exact durable control-pending target, never inferred terminal completion.
 // Brings the stack up (sequenced by health gates), opens a session on
 // node 1, prompts it with the scripted transport, subscribes to the event
 // stream from node 2, stops node 1 mid-turn, and asserts the turn either
@@ -291,7 +294,45 @@ while not started && DateTimeOffset.UtcNow < killDeadline do
 if not started then
     fail "never observed TurnStartedEvent from node 2 within 3 minutes: the turn never entered the LLM call"
 
-info "turn started: killing legate-1 mid-LLM-call"
+// Accept on a different receiving host without activating or resolving the owner.
+let targetCode, targetBody =
+    getStatus node3 (sprintf "/sessions/%s/abort-target" sessionId)
+    |> Async.RunSynchronously
+
+if targetCode <> 200 then
+    fail (sprintf "target inspection failed: %d" targetCode)
+
+let targetDoc = JsonDocument.Parse(targetBody)
+let targetTurnId = targetDoc.RootElement.GetProperty("turnId").GetString()
+
+if String.IsNullOrWhiteSpace targetTurnId then
+    fail "no exact current target before kill"
+
+let originalPosition = targetDoc.RootElement.GetProperty("inboxPosition").GetInt64()
+
+let abortPayload =
+    sprintf """{"expectedTurnId":"%s","cause":"hostShutdown","reason":"cluster smoke targeted stop"}""" targetTurnId
+
+let accepted =
+    postJson node3 (sprintf "/sessions/%s/abort" sessionId) abortPayload
+    |> Async.RunSynchronously
+
+let outcomeNumber (document: JsonDocument) =
+    let value = document.RootElement.GetProperty("outcome")
+
+    if value.ValueKind = JsonValueKind.Number then
+        value.GetInt32()
+    else
+        match value.GetString() with
+        | "Accepted" -> 0
+        | "AlreadyAccepted" -> 1
+        | _ -> -1
+
+if outcomeNumber accepted <> 0 then
+    fail "host did not durably accept the exact target"
+
+let acceptedAt = accepted.RootElement.GetProperty("acceptedAt").GetString()
+info "targeted intent accepted on node 3: killing legate-1 mid-LLM-call"
 // SIGKILL, not `stop`: a graceful stop gives the victim its 10s SIGTERM
 // grace, which covers the 10s scripted reply delay, so the victim usually
 // completes the turn itself and the run proves nothing about survivor
@@ -300,15 +341,19 @@ info "turn started: killing legate-1 mid-LLM-call"
 // the survivor must settle past the claim-lease expiry.
 runCompose "kill legate-1" 5 |> ignore
 
-// Observe from node 2 until a terminal turn event or the timeout.
-let deadline = DateTimeOffset.UtcNow.AddMinutes(4.0)
+// A surviving genuine owner may settle; a dead owner leaves a durable barrier.
+let deadline = DateTimeOffset.UtcNow.AddMinutes(1.0)
 let mutable terminal: string option = None
 
 while terminal.IsNone && DateTimeOffset.UtcNow < deadline do
     Thread.Sleep(2000)
 
     for name in seenEvents do
-        if name = "TurnFailedEvent" || name = "TurnCompletedEvent" then
+        if
+            name = "TurnFailedEvent"
+            || name = "TurnCompletedEvent"
+            || name = "TurnAbortedEvent"
+        then
             terminal <- Some name
 
 match terminal with
@@ -321,11 +366,50 @@ match terminal with
     Thread.Sleep(5000)
 
     for name in seenEvents do
-        if name = "TurnFailedEvent" || name = "TurnCompletedEvent" then
+        if
+            name = "TurnFailedEvent"
+            || name = "TurnCompletedEvent"
+            || name = "TurnAbortedEvent"
+        then
             terminal <- Some name
 
 match terminal with
-| None -> fail "no TurnFailedEvent or TurnCompletedEvent observed from node 2 within the timeout"
+| None ->
+    let code, body =
+        getStatus node2 (sprintf "/sessions/%s/abort-target" sessionId)
+        |> Async.RunSynchronously
+
+    if code <> 200 then
+        fail "receiving host cannot inspect durable control pending"
+
+    use pending = JsonDocument.Parse(body)
+
+    if pending.RootElement.ValueKind = JsonValueKind.Null then
+        fail "target vanished without an observed canonical terminal event"
+
+    if pending.RootElement.GetProperty("turnId").GetString() <> targetTurnId then
+        fail "crash recovery replaced the stopped target"
+
+    if pending.RootElement.GetProperty("inboxPosition").GetInt64() <> originalPosition then
+        fail "crash recovery redirected control to another entry"
+
+    let stop = pending.RootElement.GetProperty("stop")
+
+    if
+        stop.ValueKind = JsonValueKind.Null
+        || stop.GetProperty("acceptedAt").GetString() <> acceptedAt
+    then
+        fail "receiving host lost durable intent"
+
+    if
+        seenEvents.ToArray() |> Array.filter ((=) "TurnStartedEvent") |> Array.length
+        <> 1
+    then
+        fail "stopped target restarted execution"
+
+    info "crash path: exact durable control pending, no resumed execution or fabricated terminal event"
+| Some name when name <> "TurnAbortedEvent" ->
+    fail (sprintf "accepted stop lost to noncanonical terminal report: %s" name)
 | Some name ->
     for (eventName, payload) in seenPayloads do
         if eventName = name then
@@ -337,17 +421,20 @@ match terminal with
         |> Option.map snd
         |> Option.defaultValue ""
 
-    if name = "TurnFailedEvent" then
-        if terminalPayload.Contains("No agent ") then
-            fail (
-                sprintf
-                    "turn failed at agent load (%s): the kill raced dispatch instead of interrupting the LLM call; the smoke agent was not resolved"
-                    terminalPayload
-            )
-        else
-            info "crash path: Fail/FailAttempt (Turns:CrashResume=Fail default)"
-    else
-        info "crash path: RetryTurn/ResumeAttempt (per-session resume)"
+    if not (terminalPayload.Contains(targetTurnId)) then
+        fail "terminal event did not retain the exact target"
+
+    info "live-owner path: canonical Aborted under the accepted stop"
+
+let retried =
+    postJson node2 (sprintf "/sessions/%s/abort" sessionId) abortPayload
+    |> Async.RunSynchronously
+
+if
+    outcomeNumber retried <> 1
+    || retried.RootElement.GetProperty("acceptedAt").GetString() <> acceptedAt
+then
+    fail "fresh receiving-host retry did not retain the original immutable receipt"
 
 // No-gap, no-dup over the subscriber sequence.
 let ids = seenIds.ToArray()
@@ -379,15 +466,10 @@ info (
 // A resumed turn is one new attempt; a failed turn settles once.
 let terminals =
     seenEvents.ToArray()
-    |> Array.filter (fun n -> n = "TurnFailedEvent" || n = "TurnCompletedEvent")
+    |> Array.filter (fun n -> n = "TurnFailedEvent" || n = "TurnCompletedEvent" || n = "TurnAbortedEvent")
 
 if terminals.Length > 1 then
-    // One retry plus one settle can legitimately emit both across attempts;
-    // more than two terminal frames means a duplicated settle.
-    if terminals.Length > 2 then
-        fail (sprintf "too many terminal turn frames (possible duplicated settle): %A" terminals)
-    else
-        info (sprintf "note: both terminal frames observed across attempts: %A" terminals)
+    fail (sprintf "duplicated control settlement: %A" terminals)
 else
     info "single terminal turn frame: no duplicated settle"
 

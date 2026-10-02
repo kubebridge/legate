@@ -170,7 +170,7 @@ let private everyGoldenMessage () : obj list =
         InjectPrompt(entry.Payload, CancellationToken.None) :> obj
         InterruptPrompt(entry.Payload, CancellationToken.None) :> obj
         CloseSession(CancellationToken.None) :> obj
-        AbortSession(StopCause.ExplicitAbort, "host abort", CancellationToken.None) :> obj
+        ObserveHostAbort(TenantId.Default, fixedSessionId, TurnId.Parse("01ARZ3NDEKTSV4RRFFQ69G5FAX")) :> obj
         CompactSession(CancellationToken.None) :> obj
         GetSnapshot :> obj
         SessionTurnSettled(entry, goldenResult ()) :> obj
@@ -185,7 +185,12 @@ let private everyGoldenMessage () : obj list =
         SessionActor.SuspendableGetSnapshot :> obj
         SessionActor.SuspendTimedOut("req-1") :> obj
         SessionActor.SuspendableCloseSession(CancellationToken.None) :> obj
-        SessionActor.SuspendableAbortSession(StopCause.HostShutdown, "shutting down", CancellationToken.None) :> obj
+        SessionActor.SuspendableObserveHostAbort(
+            TenantId.Default,
+            fixedSessionId,
+            TurnId.Parse("01ARZ3NDEKTSV4RRFFQ69G5FAX")
+        )
+        :> obj
         SessionActor.SuspendableCompactSession(CancellationToken.None) :> obj
         SessionActor.SuspendableCheckInbox :> obj
         SessionActor.SuspendableSetAgent(fixedAgentId, CancellationToken.None) :> obj

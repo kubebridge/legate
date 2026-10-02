@@ -272,6 +272,20 @@ module internal Dispatcher =
                         more <- false
                     else
                         for sessionId in unseen do
+                            match store with
+                            | :? ISessionAbortControlStore as control ->
+                                let! target = control.ReadAbortTarget(tenant, sessionId, cancellationToken)
+
+                                if not (isNull (box target)) then
+                                    raise (
+                                        InvalidSessionStateException(
+                                            sessionId,
+                                            "controlPending",
+                                            "Dispatcher cannot activate persisted control work or select unrelated inbox entries."
+                                        )
+                                    )
+                            | _ -> ()
+
                             let! session = store.GetSession(tenant, sessionId, cancellationToken)
 
                             match session with
@@ -363,6 +377,20 @@ module internal Dispatcher =
                     for row in page.Items do
                         if orphanBudget > 0 && not (isNull (box row)) && row.CurrentTurnId.HasValue then
                             try
+                                match store with
+                                | :? ISessionAbortControlStore as control ->
+                                    let! target = control.ReadAbortTarget(tenant, row.Id, cancellationToken)
+
+                                    if not (isNull (box target)) then
+                                        raise (
+                                            InvalidSessionStateException(
+                                                row.Id,
+                                                "controlPending",
+                                                "Dispatcher orphan prime is forbidden for unresolved control work."
+                                            )
+                                        )
+                                | _ -> ()
+
                                 let! fresh = store.GetSession(tenant, row.Id, cancellationToken)
 
                                 match fresh with

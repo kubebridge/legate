@@ -14,6 +14,7 @@
     <Compile Include="CleanupClaimsArchiveLocation.fs" />
     <Compile Include="ScheduleOccurrenceKey.fs" />
     <Compile Include="TurnCompletionEra.fs" />
+    <Compile Include="SessionControlTargets.fs" />
     <Compile Include="MigrationServiceExtensions.fs" />
   </ItemGroup>
 

@@ -560,16 +560,29 @@ type SessionClientOperations =
             return! SessionActor.replyAsync client.Store client.Tenant sessionId actor reply cancellationToken
         }
 
-    /// Aborts the turn running in a session under a typed stop cause. Idle
-    /// is a no-op, as is WaitingForInput (a suspended turn owns nothing
-    /// running to abort). Running records the pending stop: the detached
-    /// suspendable turn runs un-cancellable, so the stop wins at its next
-    /// report and a second abort keeps the first cause.
+    /// Reads the exact current control target without activating an actor or loading its options.
+    [<Extension>]
+    static member ReadAbortTargetAsync
+        (client: SessionClient, sessionId: SessionId, cancellationToken: CancellationToken)
+        : Task<AbortTarget | null> =
+        ArgumentNullException.ThrowIfNull(client)
+
+        match client.Store with
+        | :? ISessionAbortControlStore as control ->
+            control.ReadAbortTarget(client.Tenant, sessionId, cancellationToken)
+        | _ ->
+            raise (InvalidOperationException("The configured ISessionStore must implement ISessionAbortControlStore."))
+
+    /// Durably requests stop of the exact existing current target, independently of actor activation
+    /// or destination availability. Acceptance is not terminal completion. If cancellation or transport
+    /// loss makes commit uncertain, retry the same target, never reread and retarget the request.
     /// <param name="client">The session client. Must not be null.</param>
     /// <param name="sessionId">The session to abort the turn in.</param>
+    /// <param name="expectedTurnId">The exact target read before requesting stop. Must be nonempty.</param>
     /// <param name="cause">Which abort-family stop cause wins: ExplicitAbort or HostShutdown.</param>
     /// <param name="reason">Why the turn stops. Must not be null. Never contains secrets or tool arguments.</param>
-    /// <param name="cancellationToken">Cancels the abort.</param>
+    /// <param name="cancellationToken">Abandons acceptance; cancellation after commit does not undo intent.</param>
+    /// <returns>A durable intent receipt, never a terminal result.</returns>
     /// <exception cref="T:Legate.SessionNotFoundException">The session id does not exist.</exception>
     /// <exception cref="T:Legate.InvalidSessionStateException">The session is closed.</exception>
     [<Extension>]
@@ -577,31 +590,21 @@ type SessionClientOperations =
         (
             client: SessionClient,
             sessionId: SessionId,
+            expectedTurnId: TurnId,
             cause: StopCause,
             reason: string,
             cancellationToken: CancellationToken
-        ) : Task =
+        ) : Task<HostAbortReceipt> =
         ArgumentNullException.ThrowIfNull(client)
 
         if isNull (box reason) then
             raise (ArgumentNullException(nameof reason))
 
-        task {
-            let! _ = SessionClientOperations.RequireAsync(client, sessionId, cancellationToken)
-            let! actor = client.Resolve(sessionId, cancellationToken)
-
-            let! _ =
-                SessionActor.abortSuspendableAsync
-                    client.Store
-                    client.Tenant
-                    sessionId
-                    actor
-                    cause
-                    reason
-                    cancellationToken
-
-            ()
-        }
+        match client.Store with
+        | :? ISessionAbortControlStore as control ->
+            control.RequestHostAbort(client.Tenant, sessionId, expectedTurnId, cause, reason, cancellationToken)
+        | _ ->
+            raise (InvalidOperationException("The configured ISessionStore must implement ISessionAbortControlStore."))
 
     /// Compacts a session on demand: Idle replays the journal and compacts
     /// now without starting a turn; Running arms the one-shot force flag
