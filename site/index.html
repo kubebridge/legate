@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Run Millions of Agents | Legate</title>
+<title>Run Millions of Agents on a single box | Legate</title>
 <meta name="description" content="Build durable, tool-using agents on a lightweight Akka.NET runtime. Start inside your .NET application and distribute sessions across a cluster as you grow.">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 30 30'%3E%3Crect width='30' height='30' rx='7' fill='%236ea8ff'/%3E%3Crect x='13' y='6' width='4' height='18' fill='white'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="styles.css">
@@ -35,14 +35,16 @@
   <canvas class="agent-field" id="agent-field" aria-hidden="true"></canvas>
   <div class="wrap hero-content">
     <div class="hero-eyebrow"><span class="signal-dot" aria-hidden="true"></span> THE AGENT RUNTIME FOR .NET</div>
-    <h1 class="scale-title" id="scale-title"><span class="title-run">Run</span><span class="title-millions">Millions</span><span class="title-agents">of Agents.</span></h1>
-    <div class="memory-line">In <strong>1GB</strong> of RAM.<a class="claim-marker" href="#density-note" aria-label="Read the memory-density qualification">*</a></div>
+    <h1 class="scale-title" id="scale-title">
+      <span class="headline-lead">Run <span class="word-millions">Millions</span></span>
+      <span class="headline-agents">of Agents</span>
+      <span class="machine-line">on a <span class="machine-emphasis">single box</span></span>
+    </h1>
     <p class="hero-description">An agent for every customer. Every project. Every workflow.<br>Durable sessions on a lightweight, message-driven runtime.</p>
     <div class="resource-links hero-actions">
       <a class="btn primary" href="build.html">Start building <span aria-hidden="true">↗</span></a>
       <a class="btn" href="overview.html">Inside the runtime <span aria-hidden="true">→</span></a>
     </div>
-    <p class="hero-qualification">Built on Akka.NET's actor-density foundation. <a href="#density-note">Memory basis &amp; workload limits ↗</a></p>
     <div class="hero-bottom"><a class="scroll-cue" href="#scale-story"><span aria-hidden="true">↓</span> ONE SESSION IS JUST THE START</a><button class="motion-toggle" type="button" aria-pressed="false" hidden>Pause motion</button></div>
   </div>
 </section>
@@ -112,9 +114,6 @@
     DeliveryMode.Queue, ct);</code></pre><a href="build.html">Configure your host and get started <span aria-hidden="true">→</span></a></div>
 </section>
 
-<aside class="wrap density-note" id="density-note" aria-label="Memory-density qualification">
-  <p><strong>* Memory-density basis.</strong> <a href="https://getakka.net/">Akka.NET documents approximately 2.5 million actors per GB of heap.</a> The headline refers to that lightweight actor foundation, rather than a measured capacity for complete Legate agents. Session state, conversation history, active model calls, tools, workspaces, and host overhead add memory; actual agent capacity depends on the workload. This is not a Legate benchmark or a claim of millions of simultaneous model calls.</p>
-</aside>
 </main>
 
 <footer><div class="wrap">
