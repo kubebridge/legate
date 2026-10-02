@@ -55,7 +55,7 @@ let ``Banner heads every frame above the transcript`` () =
     let frame =
         renderFrame 80 24 false [ "EVENT seq=1 TurnStartedEvent" ] (statusFor (SessionId.New()))
 
-    frame.Contains("     _       _   ") |> should equal true
+    frame.Contains(bannerLines.Head) |> should equal true
     frame.Contains(shellTitle) |> should equal true
     frame.Contains("EVENT seq=1 TurnStartedEvent") |> should equal true
 
@@ -67,7 +67,7 @@ let ``Short windows keep the banner plus the tail`` () =
 
     frame.Contains("line-50") |> should equal true
     frame.Contains("line-01") |> should equal false
-    frame.Contains("     _       _   ") |> should equal true
+    frame.Contains(bannerLines.Head) |> should equal true
     frame.Contains(statusFor sid) |> should equal true
 
 [<Fact>]
@@ -234,7 +234,7 @@ let ``Tiny windows show the notice and keep the frame`` () =
     let frame = renderFrame 30 8 false [ "ok" ] status
 
     frame.Contains("terminal too small") |> should equal true
-    frame.Contains("     _       _   ") |> should equal true
+    frame.Contains(bannerLines.Head) |> should equal true
     frame.Contains("ok") |> should equal true
     frame.Contains("Ctrl+Q") |> should equal true
     frame.Contains("\u001b") |> should equal false
@@ -372,3 +372,182 @@ let ``Overlay rows dock into the frame input budget`` () =
     frame.Contains("01JAAA") |> should equal true
     frame.Contains("line-2") |> should equal true
     frame.Contains("\u001b") |> should equal false
+
+[<Fact>]
+let ``Idle screen emits no terminal writes`` () =
+    let screen =
+        renderScreen 120 36 true true [ "[Context]"; "  AGENTS.md" ] "idle" [ "> " ] (0, 2) 0
+
+    screenUpdate (Some screen) screen |> should equal ""
+
+[<Fact>]
+let ``Typing patches only the composer row without clearing or scrolling`` () =
+    let before = renderScreen 80 24 true true [] "idle" [ "> " ] (0, 2) 0
+    let after = renderScreen 80 24 true true [] "idle" [ "> hello" ] (0, 7) 0
+    let update = screenUpdate (Some before) after
+    update.Contains("\u001b[2J") |> should equal false
+    update.Contains("\n") |> should equal false
+    update.Contains(bannerLines.Head) |> should equal false
+    update.Contains("> hello") |> should equal true
+    update.Contains("\u001b[?25h") |> should equal true
+    after.CursorRow |> should equal 21
+    after.CursorCol |> should equal 7
+
+[<Theory>]
+[<InlineData(120, 36)>]
+[<InlineData(80, 24)>]
+[<InlineData(40, 12)>]
+[<InlineData(20, 8)>]
+[<InlineData(5, 3)>]
+let ``Live frame fits terminal and keeps cursor in bounds`` (width: int, height: int) =
+    let screen =
+        renderScreen width height false true [ String.replicate 500 "x" ] "idle" [ "> hello"; "  second" ] (1, 8) 0
+
+    screen.Rows.Length |> should equal height
+    screen.Rows |> Array.forall (fun row -> row.Length < width) |> should equal true
+    Assert.InRange(screen.CursorRow, 0, height - 1)
+    Assert.InRange(screen.CursorCol, 0, width - 1)
+
+[<Fact>]
+let ``Scrollback and resize preserve fixed bottom composer`` () =
+    let lines = [ for n in 1..60 -> $"line-{n}" ]
+    let latest = renderScreen 80 24 false false lines "idle" [ "> draft" ] (0, 7) 0
+    let older = renderScreen 80 24 false false lines "idle" [ "> draft" ] (0, 7) 10
+    latest.Rows |> Array.contains "line-60" |> should equal true
+    older.Rows |> Array.contains "line-50" |> should equal true
+    older.Rows |> Array.contains "line-60" |> should equal false
+    older.CursorRow |> should equal latest.CursorRow
+    let resized = renderScreen 40 12 false false lines "idle" [ "> draft" ] (0, 7) 0
+    let update = screenUpdate (Some latest) resized
+    update.Contains("\u001b[2J") |> should equal true
+    update.Contains("\n") |> should equal false
+
+[<Fact>]
+let ``Transcript cannot inject terminal controls into screen`` () =
+    let screen =
+        renderScreen 80 24 false false [ "hello\u001b[2J\r\tworld" ] "idle" [ "> " ] (0, 2) 0
+
+    screen.Rows[0] |> should equal "hello"
+    screen.Rows[1] |> should equal "    world"
+
+[<Fact>]
+let ``User cells have full width shading with vertical padding`` () =
+    let rows = renderCells 39 true false [ { Style = User; Text = "hi" } ]
+    rows.Length |> should equal 4
+
+    for row in rows |> List.take 3 do
+        row.Contains("48;2;16;39;77") |> should equal true
+        (plainText row).Length |> should equal 39
+
+    plainText rows[1] |> should equal (" hi".PadRight 39)
+    rows[3] |> should equal ""
+
+[<Fact>]
+let ``Reasoning is italic and does not leak styling into the response`` () =
+    let rows =
+        renderCells
+            79
+            true
+            false
+            [
+                {
+                    Style = Reasoning
+                    Text = "Considering.\n\nDone."
+                }
+                { Style = Assistant; Text = "Hello!" }
+            ]
+
+    rows[0].StartsWith("\u001b[3;38;2;148;159;164m", StringComparison.Ordinal)
+    |> should equal true
+
+    rows[0].EndsWith("\u001b[0m", StringComparison.Ordinal) |> should equal true
+
+    rows
+    |> List.find (fun row -> row.Contains("Hello!"))
+    |> fun row -> row.Contains("\u001b[3;") |> should equal false
+
+[<Fact>]
+let ``Cells wrap words and preserve paragraphs without accepting ANSI`` () =
+    let rows =
+        renderCells
+            20
+            false
+            false
+            [
+                {
+                    Style = Assistant
+                    Text = "one two three four five\n\n\u001b[2Jlast"
+                }
+            ]
+
+    rows
+    |> should
+        equal
+        [
+            " one two three four"
+            " five"
+            " "
+            " last"
+            ""
+        ]
+
+    rows
+    |> List.forall (fun row -> row.Length <= 20 && not (row.Contains('\u001b')))
+    |> should equal true
+
+[<Fact>]
+let ``Growing a response only repaints its rows and preserves the user cell`` () =
+    let cells text =
+        [
+            { Style = User; Text = "hi" }
+            { Style = Assistant; Text = text }
+        ]
+
+    let before =
+        renderScreenWithCells 80 24 true false (cells "Hel") "running" [ "> " ] (0, 2) 0
+
+    let after =
+        renderScreenWithCells 80 24 true false (cells "Hello!") "running" [ "> " ] (0, 2) 0
+
+    let update = screenUpdate (Some before) after
+    update.Contains("48;2;16;39;77") |> should equal false
+    update.Contains("\u001b[2J") |> should equal false
+    update.Contains("Hello!") |> should equal true
+
+[<Fact>]
+let ``Markdown tables align columns and reflow at narrow widths`` () =
+    let markdown = "| Name | Count |\n| :--- | ---: |\n| Alpha | 12 |\n| Beta | 3 |"
+    let wide = Dot.DotMarkdown.render 50 true plainText wrapText markdown
+
+    wide
+    |> List.exists (fun row -> (plainText row).StartsWith("┌"))
+    |> should equal true
+
+    let data =
+        wide
+        |> List.filter (fun row -> (plainText row).StartsWith("│"))
+        |> List.map plainText
+
+    data |> List.map String.length |> List.distinct |> List.length |> should equal 1
+    let narrow = Dot.DotMarkdown.render 10 false plainText wrapText markdown
+    narrow |> List.exists ((=) "Name:") |> should equal false
+    narrow |> List.forall (fun row -> row.Length <= 10) |> should equal true
+
+    String.concat "\n" narrow
+    |> fun text -> text.Contains("Count: 12") |> should equal true
+
+[<Fact>]
+let ``Markdown preserves code and styles headings bold and inline code`` () =
+    let markdown = "# Heading\n**bold** and `code`\n```fsharp\n    let x = 1\n```"
+    let rows = Dot.DotMarkdown.render 60 true plainText wrapText markdown
+    rows.Head.Contains("1;38;2;112;172;255") |> should equal true
+    rows[1].Contains("\u001b[1m") |> should equal true
+    rows[1].Contains("48;2;20;36;64") |> should equal true
+
+    rows
+    |> List.exists (fun row -> (plainText row).Contains("    let x = 1"))
+    |> should equal true
+
+    let plain = Dot.DotMarkdown.render 60 false plainText wrapText markdown
+    plain |> List.exists (fun row -> row.Contains('\u001b')) |> should equal false
+    plain[1] |> should equal "bold and code"

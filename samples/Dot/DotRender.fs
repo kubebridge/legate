@@ -87,6 +87,15 @@ type QuestionPrompt =
 
 /// The pure renderer state: the fold over Subscribe events plus the engine
 /// diagnostic lines the REPL prints outside the journal.
+type DisplayBlock =
+    | UserText of string
+    | AssistantText of string
+    | ReasoningText of string
+    | ToolReference of string
+    | ErrorText of string
+    | Notice of string
+
+/// Transcript state shared by the plain-contract tests and fullscreen view.
 type RendererState =
     {
         /// The accumulated assistant text head.
@@ -109,6 +118,12 @@ type RendererState =
         System: string list
         /// The retained engine diagnostic lines (RESULT, ERROR, etc.).
         Diagnostics: string list
+        /// Chronological blocks for the human-facing conversation.
+        Display: DisplayBlock list
+        /// Whether this turn has supplied streaming text.
+        StreamedTurn: bool
+        /// Whether diagnostic lines are inside a RESULT envelope.
+        InResult: bool
     }
 
 /// The empty renderer: no text, no cards, no prompts, no markers.
@@ -124,6 +139,9 @@ let empty: RendererState =
         Lifecycle = []
         System = []
         Diagnostics = []
+        Display = []
+        StreamedTurn = false
+        InResult = false
     }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -169,7 +187,7 @@ let private addMeta (lines: string list) (line: string) : string list =
 // <param name="state">The current renderer state.</param>
 // <param name="evt">The Subscribe event just observed.</param>
 // <returns>The next renderer state.</returns>
-let apply (state: RendererState) (evt: SessionEvent) : RendererState =
+let private applyState (state: RendererState) (evt: SessionEvent) : RendererState =
     if isNull (box evt) then
         state
     else if isNull (box state) then
@@ -442,6 +460,46 @@ let apply (state: RendererState) (evt: SessionEvent) : RendererState =
                 System = addMeta state.System $"event {evt.GetType().Name}"
             }
 
+/// Folds an event and maintains chronological display blocks alongside the
+/// information-parity model. Tool updates keep their original position.
+let apply (state: RendererState) (evt: SessionEvent) : RendererState =
+    let next = applyState state evt
+
+    let append block =
+        { next with
+            Display = (next.Display @ [ block ]) |> List.rev |> List.truncate maxMetaLines |> List.rev
+        }
+
+    match evt with
+    | :? TurnStartedEvent -> { next with StreamedTurn = false }
+    | :? TextDeltaEvent as delta when not (String.IsNullOrEmpty delta.Text) ->
+        let blocks =
+            match List.rev next.Display with
+            | AssistantText text :: rest when state.StreamedTurn ->
+                let value, _, _ = appendCapped text delta.Text maxAssistantChars
+                List.rev rest @ [ AssistantText value ]
+            | _ ->
+                let value, _, _ = appendCapped "" delta.Text maxAssistantChars
+                next.Display @ [ AssistantText value ]
+
+        { next with
+            Display = blocks
+            StreamedTurn = true
+        }
+    | :? ReasoningDeltaEvent as delta when not (String.IsNullOrEmpty delta.Text) ->
+        let blocks =
+            match List.rev next.Display with
+            | ReasoningText text :: rest ->
+                let value, _, _ = appendCapped text delta.Text maxAssistantChars
+                List.rev rest @ [ ReasoningText value ]
+            | _ -> next.Display @ [ ReasoningText delta.Text ]
+
+        { next with Display = blocks }
+    | :? ToolCallStartedEvent as tool -> append (ToolReference tool.ToolCallId)
+    | :? TurnFailedEvent as failed -> append (ErrorText($"Error: {failed.Reason}"))
+    | :? TurnAbortedEvent as aborted -> append (ErrorText($"Aborted: {aborted.Reason}"))
+    | _ -> next
+
 /// Folds a sequence of Subscribe events into the renderer state, oldest
 /// first.
 /// <param name="state">The starting renderer state.</param>
@@ -464,16 +522,56 @@ let applyAll (state: RendererState) (events: SessionEvent seq) : RendererState =
 let addLine (state: RendererState) (line: string | null) : RendererState =
     match line with
     | null -> state
-    | text when String.IsNullOrWhiteSpace text -> state
+    | text when String.IsNullOrWhiteSpace text && not state.InResult -> state
     | text ->
         let trimmed = text.Trim()
 
-        if trimmed = "" then
+        if trimmed = "" && not state.InResult then
             state
         else
-            { state with
-                Diagnostics = addMeta state.Diagnostics trimmed
-            }
+            let next =
+                { state with
+                    Diagnostics = addMeta state.Diagnostics trimmed
+                }
+
+            if trimmed.StartsWith("RESULT ", StringComparison.Ordinal) then
+                { next with InResult = true }
+            elif trimmed = "END-RESULT" then
+                { next with InResult = false }
+            elif
+                trimmed.StartsWith("SESSION ", StringComparison.Ordinal)
+                || (state.InResult && state.StreamedTurn)
+            then
+                next
+            elif state.InResult then
+                let blocks =
+                    match List.rev state.Display with
+                    | AssistantText previous :: rest ->
+                        List.rev rest
+                        @ [
+                            AssistantText(previous + "\n" + text)
+                        ]
+                    | _ -> state.Display @ [ AssistantText text ]
+
+                { next with Display = blocks }
+            else
+                { next with
+                    Display =
+                        (state.Display @ [ Notice trimmed ])
+                        |> List.rev
+                        |> List.truncate maxMetaLines
+                        |> List.rev
+                }
+
+/// Retains the submitted text verbatim as a user cell, including indentation.
+let addUserMessage (state: RendererState) (text: string) : RendererState =
+    { state with
+        Display =
+            (state.Display @ [ UserText text ])
+            |> List.rev
+            |> List.truncate maxMetaLines
+            |> List.rev
+    }
 
 /// Adds engine diagnostic lines in order.
 /// <param name="state">The current renderer state.</param>
@@ -673,6 +771,56 @@ let toViewportLines (state: RendererState) : string list =
 
 // ──────────────────────────────────────────────────────────────────────────
 // Inline prompts: keyboard and answer-field contracts.
+
+/// Human-facing transcript without the plain REPL's wire-format envelopes.
+/// Command results and errors remain visible; journal duplicates stay hidden.
+let toDisplayLines (state: RendererState) : string list =
+    let blocks =
+        state.Display
+        |> List.collect (function
+            | UserText text -> [ "> " + text ]
+            | AssistantText text -> [ ""; "Dot" ] @ renderMarkdownLite text @ [ "" ]
+            | ReasoningText text -> renderMarkdownLite text
+            | ToolReference id -> state.Tools.TryFind id |> Option.map renderToolCard |> Option.defaultValue []
+            | ErrorText text -> renderMarkdownLite text
+            | Notice text -> renderMarkdownLite text)
+
+    let prompts =
+        state.Permissions
+        |> List.map (fun pending -> $"[permission] {pending.ToolName} · [a]llow once / [s]ession / [d]eny")
+
+    let questions =
+        state.Questions |> List.map (fun pending -> $"[question] {pending.Question}")
+
+    blocks @ prompts @ questions
+
+/// Preserves message semantics through layout instead of flattening every
+/// response into indistinguishable console lines.
+let toSessionCells (state: RendererState) : DotShell.SessionCell list =
+    let cell style text : DotShell.SessionCell = { Style = style; Text = text }
+
+    let blocks =
+        state.Display
+        |> List.choose (function
+            | UserText text -> Some(cell DotShell.User text)
+            | AssistantText text -> Some(cell DotShell.Assistant text)
+            | ReasoningText text -> Some(cell DotShell.Reasoning text)
+            | ToolReference id ->
+                state.Tools.TryFind id
+                |> Option.map (fun tool -> cell DotShell.Tool (renderToolCard tool |> String.concat "\n"))
+            | ErrorText text -> Some(cell DotShell.Error text)
+            | Notice text -> Some(cell DotShell.Plain text))
+
+    let permissions =
+        state.Permissions
+        |> List.map (fun pending ->
+            cell DotShell.Tool $"[permission] {pending.ToolName} · [a]llow once / [s]ession / [d]eny")
+
+    let questions =
+        state.Questions
+        |> List.map (fun pending -> cell DotShell.Assistant $"[question] {pending.Question}")
+
+    blocks @ permissions @ questions
 
 // Maps one typed permission choice to the REPL-identical decision: s or
 // session allows for the session, d or deny denies, and everything else

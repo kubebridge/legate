@@ -57,15 +57,54 @@ unknown flags fail naming the flag; `--mode` accepts only `text`/`json`;
 
 ## Fullscreen input box
 
-On a real terminal dot opens the stdlib-only fullscreen shell: an ASCII
-`dot` banner header, a transcript viewport over plain event lines, a
-status bar naming the short session id, the current model, and the live
-turn state (Idle / Running / WaitingForInput), and a multiline input box
-with session history and slash-command hints. The box docks into the
-layout shell's input region and routes every submitted line through the
-same handlers the REPL owns (plain text queues, every slash command
-routes verbatim), so delivery-mode and turn semantics stay identical:
-only the capture surface is new.
+On a real terminal Dot opens a fullscreen conversation with a centered teal
+Dot wordmark, project context and available skills. The input stays at the
+bottom between two thin rules, with the workspace, current model,
+and turn state beneath it. The welcome gives way to the conversation after
+the first prompt. Page Up / Page Down scroll the transcript; End on empty
+input returns to the latest message.
+
+User messages appear in full-width blue-grey cells with padding. Provider
+reasoning events appear in muted italics, followed by the assistant response
+in normal text. Messages retain paragraph breaks and code indentation, wrap
+at word boundaries, and remain separated from tool output and errors.
+Reasoning is shown only when the provider emits reasoning events.
+
+The theme uses Meta blue (`#0866FF`) for the wordmark and composer rules,
+lighter blue accents for headings and tools, and dark navy user-message cells.
+Assistant Markdown supports headings, bold, italics, links, inline and fenced
+code, lists, quotes, and tables. Tables keep aligned columns, wrap long cell
+contents, and become labeled rows when the terminal is too narrow.
+
+`/model` opens a filterable model picker. Ollama Cloud and OpenAI-compatible
+providers discover models from their `/models` endpoint; defaults and the
+current model remain available when discovery fails. Additional choices can
+be configured in `Dot:Providers:<id>:Models` as a YAML list. An explicit
+`/model ollamacloud/gpt-oss:20b` also works. Switching changes the actual
+provider client on the next turn while keeping the same session transcript;
+a switch during a turn applies when that turn settles.
+
+## Sub-agents
+
+Dot supplies two nested agents through the model-facing `task` tool:
+
+- `explore`: read-only `read_file`, `list_files`, `glob`, and `grep` access.
+- `general`: the parent's tool pool for delegated implementation or research.
+
+Use `/agents` to list them, then ask Dot to delegate, for example:
+"Use the explore sub-agent to find the CLI entry points and summarize them."
+The tool accepts `subagent`, `task`, and an optional `provider/model` override.
+Nested work shares the session workspace and permission policy, has a depth
+and timeout limit under `Legate:Sessions:SubAgents`, and returns findings to
+the parent. `ask_user` is unavailable inside nested agents.
+
+Rendering is change-driven: idle writes nothing, edits update only changed
+rows, and resize reflows the screen. Frames use absolute cursor positioning
+without trailing newlines, keeping the terminal from scrolling or flashing.
+The fullscreen host disables console logging so background log messages
+cannot overwrite the composer. The visible cursor follows the input, including
+horizontally scrolled long lines. Input and slash commands use the same
+session handlers as the plain REPL.
 
 Keybindings (also summarized in the input region's hint bar):
 
@@ -74,12 +113,14 @@ Keybindings (also summarized in the input region's hint bar):
 | `Enter` | Send (plain text queues behind the turn; slash routes verbatim; empty sends nothing). |
 | `Ctrl+O`, `Alt+Enter` | Newline (`Alt+Enter` where the terminal reports it; `Ctrl+O` everywhere). |
 | `Ctrl+S` | Steer the running turn with the buffer (`Interrupt`; a slash buffer submits verbatim). |
-| `Ctrl+C` | Abort the running turn without killing dot (the buffer is preserved). |
+| `Ctrl+C`, `Ctrl+D`, `Ctrl+Q` | Exit Dot from any view, including pickers and approval prompts. A running turn is aborted with a bounded wait. |
+| `/abort` | Stop the running turn and keep Dot open. |
 | `Ctrl+T` | Expand the first truncated tool card (no-op when none are truncated). |
+| `Page Up` / `Page Down`, `End` on empty input | Scroll the transcript / return to latest. |
 | `Up`/`Down`, `Ctrl+P`/`Ctrl+N` | Browse session history (`Up`/`Down` move inside multiline text; history is in-memory only). |
 | `Alt+B`/`Alt+F`, `Ctrl+A`/`Ctrl+E`, `Home`/`End`, arrows | Word-wise and line-wise navigation. |
 | `Backspace`/`Delete`, `Ctrl+W`/`Ctrl+U`/`Ctrl+K` | Delete and kill (kill ring edits the line only). |
-| `Esc` on empty input, `Ctrl+Q`, `/quit` | Quit (drains in-flight turns first; bare `q` types). |
+| `Esc` on empty input, `/quit` | Quit (drains in-flight turns first; bare `q` types). |
 
 While a picker is open it owns the keys and the editor stays suspended:
 
@@ -134,8 +175,9 @@ bytes (session ids and timestamps differ per run).
 Tiny terminals (narrower than 40 columns or shorter than 12 rows) show a
 `terminal too small (min 40x12)` notice above the transcript and keep
 running; resize re-reads the window every frame. Quit, abort, error, and
-Ctrl+C paths restore the cursor and the primary screen; Ctrl+C aborts the
-running turn without killing dot (the buffer is preserved).
+Ctrl+C/D paths restore the cursor and the primary screen. Ctrl+C/D exit
+even with an unfinished draft or a pending approval; `/abort` stops only
+the running turn and keeps the TUI open.
 
 ## One-shot print
 

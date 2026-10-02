@@ -1178,6 +1178,17 @@ let main (argv: string[]) : int =
         task {
             let application = Host.CreateApplicationBuilder()
 
+            // The fullscreen renderer must be the sole terminal writer. The
+            // default asynchronous console logger otherwise writes into the
+            // composer after a frame has been painted.
+            if
+                not start.ListSessions
+                && isNull (box start.Print)
+                && DotTuiMode.shouldUseTui (DotTuiMode.readRequest start.NoTui)
+            then
+                Microsoft.Extensions.Logging.LoggingBuilderExtensions.ClearProviders(application.Logging)
+                |> ignore
+
             // YAML scopes weakest first, then the environment again so env
             // wins over files; CLI flags win through the effective resolve
             // below (never through the configuration itself).
@@ -1308,6 +1319,7 @@ let main (argv: string[]) : int =
                                                         packages
                                                         initialModel
                                                         options
+                                                        configuration
                                                         waitBound
                                                         CancellationToken.None
                                             else

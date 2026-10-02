@@ -1428,7 +1428,42 @@ module internal ClusterSubscriptions =
 /// IChatClient. Internal: hosts resolve SessionClient from DI and call
 /// the SessionClientOperations extensions; nothing here crosses the public
 /// API.
+type internal SessionModelClients(providers: IEnumerable<ILlmProvider>) =
+    let clients =
+        System.Collections.Concurrent.ConcurrentDictionary<string, Lazy<IChatClient>>(StringComparer.Ordinal)
+
+    member _.Resolve(model: ModelReference, fallback: IChatClient) : IChatClient =
+        match
+            providers
+            |> Seq.tryFind (fun provider ->
+                String.Equals(provider.Id, model.Provider, StringComparison.OrdinalIgnoreCase))
+        with
+        | None -> fallback
+        | Some provider -> clients.GetOrAdd(model.Value, fun _ -> lazy (provider.CreateChatClient(model, null))).Value
+
+    interface IDisposable with
+        member _.Dispose() =
+            for client in clients.Values do
+                if client.IsValueCreated then
+                    client.Value.Dispose()
+
 module internal SessionClientWiring =
+
+    /// Resolves the stored session agent's model for each new attempt. Hosts
+    /// without provider registrations keep their explicitly supplied client.
+    let modelForEntryAsync (store: ISessionStore) (agents: IAgentStore | null) tenant (entry: InboxEntry) ct =
+        task {
+            match agents with
+            | null -> return None
+            | catalog ->
+                let! session = store.GetSession(tenant, entry.SessionId, ct)
+
+                match session with
+                | null -> return None
+                | session ->
+                    let! agent = catalog.GetAgent(tenant, session.AgentId, ct)
+                    return Option.ofObj agent |> Option.map (fun agent -> agent.Model)
+        }
 
     /// Resolves one entry's tool set and turn budget: the session row
     /// carries the agent (for the tool context) and the options snapshot
@@ -1723,15 +1758,70 @@ module internal SessionClientWiring =
 
             let policy = SessionPermissions.resolvePolicy provider
 
-            let runner =
-                SessionPermissions.createRunner
-                    client
-                    store
-                    clientOptions.Tenant
-                    (resolveInputs store clientOptions.Tenant sources legateOptions.Turns legateOptions.AskUser)
-                    delay
-                    policy
-                    (Some(systemPromptFor store clientOptions.Tenant))
+            let modelClients = provider.GetRequiredService<SessionModelClients>()
+            let agentStore = provider.GetService<IAgentStore>()
+
+            let baseInputs =
+                resolveInputs store clientOptions.Tenant sources legateOptions.Turns legateOptions.AskUser
+
+            let inputs entry =
+                let tools, options = baseInputs entry
+
+                match agentStore with
+                | null -> tools, options
+                | agents ->
+                    let available =
+                        agents.ListAgents(clientOptions.Tenant, CancellationToken.None).GetAwaiter().GetResult()
+
+                    let nested =
+                        available
+                        |> Seq.filter (fun agent -> agent.Enabled && not (String.IsNullOrWhiteSpace agent.Description))
+                        |> Seq.toArray
+                        :> IReadOnlyList<Agent>
+
+                    if nested.Count = 0 then
+                        tools, options
+                    else
+                        let table = Dictionary<string, AITool>(tools, StringComparer.Ordinal)
+                        table[TaskTool.ToolName] <- TaskTool.Create(TaskTool.DescriptionFor nested)
+
+                        let deps: TaskRunner.TaskHookDeps =
+                            {
+                                Store = agents
+                                Tenant = clientOptions.Tenant
+                                Config = legateOptions.Sessions.SubAgents
+                                Depth = 0
+                                ResolveClient = Some(fun model -> modelClients.Resolve(model, client))
+                                Journal = None
+                            }
+
+                        table :> IReadOnlyDictionary<string, AITool>,
+                        { options with
+                            TaskNested = Some(TaskRunner.createHook deps)
+                        }
+
+            let runner: SessionActor.SuspendableRunner =
+                fun entry attempt allowed cursor reply seed token started usage skill turnId ->
+                    task {
+                        let! model = modelForEntryAsync store agentStore clientOptions.Tenant entry token
+
+                        let selected =
+                            model
+                            |> Option.map (fun model -> modelClients.Resolve(model, client))
+                            |> Option.defaultValue client
+
+                        let run =
+                            SessionPermissions.createRunner
+                                selected
+                                store
+                                clientOptions.Tenant
+                                inputs
+                                delay
+                                policy
+                                (Some(systemPromptFor store clientOptions.Tenant))
+
+                        return! run entry attempt allowed cursor reply seed token started usage skill turnId
+                    }
 
             let eventStore = bus.EventStore
             let model = sessionModelOf clientOptions legateOptions
@@ -1867,6 +1957,12 @@ module internal SessionClientRegistration =
     /// <param name="services">The container to add the facade to.</param>
     let register (services: IServiceCollection) : unit =
         ArgumentNullException.ThrowIfNull(services)
+
+        services.TryAddSingleton<SessionModelClients>(
+            Func<IServiceProvider, SessionModelClients>(fun provider ->
+                new SessionModelClients(provider.GetServices<ILlmProvider>()))
+        )
+        |> ignore
 
         services.TryAddSingleton(SessionClientOptions()) |> ignore
 

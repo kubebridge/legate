@@ -2446,7 +2446,7 @@ let ``Headless TUI smoke boots renders one turn and exits`` () =
         let output = stdout + Environment.NewLine + stderr
 
         exit |> should equal 0
-        check stdout "dot fullscreen"
+        check stdout "Your workspace. Your agent."
         check stdout "session "
         check stdout "Ctrl+Q"
         check stdout "dot scripted answer"
