@@ -468,7 +468,7 @@ let ``Repl streams turns serves slash commands and prints usage for unknown`` ()
 
         check
             output
-            "Commands: /new [title], /sessions, /resume <id-or-index>, /model [provider[/model]], /steer <text>, /follow <text>, /abort, /compact, /tree, /fork <sequence>, /clone, /session, /export <file>, /<template>, /quit."
+            "Commands: /new [title], /sessions, /resume <id-or-index>, /model [provider[/model]], /agents, /steer <text>, /follow <text>, /abort, /compact, /tree, /fork <sequence>, /clone, /session, /export <file>, /<template>, /quit."
 
         checkNoErrors output
     finally
