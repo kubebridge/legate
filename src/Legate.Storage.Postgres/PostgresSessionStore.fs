@@ -446,6 +446,30 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
         entry
 
     interface ISessionAbortControlStore with
+        member this.TryRecoverControlTarget(tenant, sessionId, turn, owner, duration, ct) =
+            this.EnsureMigrated()
+
+            let result =
+                transact options (fun connection transaction ->
+                    RelationalControlTarget.recover
+                        connection
+                        transaction
+                        this.SessionsTable
+                        this.InboxTable
+                        this.TurnsTable
+                        this.ControlTable
+                        true
+                        tenant
+                        sessionId
+                        (fun () -> this.UtcNow)
+                        ct
+                        turn
+                        owner
+                        duration)
+
+            ct.ThrowIfCancellationRequested()
+            Task.FromResult result
+
         member this.ReadAbortTarget(tenant, sessionId, ct) =
             this.Control(tenant, sessionId, ct, fun context state -> ControlTargetProtocol.read context state, state)
 

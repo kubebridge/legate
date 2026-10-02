@@ -117,6 +117,10 @@ so the public boundary follows these rules; internal code stays idiomatic F#.
   sleep to exercise a timeout, backoff, or cooldown.
 - Tests that touch a store run against the in-memory implementation and, for
   relational stores, SQLite; never assume Postgres or Docker on the machine.
+- Mandatory fencing/control protocol tests must supply genuine captured provider
+  authority. Unclaimed actor shells do not count as production gate coverage.
+  Per-session recovery barriers require mixed blocked/eligible-session dispatcher
+  regressions across repeated sweeps, plus current-format unstopped recovery tests.
 
 ## Other conventions
 

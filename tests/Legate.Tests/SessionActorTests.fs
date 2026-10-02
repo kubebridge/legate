@@ -1134,6 +1134,7 @@ let private spawnSuspendable
             AskTimeout = askTimeout
             JournalToken = "test-token"
             PrimeClaim = None
+            Recovery = null
             RunSuspendable = runner.Func
             ReprimeJournal = None
             RefreshCompact = None
@@ -3396,6 +3397,7 @@ let private spawnSuspendableOver
             AskTimeout = TimeSpan.FromMinutes 5.0
             JournalToken = token
             PrimeClaim = None
+            Recovery = null
             RunSuspendable = runner.Func
             ReprimeJournal = None
             RefreshCompact = None
@@ -3708,6 +3710,7 @@ let ``Kill mid-turn restarts exactly once with the journal prefix intact`` () =
                 AskTimeout = TimeSpan.FromMinutes 5.0
                 JournalToken = token
                 PrimeClaim = None
+                Recovery = null
                 RunSuspendable = runner.Func
                 ReprimeJournal = None
                 RefreshCompact = None
@@ -3832,6 +3835,7 @@ let ``Running with empty inbox and marker-only journal settles Failed instead of
             AskTimeout = TimeSpan.FromMinutes 5.0
             JournalToken = token
             PrimeClaim = None
+            Recovery = null
             RunSuspendable = runner.Func
             ReprimeJournal = None
             RefreshCompact = None
@@ -3988,6 +3992,7 @@ let ``Orphan fail takeover loser journals nothing under the fresh token`` () =
                 AskTimeout = TimeSpan.FromMinutes 5.0
                 JournalToken = token
                 PrimeClaim = None
+                Recovery = null
                 RunSuspendable = runner.Func
                 ReprimeJournal = None
                 RefreshCompact = None
@@ -4264,6 +4269,7 @@ let private spawnReprimeable
             AskTimeout = TimeSpan.FromMinutes 5.0
             JournalToken = token
             PrimeClaim = None
+            Recovery = null
             RunSuspendable = runner.Func
             ReprimeJournal = Some(reprimeFor store tenantId sessionId "owner-a")
             RefreshCompact = refresh
@@ -4658,6 +4664,7 @@ let private spawnProbe
             AskTimeout = TimeSpan.FromMinutes 5.0
             JournalToken = token
             PrimeClaim = None
+            Recovery = null
             RunSuspendable = runner
             ReprimeJournal = reprime
             RefreshCompact = None

@@ -455,6 +455,40 @@ type SqliteSessionStore(database: SqliteDatabase) =
         }
 
     interface ISessionAbortControlStore with
+        member _.TryRecoverControlTarget(tenant, sessionId, turn, owner, duration, ct) =
+            task {
+                try
+                    return
+                        lock database.Gate (fun () ->
+                            ct.ThrowIfCancellationRequested()
+                            use connection = database.OpenConnection()
+                            use transaction = connection.BeginTransaction(deferred = false)
+
+                            let result =
+                                RelationalControlTarget.recover
+                                    connection
+                                    transaction
+                                    $"\"{sessionsTable ()}\""
+                                    $"\"{inboxTable ()}\""
+                                    $"\"{turnsTable ()}\""
+                                    (controlTable ())
+                                    false
+                                    tenant
+                                    sessionId
+                                    (fun () -> database.UtcNow)
+                                    ct
+                                    turn
+                                    owner
+                                    duration
+
+                            ct.ThrowIfCancellationRequested()
+                            transaction.Commit()
+                            ct.ThrowIfCancellationRequested()
+                            result)
+                with :? SqliteException as ex ->
+                    return raise (mapSql ex)
+            }
+
         member _.ReadAbortTarget(tenant, sessionId, ct) =
             control tenant sessionId ct (fun context state -> ControlTargetProtocol.read context state, state)
 

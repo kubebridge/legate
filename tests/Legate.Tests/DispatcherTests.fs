@@ -361,6 +361,7 @@ let private spawnSuspendable
             AskTimeout = TimeSpan.FromMinutes 5.0
             JournalToken = "test-token"
             PrimeClaim = None
+            Recovery = null
             RunSuspendable = runner
             ReprimeJournal = None
             RefreshCompact = None
@@ -1031,6 +1032,126 @@ let ``Check-vs-prompt race is duplicate-free`` () =
 
 // ──────────────────────────────────────────────────────────────────────────
 // Hosted loop wiring
+
+[<Theory>]
+[<InlineData(0)>]
+[<InlineData(1)>]
+[<InlineData(2)>]
+let ``control candidate refusal cannot starve later eligible sessions on repeated sweeps`` disposition : Task =
+    task {
+        let clock = TestClock()
+        let database = InMemoryDatabase(clock)
+        let store = InMemoryStoreFactory.sessionStore database
+        let journal = InMemoryStoreFactory.eventStore database
+        let control = store :?> ISessionAbortControlStore
+
+        let first =
+            { sampleSession (AgentId.New()) with
+                Id = SessionId.Parse("01ARZ3NDEKTSV4RRFFQ69G5FAV")
+            }
+
+        let! first = store.CreateSession(tenant, first, CancellationToken.None)
+
+        let! _ =
+            store.AppendInboxMessage(
+                tenant,
+                first.Id,
+                UserMessagePayload(UserMessage.Text "prime"),
+                DeliveryMode.Queue,
+                CancellationToken.None
+            )
+
+        let! lease = store.ClaimNextTurn(tenant, first.Id, "owner", TimeSpan.FromMinutes 5.0, CancellationToken.None)
+
+        let claim =
+            match lease with
+            | :? TurnLeaseRenewed as lease -> lease.Claim
+            | _ -> failwith "No prime"
+
+        let! current =
+            store.AppendInboxMessage(
+                tenant,
+                first.Id,
+                UserMessagePayload(UserMessage.Text "current"),
+                DeliveryMode.Queue,
+                CancellationToken.None
+            )
+
+        let turn = TurnId.New()
+        let! _ = control.BindControlTarget(tenant, first.Id, turn, current.Position, claim, CancellationToken.None)
+        let! _ = store.UpdateSessionState(tenant, first.Id, SessionState.Running, CancellationToken.None)
+
+        if disposition = 1 then
+            let! _ =
+                control.RequestHostAbort(
+                    tenant,
+                    first.Id,
+                    turn,
+                    StopCause.ExplicitAbort,
+                    "stop",
+                    CancellationToken.None
+                )
+
+            ()
+
+        if disposition = 2 then
+            let! _ =
+                control.TryDecideControlTarget(
+                    tenant,
+                    first.Id,
+                    turn,
+                    current.Position,
+                    claim,
+                    "report",
+                    TurnStatus.Completed,
+                    Nullable(),
+                    null,
+                    CancellationToken.None
+                )
+
+            ()
+
+        let! later = store.CreateSession(tenant, sampleSession (AgentId.New()), CancellationToken.None)
+
+        let! _ =
+            store.AppendInboxMessage(
+                tenant,
+                later.Id,
+                UserMessagePayload(UserMessage.Text "eligible"),
+                DeliveryMode.Queue,
+                CancellationToken.None
+            )
+
+        let resolve = RecordingResolve()
+
+        for _ in 1..3 do
+            let! result =
+                Dispatcher.passOnceAsync
+                    store
+                    journal
+                    (fun _ _ _ -> Task.FromResult false)
+                    tenant
+                    (SessionsOptions())
+                    (DispatcherOptions())
+                    resolve.Func
+                    clock
+                    CancellationToken.None
+
+            Assert.True(result.Started >= 1)
+
+        Assert.Equal(3, resolve.Resolved |> Seq.filter ((=) later.Id) |> Seq.length)
+        Assert.Equal((if disposition = 0 then 3 else 0), resolve.Resolved |> Seq.filter ((=) first.Id) |> Seq.length)
+        let! unchanged = store.VerifyClaim(tenant, claim, CancellationToken.None)
+        Assert.IsType<TurnLeaseHeld>(unchanged) |> ignore
+        let! rows = store.ReadPendingInbox(tenant, first.Id, CancellationToken.None)
+        Assert.Single(rows) |> ignore
+        Assert.Equal(current.Position, rows[0].Position)
+        let! target = control.ReadAbortTarget(tenant, first.Id, CancellationToken.None)
+
+        match target with
+        | null -> failwith "Control binding lost"
+        | target -> Assert.Equal(turn, target.TurnId)
+    }
 
 /// Builds the container the dispatcher service runs on: the store, the
 /// facade tenant, the options, the wake sink, and a client resolving to

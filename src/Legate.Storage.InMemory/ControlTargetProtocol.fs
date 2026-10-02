@@ -270,6 +270,37 @@ module internal ControlTargetProtocol =
                 Stop = receipt target.TurnId state |> Option.toObj
             }
 
+    // Recovery changes only the existing prime fence. It never binds a new target,
+    // selects another entry, or treats a stop receipt as authority to settle.
+    let recover context state turn owner leaseDuration =
+        targetId turn
+
+        if String.IsNullOrWhiteSpace owner then
+            raise (ArgumentException("A recovery owner is required.", "owner"))
+
+        if leaseDuration <= TimeSpan.Zero then
+            raise (ArgumentOutOfRangeException("leaseDuration"))
+
+        let target = read context state
+
+        match target with
+        | null -> ControlOperationOutcome.TargetChanged, None
+        | target when target.TurnId <> turn -> ControlOperationOutcome.TargetChanged, None
+        | target when target.State <> ControlTargetState.Active || not (isNull (box target.Stop)) ->
+            ControlOperationOutcome.Stopped, None
+        | _ ->
+            match context.Prime with
+            | Some prime when prime.ExpiresAt <= context.Now ->
+                ControlOperationOutcome.Applied,
+                Some
+                    { prime with
+                        Token = Guid.NewGuid().ToString("N")
+                        Owner = owner
+                        ExpiresAt = context.Now + leaseDuration
+                        Attempt = prime.Attempt + 1
+                    }
+            | _ -> ControlOperationOutcome.LostAuthority, None
+
     let request context state turn cause text =
         targetId turn
         reason text

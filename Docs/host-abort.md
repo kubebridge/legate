@@ -46,6 +46,14 @@ and publication are separate work; a control verdict must not be used to infer
 that downstream effects happened or to replay them after a crash.
 
 Actual model/tool admission checks honor durable stop alongside claim fencing.
+Unstopped Active targets are not control barriers. `TryRecoverControlTarget` can
+re-fence their expired existing prime, preserving the same target and original entry,
+including consumed entries. A live owner refuses takeover. Recovery never consumes
+queued work to acquire authority; both crash policies and suspended Reply recovery
+use the original association. Accepted stops and pending terminal verdicts cannot
+use this recovery operation. Dispatcher refusals are isolated to their session so
+unrelated eligible sessions continue through subsequent sweeps.
+
 Requests already admitted before acceptance may finish and external effects cannot
 universally be recalled. There is no rollback or exactly-once transport promise.
 

@@ -121,11 +121,13 @@ module internal RelationalControlTarget =
             match current with
             | None -> None
             | Some turn ->
+                let locking = if postgres then " FOR UPDATE" else ""
+
                 use cmd =
                     command
                         connection
                         transaction
-                        $"SELECT turn_id,claim_token,claim_owner,claim_expires_at,attempt FROM {turnsTable} WHERE tenant=@t AND session_id=@sid AND turn_id=@turn AND status IN ('Pending','Running','Suspended')"
+                        $"SELECT turn_id,claim_token,claim_owner,claim_expires_at,attempt FROM {turnsTable} WHERE tenant=@t AND session_id=@sid AND turn_id=@turn AND status IN ('Pending','Running','Suspended'){locking}"
                         tenant
                         sessionId
 
@@ -224,3 +226,130 @@ module internal RelationalControlTarget =
 
         ct.ThrowIfCancellationRequested()
         result
+
+    let recover
+        connection
+        transaction
+        sessionTable
+        inboxTable
+        turnsTable
+        controlTable
+        postgres
+        tenant
+        sessionId
+        utcNow
+        ct
+        turn
+        owner
+        duration
+        =
+        invoke
+            connection
+            transaction
+            sessionTable
+            inboxTable
+            turnsTable
+            controlTable
+            postgres
+            tenant
+            sessionId
+            utcNow
+            ct
+            (fun context state ->
+                let outcome, recovered =
+                    ControlTargetProtocol.recover context state turn owner duration
+
+                match recovered, state.Binding with
+                | Some claim, target ->
+                    match target with
+                    | null ->
+                        raise (
+                            InvalidSessionStateException(sessionId, "missingControlTarget", "Recovery has no target.")
+                        )
+                    | target ->
+                        let entry =
+                            use cmd =
+                                command
+                                    connection
+                                    transaction
+                                    $"SELECT payload_json,delivery_mode,consumed,appended_at FROM {inboxTable} WHERE tenant=@t AND session_id=@sid AND position=@pos"
+                                    tenant
+                                    sessionId
+
+                            let parameter = cmd.CreateParameter()
+                            parameter.ParameterName <- "pos"
+                            parameter.Value <- target.InboxPosition
+                            cmd.Parameters.Add parameter |> ignore
+                            use reader = cmd.ExecuteReader()
+
+                            if not (reader.Read()) then
+                                raise (
+                                    InvalidSessionStateException(
+                                        sessionId,
+                                        "missingControlAssociation",
+                                        "Recovery has no original entry."
+                                    )
+                                )
+
+                            let payload =
+                                match JsonSerializer.Deserialize<InboxPayload>(reader.GetString(0)) with
+                                | null ->
+                                    raise (
+                                        InvalidSessionStateException(
+                                            sessionId,
+                                            "unsupportedInboxFormat",
+                                            "Recovery requires supported original entry data."
+                                        )
+                                    )
+                                | payload -> payload
+
+                            {
+                                SessionId = sessionId
+                                Position = target.InboxPosition
+                                Payload = payload
+                                Delivery = Enum.Parse<DeliveryMode>(reader.GetString(1))
+                                Consumed = Convert.ToBoolean(reader.GetValue(2), CultureInfo.InvariantCulture)
+                                AppendedAt = DateTimeOffset.Parse(reader.GetString(3), CultureInfo.InvariantCulture)
+                            }
+
+                        use update =
+                            command
+                                connection
+                                transaction
+                                $"UPDATE {turnsTable} SET claim_token=@token,claim_owner=@owner,claim_expires_at=@expiry,attempt=@attempt WHERE tenant=@t AND session_id=@sid AND turn_id=@prime"
+                                tenant
+                                sessionId
+
+                        for name, value in
+                            [
+                                "token", box claim.Token
+                                "owner", box claim.Owner
+                                "expiry", box (claim.ExpiresAt.ToString("O", CultureInfo.InvariantCulture))
+                                "attempt", box claim.Attempt
+                                "prime", box (claim.TurnId.ToString())
+                            ] do
+                            let parameter = update.CreateParameter()
+                            parameter.ParameterName <- name
+                            parameter.Value <- value
+                            update.Parameters.Add parameter |> ignore
+
+                        ct.ThrowIfCancellationRequested()
+
+                        if update.ExecuteNonQuery() <> 1 then
+                            raise (InvalidOperationException("Recovery lost its existing prime row."))
+
+                        {
+                            Outcome = outcome
+                            Target = target
+                            Claim = claim
+                            Entry = entry
+                        },
+                        state
+                | _ ->
+                    {
+                        Outcome = outcome
+                        Target = state.Binding
+                        Claim = null
+                        Entry = null
+                    },
+                    state)

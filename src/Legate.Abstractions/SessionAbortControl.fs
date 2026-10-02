@@ -131,11 +131,38 @@ type ControlOperationResult =
         Decision: ControlTargetDecision | null
     }
 
+/// Result of recovering one unstopped current-format entry under a newly fenced existing prime.
+/// No entry is selected from the queue or consumed, and no independent turn lease is created.
+[<CLIMutable; NoComparison>]
+type ControlTargetRecovery =
+    {
+        /// Applied grants the returned genuine prime; all refusals grant no authority.
+        Outcome: ControlOperationOutcome
+        /// Exact preserved target, or null when absent.
+        Target: AbortTarget | null
+        /// Newly persisted prime claim, present only on Applied.
+        Claim: TurnClaim | null
+        /// The original associated entry, including its existing consumed disposition.
+        Entry: InboxEntry | null
+    }
+
 /// Required capability on the configured session store. Every operation is tenant-scoped
 /// and serialized with prime claims, current binding and lifecycle competitors.
 /// Host acceptance never activates actors, acquires claims, consumes entries or settles work.
 /// Cancellation after commit can leave acceptance uncertain: retry the same target.
 type ISessionAbortControlStore =
+    /// Recovers only an unstopped Active binding after its existing prime expires.
+    /// Atomically re-fences that same prime and returns the original entry without consuming
+    /// it or unrelated inbox work. A live owner, accepted stop or pending verdict refuses.
+    abstract TryRecoverControlTarget:
+        tenant: TenantId *
+        sessionId: SessionId *
+        expectedTurnId: TurnId *
+        owner: string *
+        leaseDuration: TimeSpan *
+        cancellationToken: CancellationToken ->
+            Task<ControlTargetRecovery>
+
     /// Reads current attribution without loading session options or activating execution.
     abstract ReadAbortTarget:
         tenant: TenantId * sessionId: SessionId * cancellationToken: CancellationToken -> Task<AbortTarget | null>

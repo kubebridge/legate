@@ -214,6 +214,47 @@ type InMemorySessionStore(database: InMemoryDatabase) =
             )
 
     interface ISessionAbortControlStore with
+        member _.TryRecoverControlTarget(tenant, sessionId, turn, owner, duration, ct) =
+            control tenant sessionId ct (fun context state ->
+                let outcome, recovered =
+                    ControlTargetProtocol.recover context state turn owner duration
+
+                match recovered, state.Binding with
+                | Some claim, target ->
+                    match target with
+                    | null ->
+                        raise (
+                            InvalidSessionStateException(
+                                sessionId,
+                                "missingControlTarget",
+                                "Recovery has no original target."
+                            )
+                        )
+                    | target ->
+                        let entry =
+                            database.Inboxes[(tenant, sessionId)]
+                            |> Seq.find (fun entry -> entry.Position = target.InboxPosition)
+
+                        ct.ThrowIfCancellationRequested()
+                        database.LiveClaims[(tenant, sessionId)] <- { claim with Token = claim.Token }
+                        database.OpenTurns[(tenant, sessionId)] <- OpenTurnRow(claim.TurnId, claim.Attempt)
+
+                        {
+                            Outcome = outcome
+                            Target = target
+                            Claim = claim
+                            Entry = entry
+                        },
+                        state
+                | _ ->
+                    {
+                        Outcome = outcome
+                        Target = state.Binding
+                        Claim = null
+                        Entry = null
+                    },
+                    state)
+
         member _.ReadAbortTarget(tenant, sessionId, ct) =
             control tenant sessionId ct (fun context state -> ControlTargetProtocol.read context state, state)
 

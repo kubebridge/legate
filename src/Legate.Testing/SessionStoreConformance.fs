@@ -531,6 +531,134 @@ type SessionStoreConformance(store: ISessionStore, clock: TestClock, tenant: Ten
 
     // ── Tenancy ──
 
+    /// Unstopped recovery preserves target/entry and fences the old owner without claiming queued work.
+    [<Theory>]
+    [<InlineData(false)>]
+    [<InlineData(true)>]
+    member this.``unstopped control recovery preserves original pending or consumed entry``(consumed: bool) =
+        task {
+            let! control, session, entry, turn, oldClaim = this.ControlWork()
+
+            if consumed then
+                let! _ = store.MarkInboxConsumed(tenant, session, [| entry.Position |], CancellationToken.None)
+                ()
+
+            let! queued =
+                store.AppendInboxMessage(
+                    tenant,
+                    session,
+                    UserMessagePayload(UserMessage.Text "unrelated"),
+                    DeliveryMode.Interrupt,
+                    CancellationToken.None
+                )
+
+            let! held =
+                control.TryRecoverControlTarget(
+                    tenant,
+                    session,
+                    turn,
+                    "new owner",
+                    TimeSpan.FromMinutes 5.0,
+                    CancellationToken.None
+                )
+
+            Assert.Equal(ControlOperationOutcome.LostAuthority, held.Outcome)
+            Assert.Null(held.Claim)
+            clock.Advance(TimeSpan.FromMinutes 6.0)
+
+            let! recovered =
+                control.TryRecoverControlTarget(
+                    tenant,
+                    session,
+                    turn,
+                    "new owner",
+                    TimeSpan.FromMinutes 5.0,
+                    CancellationToken.None
+                )
+
+            Assert.Equal(ControlOperationOutcome.Applied, recovered.Outcome)
+
+            match recovered.Claim, recovered.Entry, recovered.Target with
+            | null, _, _
+            | _, null, _
+            | _, _, null -> failwith "Missing recovered authority or original entry"
+            | claim, original, target ->
+                Assert.Equal(oldClaim.TurnId, claim.TurnId)
+                Assert.NotEqual<string>(oldClaim.Token, claim.Token)
+                Assert.Equal(oldClaim.Attempt + 1, claim.Attempt)
+                Assert.Equal(entry.Position, original.Position)
+                Assert.Equal(consumed, original.Consumed)
+                Assert.Equal(turn, target.TurnId)
+
+                let! old =
+                    control.CheckControlTarget(tenant, session, turn, entry.Position, oldClaim, CancellationToken.None)
+
+                Assert.Equal(ControlOperationOutcome.LostAuthority, old.Outcome)
+
+                let! winner =
+                    control.CheckControlTarget(tenant, session, turn, entry.Position, claim, CancellationToken.None)
+
+                Assert.Equal(ControlOperationOutcome.Applied, winner.Outcome)
+
+            let! pending = store.ReadPendingInbox(tenant, session, CancellationToken.None)
+            Assert.Contains(pending, fun item -> item.Position = queued.Position && not item.Consumed)
+        }
+
+    /// Recovery never transfers authority for accepted stop or pending terminal work.
+    [<Theory>]
+    [<InlineData(false)>]
+    [<InlineData(true)>]
+    member this.``control recovery refuses stopped and terminal pending targets``(decided: bool) =
+        task {
+            let! control, session, entry, turn, claim = this.ControlWork()
+
+            if decided then
+                let! _ =
+                    control.TryDecideControlTarget(
+                        tenant,
+                        session,
+                        turn,
+                        entry.Position,
+                        claim,
+                        "report",
+                        TurnStatus.Completed,
+                        Nullable(),
+                        null,
+                        CancellationToken.None
+                    )
+
+                ()
+            else
+                let! _ =
+                    control.RequestHostAbort(
+                        tenant,
+                        session,
+                        turn,
+                        StopCause.HostShutdown,
+                        "stop",
+                        CancellationToken.None
+                    )
+
+                ()
+
+            clock.Advance(TimeSpan.FromMinutes 6.0)
+
+            let! refused =
+                control.TryRecoverControlTarget(
+                    tenant,
+                    session,
+                    turn,
+                    "new owner",
+                    TimeSpan.FromMinutes 5.0,
+                    CancellationToken.None
+                )
+
+            Assert.Equal(ControlOperationOutcome.Stopped, refused.Outcome)
+            Assert.Null(refused.Claim)
+            let! rows = store.ReadPendingInbox(tenant, session, CancellationToken.None)
+            Assert.Single(rows) |> ignore
+        }
+
     /// Concurrent requests have one immutable winner under the provider serialization boundary.
     [<Fact>]
     member this.``concurrent host stops retain one exact first receipt``() =

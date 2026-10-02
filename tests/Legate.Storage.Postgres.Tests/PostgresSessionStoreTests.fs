@@ -150,5 +150,61 @@ type PostgresSessionStoreTests private (store: ISessionStore, clock: TestClock) 
             Assert.Single(pending) |> ignore
         }
 
+    /// A fresh provider fences original unstopped work without claiming a queued entry.
+    [<Fact>]
+    member this.``Postgres fresh provider recovers exact original entry and fences old owner``() =
+        task {
+            let! _, session, entry, turn, oldClaim = this.ControlWork()
+
+            let! queued =
+                this.Store.AppendInboxMessage(
+                    this.Tenant,
+                    session,
+                    UserMessagePayload(UserMessage.Text "unrelated"),
+                    DeliveryMode.Inject,
+                    CancellationToken.None
+                )
+
+            clock.Advance(TimeSpan.FromMinutes 6.0)
+
+            let fresh =
+                PostgresSessionStore(PostgresTestDatabase.testOptions (PostgresTestDatabase.ensureReady ()), clock)
+                :> ISessionAbortControlStore
+
+            let! recovered =
+                fresh.TryRecoverControlTarget(
+                    this.Tenant,
+                    session,
+                    turn,
+                    "new owner",
+                    TimeSpan.FromMinutes 5.0,
+                    CancellationToken.None
+                )
+
+            Assert.Equal(ControlOperationOutcome.Applied, recovered.Outcome)
+
+            match recovered.Entry, recovered.Claim with
+            | null, _
+            | _, null -> failwith "Missing original entry/claim"
+            | original, claim ->
+                Assert.Equal(entry.Position, original.Position)
+                Assert.Equal(oldClaim.TurnId, claim.TurnId)
+
+                let! stale =
+                    fresh.CheckControlTarget(
+                        this.Tenant,
+                        session,
+                        turn,
+                        entry.Position,
+                        oldClaim,
+                        CancellationToken.None
+                    )
+
+                Assert.Equal(ControlOperationOutcome.LostAuthority, stale.Outcome)
+
+            let! rows = this.Store.ReadPendingInbox(this.Tenant, session, CancellationToken.None)
+            Assert.Contains(rows, fun row -> row.Position = queued.Position && not row.Consumed)
+        }
+
     interface IDisposable with
         member _.Dispose() = PostgresTestDatabase.truncate ()

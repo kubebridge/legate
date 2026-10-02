@@ -581,6 +581,7 @@ type SessionHarness
                             | :? TurnLeaseRenewed as lease -> Some lease.Claim
                             | :? TurnLeaseHeld as lease -> Some lease.Claim
                             | _ -> None
+                        Recovery = null
                         RunSuspendable = runner
                         ReprimeJournal = Some reprime
                         RefreshCompact = None

@@ -272,21 +272,34 @@ module internal Dispatcher =
                         more <- false
                     else
                         for sessionId in unseen do
-                            match store with
-                            | :? ISessionAbortControlStore as control ->
-                                let! target = control.ReadAbortTarget(tenant, sessionId, cancellationToken)
+                            // A refusal belongs to this candidate, never to the whole sweep.
+                            let! session =
+                                task {
+                                    try
+                                        let! blocked =
+                                            task {
+                                                match store with
+                                                | :? ISessionAbortControlStore as control ->
+                                                    let! target =
+                                                        control.ReadAbortTarget(tenant, sessionId, cancellationToken)
 
-                                if not (isNull (box target)) then
-                                    raise (
-                                        InvalidSessionStateException(
-                                            sessionId,
-                                            "controlPending",
-                                            "Dispatcher cannot activate persisted control work or select unrelated inbox entries."
-                                        )
-                                    )
-                            | _ -> ()
+                                                    return
+                                                        match target with
+                                                        | null -> false
+                                                        | target ->
+                                                            target.State <> ControlTargetState.Active
+                                                            || not (isNull (box target.Stop))
+                                                | _ -> return false
+                                            }
 
-                            let! session = store.GetSession(tenant, sessionId, cancellationToken)
+                                        if blocked then
+                                            return null
+                                        else
+                                            return! store.GetSession(tenant, sessionId, cancellationToken)
+                                    with
+                                    | :? OperationCanceledException as cancelled -> return raise cancelled
+                                    | _ -> return null
+                                }
 
                             match session with
                             | null -> () // Vanished mid-pass: stays out of this pass.
@@ -381,7 +394,12 @@ module internal Dispatcher =
                                 | :? ISessionAbortControlStore as control ->
                                     let! target = control.ReadAbortTarget(tenant, row.Id, cancellationToken)
 
-                                    if not (isNull (box target)) then
+                                    if
+                                        match target with
+                                        | null -> false
+                                        | target ->
+                                            target.State <> ControlTargetState.Active || not (isNull (box target.Stop))
+                                    then
                                         raise (
                                             InvalidSessionStateException(
                                                 row.Id,

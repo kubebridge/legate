@@ -237,6 +237,7 @@ let private spawnGated
             AskTimeout = TimeSpan.FromMinutes 5.0
             JournalToken = "test-token"
             PrimeClaim = None
+            Recovery = null
             RunSuspendable = runner
             ReprimeJournal = None
             RefreshCompact = None
