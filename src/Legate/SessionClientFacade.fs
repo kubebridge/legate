@@ -1428,18 +1428,27 @@ module internal ClusterSubscriptions =
 /// IChatClient. Internal: hosts resolve SessionClient from DI and call
 /// the SessionClientOperations extensions; nothing here crosses the public
 /// API.
-type internal SessionModelClients(providers: IEnumerable<ILlmProvider>) =
+type internal SessionModelClients(resolveClient: Func<ModelReference, IChatClient> | null) =
     let clients =
         System.Collections.Concurrent.ConcurrentDictionary<string, Lazy<IChatClient>>(StringComparer.Ordinal)
 
     member _.Resolve(model: ModelReference, fallback: IChatClient) : IChatClient =
-        match
-            providers
-            |> Seq.tryFind (fun provider ->
-                String.Equals(provider.Id, model.Provider, StringComparison.OrdinalIgnoreCase))
-        with
-        | None -> fallback
-        | Some provider -> clients.GetOrAdd(model.Value, fun _ -> lazy (provider.CreateChatClient(model, null))).Value
+        match resolveClient with
+        | null -> fallback
+        | resolve ->
+            clients
+                .GetOrAdd(
+                    model.Value,
+                    fun _ ->
+                        lazy
+                            (let client = resolve.Invoke(model)
+
+                             if isNull (box client) then
+                                 raise (InvalidOperationException("The model-aware chat client factory returned null."))
+
+                             client)
+                )
+                .Value
 
     interface IDisposable with
         member _.Dispose() =
@@ -1448,6 +1457,13 @@ type internal SessionModelClients(providers: IEnumerable<ILlmProvider>) =
                     client.Value.Dispose()
 
 module internal SessionClientWiring =
+
+    /// Catalog reads belong to the attempt's cancellation scope, including
+    /// stores that do not complete promptly after receiving cancellation.
+    let agentsForEntryAsync (agents: IAgentStore | null) tenant (token: CancellationToken) =
+        match agents with
+        | null -> Task.FromResult(Array.empty<Agent> :> IReadOnlyList<Agent>)
+        | agents -> agents.ListAgents(tenant, token).WaitAsync(token)
 
     /// Resolves the stored session agent's model for each new attempt. Hosts
     /// without provider registrations keep their explicitly supplied client.
@@ -1764,15 +1780,12 @@ module internal SessionClientWiring =
             let baseInputs =
                 resolveInputs store clientOptions.Tenant sources legateOptions.Turns legateOptions.AskUser
 
-            let inputs entry =
+            let inputs (available: IReadOnlyList<Agent>) entry =
                 let tools, options = baseInputs entry
 
                 match agentStore with
                 | null -> tools, options
                 | agents ->
-                    let available =
-                        agents.ListAgents(clientOptions.Tenant, CancellationToken.None).GetAwaiter().GetResult()
-
                     let nested =
                         available
                         |> Seq.filter (fun agent -> agent.Enabled && not (String.IsNullOrWhiteSpace agent.Description))
@@ -1804,6 +1817,7 @@ module internal SessionClientWiring =
                 fun entry attempt allowed cursor reply seed token started usage skill turnId ->
                     task {
                         let! model = modelForEntryAsync store agentStore clientOptions.Tenant entry token
+                        let! available = agentsForEntryAsync agentStore clientOptions.Tenant token
 
                         let selected =
                             model
@@ -1815,7 +1829,7 @@ module internal SessionClientWiring =
                                 selected
                                 store
                                 clientOptions.Tenant
-                                inputs
+                                (inputs available)
                                 delay
                                 policy
                                 (Some(systemPromptFor store clientOptions.Tenant))
@@ -1960,7 +1974,7 @@ module internal SessionClientRegistration =
 
         services.TryAddSingleton<SessionModelClients>(
             Func<IServiceProvider, SessionModelClients>(fun provider ->
-                new SessionModelClients(provider.GetServices<ILlmProvider>()))
+                new SessionModelClients(provider.GetService<Func<ModelReference, IChatClient>>()))
         )
         |> ignore
 

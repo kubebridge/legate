@@ -804,6 +804,19 @@ let private buildServices
         )
         |> ignore
 
+        // The runtime keeps the host pipeline unless the host explicitly
+        // supplies a model-aware client factory. Dot owns this opt-in.
+        services.AddSingleton<Func<ModelReference, IChatClient>>(
+            Func<IServiceProvider, Func<ModelReference, IChatClient>>(fun provider ->
+                Func<ModelReference, IChatClient>(fun reference ->
+                    let selected =
+                        provider.GetServices<ILlmProvider>()
+                        |> Seq.find (fun candidate -> candidate.Id = reference.Provider)
+
+                    selected.CreateChatClient(reference, null)))
+        )
+        |> ignore
+
 /// Stops the MCP lifecycle sources so subprocess servers exit with dot.
 /// Mirrors the samples/LegateCli precedent; host-local, like the scripted
 /// client.

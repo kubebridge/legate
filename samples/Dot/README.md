@@ -84,6 +84,11 @@ be configured in `Dot:Providers:<id>:Models` as a YAML list. An explicit
 provider client on the next turn while keeping the same session transcript;
 a switch during a turn applies when that turn settles.
 
+Dot explicitly registers a `Func<ModelReference, IChatClient>` model factory.
+Other hosts retain their registered `IChatClient` pipeline unless they opt
+into that factory; a host-supplied factory can apply its middleware to every
+model-specific client. Cached factory clients are disposed with the container.
+
 ## Sub-agents
 
 Dot supplies two nested agents through the model-facing `task` tool:

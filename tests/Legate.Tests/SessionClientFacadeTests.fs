@@ -237,6 +237,12 @@ let ``SetAgent switches the actual provider client on the next prompt`` () : Tas
 
         services.AddSingleton<IChatClient>(first) |> ignore
         services.AddSingleton<ILlmProvider>(SwitchingProvider(first, second)) |> ignore
+
+        services.AddSingleton<Func<ModelReference, IChatClient>>(
+            Func<ModelReference, IChatClient>(fun model -> if model.Model = "second" then second else first)
+        )
+        |> ignore
+
         use provider = services.BuildServiceProvider()
         let! agents = provider.GetRequiredService<IAgentStore>().ListAgents(TenantId.Default, CancellationToken.None)
 
@@ -282,6 +288,96 @@ let ``SetAgent switches the actual provider client on the next prompt`` () : Tas
 
                     changed.AssistantText |> should equal "second model"
                 })
+    }
+
+[<Fact>]
+let ``Registered providers do not bypass the host chat pipeline without opt-in`` () : Task =
+    task {
+        let hostClient =
+            scripted
+                [
+                    ScriptStep.Text "host middleware pipeline"
+                ]
+
+        let rawClient = scripted [ ScriptStep.Text "raw provider" ]
+        let database = InMemoryDatabase()
+        let services = ServiceCollection()
+
+        services.AddLegate(
+            Action<LegateBuilder>(fun builder ->
+                builder.Storage.UseSessionStore(InMemorySessionStore(database)) |> ignore
+
+                builder.Agents.Add(
+                    "host",
+                    Func<Agent, Agent>(fun agent ->
+                        { agent with
+                            Model = ModelReference.Parse("switch-test/first")
+                        })
+                )
+                |> ignore)
+        )
+        |> ignore
+
+        services.AddSingleton<ISessionEventStore>(InMemorySessionEventStore(database))
+        |> ignore
+
+        services.AddSingleton<IChatClient>(hostClient) |> ignore
+
+        services.AddSingleton<ILlmProvider>(SwitchingProvider(rawClient, rawClient))
+        |> ignore
+
+        use provider = services.BuildServiceProvider()
+        let! agents = provider.GetRequiredService<IAgentStore>().ListAgents(TenantId.Default, CancellationToken.None)
+
+        do!
+            withClient provider (fun client ->
+                task {
+                    let! session =
+                        SessionClientOperations.OpenSessionAsync(client, agents[0].Id, null, CancellationToken.None)
+
+                    let! result =
+                        SessionClientExtensions.PromptAndWaitAsync(
+                            client,
+                            session.Id,
+                            UserMessage.Text "hi",
+                            CancellationToken.None
+                        )
+
+                    result.AssistantText |> should equal "host middleware pipeline"
+                    rawClient.Calls |> should equal 0
+                })
+    }
+
+[<Fact>]
+let ``Catalog lookup propagates cancellation and abandons an unresponsive store`` () : Task =
+    task {
+        use cts = new CancellationTokenSource()
+
+        let never =
+            TaskCompletionSource<IReadOnlyList<Agent>>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+        let mutable received = CancellationToken.None
+
+        let store =
+            { new IAgentStore with
+                member _.ListAgents(_, token) =
+                    received <- token
+                    never.Task
+
+                member _.GetAgent(_, _, _) = failwith "unused"
+                member _.UpdateIfUnchanged(_, _, _, _) = failwith "unused"
+                member _.DeleteAgent(_, _, _) = failwith "unused"
+                member _.ListAgentsWithEnabledSchedules(_, _) = failwith "unused"
+                member _.TryConsumeScheduleOccurrence(_, _, _, _, _) = failwith "unused"
+            }
+
+        let pending =
+            SessionClientWiring.agentsForEntryAsync store TenantId.Default cts.Token
+
+        received |> should equal cts.Token
+        cts.Cancel()
+        let! _ = Assert.ThrowsAnyAsync<OperationCanceledException>(Func<Task>(fun () -> pending :> Task))
+        never.TrySetResult(Array.empty<Agent>) |> ignore
     }
 
 [<Fact>]
