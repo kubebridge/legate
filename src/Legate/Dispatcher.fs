@@ -272,7 +272,34 @@ module internal Dispatcher =
                         more <- false
                     else
                         for sessionId in unseen do
-                            let! session = store.GetSession(tenant, sessionId, cancellationToken)
+                            // A refusal belongs to this candidate, never to the whole sweep.
+                            let! session =
+                                task {
+                                    try
+                                        let! blocked =
+                                            task {
+                                                match store with
+                                                | :? ISessionAbortControlStore as control ->
+                                                    let! target =
+                                                        control.ReadAbortTarget(tenant, sessionId, cancellationToken)
+
+                                                    return
+                                                        match target with
+                                                        | null -> false
+                                                        | target ->
+                                                            target.State <> ControlTargetState.Active
+                                                            || not (isNull (box target.Stop))
+                                                | _ -> return false
+                                            }
+
+                                        if blocked then
+                                            return null
+                                        else
+                                            return! store.GetSession(tenant, sessionId, cancellationToken)
+                                    with
+                                    | :? OperationCanceledException as cancelled -> return raise cancelled
+                                    | _ -> return null
+                                }
 
                             match session with
                             | null -> () // Vanished mid-pass: stays out of this pass.
@@ -363,6 +390,25 @@ module internal Dispatcher =
                     for row in page.Items do
                         if orphanBudget > 0 && not (isNull (box row)) && row.CurrentTurnId.HasValue then
                             try
+                                match store with
+                                | :? ISessionAbortControlStore as control ->
+                                    let! target = control.ReadAbortTarget(tenant, row.Id, cancellationToken)
+
+                                    if
+                                        match target with
+                                        | null -> false
+                                        | target ->
+                                            target.State <> ControlTargetState.Active || not (isNull (box target.Stop))
+                                    then
+                                        raise (
+                                            InvalidSessionStateException(
+                                                row.Id,
+                                                "controlPending",
+                                                "Dispatcher orphan prime is forbidden for unresolved control work."
+                                            )
+                                        )
+                                | _ -> ()
+
                                 let! fresh = store.GetSession(tenant, row.Id, cancellationToken)
 
                                 match fresh with

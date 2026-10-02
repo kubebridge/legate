@@ -6,6 +6,8 @@
       href: getting-started-cli.md
     - name: Hosted service
       href: getting-started-hosted.md
+    - name: Targeted host abort
+      href: host-abort.md
 - name: Configuration
   href: configuration.md
 - name: Architecture

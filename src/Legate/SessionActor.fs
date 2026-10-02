@@ -131,6 +131,8 @@ type internal SessionActorMessage =
     /// (ExplicitAbort, HostShutdown) act; anything else is a no-op. Answered
     /// with <see cref="T:Legate.SessionSnapshot" />.
     | AbortSession of cause: StopCause * reason: string * cancellationToken: CancellationToken
+    /// Exact-target durable-intent wake hint. It never authorizes stop without provider evidence.
+    | ObserveHostAbort of tenant: TenantId * sessionId: SessionId * targetTurnId: TurnId
 
     /// Compact the session on demand: Idle replays the journal into a
     /// history and compacts now without starting a turn, Running arms the
@@ -1448,6 +1450,33 @@ module internal SessionActor =
 
                     mailbox.Sender() <! closed
                     return! loop SessionState.Closed None StopArbitration.Undecided None
+                | ObserveHostAbort(tenant, sessionId, targetTurnId) ->
+                    match state, running, props.Store with
+                    | SessionState.Running, Some inFlight, (:? ISessionAbortControlStore as control) when
+                        tenant = props.Tenant
+                        && sessionId = props.SessionId
+                        && inFlight.TurnId = targetTurnId
+                        ->
+                        match awaitTask (control.ReadAbortTarget(tenant, sessionId, CancellationToken.None)) with
+                        | null -> return! loop state running arbitration pendingStop
+                        | target when target.TurnId = targetTurnId ->
+                            match target.Stop with
+                            | null -> return! loop state running arbitration pendingStop
+                            | stop ->
+                                let next, won = StopArbitration.applyStop arbitration stop.Cause.Value
+
+                                if won then
+                                    inFlight.Cts.Cancel()
+
+                                let selected =
+                                    if won then
+                                        Some(stop.Cause.Value, stop.Reason |> Option.ofObj |> Option.defaultValue "")
+                                    else
+                                        pendingStop
+
+                                return! loop state running next selected
+                        | _ -> return! loop state running arbitration pendingStop
+                    | _ -> return! loop state running arbitration pendingStop
                 | AbortSession(cause, reason, _) ->
                     match state, running with
                     | SessionState.Running, Some inFlight when
@@ -1971,6 +2000,10 @@ module internal SessionActor =
             AskTimeout: TimeSpan
             /// The claim token fencing journal appends.
             JournalToken: string
+            /// Genuine captured journal-prime authority. None only for internal unclaimed test shells.
+            PrimeClaim: TurnClaim option
+            /// Provider-fenced original entry for unstopped current-format recovery; null on fresh activation.
+            Recovery: ControlTargetRecovery | null
             /// Runs one suspendable attempt. Never null.
             RunSuspendable: SuspendableRunner
             /// Re-primes the journal after the actor settles its primed
@@ -2146,6 +2179,8 @@ module internal SessionActor =
         /// (ExplicitAbort, HostShutdown) act; anything else is a no-op.
         /// Answered with <see cref="T:Legate.SessionSnapshot" />.
         | SuspendableAbortSession of cause: StopCause * reason: string * cancellationToken: CancellationToken
+        /// Exact-target wake hint; receiving actors read persisted intent and validate tenant/session.
+        | SuspendableObserveHostAbort of tenant: TenantId * sessionId: SessionId * targetTurnId: TurnId
 
         /// Compact the suspendable session on demand: Idle replays the
         /// journal and compacts now without starting a turn, Running arms
@@ -2510,6 +2545,168 @@ module internal SessionActor =
         // SuspendDeps.JournalToken, so post-swap writes stay live. A cell
         // rather than a loop parameter, like pendingStop below.
         let mutable journalToken = suspend.JournalToken
+        let mutable controlPrime = suspend.PrimeClaim
+        let controlReports = Dictionary<int64, TurnId * TurnClaim * string>()
+        let completedControlReports = HashSet<string>()
+
+        let controlStore =
+            match props.Store with
+            | :? ISessionAbortControlStore as control -> Some control
+            | _ when suspend.PrimeClaim.IsNone -> None
+            | _ -> raise (InvalidOperationException("ISessionAbortControlStore is required."))
+
+        let controlAdmission turn position claim () =
+            match controlStore with
+            | None -> true
+            | Some control ->
+                let checkedTarget =
+                    awaitTask (
+                        control.CheckControlTarget(
+                            props.Tenant,
+                            props.SessionId,
+                            turn,
+                            position,
+                            claim,
+                            CancellationToken.None
+                        )
+                    )
+
+                checkedTarget.Outcome = ControlOperationOutcome.Applied
+
+        let bindControl (entry: InboxEntry) =
+            match controlStore, controlPrime with
+            | Some control, Some claim ->
+                let turn =
+                    match controlReports.TryGetValue entry.Position with
+                    | true, (turn, _, _) -> turn
+                    | _ -> TurnId.New()
+
+                let bound =
+                    awaitTask (
+                        control.BindControlTarget(
+                            props.Tenant,
+                            props.SessionId,
+                            turn,
+                            entry.Position,
+                            claim,
+                            CancellationToken.None
+                        )
+                    )
+
+                if bound.Outcome <> ControlOperationOutcome.Applied then
+                    raise (
+                        InvalidSessionStateException(
+                            props.SessionId,
+                            "controlPending",
+                            "Current target refused execution admission."
+                        )
+                    )
+
+                controlReports[entry.Position] <- turn, claim, Guid.NewGuid().ToString("N")
+                Some turn
+            | _ -> None
+
+        let decideControl (entry: InboxEntry) (candidate: TurnResult) =
+            match controlStore, controlReports.TryGetValue entry.Position with
+            | Some control, (true, (turn, claim, id)) ->
+                if completedControlReports.Contains id then
+                    raise (
+                        InvalidSessionStateException(
+                            props.SessionId,
+                            "duplicateControlReport",
+                            "A duplicate report cannot publish or drain."
+                        )
+                    )
+
+                let cause, reason =
+                    match candidate.Outcome with
+                    | :? TurnAborted as stop -> Nullable stop.Cause, (stop.Reason: string | null)
+                    | _ when candidate.Status = TurnStatus.Aborted ->
+                        Nullable StopCause.ExplicitAbort, (InterruptReason: string | null)
+                    | _ -> Nullable(), null
+
+                let decided =
+                    awaitTask (
+                        control.TryDecideControlTarget(
+                            props.Tenant,
+                            props.SessionId,
+                            turn,
+                            entry.Position,
+                            claim,
+                            id,
+                            candidate.Status,
+                            cause,
+                            reason,
+                            CancellationToken.None
+                        )
+                    )
+
+                match decided.Outcome, decided.Decision with
+                | ControlOperationOutcome.Applied, evidence ->
+                    match evidence with
+                    | null -> raise (InvalidOperationException("Applied control decision has no evidence."))
+                    | evidence when evidence.Status = TurnStatus.Aborted ->
+                        { candidate with
+                            Status = TurnStatus.Aborted
+                            Outcome =
+                                TurnAborted(
+                                    evidence.Cause.Value,
+                                    evidence.Reason |> Option.ofObj |> Option.defaultValue ""
+                                )
+                                :> TurnOutcome
+                        }
+                    | evidence ->
+                        { candidate with
+                            Status = evidence.Status
+                        }
+                | _ ->
+                    raise (
+                        InvalidSessionStateException(
+                            props.SessionId,
+                            "controlPending",
+                            "Control decision refused this report; no downstream effects are authorized."
+                        )
+                    )
+            | _ -> candidate
+
+        let retireControl (entry: InboxEntry) =
+            match controlStore, controlReports.TryGetValue entry.Position with
+            | Some control, (true, (turn, claim, id)) ->
+                let retired =
+                    awaitTask (
+                        control.RetireControlTarget(
+                            props.Tenant,
+                            props.SessionId,
+                            turn,
+                            entry.Position,
+                            claim,
+                            id,
+                            CancellationToken.None
+                        )
+                    )
+
+                if retired.Outcome <> ControlOperationOutcome.Applied then
+                    raise (
+                        InvalidSessionStateException(
+                            props.SessionId,
+                            "controlPending",
+                            "Control retirement refused further settlement or queue drain."
+                        )
+                    )
+
+                completedControlReports.Add id |> ignore
+            | _ -> ()
+
+        let durableStop () =
+            match controlStore, controlPrime with
+            | Some control, Some _ ->
+                match awaitTask (control.ReadAbortTarget(props.Tenant, props.SessionId, CancellationToken.None)) with
+                | null -> None
+                | target ->
+                    match target.Stop with
+                    | null -> None
+                    | stop -> Some(stop.Cause.Value, stop.Reason |> Option.ofObj |> Option.defaultValue "")
+            | _ -> None
 
         // The on-demand compaction wiring the Idle compact path runs: the
         // spawn wiring at first, refreshed by the SetAgent swap with each
@@ -2646,7 +2843,7 @@ module internal SessionActor =
                 ()
 
         let failInterruptedTurn (liveId: TurnId option) (entryOpt: InboxEntry option) : unit =
-            let result =
+            let candidate =
                 {
                     AssistantText = ""
                     Status = TurnStatus.Failed
@@ -2654,6 +2851,29 @@ module internal SessionActor =
                     Usage = { InputTokens = 0L; OutputTokens = 0L }
                     Outcome = TurnFailed(CrashFailReason) :> TurnOutcome
                 }
+
+            let fenced =
+                entryOpt
+                |> Option.exists (fun entry -> controlReports.ContainsKey entry.Position)
+
+            let result =
+                match entryOpt with
+                | Some entry when fenced -> decideControl entry candidate
+                | _ -> candidate
+
+            if fenced then
+                match entryOpt with
+                | Some entry ->
+                    awaitTask (
+                        props.Store.MarkInboxConsumed(
+                            props.Tenant,
+                            props.SessionId,
+                            [| entry.Position |],
+                            CancellationToken.None
+                        )
+                    )
+                    |> ignore
+                | None -> ()
 
             match props.OnTurnSettled with
             | Some observe ->
@@ -2666,6 +2886,7 @@ module internal SessionActor =
             dispatchCompletion props result |> ignore
 
             match entryOpt with
+            | Some _ when fenced -> ()
             | Some entry ->
                 let positions = [| entry.Position |] :> IReadOnlyList<int64>
 
@@ -2678,7 +2899,39 @@ module internal SessionActor =
                     ()
             | None -> ()
 
-            try
+            if fenced then
+                match liveId with
+                | Some turnId ->
+                    let event: SessionEvent =
+                        match result.Outcome with
+                        | :? TurnAborted as stop ->
+                            TurnAbortedEvent(
+                                props.SessionId,
+                                turnId,
+                                Nullable(),
+                                DateTimeOffset.UtcNow,
+                                stop.Cause,
+                                stop.Reason
+                            )
+                        | _ ->
+                            TurnFailedEvent(props.SessionId, turnId, Nullable(), DateTimeOffset.UtcNow, CrashFailReason)
+
+                    awaitTask (
+                        JournalWriter.appendWithTokenAsync
+                            suspend.EventStore
+                            props.Tenant
+                            props.SessionId
+                            journalToken
+                            [| event |]
+                            CancellationToken.None
+                    )
+                    |> ignore
+                | None -> ()
+
+                match entryOpt with
+                | Some entry -> retireControl entry
+                | None -> ()
+
                 awaitTask (
                     props.Store.UpdateSessionState(
                         props.Tenant,
@@ -2688,14 +2941,26 @@ module internal SessionActor =
                     )
                 )
                 |> ignore
-            with _ ->
-                ()
+            else
+                try
+                    awaitTask (
+                        props.Store.UpdateSessionState(
+                            props.Tenant,
+                            props.SessionId,
+                            SessionState.Idle,
+                            CancellationToken.None
+                        )
+                    )
+                    |> ignore
+                with _ ->
+                    ()
 
             // The crash-path terminal (issue 289): the CurrentTurnId
             // snapshot the crash path never ran a loop for. Fenced under
             // the live journal token; a settled-NULL turn (None) journals
             // nothing.
             match liveId with
+            | Some _ when fenced -> ()
             | Some turnId ->
                 try
                     let failedEvent =
@@ -2841,9 +3106,67 @@ module internal SessionActor =
                     | None -> None
                     | Some prime ->
                         journalToken <- prime.Token
+                        controlPrime <- Some prime
                         Some(settlingId, prime)
 
+        let originalRecoveryEntry () =
+            match suspend.Recovery with
+            | null ->
+                try
+                    awaitTask (props.Store.ReadPendingInbox(props.Tenant, props.SessionId, CancellationToken.None))
+                    |> selectDrainableEntries
+                    |> List.tryHead
+                with _ ->
+                    None
+            | recovery -> recovery.Entry |> Option.ofObj
+
         let initialRecovered: SessionState * RebuiltPending option * InboxEntry option =
+            match controlStore, controlPrime with
+            | Some control, Some _ ->
+                match awaitTask (control.ReadAbortTarget(props.Tenant, props.SessionId, CancellationToken.None)) with
+                | null -> ()
+                | target ->
+                    match target, suspend.Recovery with
+                    | _, null ->
+                        raise (
+                            InvalidSessionStateException(
+                                props.SessionId,
+                                "controlPending",
+                                "Recovery requires a provider-fenced original association."
+                            )
+                        )
+                    | target, recovery when target.State = ControlTargetState.Active && isNull (box target.Stop) ->
+                        match recovery.Claim, recovery.Entry with
+                        | null, _
+                        | _, null ->
+                            raise (
+                                InvalidSessionStateException(
+                                    props.SessionId,
+                                    "controlPending",
+                                    "Recovery has no original association or authority."
+                                )
+                            )
+                        | claim, _ ->
+                            if not (controlAdmission target.TurnId target.InboxPosition claim ()) then
+                                raise (
+                                    InvalidSessionStateException(
+                                        props.SessionId,
+                                        "controlPending",
+                                        "Recovery admission lost its exact authority or observed stop."
+                                    )
+                                )
+
+                            controlReports[target.InboxPosition] <- target.TurnId, claim, Guid.NewGuid().ToString("N")
+                    | _ ->
+                        raise (
+                            InvalidSessionStateException(
+                                props.SessionId,
+                                "controlPending",
+                                "Persisted attribution blocks fresh recovery; no synthetic prime or settlement is authorized."
+                            )
+                        )
+            | _ -> ()
+
             let found =
                 awaitTask (props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
 
@@ -2854,23 +3177,14 @@ module internal SessionActor =
                 // the crash interrupted, or None for a settled-NULL row
                 // (which journals nothing).
                 let liveId =
-                    if session.CurrentTurnId.HasValue then
-                        Some session.CurrentTurnId.Value
-                    else
-                        None
+                    match suspend.Recovery with
+                    | null when session.CurrentTurnId.HasValue -> Some session.CurrentTurnId.Value
+                    | null -> None
+                    | recovery -> recovery.Target |> Option.ofObj |> Option.map _.TurnId
 
                 match session.State with
                 | SessionState.Running ->
-                    let drainable =
-                        try
-                            let pending =
-                                awaitTask (
-                                    props.Store.ReadPendingInbox(props.Tenant, props.SessionId, CancellationToken.None)
-                                )
-
-                            selectDrainableEntries pending |> List.tryHead
-                        with _ ->
-                            None
+                    let drainable = originalRecoveryEntry ()
 
                     match crashKnobOf session with
                     | OnCrashResume.FailAttempt ->
@@ -3001,16 +3315,7 @@ module internal SessionActor =
                 // timeout is not restarted here: the AskTimeout bound restarts
                 // when the retried turn suspends again, so a restarted host
                 // never inherits a fired deadline.
-                let queueEntry =
-                    try
-                        let pending =
-                            awaitTask (
-                                props.Store.ReadPendingInbox(props.Tenant, props.SessionId, CancellationToken.None)
-                            )
-
-                        selectDrainableEntries pending |> List.tryHead
-                    with _ ->
-                        None
+                let queueEntry = originalRecoveryEntry ()
 
                 match queueEntry with
                 | Some entry ->
@@ -3018,13 +3323,17 @@ module internal SessionActor =
                         {
                             Entry = entry
                             TurnId =
-                                match currentTurnSnapshot () with
-                                | Some live -> live
-                                | None -> Unchecked.defaultof<TurnId>
+                                match suspend.Recovery with
+                                | null -> currentTurnSnapshot () |> Option.defaultValue Unchecked.defaultof<TurnId>
+                                | recovery ->
+                                    recovery.Target
+                                    |> Option.ofObj
+                                    |> Option.map _.TurnId
+                                    |> Option.defaultValue Unchecked.defaultof<TurnId>
                             Cursor = None
                             Rebuilt = Some rebuilt
                             Allowed = readGrantsNow ()
-                            Attempt = 1
+                            Attempt = controlPrime |> Option.map _.Attempt |> Option.defaultValue 1
                             TimeoutCts = new CancellationTokenSource()
                         }
                 | None -> None
@@ -3131,13 +3440,16 @@ module internal SessionActor =
                     Outcome = TurnFailed(reason) :> TurnOutcome
                 }
 
-            notifySettled result
-            dispatchCompletion props result |> ignore
+            let result = decideControl entry result
 
             let positions = [| entry.Position |] :> IReadOnlyList<int64>
 
             awaitTask (props.Store.MarkInboxConsumed(props.Tenant, props.SessionId, positions, CancellationToken.None))
             |> ignore
+
+            notifySettled result
+            dispatchCompletion props result |> ignore
+            retireControl entry
 
             awaitTask (
                 props.Store.UpdateSessionState(props.Tenant, props.SessionId, SessionState.Idle, CancellationToken.None)
@@ -3184,7 +3496,23 @@ module internal SessionActor =
             }
 
         let journalSuspend (suspension: TurnLoop.TurnLoopSuspension) : JournalWriter.JournalWriteResult =
-            let turnId = TurnId.New()
+            let turnId =
+                match controlStore, controlPrime with
+                | Some control, Some _ ->
+                    match
+                        awaitTask (control.ReadAbortTarget(props.Tenant, props.SessionId, CancellationToken.None))
+                    with
+                    | null ->
+                        raise (
+                            InvalidSessionStateException(
+                                props.SessionId,
+                                "missingControlTarget",
+                                "Suspension requires current attribution."
+                            )
+                        )
+                    | target -> target.TurnId
+                | _ -> TurnId.New()
+
             let stamp = DateTimeOffset.UtcNow
 
             let event =
@@ -3227,7 +3555,23 @@ module internal SessionActor =
             )
 
         let journalResolve (reply: Reply) : JournalWriter.JournalWriteResult =
-            let turnId = TurnId.New()
+            let turnId =
+                match controlStore, controlPrime with
+                | Some control, Some _ ->
+                    match
+                        awaitTask (control.ReadAbortTarget(props.Tenant, props.SessionId, CancellationToken.None))
+                    with
+                    | null ->
+                        raise (
+                            InvalidSessionStateException(
+                                props.SessionId,
+                                "missingControlTarget",
+                                "Reply resolution requires current attribution."
+                            )
+                        )
+                    | target -> target.TurnId
+                | _ -> TurnId.New()
+
             let stamp = DateTimeOffset.UtcNow
 
             let eventOpt: SessionEvent option =
@@ -3502,9 +3846,19 @@ module internal SessionActor =
             // points all key on. A missing snapshot mints fresh,
             // preserving the pre-plumbing marker shape.
             let runTurnId =
-                match currentTurnSnapshot () with
+                match bindControl entry |> Option.orElseWith currentTurnSnapshot with
                 | Some live -> live
                 | None -> TurnId.New()
+
+            awaitTask (
+                props.Store.UpdateSessionState(
+                    props.Tenant,
+                    props.SessionId,
+                    SessionState.Running,
+                    CancellationToken.None
+                )
+            )
+            |> ignore
 
             runningTurnId <- Some runTurnId
 
@@ -3552,6 +3906,14 @@ module internal SessionActor =
 
             let runTask =
                 try
+                    use _controlScope =
+                        match controlReports.TryGetValue entry.Position with
+                        | true, (turn, claim, _) -> ControlAdmission.enter (controlAdmission turn entry.Position claim)
+                        | _ -> ControlAdmission.enter (fun () -> true)
+
+                    if not (ControlAdmission.check ()) then
+                        raise (TurnLoop.TurnLeaseLostException())
+
                     let started =
                         suspend.RunSuspendable
                             entry
@@ -3602,6 +3964,18 @@ module internal SessionActor =
             |> ignore
 
         let resumeSuspendable (parked: SuspendedTurn) (reply: Reply) (nextAttempt: int) : unit =
+            match controlReports.TryGetValue parked.Entry.Position with
+            | true, (turn, claim, _) when not (controlAdmission turn parked.Entry.Position claim ()) ->
+                raise (
+                    InvalidSessionStateException(props.SessionId, "controlPending", "Durable control forbids resume.")
+                )
+            | _ -> ()
+
+            use _controlScope =
+                match controlReports.TryGetValue parked.Entry.Position with
+                | true, (turn, claim, _) -> ControlAdmission.enter (controlAdmission turn parked.Entry.Position claim)
+                | _ -> ControlAdmission.enter (fun () -> true)
+
             let cursor =
                 match parked.Cursor with
                 | Some live -> Some live
@@ -3753,6 +4127,7 @@ module internal SessionActor =
         /// <param name="fresh">The live journal claim to adopt.</param>
         let swapJournal (fresh: TurnClaim) : unit =
             journalToken <- fresh.Token
+            controlPrime <- Some fresh
 
             match suspend.RefreshCompact with
             | Some refresh ->
@@ -4000,19 +4375,19 @@ module internal SessionActor =
                         // the drain moves on.
                         match checkAgentAuthority () with
                         | None ->
-                            awaitTask (
-                                props.Store.UpdateSessionState(
-                                    props.Tenant,
-                                    props.SessionId,
-                                    SessionState.Running,
-                                    cancellationToken
-                                )
-                            )
-                            |> ignore
+                            let started =
+                                try
+                                    startSuspendable first 1 (readGrantsNow ()) None
+                                    true
+                                with error ->
+                                    mailbox.Sender() <! Status.Failure(error)
+                                    false
 
-                            startSuspendable first 1 (readGrantsNow ()) None
-                            mailbox.Sender() <! PromptAccepted appended
-                            return! loop SessionState.Running None resolved
+                            if started then
+                                mailbox.Sender() <! PromptAccepted appended
+                                return! loop SessionState.Running None resolved
+                            else
+                                return! loop state suspended resolved
                         | Some(failure, reason) ->
                             settleAuthorityRefusal first failure reason
                             mailbox.Sender() <! PromptAccepted appended
@@ -4089,19 +4464,19 @@ module internal SessionActor =
                         // the drain moves on.
                         match checkAgentAuthority () with
                         | None ->
-                            awaitTask (
-                                props.Store.UpdateSessionState(
-                                    props.Tenant,
-                                    props.SessionId,
-                                    SessionState.Running,
-                                    cancellationToken
-                                )
-                            )
-                            |> ignore
+                            let started =
+                                try
+                                    startSuspendable first 1 (readGrantsNow ()) None
+                                    true
+                                with error ->
+                                    mailbox.Sender() <! Status.Failure(error)
+                                    false
 
-                            startSuspendable first 1 (readGrantsNow ()) None
-                            mailbox.Sender() <! PromptAccepted appended
-                            return! loop SessionState.Running None resolved
+                            if started then
+                                mailbox.Sender() <! PromptAccepted appended
+                                return! loop SessionState.Running None resolved
+                            else
+                                return! loop state suspended resolved
                         | Some(failure, reason) ->
                             settleAuthorityRefusal first failure reason
                             mailbox.Sender() <! PromptAccepted appended
@@ -4182,19 +4557,19 @@ module internal SessionActor =
                         // the drain moves on.
                         match checkAgentAuthority () with
                         | None ->
-                            awaitTask (
-                                props.Store.UpdateSessionState(
-                                    props.Tenant,
-                                    props.SessionId,
-                                    SessionState.Running,
-                                    cancellationToken
-                                )
-                            )
-                            |> ignore
+                            let started =
+                                try
+                                    startSuspendable first 1 (readGrantsNow ()) None
+                                    true
+                                with error ->
+                                    mailbox.Sender() <! Status.Failure(error)
+                                    false
 
-                            startSuspendable first 1 (readGrantsNow ()) None
-                            mailbox.Sender() <! PromptAccepted appended
-                            return! loop SessionState.Running None resolved
+                            if started then
+                                mailbox.Sender() <! PromptAccepted appended
+                                return! loop SessionState.Running None resolved
+                            else
+                                return! loop state suspended resolved
                         | Some(failure, reason) ->
                             settleAuthorityRefusal first failure reason
                             mailbox.Sender() <! PromptAccepted appended
@@ -4257,13 +4632,17 @@ module internal SessionActor =
                         return! loop state suspended resolved
                 | SuspendableFinished(entry, completion, attempt, allowed) ->
                     match state, suspended with
+                    | SessionState.Running, None when
+                        controlReports.ContainsKey entry.Position
+                        && (let _, _, id = controlReports[entry.Position] in completedControlReports.Contains id)
+                        ->
+                        return! loop state suspended resolved
                     | SessionState.Running, None ->
                         // A recorded stop wins over whatever the detached
                         // turn reported, even a success or a suspension: map
                         // to Aborted and clear the cell. Settlement already
                         // won when the cell is empty.
-                        let stop = pendingStop
-                        pendingStop <- None
+                        let stop = durableStop () |> Option.orElse pendingStop
 
                         let carried =
                             match stop with
@@ -4285,6 +4664,9 @@ module internal SessionActor =
                             (result: TurnResult)
                             (turnId: TurnId option)
                             : SessionState =
+                            let result = decideControl entry result
+                            pendingStop <- None
+                            runningTurnId <- None
                             let positions = [| entry.Position |] :> IReadOnlyList<int64>
 
                             awaitTask (
@@ -4310,6 +4692,8 @@ module internal SessionActor =
                             match turnId with
                             | Some tid -> journalSettledCompletion tid result
                             | None -> ()
+
+                            retireControl entry
 
                             if result.Status = TurnStatus.Completed && autoCloseEnabled props then
                                 // AutoClose (issue 82): the first Completed
@@ -4444,7 +4828,6 @@ module internal SessionActor =
                             // turn-cell, then snapshot, else the terminal
                             // journals nothing.
                             let settling = resolveSettlingTurnId completion.TurnId
-                            runningTurnId <- None
                             let next = settleEntryNow entry carried settling
                             return! loop next None resolved
                     | SessionState.WaitingForInput, Some parked when parked.Cursor.IsNone && parked.Rebuilt.IsSome ->
@@ -4454,12 +4837,16 @@ module internal SessionActor =
                     | _ -> return! loop state suspended resolved
                 | SuspendableFaulted(entry, error, _, faultTurnId) ->
                     match state, suspended with
+                    | SessionState.Running, None when
+                        controlReports.ContainsKey entry.Position
+                        && (let _, _, id = controlReports[entry.Position] in completedControlReports.Contains id)
+                        ->
+                        return! loop state suspended resolved
                     | SessionState.Running, None ->
                         // A recorded stop wins even over a real fault:
                         // settle Aborted under the cause instead of failing
                         // silently. The cell clears on every fault settle.
-                        let stop = pendingStop
-                        pendingStop <- None
+                        let stop = durableStop () |> Option.orElse pendingStop
 
                         // The fault's settling id (issue 289): the
                         // message-carried id, then the turn cell, then the
@@ -4473,43 +4860,19 @@ module internal SessionActor =
                                 | Some _ as resolved -> resolved
                                 | None -> currentTurnSnapshot ()
 
-                        runningTurnId <- None
+                        let candidate =
+                            match stop with
+                            | Some(cause, reason) -> abortedSuspendResult cause reason
+                            | None ->
+                                {
+                                    AssistantText = ""
+                                    Status = TurnStatus.Failed
+                                    Iterations = 0
+                                    Usage = { InputTokens = 0L; OutputTokens = 0L }
+                                    Outcome = TurnFailed(ProviderFailureReason.formatFault error) :> TurnOutcome
+                                }
 
-                        match stop with
-                        | Some(cause, reason) ->
-                            let settled = abortedSuspendResult cause reason
-                            notifySettled settled
-                            dispatchCompletion props settled |> ignore
-
-                            match settling with
-                            | Some tid -> journalSettledCompletion tid settled
-                            | None -> ()
-                        | None ->
-                            match settling with
-                            | Some tid ->
-                                // Fault detail (issue 349): a provider fault
-                                // settles with the shaped provider id +
-                                // status + message through the shared
-                                // formatter, so a 401 bad key and a 404 bad
-                                // model stay distinguishable; every other
-                                // fault keeps the type-name shape.
-                                // failedReasonOf passes the reason through
-                                // untouched. Secrets never travel: the
-                                // formatter reads ProviderException
-                                // properties only.
-                                let reason = ProviderFailureReason.formatFault error
-
-                                let failed =
-                                    {
-                                        AssistantText = ""
-                                        Status = TurnStatus.Failed
-                                        Iterations = 0
-                                        Usage = { InputTokens = 0L; OutputTokens = 0L }
-                                        Outcome = TurnFailed(reason) :> TurnOutcome
-                                    }
-
-                                journalSettledCompletion tid failed
-                            | None -> ()
+                        let selected = decideControl entry candidate
 
                         let positions = [| entry.Position |] :> IReadOnlyList<int64>
 
@@ -4522,6 +4885,17 @@ module internal SessionActor =
                             )
                         )
                         |> ignore
+
+                        pendingStop <- None
+                        runningTurnId <- None
+                        notifySettled selected
+                        dispatchCompletion props selected |> ignore
+
+                        match settling with
+                        | Some tid -> journalSettledCompletion tid selected
+                        | None -> ()
+
+                        retireControl entry
 
                         awaitTask (
                             props.Store.UpdateSessionState(
@@ -4543,6 +4917,17 @@ module internal SessionActor =
                     | _ -> return! loop state suspended resolved
                 | ReplyEntry replyEntry ->
                     match state, suspended with
+                    | SessionState.WaitingForInput, Some _ when durableStop().IsSome ->
+                        mailbox.Sender()
+                        <! Status.Failure(
+                            InvalidSessionStateException(
+                                props.SessionId,
+                                "controlPending",
+                                "Accepted stop forbids reply consumption or resume."
+                            )
+                        )
+
+                        return! loop state suspended resolved
                     | SessionState.WaitingForInput, Some parked ->
                         let replyOpt: Reply option =
                             match replyEntry.Payload with
@@ -4749,11 +5134,7 @@ module internal SessionActor =
                             with _ ->
                                 ()
 
-                            journalTimeout parked.TurnId
-
-                            let result = timeoutResult ()
-                            notifySettled result
-                            dispatchCompletion props result |> ignore
+                            let result = decideControl parked.Entry (timeoutResult ())
 
                             // The timeout settled the turn Failed: a
                             // recorded stop loses to the settlement.
@@ -4771,6 +5152,11 @@ module internal SessionActor =
                             )
                             |> ignore
 
+                            journalTimeout parked.TurnId
+                            notifySettled result
+                            dispatchCompletion props result |> ignore
+                            retireControl parked.Entry
+
                             awaitTask (
                                 props.Store.UpdateSessionState(
                                     props.Tenant,
@@ -4784,6 +5170,17 @@ module internal SessionActor =
                             return! loop SessionState.Idle None resolved
                         | _ -> return! loop state suspended resolved
                     | _ -> return! loop state suspended resolved
+                | SuspendableObserveHostAbort(tenant, sessionId, turn) ->
+                    if
+                        tenant = props.Tenant
+                        && sessionId = props.SessionId
+                        && runningTurnId = Some turn
+                    then
+                        match durableStop () with
+                        | Some stop -> pendingStop <- Some stop
+                        | None -> ()
+
+                    return! loop state suspended resolved
                 | SuspendableAbortSession(cause, reason, _) ->
                     match state, suspended with
                     | SessionState.Running, None when cause = StopCause.ExplicitAbort || cause = StopCause.HostShutdown ->
@@ -4951,7 +5348,12 @@ module internal SessionActor =
                 with _ ->
                     None
 
-            startSuspendable entry 2 (readGrantsNow ()) crashSeed
+            startSuspendable
+                entry
+                (controlPrime |> Option.map _.Attempt |> Option.defaultValue 2)
+                (readGrantsNow ())
+                crashSeed
+
             loop SessionState.Running None (HashSet<string>())
         | _ -> loop initialState initialSuspended (HashSet<string>())
 
@@ -5574,12 +5976,72 @@ module internal SessionActor =
             with _ ->
                 None
 
+        let recoverTarget captured : ControlTargetRecovery | null =
+            match store with
+            | :? ISessionAbortControlStore as control ->
+                match control.ReadAbortTarget(tenant, captured, CancellationToken.None).GetAwaiter().GetResult() with
+                | null -> null
+                | target when target.State = ControlTargetState.Active && isNull (box target.Stop) ->
+                    let result =
+                        control
+                            .TryRecoverControlTarget(
+                                tenant,
+                                captured,
+                                target.TurnId,
+                                claimOwner,
+                                leaseDuration,
+                                CancellationToken.None
+                            )
+                            .GetAwaiter()
+                            .GetResult()
+
+                    if result.Outcome <> ControlOperationOutcome.Applied then
+                        let category =
+                            if result.Outcome = ControlOperationOutcome.Stopped then
+                                "controlPending"
+                            else
+                                "executionAuthorityUnavailable"
+
+                        raise (
+                            InvalidSessionStateException(
+                                captured,
+                                category,
+                                "Recovery cannot acquire genuine authority for this exact unstopped target."
+                            )
+                        )
+
+                    result
+                | _ ->
+                    raise (
+                        InvalidSessionStateException(
+                            captured,
+                            "controlPending",
+                            "Accepted stop or pending control decision forbids activation."
+                        )
+                    )
+            | _ -> raise (InvalidOperationException("ISessionAbortControlStore is required before session activation."))
+
         fun sessionId context name ->
             let mutable parsed = Unchecked.defaultof<SessionId>
 
             if SessionId.TryParse(sessionId, &parsed) then
                 let captured = parsed
-                let primed = primeClaim captured
+
+                let recovery = recoverTarget captured
+
+                let primed =
+                    match recovery with
+                    | null -> primeClaim captured
+                    | recovery -> recovery.Claim |> Option.ofObj
+
+                if primed.IsNone then
+                    raise (
+                        InvalidSessionStateException(
+                            captured,
+                            "executionAuthorityUnavailable",
+                            "Activation acquired no genuine prime authority; no runner may start."
+                        )
+                    )
 
                 let token =
                     match primed with
@@ -5604,6 +6066,8 @@ module internal SessionActor =
                         Delay = delay
                         AskTimeout = askTimeout
                         JournalToken = token
+                        PrimeClaim = primed
+                        Recovery = recovery
                         RunSuspendable = runSuspendable
                         ReprimeJournal = Some(fun () -> primeClaim captured)
                         RefreshCompact = Some(compactFor captured)

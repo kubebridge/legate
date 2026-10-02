@@ -21,6 +21,7 @@ module PostgresMigrationTests =
             "inbox"
             "outbox"
             "schedule_occurrences"
+            "session_control"
             "session_grants"
             "sessions"
             "turn_completion_era"
@@ -49,7 +50,7 @@ module PostgresMigrationTests =
         reader.Read()
 
     [<Fact>]
-    let ``Baseline migrates the legate schema with all eleven tables`` () =
+    let ``Migrations include the additive control table without backfill`` () =
         let connectionString = PostgresTestDatabase.ensureReady ()
 
         use connection = new NpgsqlConnection(connectionString)

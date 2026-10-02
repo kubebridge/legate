@@ -1198,7 +1198,7 @@ module internal TurnLoop =
                 | call :: rest ->
                     cancellationToken.ThrowIfCancellationRequested()
 
-                    if not (isLeaseValid ()) then
+                    if not (ControlAdmission.check () && isLeaseValid ()) then
                         raise (TurnLeaseLostException())
 
                     if timeoutCts.IsCancellationRequested then
@@ -1321,7 +1321,7 @@ module internal TurnLoop =
             task {
                 cancellationToken.ThrowIfCancellationRequested()
 
-                if not (isLeaseValid ()) then
+                if not (ControlAdmission.check () && isLeaseValid ()) then
                     return! Task.FromException<TurnLoopCompletion>(TurnLeaseLostException())
                 elif iterations >= options.MaxIterations then
                     logLoop MaxIterationsExceededMessage
@@ -2082,7 +2082,7 @@ module internal TurnLoop =
                 | call :: rest ->
                     cancellationToken.ThrowIfCancellationRequested()
 
-                    if not (isLeaseValid ()) then
+                    if not (ControlAdmission.check () && isLeaseValid ()) then
                         raise (TurnLeaseLostException())
 
                     if timeoutCts.IsCancellationRequested then
@@ -2330,7 +2330,7 @@ module internal TurnLoop =
             task {
                 cancellationToken.ThrowIfCancellationRequested()
 
-                if not (isLeaseValid ()) then
+                if not (ControlAdmission.check () && isLeaseValid ()) then
                     return! Task.FromException<TurnLoopCompletion>(TurnLeaseLostException())
                 elif iterations >= options.MaxIterations then
                     // Settle checkpoint (issue 321): journal the final totals
@@ -2536,7 +2536,7 @@ module internal TurnLoop =
             match decision with
             | PermissionDecisionKind.Deny -> ()
             | _ ->
-                if not (isLeaseValid ()) then
+                if not (ControlAdmission.check () && isLeaseValid ()) then
                     raise (TurnLeaseLostException())
 
                 match options.VerifyClaim with

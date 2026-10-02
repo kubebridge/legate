@@ -37,6 +37,10 @@ an `AllowAll` permission policy, an optional completion sink, and optionally
 
 ### Turn lifecycle
 
+Targeted host abort is a durable control-intent API, not terminal settlement.
+See [Targeted host abort](host-abort.md) for exact-target retries, provider arbitration,
+pending recovery barriers and breaking 0.1.0/current-format requirements.
+
 1. The host prompts. The message is appended to the session inbox in
    `ISessionStore` and the dispatcher wakes the session entity (a sharded
    entity in cluster mode, a local child actor in single-node mode).
@@ -327,7 +331,7 @@ Small bound is 32,768 bytes (control DTOs); large bound is 1,048,576 bytes
 
 | Manifest | DTO type | Version | Bound |
 |---|---|---|---|
-| `legate.actor.AbortSession.v1` | `WireDtos.AbortSessionDto` | 1 | large |
+| `legate.actor.AbortSession.v2` | `WireDtos.AbortSessionDto` | 2 | large |
 | `legate.actor.CloseSession.v1` | `WireDtos.CloseSessionDto` | 1 | small |
 | `legate.actor.CompactCompleted.v1` | `WireDtos.CompactCompletedDto` | 1 | small |
 | `legate.actor.CompactDeferred.v1` | `WireDtos.CompactDeferredDto` | 1 | small |
@@ -353,7 +357,7 @@ Small bound is 32,768 bytes (control DTOs); large bound is 1,048,576 bytes
 | `legate.entity.SetAgentPending.v1` | `WireDtos.SetAgentPendingDto` | 1 | large |
 | `legate.entity.SetAgentRejected.v1` | `WireDtos.SetAgentRejectedDto` | 1 | small |
 | `legate.entity.SuspendTimedOut.v1` | `WireDtos.SuspendTimedOutDto` | 1 | small |
-| `legate.entity.SuspendableAbortSession.v1` | `WireDtos.SuspendableAbortSessionDto` | 1 | large |
+| `legate.entity.SuspendableAbortSession.v2` | `WireDtos.SuspendableAbortSessionDto` | 2 | large |
 | `legate.entity.SuspendableCheckInbox.v1` | `WireDtos.SuspendableCheckInboxDto` | 1 | small |
 | `legate.entity.SuspendableCloseSession.v1` | `WireDtos.SuspendableCloseSessionDto` | 1 | small |
 | `legate.entity.SuspendableCompactSession.v1` | `WireDtos.SuspendableCompactSessionDto` | 1 | small |

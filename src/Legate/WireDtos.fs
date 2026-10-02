@@ -58,6 +58,14 @@ module internal WireDtos =
     /// Wire form of SessionActorMessage.AbortSession: the typed stop cause
     /// and reason. The caller's token never crosses.
     type AbortSessionDto() =
+        /// Explicit targeted-control payload version; absent is unsupported.
+        member val ControlVersion: int = 0 with get, set
+        /// Trusted routing tenant, checked again by the receiving actor.
+        member val Tenant: TenantId = Unchecked.defaultof<TenantId> with get, set
+        /// Exact session scope.
+        member val SessionId: SessionId = Unchecked.defaultof<SessionId> with get, set
+        /// Stable real-entry target, not execution authority.
+        member val TargetTurnId: TurnId = Unchecked.defaultof<TurnId> with get, set
 
         /// Which abort-family stop cause won.
         member val Cause: StopCause = StopCause.ExplicitAbort with get, set
@@ -311,6 +319,14 @@ module internal WireDtos =
 
     /// Wire form of SuspendableActorMessage.SuspendableAbortSession.
     type SuspendableAbortSessionDto() =
+        /// Explicit targeted-control payload version; absent is unsupported.
+        member val ControlVersion: int = 0 with get, set
+        /// Tenant checked on receipt.
+        member val Tenant: TenantId = Unchecked.defaultof<TenantId> with get, set
+        /// Exact session scope.
+        member val SessionId: SessionId = Unchecked.defaultof<SessionId> with get, set
+        /// Exact real-entry target.
+        member val TargetTurnId: TurnId = Unchecked.defaultof<TurnId> with get, set
 
         /// Which abort-family stop cause won.
         member val Cause: StopCause = StopCause.ExplicitAbort with get, set
@@ -726,11 +742,19 @@ module internal WireDtos =
             | InterruptPrompt(payload, _) ->
                 buildDto (fun (dto: InterruptPromptDto) -> dto.Payload <- requirePayload payload) :> obj
             | CloseSession _ -> CloseSessionDto() :> obj
-            | AbortSession(cause, reason, _) ->
+            | ObserveHostAbort(tenant, sessionId, target) ->
                 buildDto (fun (dto: AbortSessionDto) ->
-                    dto.Cause <- cause
-                    dto.Reason <- reason)
+                    dto.ControlVersion <- 2
+                    dto.Tenant <- tenant
+                    dto.SessionId <- sessionId
+                    dto.TargetTurnId <- target)
                 :> obj
+            | AbortSession _ ->
+                raise (
+                    InvalidOperationException(
+                        "Untargeted actor abort is local-only; legacy abort wire messages are unsupported."
+                    )
+                )
             | CompactSession _ -> CompactSessionDto() :> obj
             | GetSnapshot -> GetSnapshotDto() :> obj
             | SessionTurnSettled(entry, result) ->
@@ -782,11 +806,19 @@ module internal WireDtos =
             | SessionActor.SuspendTimedOut requestId ->
                 buildDto (fun (dto: SuspendTimedOutDto) -> dto.RequestId <- requestId) :> obj
             | SessionActor.SuspendableCloseSession _ -> SuspendableCloseSessionDto() :> obj
-            | SessionActor.SuspendableAbortSession(cause, reason, _) ->
+            | SessionActor.SuspendableObserveHostAbort(tenant, sessionId, target) ->
                 buildDto (fun (dto: SuspendableAbortSessionDto) ->
-                    dto.Cause <- cause
-                    dto.Reason <- reason)
+                    dto.ControlVersion <- 2
+                    dto.Tenant <- tenant
+                    dto.SessionId <- sessionId
+                    dto.TargetTurnId <- target)
                 :> obj
+            | SessionActor.SuspendableAbortSession _ ->
+                raise (
+                    InvalidOperationException(
+                        "Untargeted actor abort is local-only; legacy abort wire messages are unsupported."
+                    )
+                )
             | SessionActor.SuspendableCompactSession _ -> SuspendableCompactSessionDto() :> obj
             | SessionActor.SuspendableCheckInbox -> SuspendableCheckInboxDto() :> obj
             | SessionActor.SuspendableSetAgent(agentId, _) ->
@@ -902,7 +934,16 @@ module internal WireDtos =
             CloseSession(CancellationToken.None) :> obj
         elif wire :? AbortSessionDto then
             let dto = wire :?> AbortSessionDto
-            AbortSession(dto.Cause, dto.Reason, CancellationToken.None) :> obj
+
+            if
+                dto.ControlVersion <> 2
+                || dto.SessionId = Unchecked.defaultof<SessionId>
+                || dto.TargetTurnId = Unchecked.defaultof<TurnId>
+                || dto.Tenant = Unchecked.defaultof<TenantId>
+            then
+                raise (InvalidOperationException("Unsupported targeted abort payload."))
+
+            ObserveHostAbort(dto.Tenant, dto.SessionId, dto.TargetTurnId) :> obj
         elif wire :? CompactSessionDto then
             CompactSession(CancellationToken.None) :> obj
         elif wire :? GetSnapshotDto then
@@ -979,7 +1020,16 @@ module internal WireDtos =
             SessionActor.SuspendableCloseSession(CancellationToken.None) :> obj
         elif wire :? SuspendableAbortSessionDto then
             let dto = wire :?> SuspendableAbortSessionDto
-            SessionActor.SuspendableAbortSession(dto.Cause, dto.Reason, CancellationToken.None) :> obj
+
+            if
+                dto.ControlVersion <> 2
+                || dto.SessionId = Unchecked.defaultof<SessionId>
+                || dto.TargetTurnId = Unchecked.defaultof<TurnId>
+                || dto.Tenant = Unchecked.defaultof<TenantId>
+            then
+                raise (InvalidOperationException("Unsupported targeted abort payload."))
+
+            SessionActor.SuspendableObserveHostAbort(dto.Tenant, dto.SessionId, dto.TargetTurnId) :> obj
         elif wire :? SuspendableCompactSessionDto then
             SessionActor.SuspendableCompactSession(CancellationToken.None) :> obj
         elif wire :? SuspendableCheckInboxDto then

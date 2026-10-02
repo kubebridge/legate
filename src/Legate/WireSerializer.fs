@@ -357,7 +357,12 @@ type internal WireSerializer(system: ExtendedActorSystem) =
                         $"Wire manifest '{manifest}' is newer than the registered v{wireCase.Version}."
                 elif
                     version <> wireCase.Version
-                    && not (wireCase.Version > 1 && version = wireCase.Version - 1)
+                    && not (
+                        wireCase.Version > 1
+                        && version = wireCase.Version - 1
+                        && name <> "AbortSession"
+                        && name <> "SuspendableAbortSession"
+                    )
                 then
                     this.refuse
                         Telemetry.RejectionFailed

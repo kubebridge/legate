@@ -75,6 +75,21 @@ internal sealed class ScriptedClient : IChatClient
     }
 }
 
+// Compile-time C# proof of the targeted, receipt-returning control boundary.
+// Callers retain expectedTurnId across uncertain responses instead of retargeting retries.
+internal static class HostAbortControl
+{
+    internal static Task<HostAbortReceipt> RequestAsync(
+        SessionClient client, SessionId sessionId, TurnId expectedTurnId,
+        CancellationToken cancellationToken) =>
+        client.AbortAsync(sessionId, expectedTurnId, StopCause.ExplicitAbort,
+            "host requested stop", cancellationToken);
+
+    internal static Task<AbortTarget?> ReadTargetAsync(
+        SessionClient client, SessionId sessionId, CancellationToken cancellationToken) =>
+        client.ReadAbortTargetAsync(sessionId, cancellationToken);
+}
+
 internal sealed class StubScriptedProvider : ILlmProvider
 {
     private readonly IChatClient _client;

@@ -63,7 +63,657 @@ type SessionStoreConformance(store: ISessionStore, clock: TestClock, tenant: Ten
             PermissionGrants = ResizeArray<string>() :> IReadOnlyList<string>
         }
 
+    /// Establishes a genuine prime and a separately bound real-entry control target.
+    member this.ControlWork() =
+        task {
+            let control = store :?> ISessionAbortControlStore
+            let! session = store.CreateSession(tenant, this.SampleSession(), CancellationToken.None)
+
+            let! _ =
+                store.AppendInboxMessage(
+                    tenant,
+                    session.Id,
+                    UserMessagePayload(UserMessage.Text "prime"),
+                    DeliveryMode.Queue,
+                    CancellationToken.None
+                )
+
+            let! lease =
+                store.ClaimNextTurn(
+                    tenant,
+                    session.Id,
+                    "control-owner",
+                    TimeSpan.FromMinutes 5.0,
+                    CancellationToken.None
+                )
+
+            let claim =
+                match lease with
+                | :? TurnLeaseRenewed as lease -> lease.Claim
+                | _ -> failwith "Prime not established."
+
+            let! entry =
+                store.AppendInboxMessage(
+                    tenant,
+                    session.Id,
+                    UserMessagePayload(UserMessage.Text "real entry"),
+                    DeliveryMode.Queue,
+                    CancellationToken.None
+                )
+
+            let turn = TurnId.New()
+
+            let! binding =
+                control.BindControlTarget(tenant, session.Id, turn, entry.Position, claim, CancellationToken.None)
+
+            Assert.Equal(ControlOperationOutcome.Applied, binding.Outcome)
+            let! _ = store.UpdateSessionState(tenant, session.Id, SessionState.Running, CancellationToken.None)
+            return control, session.Id, entry, turn, claim
+        }
+
+    /// Acceptance changes only intent, with immutable retries and exact tenant isolation.
+    [<Fact>]
+    member this.``control acceptance preserves current work and immutable first receipt``() =
+        task {
+            let! control, session, entry, turn, claim = this.ControlWork()
+
+            for delivery in
+                [
+                    DeliveryMode.Queue
+                    DeliveryMode.Inject
+                    DeliveryMode.Interrupt
+                ] do
+                let! _ =
+                    store.AppendInboxMessage(
+                        tenant,
+                        session,
+                        UserMessagePayload(UserMessage.Text "unrelated"),
+                        delivery,
+                        CancellationToken.None
+                    )
+
+                ()
+
+            let! before = store.ReadPendingInbox(tenant, session, CancellationToken.None)
+            let! sessionBefore = store.GetSession(tenant, session, CancellationToken.None)
+
+            let! accepted =
+                control.RequestHostAbort(tenant, session, turn, StopCause.HostShutdown, "first", CancellationToken.None)
+
+            let! duplicate =
+                control.RequestHostAbort(
+                    tenant,
+                    session,
+                    turn,
+                    StopCause.ExplicitAbort,
+                    "second",
+                    CancellationToken.None
+                )
+
+            Assert.Equal(HostAbortOutcome.Accepted, accepted.Outcome)
+            Assert.Equal(HostAbortOutcome.AlreadyAccepted, duplicate.Outcome)
+            Assert.Equal(accepted.AcceptedAt, duplicate.AcceptedAt)
+            Assert.Equal(accepted.Cause, duplicate.Cause)
+            Assert.Equal("first", duplicate.Reason)
+
+            match typeof<HostAbortReceipt>.GetProperty("Reason") with
+            | null -> failwith "Missing C# setter"
+            | property -> property.SetValue(accepted, "caller mutation")
+
+            let! again =
+                control.RequestHostAbort(
+                    tenant,
+                    session,
+                    turn,
+                    StopCause.ExplicitAbort,
+                    "third",
+                    CancellationToken.None
+                )
+
+            Assert.Equal("first", again.Reason)
+            let! after = store.ReadPendingInbox(tenant, session, CancellationToken.None)
+            Assert.Equal<int64>(before |> Seq.map _.Position, after |> Seq.map _.Position)
+            Assert.Equal<bool>(before |> Seq.map _.Consumed, after |> Seq.map _.Consumed)
+            let! sessionAfter = store.GetSession(tenant, session, CancellationToken.None)
+
+            Assert.Equal(
+                System.Text.Json.JsonSerializer.Serialize(sessionBefore),
+                System.Text.Json.JsonSerializer.Serialize(sessionAfter)
+            )
+
+            let! verified = store.VerifyClaim(tenant, claim, CancellationToken.None)
+
+            let current =
+                match verified with
+                | :? TurnLeaseHeld as lease -> lease.Claim
+                | _ -> failwith "Claim changed."
+
+            Assert.Equal(claim, current)
+
+            let! admission =
+                control.CheckControlTarget(tenant, session, turn, entry.Position, claim, CancellationToken.None)
+
+            Assert.Equal(ControlOperationOutcome.Stopped, admission.Outcome)
+
+            let! _ =
+                Assert.ThrowsAsync<SessionNotFoundException>(fun () ->
+                    control.RequestHostAbort(
+                        this.OtherTenant,
+                        session,
+                        turn,
+                        StopCause.ExplicitAbort,
+                        "wrong",
+                        CancellationToken.None
+                    ))
+
+            let! stale =
+                control.RequestHostAbort(
+                    tenant,
+                    session,
+                    TurnId.New(),
+                    StopCause.ExplicitAbort,
+                    "stale",
+                    CancellationToken.None
+                )
+
+            Assert.Equal(HostAbortOutcome.TargetChanged, stale.Outcome)
+        }
+
+    /// All terminal statuses retire one entry while retaining the genuine shared prime.
+    [<Theory>]
+    [<InlineData(TurnStatus.Completed)>]
+    [<InlineData(TurnStatus.Failed)>]
+    [<InlineData(TurnStatus.Aborted)>]
+    member this.``control retirement isolates two real entries sharing a prime``(status: TurnStatus) =
+        task {
+            let! control, session, entry, turn, claim = this.ControlWork()
+
+            let cause, reason =
+                if status = TurnStatus.Aborted then
+                    Nullable StopCause.ExplicitAbort, ("local": string | null)
+                else
+                    Nullable(), null
+
+            let id = Guid.NewGuid().ToString("N")
+
+            let! applied =
+                control.TryDecideControlTarget(
+                    tenant,
+                    session,
+                    turn,
+                    entry.Position,
+                    claim,
+                    id,
+                    status,
+                    cause,
+                    reason,
+                    CancellationToken.None
+                )
+
+            Assert.Equal(ControlOperationOutcome.Applied, applied.Outcome)
+
+            let evidence =
+                match applied.Decision with
+                | null -> failwith "Missing evidence"
+                | decision -> decision
+
+            Assert.Equal(status, evidence.Status)
+
+            let! stopped =
+                control.RequestHostAbort(
+                    tenant,
+                    session,
+                    turn,
+                    StopCause.HostShutdown,
+                    "too late",
+                    CancellationToken.None
+                )
+
+            Assert.Equal(HostAbortOutcome.AlreadyTerminal, stopped.Outcome)
+            Assert.Equal(Nullable status, stopped.TerminalStatus)
+
+            let! notReady =
+                control.RetireControlTarget(tenant, session, turn, entry.Position, claim, id, CancellationToken.None)
+
+            Assert.Equal(ControlOperationOutcome.NotReady, notReady.Outcome)
+            let! _ = store.MarkInboxConsumed(tenant, session, [| entry.Position |], CancellationToken.None)
+
+            let! retired =
+                control.RetireControlTarget(tenant, session, turn, entry.Position, claim, id, CancellationToken.None)
+
+            Assert.Equal(ControlOperationOutcome.Applied, retired.Outcome)
+
+            let! next =
+                store.AppendInboxMessage(
+                    tenant,
+                    session,
+                    UserMessagePayload(UserMessage.Text "next"),
+                    DeliveryMode.Queue,
+                    CancellationToken.None
+                )
+
+            let nextTurn = TurnId.New()
+
+            let! nextBinding =
+                control.BindControlTarget(tenant, session, nextTurn, next.Position, claim, CancellationToken.None)
+
+            Assert.Equal(ControlOperationOutcome.Applied, nextBinding.Outcome)
+
+            let! late =
+                control.RetireControlTarget(tenant, session, turn, entry.Position, claim, id, CancellationToken.None)
+
+            Assert.Equal(ControlOperationOutcome.AlreadyRetired, late.Outcome)
+            let! current = control.ReadAbortTarget(tenant, session, CancellationToken.None)
+
+            match current with
+            | null -> failwith "New binding was cleared"
+            | target -> Assert.Equal(nextTurn, target.TurnId)
+
+            let! admitted =
+                control.CheckControlTarget(tenant, session, nextTurn, next.Position, claim, CancellationToken.None)
+
+            Assert.Equal(ControlOperationOutcome.Applied, admitted.Outcome)
+            let! verified = store.VerifyClaim(tenant, claim, CancellationToken.None)
+            Assert.IsType<TurnLeaseHeld>(verified) |> ignore
+        }
+
+    /// Accepted intent wins before the control decision, even against a final successful result.
+    [<Theory>]
+    [<InlineData(TurnStatus.Completed)>]
+    [<InlineData(TurnStatus.Failed)>]
+    member this.``accepted stop wins decision and survives terminal retry``(proposal: TurnStatus) =
+        task {
+            let! control, session, entry, turn, claim = this.ControlWork()
+
+            let! receipt =
+                control.RequestHostAbort(
+                    tenant,
+                    session,
+                    turn,
+                    StopCause.HostShutdown,
+                    "shutdown",
+                    CancellationToken.None
+                )
+
+            let id = Guid.NewGuid().ToString("N")
+
+            let! selected =
+                control.TryDecideControlTarget(
+                    tenant,
+                    session,
+                    turn,
+                    entry.Position,
+                    claim,
+                    id,
+                    proposal,
+                    Nullable(),
+                    null,
+                    CancellationToken.None
+                )
+
+            let evidence =
+                match selected.Decision with
+                | null -> failwith "Missing decision"
+                | evidence -> evidence
+
+            Assert.Equal(TurnStatus.Aborted, evidence.Status)
+            Assert.Equal(receipt.Cause, evidence.Cause)
+            Assert.Equal(receipt.Reason, evidence.Reason)
+
+            let staleClaim =
+                { claim with
+                    Token = "stale"
+                    Owner = "loser"
+                }
+
+            let! duplicate =
+                control.TryDecideControlTarget(
+                    tenant,
+                    session,
+                    turn,
+                    entry.Position,
+                    staleClaim,
+                    id,
+                    proposal,
+                    Nullable(),
+                    null,
+                    CancellationToken.None
+                )
+
+            Assert.Equal(ControlOperationOutcome.AlreadyDecided, duplicate.Outcome)
+            Assert.Equal(selected.Decision, duplicate.Decision)
+
+            let! changed =
+                control.TryDecideControlTarget(
+                    tenant,
+                    session,
+                    turn,
+                    entry.Position,
+                    claim,
+                    id,
+                    TurnStatus.Aborted,
+                    Nullable StopCause.ExplicitAbort,
+                    "different",
+                    CancellationToken.None
+                )
+
+            Assert.Equal(ControlOperationOutcome.Conflict, changed.Outcome)
+
+            let! competitor =
+                control.TryDecideControlTarget(
+                    tenant,
+                    session,
+                    turn,
+                    entry.Position,
+                    claim,
+                    "other",
+                    proposal,
+                    Nullable(),
+                    null,
+                    CancellationToken.None
+                )
+
+            Assert.Equal(ControlOperationOutcome.DecisionConflict, competitor.Outcome)
+
+            let! lost =
+                control.RetireControlTarget(
+                    tenant,
+                    session,
+                    turn,
+                    entry.Position,
+                    staleClaim,
+                    id,
+                    CancellationToken.None
+                )
+
+            Assert.Equal(ControlOperationOutcome.LostAuthority, lost.Outcome)
+            let! _ = store.MarkInboxConsumed(tenant, session, [| entry.Position |], CancellationToken.None)
+
+            let! _ =
+                control.RetireControlTarget(tenant, session, turn, entry.Position, claim, id, CancellationToken.None)
+
+            let! _ = store.CloseSession(tenant, session, CancellationToken.None)
+
+            let! retry =
+                control.RequestHostAbort(
+                    tenant,
+                    session,
+                    turn,
+                    StopCause.ExplicitAbort,
+                    "changed",
+                    CancellationToken.None
+                )
+
+            Assert.Equal(HostAbortOutcome.AlreadyAccepted, retry.Outcome)
+            Assert.Equal(receipt.AcceptedAt, retry.AcceptedAt)
+        }
+
+    /// Fencing and cancellation refuse before any new control evidence is committed.
+    [<Fact>]
+    member this.``control rejects wrong prime association cancellation and invalid arguments``() =
+        task {
+            let! control, session, entry, turn, claim = this.ControlWork()
+            let stale = { claim with Owner = "not the owner" }
+
+            let! refused =
+                control.TryDecideControlTarget(
+                    tenant,
+                    session,
+                    turn,
+                    entry.Position,
+                    stale,
+                    "decision",
+                    TurnStatus.Completed,
+                    Nullable(),
+                    null,
+                    CancellationToken.None
+                )
+
+            Assert.Equal(ControlOperationOutcome.LostAuthority, refused.Outcome)
+
+            let! wrongPosition =
+                control.TryDecideControlTarget(
+                    tenant,
+                    session,
+                    turn,
+                    entry.Position + 1L,
+                    claim,
+                    "decision",
+                    TurnStatus.Completed,
+                    Nullable(),
+                    null,
+                    CancellationToken.None
+                )
+
+            Assert.Equal(ControlOperationOutcome.TargetChanged, wrongPosition.Outcome)
+            use cancelled = new CancellationTokenSource()
+            cancelled.Cancel()
+
+            let! _ =
+                Assert.ThrowsAnyAsync<OperationCanceledException>(fun () ->
+                    control.RequestHostAbort(
+                        tenant,
+                        session,
+                        turn,
+                        StopCause.ExplicitAbort,
+                        "cancelled",
+                        cancelled.Token
+                    ))
+
+            let! _ =
+                Assert.ThrowsAsync<ArgumentOutOfRangeException>(fun () ->
+                    control.RequestHostAbort(
+                        tenant,
+                        session,
+                        turn,
+                        StopCause.Deadline,
+                        "invalid",
+                        CancellationToken.None
+                    ))
+
+            let! _ =
+                Assert.ThrowsAsync<ArgumentException>(fun () ->
+                    control.RequestHostAbort(
+                        tenant,
+                        session,
+                        turn,
+                        StopCause.ExplicitAbort,
+                        String('x', 513),
+                        CancellationToken.None
+                    ))
+
+            let! current = control.ReadAbortTarget(tenant, session, CancellationToken.None)
+
+            match current with
+            | null -> failwith "Binding lost"
+            | target -> Assert.Null target.Stop
+        }
+
     // ── Tenancy ──
+
+    /// Unstopped recovery preserves target/entry and fences the old owner without claiming queued work.
+    [<Theory>]
+    [<InlineData(false)>]
+    [<InlineData(true)>]
+    member this.``unstopped control recovery preserves original pending or consumed entry``(consumed: bool) =
+        task {
+            let! control, session, entry, turn, oldClaim = this.ControlWork()
+
+            if consumed then
+                let! _ = store.MarkInboxConsumed(tenant, session, [| entry.Position |], CancellationToken.None)
+                ()
+
+            let! queued =
+                store.AppendInboxMessage(
+                    tenant,
+                    session,
+                    UserMessagePayload(UserMessage.Text "unrelated"),
+                    DeliveryMode.Interrupt,
+                    CancellationToken.None
+                )
+
+            let! held =
+                control.TryRecoverControlTarget(
+                    tenant,
+                    session,
+                    turn,
+                    "new owner",
+                    TimeSpan.FromMinutes 5.0,
+                    CancellationToken.None
+                )
+
+            Assert.Equal(ControlOperationOutcome.LostAuthority, held.Outcome)
+            Assert.Null(held.Claim)
+            clock.Advance(TimeSpan.FromMinutes 6.0)
+
+            let! recovered =
+                control.TryRecoverControlTarget(
+                    tenant,
+                    session,
+                    turn,
+                    "new owner",
+                    TimeSpan.FromMinutes 5.0,
+                    CancellationToken.None
+                )
+
+            Assert.Equal(ControlOperationOutcome.Applied, recovered.Outcome)
+
+            match recovered.Claim, recovered.Entry, recovered.Target with
+            | null, _, _
+            | _, null, _
+            | _, _, null -> failwith "Missing recovered authority or original entry"
+            | claim, original, target ->
+                Assert.Equal(oldClaim.TurnId, claim.TurnId)
+                Assert.NotEqual<string>(oldClaim.Token, claim.Token)
+                Assert.Equal(oldClaim.Attempt + 1, claim.Attempt)
+                Assert.Equal(entry.Position, original.Position)
+                Assert.Equal(consumed, original.Consumed)
+                Assert.Equal(turn, target.TurnId)
+
+                let! old =
+                    control.CheckControlTarget(tenant, session, turn, entry.Position, oldClaim, CancellationToken.None)
+
+                Assert.Equal(ControlOperationOutcome.LostAuthority, old.Outcome)
+
+                let! winner =
+                    control.CheckControlTarget(tenant, session, turn, entry.Position, claim, CancellationToken.None)
+
+                Assert.Equal(ControlOperationOutcome.Applied, winner.Outcome)
+
+            let! pending = store.ReadPendingInbox(tenant, session, CancellationToken.None)
+            Assert.Contains(pending, fun item -> item.Position = queued.Position && not item.Consumed)
+        }
+
+    /// Recovery never transfers authority for accepted stop or pending terminal work.
+    [<Theory>]
+    [<InlineData(false)>]
+    [<InlineData(true)>]
+    member this.``control recovery refuses stopped and terminal pending targets``(decided: bool) =
+        task {
+            let! control, session, entry, turn, claim = this.ControlWork()
+
+            if decided then
+                let! _ =
+                    control.TryDecideControlTarget(
+                        tenant,
+                        session,
+                        turn,
+                        entry.Position,
+                        claim,
+                        "report",
+                        TurnStatus.Completed,
+                        Nullable(),
+                        null,
+                        CancellationToken.None
+                    )
+
+                ()
+            else
+                let! _ =
+                    control.RequestHostAbort(
+                        tenant,
+                        session,
+                        turn,
+                        StopCause.HostShutdown,
+                        "stop",
+                        CancellationToken.None
+                    )
+
+                ()
+
+            clock.Advance(TimeSpan.FromMinutes 6.0)
+
+            let! refused =
+                control.TryRecoverControlTarget(
+                    tenant,
+                    session,
+                    turn,
+                    "new owner",
+                    TimeSpan.FromMinutes 5.0,
+                    CancellationToken.None
+                )
+
+            Assert.Equal(ControlOperationOutcome.Stopped, refused.Outcome)
+            Assert.Null(refused.Claim)
+            let! rows = store.ReadPendingInbox(tenant, session, CancellationToken.None)
+            Assert.Single(rows) |> ignore
+        }
+
+    /// Concurrent requests have one immutable winner under the provider serialization boundary.
+    [<Fact>]
+    member this.``concurrent host stops retain one exact first receipt``() =
+        task {
+            let! control, session, _, turn, _ = this.ControlWork()
+            use start = new ManualResetEventSlim(false)
+
+            let first =
+                Task.Run(fun () ->
+                    start.Wait()
+
+                    control
+                        .RequestHostAbort(
+                            tenant,
+                            session,
+                            turn,
+                            StopCause.ExplicitAbort,
+                            "first",
+                            CancellationToken.None
+                        )
+                        .GetAwaiter()
+                        .GetResult())
+
+            let second =
+                Task.Run(fun () ->
+                    start.Wait()
+
+                    control
+                        .RequestHostAbort(
+                            tenant,
+                            session,
+                            turn,
+                            StopCause.HostShutdown,
+                            "second",
+                            CancellationToken.None
+                        )
+                        .GetAwaiter()
+                        .GetResult())
+
+            start.Set()
+            let! responses = Task.WhenAll(first, second)
+
+            Assert.Single(responses |> Array.filter (fun item -> item.Outcome = HostAbortOutcome.Accepted))
+            |> ignore
+
+            Assert.Single(
+                responses
+                |> Array.filter (fun item -> item.Outcome = HostAbortOutcome.AlreadyAccepted)
+            )
+            |> ignore
+
+            Assert.Equal(responses[0].Reason, responses[1].Reason)
+            Assert.Equal(responses[0].Cause, responses[1].Cause)
+            Assert.Equal(responses[0].AcceptedAt, responses[1].AcceptedAt)
+        }
 
     [<Fact>]
     member this.``GetSession resolves null for the wrong tenant``() =

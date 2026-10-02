@@ -920,7 +920,7 @@ let ``Reply with an unknown request id throws ReplyMismatch`` () : Task =
 // Abort
 
 [<Fact>]
-let ``Abort on Idle is a no-op`` () : Task =
+let ``Abort on Idle reports NoCurrentTurn`` () : Task =
     task {
         use provider =
             (createServices (scripted [ ScriptStep.Text "done" ]) (sourced [])).BuildServiceProvider()
@@ -930,14 +930,17 @@ let ``Abort on Idle is a no-op`` () : Task =
                 task {
                     let! created = openSession client
 
-                    do!
+                    let! receipt =
                         SessionClientOperations.AbortAsync(
                             client,
                             created.Id,
+                            TurnId.New(),
                             StopCause.ExplicitAbort,
                             "nothing runs",
                             CancellationToken.None
                         )
+
+                    receipt.Outcome |> should equal HostAbortOutcome.NoCurrentTurn
 
                     let! stored = storedOf client created.Id
                     stored.State |> should equal SessionState.Idle
@@ -985,14 +988,25 @@ let ``Abort while Running settles Aborted with zero loser effects`` () : Task =
                         let! _ = awaitWhat prompt "the prompt to land"
                         Assert.True(entered.Wait(waitBound))
 
-                        do!
+                        let! current =
+                            SessionClientOperations.ReadAbortTargetAsync(client, created.Id, CancellationToken.None)
+
+                        let target =
+                            match current with
+                            | null -> failwith "No current control target."
+                            | target -> target
+
+                        let! receipt =
                             SessionClientOperations.AbortAsync(
                                 client,
                                 created.Id,
+                                target.TurnId,
                                 StopCause.ExplicitAbort,
                                 "test-abort",
                                 CancellationToken.None
                             )
+
+                        receipt.Outcome |> should equal HostAbortOutcome.Accepted
 
                         // The loser reports back after the release, and the
                         // recorded stop maps its finish to Aborted.
@@ -1021,7 +1035,7 @@ let ``Abort while Running settles Aborted with zero loser effects`` () : Task =
     }
 
 [<Fact>]
-let ``Abort while WaitingForInput is a no-op and Reply still resumes`` () : Task =
+let ``Abort while WaitingForInput refuses and Reply still resumes`` () : Task =
     task {
         let chat =
             scripted
@@ -1062,14 +1076,24 @@ let ``Abort while WaitingForInput is a no-op and Reply still resumes`` () : Task
                             | :? PermissionRequestedEvent as asked when not (isNull (box asked)) -> Some asked
                             | _ -> None)
 
-                    do!
-                        SessionClientOperations.AbortAsync(
-                            client,
-                            created.Id,
-                            StopCause.ExplicitAbort,
-                            "suspended",
-                            CancellationToken.None
-                        )
+                    let! current =
+                        SessionClientOperations.ReadAbortTargetAsync(client, created.Id, CancellationToken.None)
+
+                    let target =
+                        match current with
+                        | null -> failwith "No suspended control target."
+                        | target -> target
+
+                    let! _ =
+                        Assert.ThrowsAsync<InvalidSessionStateException>(fun () ->
+                            SessionClientOperations.AbortAsync(
+                                client,
+                                created.Id,
+                                target.TurnId,
+                                StopCause.ExplicitAbort,
+                                "suspended",
+                                CancellationToken.None
+                            ))
 
                     let! stored = storedOf client created.Id
                     stored.State |> should equal SessionState.WaitingForInput
@@ -1101,6 +1125,7 @@ let ``Abort validates the session and the cause`` () : Task =
                             SessionClientOperations.AbortAsync(
                                 client,
                                 SessionId.New(),
+                                TurnId.New(),
                                 StopCause.ExplicitAbort,
                                 "gone",
                                 CancellationToken.None
@@ -1115,6 +1140,7 @@ let ``Abort validates the session and the cause`` () : Task =
                             SessionClientOperations.AbortAsync(
                                 client,
                                 created.Id,
+                                TurnId.New(),
                                 StopCause.Deadline,
                                 "not abort-family",
                                 CancellationToken.None
@@ -2821,6 +2847,77 @@ let ``ForkAsync marks the completion era`` () : Task =
                     marked[0] |> should equal (client.Tenant, created.Id)
                     marked[1] |> should equal (client.Tenant, forked.Id)
                 })
+    }
+
+[<Fact>]
+let ``Public DI abort accepts without a started actor system or any route resolution`` () : Task =
+    task {
+        use provider =
+            (createServices (scripted [ ScriptStep.Text "must not run" ]) (sourced [])).BuildServiceProvider()
+
+        let client = provider.GetRequiredService<SessionClient>()
+        // Opening succeeds despite unavailable resolution; no host or actor system is started.
+        let! session = openSession client
+
+        let! _ =
+            Assert.ThrowsAsync<InvalidOperationException>(fun () -> client.Resolve(session.Id, CancellationToken.None))
+
+        let control = client.Store :?> ISessionAbortControlStore
+
+        let! _ =
+            client.Store.AppendInboxMessage(
+                client.Tenant,
+                session.Id,
+                UserMessagePayload(UserMessage.Text "prime"),
+                DeliveryMode.Queue,
+                CancellationToken.None
+            )
+
+        let! lease =
+            client.Store.ClaimNextTurn(
+                client.Tenant,
+                session.Id,
+                "test owner",
+                TimeSpan.FromMinutes 5.0,
+                CancellationToken.None
+            )
+
+        let claim =
+            match lease with
+            | :? TurnLeaseRenewed as lease -> lease.Claim
+            | _ -> failwith "No prime"
+
+        let! entry =
+            client.Store.AppendInboxMessage(
+                client.Tenant,
+                session.Id,
+                UserMessagePayload(UserMessage.Text "real"),
+                DeliveryMode.Queue,
+                CancellationToken.None
+            )
+
+        let turn = TurnId.New()
+
+        let! _ =
+            control.BindControlTarget(client.Tenant, session.Id, turn, entry.Position, claim, CancellationToken.None)
+
+        let! _ =
+            client.Store.UpdateSessionState(client.Tenant, session.Id, SessionState.Running, CancellationToken.None)
+
+        let! before = client.Store.ReadPendingInbox(client.Tenant, session.Id, CancellationToken.None)
+        let! receipt = client.AbortAsync(session.Id, turn, StopCause.HostShutdown, "durable", CancellationToken.None)
+        Assert.Equal(HostAbortOutcome.Accepted, receipt.Outcome)
+        let! current = client.ReadAbortTargetAsync(session.Id, CancellationToken.None)
+
+        match current with
+        | null -> failwith "Target missing"
+        | target -> Assert.Equal(turn, target.TurnId)
+
+        let! after = client.Store.ReadPendingInbox(client.Tenant, session.Id, CancellationToken.None)
+        Assert.Equal<int64>(before |> Seq.map _.Position, after |> Seq.map _.Position)
+        Assert.Empty(PromptWaitHubs.GetOrAdd(session.Id).Settled)
+        let! stillOwned = client.Store.VerifyClaim(client.Tenant, claim, CancellationToken.None)
+        Assert.IsType<TurnLeaseHeld>(stillOwned) |> ignore
     }
 
 [<Fact>]

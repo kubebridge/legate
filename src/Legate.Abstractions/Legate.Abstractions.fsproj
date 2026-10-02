@@ -35,6 +35,7 @@
     <Compile Include="Transcripts.fs" />
     <Compile Include="ContextPruning.fs" />
     <Compile Include="SessionsStore.fs" />
+    <Compile Include="SessionAbortControl.fs" />
     <Compile Include="SessionEventStore.fs" />
     <Compile Include="AgentStore.fs" />
     <Compile Include="AgentPackages.fs" />

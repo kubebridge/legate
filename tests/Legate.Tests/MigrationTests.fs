@@ -188,6 +188,7 @@ let ``Migrations create all eleven tables with their indexes`` () =
             "inbox"
             "outbox"
             "schedule_occurrences"
+            "session_control"
             "session_grants"
             "sessions"
             "turn_completion_era"

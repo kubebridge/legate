@@ -6,6 +6,7 @@ open System.Collections.Generic
 open System.Threading
 open System.Threading.Tasks
 open Legate
+open Legate.Storage
 open Microsoft.Data.Sqlite
 
 // The SQLite ISessionStore: session CRUD, the inbox, turn claims under a
@@ -375,6 +376,44 @@ type SqliteSessionStore(database: SqliteDatabase) =
     /// over the turn_completion_era table. Internal: the registration
     /// closes the runtime's era gate over it. A missing table (migrations
     /// not run) throws, and the gate degrades to pre-era quiet.
+    let controlTable () =
+        "\"" + database.Table "session_control" + "\""
+
+    let requireNoBinding connection transaction tenant sessionId =
+        RelationalControlTarget.requireNoBinding connection transaction (controlTable ()) tenant sessionId
+
+    let control tenant sessionId (ct: CancellationToken) operation =
+        task {
+            try
+                return
+                    lock database.Gate (fun () ->
+                        ct.ThrowIfCancellationRequested()
+                        use connection = database.OpenConnection()
+                        use transaction = connection.BeginTransaction(deferred = false)
+
+                        let result =
+                            RelationalControlTarget.invoke
+                                connection
+                                transaction
+                                $"\"{sessionsTable ()}\""
+                                $"\"{inboxTable ()}\""
+                                $"\"{turnsTable ()}\""
+                                (controlTable ())
+                                false
+                                tenant
+                                sessionId
+                                (fun () -> database.UtcNow)
+                                ct
+                                operation
+
+                        ct.ThrowIfCancellationRequested()
+                        transaction.Commit()
+                        ct.ThrowIfCancellationRequested()
+                        result)
+            with :? SqliteException as ex ->
+                return raise (mapSql ex)
+        }
+
     member internal _.MarkCompletionEraAsync
         (tenant: TenantId, sessionId: SessionId, _cancellationToken: CancellationToken)
         : Task =
@@ -414,6 +453,64 @@ type SqliteSessionStore(database: SqliteDatabase) =
                     use reader = command.ExecuteReader()
                     reader.Read())
         }
+
+    interface ISessionAbortControlStore with
+        member _.TryRecoverControlTarget(tenant, sessionId, turn, owner, duration, ct) =
+            task {
+                try
+                    return
+                        lock database.Gate (fun () ->
+                            ct.ThrowIfCancellationRequested()
+                            use connection = database.OpenConnection()
+                            use transaction = connection.BeginTransaction(deferred = false)
+
+                            let result =
+                                RelationalControlTarget.recover
+                                    connection
+                                    transaction
+                                    $"\"{sessionsTable ()}\""
+                                    $"\"{inboxTable ()}\""
+                                    $"\"{turnsTable ()}\""
+                                    (controlTable ())
+                                    false
+                                    tenant
+                                    sessionId
+                                    (fun () -> database.UtcNow)
+                                    ct
+                                    turn
+                                    owner
+                                    duration
+
+                            ct.ThrowIfCancellationRequested()
+                            transaction.Commit()
+                            ct.ThrowIfCancellationRequested()
+                            result)
+                with :? SqliteException as ex ->
+                    return raise (mapSql ex)
+            }
+
+        member _.ReadAbortTarget(tenant, sessionId, ct) =
+            control tenant sessionId ct (fun context state -> ControlTargetProtocol.read context state, state)
+
+        member _.RequestHostAbort(tenant, sessionId, turn, cause, reason, ct) =
+            control tenant sessionId ct (fun context state ->
+                ControlTargetProtocol.request context state turn cause reason)
+
+        member _.BindControlTarget(tenant, sessionId, turn, position, claim, ct) =
+            control tenant sessionId ct (fun context state ->
+                ControlTargetProtocol.bind context state turn position claim)
+
+        member _.CheckControlTarget(tenant, sessionId, turn, position, claim, ct) =
+            control tenant sessionId ct (fun context state ->
+                ControlTargetProtocol.check context state turn position claim, state)
+
+        member _.TryDecideControlTarget(tenant, sessionId, turn, position, claim, id, status, cause, reason, ct) =
+            control tenant sessionId ct (fun context state ->
+                ControlTargetProtocol.decide context state turn position claim id status cause reason)
+
+        member _.RetireControlTarget(tenant, sessionId, turn, position, claim, id, ct) =
+            control tenant sessionId ct (fun context state ->
+                ControlTargetProtocol.retire context state turn position claim id)
 
     interface ISessionStore with
 
@@ -487,6 +584,14 @@ type SqliteSessionStore(database: SqliteDatabase) =
                             insert.Parameters.AddWithValue("$options", optionsJson) |> ignore
                             insert.Parameters.AddWithValue("$grants", grantsJson) |> ignore
                             insert.ExecuteNonQuery() |> ignore
+
+                            RelationalControlTarget.initialize
+                                connection
+                                transaction
+                                (controlTable ())
+                                tenant
+                                session.Id
+
                             transaction.Commit()
 
                             { session with
@@ -608,6 +713,14 @@ type SqliteSessionStore(database: SqliteDatabase) =
                             use transaction = connection.BeginTransaction()
                             let session = requireSessionRow connection transaction tenant sessionId
 
+                            ControlTargetProtocol.requireTransition
+                                sessionId
+                                state
+                                (RelationalControlTarget.load connection transaction (controlTable ()) tenant sessionId)
+
+                            if state = SessionState.Idle || state = SessionState.Closed then
+                                requireNoBinding connection transaction tenant sessionId
+
                             if session.State = SessionState.Closed && state <> SessionState.Closed then
                                 raise (
                                     InvalidSessionStateException(
@@ -649,6 +762,7 @@ type SqliteSessionStore(database: SqliteDatabase) =
                             use connection = database.OpenConnection()
                             use transaction = connection.BeginTransaction()
                             let session = requireSessionRow connection transaction tenant sessionId
+                            requireNoBinding connection transaction tenant sessionId
 
                             if session.State = SessionState.Closed then
                                 transaction.Rollback()
@@ -944,6 +1058,7 @@ type SqliteSessionStore(database: SqliteDatabase) =
                             use transaction = connection.BeginTransaction()
                             requireSessionRow connection transaction tenant sessionId |> ignore
                             let now = database.UtcNow
+                            requireNoBinding connection transaction tenant sessionId
                             let expiresAt = now + leaseDuration
 
                             if liveClaimHeld connection transaction tenant sessionId then
@@ -1228,6 +1343,8 @@ type SqliteSessionStore(database: SqliteDatabase) =
                             match resolveClaim connection transaction tenant claim with
                             | Live(sessionId, _, _, _, _) ->
                                 let outcomeJson =
+                                    requireNoBinding connection transaction tenant sessionId
+
                                     if isNull (box outcome) then
                                         null
                                     else
@@ -1304,6 +1421,7 @@ type SqliteSessionStore(database: SqliteDatabase) =
 
                             match resolveClaim connection transaction tenant claim with
                             | Live(sessionId, _, _, expiresAt, _) ->
+                                requireNoBinding connection transaction tenant sessionId
                                 let now = database.UtcNow
 
                                 use update = connection.CreateCommand()

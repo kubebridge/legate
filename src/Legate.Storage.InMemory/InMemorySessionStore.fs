@@ -6,6 +6,7 @@ open System.Collections.Generic
 open System.Threading
 open System.Threading.Tasks
 open Legate
+open Legate.Storage
 
 /// The in-memory <see cref="T:Legate.ISessionStore" />: session CRUD, the
 /// inbox, turn claims under a lease with the fencing semantics the contract
@@ -141,6 +142,142 @@ type InMemorySessionStore(database: InMemoryDatabase) =
             LeaseExpiresAt = row.LeaseExpiresAt
         }
 
+    let controlState tenant sessionId =
+        requireSession tenant sessionId |> ignore
+
+        match database.ControlStates.TryGetValue((tenant, sessionId)) with
+        | true, text -> ControlTargetProtocol.decode sessionId text
+        | _ ->
+            raise (
+                InvalidSessionStateException(
+                    sessionId,
+                    "unsupportedControlFormat",
+                    "Legacy session control data is unsupported. Start a new session."
+                )
+            )
+
+    let controlContext tenant sessionId =
+        let session = requireSession tenant sessionId
+
+        let prime =
+            match database.LiveClaims.TryGetValue((tenant, sessionId)) with
+            | true, claim -> Some claim
+            | _ -> None
+
+        let entries =
+            match database.Inboxes.TryGetValue((tenant, sessionId)) with
+            | true, entries ->
+                entries
+                |> Seq.choose (fun entry ->
+                    match entry.Payload with
+                    | :? UserMessagePayload -> Some(entry.Position, entry.Consumed)
+                    | _ -> None)
+                |> Map.ofSeq
+            | _ -> Map.empty
+
+        {
+            SessionId = sessionId
+            Lifecycle = session.State
+            Now = database.UtcNow
+            Prime = prime
+            Entries = entries
+        }
+
+    let control tenant sessionId (ct: CancellationToken) operation =
+        ct.ThrowIfCancellationRequested()
+
+        lock database.Gate (fun () ->
+            ct.ThrowIfCancellationRequested()
+            let state = controlState tenant sessionId
+            let result, updated = operation (controlContext tenant sessionId) state
+            ct.ThrowIfCancellationRequested()
+
+            if not (obj.ReferenceEquals(state, updated)) then
+                let snapshot = ControlTargetProtocol.encode updated
+                ct.ThrowIfCancellationRequested()
+                database.ControlStates[(tenant, sessionId)] <- snapshot
+
+            ct.ThrowIfCancellationRequested()
+            result)
+        |> ok
+
+    let requireNoBinding tenant sessionId =
+        let state = controlState tenant sessionId
+
+        if not (isNull (box state.Binding)) then
+            raise (
+                InvalidSessionStateException(
+                    sessionId,
+                    "controlPending",
+                    "Current control work must be retired before changing prime ownership or lifecycle."
+                )
+            )
+
+    interface ISessionAbortControlStore with
+        member _.TryRecoverControlTarget(tenant, sessionId, turn, owner, duration, ct) =
+            control tenant sessionId ct (fun context state ->
+                let outcome, recovered =
+                    ControlTargetProtocol.recover context state turn owner duration
+
+                match recovered, state.Binding with
+                | Some claim, target ->
+                    match target with
+                    | null ->
+                        raise (
+                            InvalidSessionStateException(
+                                sessionId,
+                                "missingControlTarget",
+                                "Recovery has no original target."
+                            )
+                        )
+                    | target ->
+                        let entry =
+                            database.Inboxes[(tenant, sessionId)]
+                            |> Seq.find (fun entry -> entry.Position = target.InboxPosition)
+
+                        ct.ThrowIfCancellationRequested()
+                        database.LiveClaims[(tenant, sessionId)] <- { claim with Token = claim.Token }
+                        database.OpenTurns[(tenant, sessionId)] <- OpenTurnRow(claim.TurnId, claim.Attempt)
+
+                        {
+                            Outcome = outcome
+                            Target = target
+                            Claim = claim
+                            Entry = entry
+                        },
+                        state
+                | _ ->
+                    {
+                        Outcome = outcome
+                        Target = state.Binding
+                        Claim = null
+                        Entry = null
+                    },
+                    state)
+
+        member _.ReadAbortTarget(tenant, sessionId, ct) =
+            control tenant sessionId ct (fun context state -> ControlTargetProtocol.read context state, state)
+
+        member _.RequestHostAbort(tenant, sessionId, turn, cause, reason, ct) =
+            control tenant sessionId ct (fun context state ->
+                ControlTargetProtocol.request context state turn cause reason)
+
+        member _.BindControlTarget(tenant, sessionId, turn, position, claim, ct) =
+            control tenant sessionId ct (fun context state ->
+                ControlTargetProtocol.bind context state turn position claim)
+
+        member _.CheckControlTarget(tenant, sessionId, turn, position, claim, ct) =
+            control tenant sessionId ct (fun context state ->
+                ControlTargetProtocol.check context state turn position claim, state)
+
+        member _.TryDecideControlTarget(tenant, sessionId, turn, position, claim, id, status, cause, reason, ct) =
+            control tenant sessionId ct (fun context state ->
+                ControlTargetProtocol.decide context state turn position claim id status cause reason)
+
+        member _.RetireControlTarget(tenant, sessionId, turn, position, claim, id, ct) =
+            control tenant sessionId ct (fun context state ->
+                ControlTargetProtocol.retire context state turn position claim id)
+
     interface ISessionStore with
 
         member _.CreateSession(tenant, session, _) =
@@ -172,6 +309,10 @@ type InMemorySessionStore(database: InMemoryDatabase) =
                         }
 
                     database.Sessions[(tenant, session.Id)] <- stored
+
+                    database.ControlStates[(tenant, session.Id)] <-
+                        ControlTargetProtocol.encode (ControlTargetProtocol.fresh ())
+
                     stored)
             |> ok
 
@@ -228,6 +369,10 @@ type InMemorySessionStore(database: InMemoryDatabase) =
         member _.UpdateSessionState(tenant, sessionId, state, _) =
             lock database.Gate (fun () ->
                 let session = requireSession tenant sessionId
+                ControlTargetProtocol.requireTransition sessionId state (controlState tenant sessionId)
+
+                if state = SessionState.Idle || state = SessionState.Closed then
+                    requireNoBinding tenant sessionId
 
                 if session.State = SessionState.Closed && state <> SessionState.Closed then
                     raise (
@@ -251,6 +396,7 @@ type InMemorySessionStore(database: InMemoryDatabase) =
         member _.CloseSession(tenant, sessionId, _) =
             lock database.Gate (fun () ->
                 let session = requireSession tenant sessionId
+                requireNoBinding tenant sessionId
 
                 if session.State = SessionState.Closed then
                     session
@@ -417,6 +563,7 @@ type InMemorySessionStore(database: InMemoryDatabase) =
                 requireSession tenant sessionId |> ignore
 
                 let now = database.UtcNow
+                requireNoBinding tenant sessionId
                 let expiresAt = now + leaseDuration
 
                 // One live claim per session: an unexpired claim makes
@@ -585,6 +732,7 @@ type InMemorySessionStore(database: InMemoryDatabase) =
 
                 match resolve tenant claim with
                 | Choice1Of3(sessionId, _: TurnClaim) ->
+                    requireNoBinding tenant sessionId
                     // The token still fences: the first settle wins, and a
                     // lapsed-but-uncontested lease does not unseat it (a
                     // settle is terminal; nothing can take over a turn the
@@ -623,6 +771,7 @@ type InMemorySessionStore(database: InMemoryDatabase) =
                 match resolve tenant claim with
                 | Choice1Of3(sessionId, live) ->
                     // Abort settles Aborted and releases the lease; a
+                    requireNoBinding tenant sessionId
                     // later settle observes the applied settlement.
                     applySettlement tenant sessionId claim TurnStatus.Aborted null
                     TurnLeaseHeld live :> TurnLeaseState
