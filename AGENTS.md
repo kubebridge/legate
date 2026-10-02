@@ -102,11 +102,10 @@ dotnet test Legate.slnx                 # plain test run
   never finishes is almost always a stack overflow in the code under test
   (observed with a recursive `Equals`). Kill `testhost`, do not raise the
   timeout.
-- **DB tripwire files**: none (no database layer yet). When
-  `src/Legate.Storage.Postgres/**` or `src/Legate.Storage.Sqlite/**` exist,
-  changes there require the relevant store tests to run against a real
-  provider (SQLite locally; Postgres via Testcontainers in CI) before opening
-  or merging a PR.
+- **DB tripwire files**: `src/Legate.Storage.Postgres/**` and
+  `src/Legate.Storage.Sqlite/**`. Changes there require the relevant store
+  tests to run against a real provider (SQLite locally; Postgres via
+  Testcontainers in CI) before opening or merging a PR.
 - **Commit message convention**: single line, lowercase, imperative mood,
   under 72 characters (`add session store contract`).
 

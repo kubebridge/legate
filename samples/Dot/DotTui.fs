@@ -158,9 +158,7 @@ let runSpikeAsync
                 with _ ->
                     ()
 
-            let mutable editor = DotInput.empty
-            let mutable history = DotInput.emptyHistory
-            let mutable go = true
+            let input = DotTuiRouting.create ()
             let mutable scrollOffset = 0
             let mutable previousScreen: DotShell.Screen option = None
             let mutable lastPaintKey = None
@@ -188,18 +186,12 @@ let runSpikeAsync
                     "Enter to send · / for commands · Ctrl+O for a new line"
                 ]
 
-            // The open selection picker, if any: while open it owns
-            // Up/Down/Enter/Esc and the editor stays suspended. A pick
-            // resolves to the verbatim engine line typing the id would
-            // send; Esc closes with no routing.
-            let mutable picker: DotPicker.PickerState option = None
-
             // Opens the picker serving one bare command: items come from
             // the same reads the verbatim listing just printed (stored
             // sessions, registered providers, journal positions), so the
             // rows match the viewport. A failed read keeps the listing
             // and opens nothing; the verbatim lines already prove parity.
-            let openPickerAsync (kind: DotPicker.PickerKind) : Task =
+            let openPickerAsync (kind: DotPicker.PickerKind) : Task<DotPicker.PickerState option> =
                 task {
                     try
                         match kind with
@@ -225,7 +217,7 @@ let runSpikeAsync
                                         })
                                     |> List.ofSeq
 
-                            picker <- Some(DotPicker.fromItems kind items)
+                            return Some(DotPicker.fromItems kind items)
                         | DotPicker.SwitchModel ->
                             let! items =
                                 DotModels.discoverAsync
@@ -234,7 +226,7 @@ let runSpikeAsync
                                     engine.CurrentModel
                                     cancellationToken
 
-                            picker <- Some(DotPicker.fromItems kind items)
+                            return Some(DotPicker.fromItems kind items)
                         | DotPicker.ForkAtSequence ->
                             let! events = DotExport.readAllEventsAsync client engine.CurrentSessionId cancellationToken
 
@@ -257,9 +249,9 @@ let runSpikeAsync
                                         else
                                             all |> List.skip (all.Length - 100)
 
-                            picker <- Some(DotPicker.fromItems kind items)
+                            return Some(DotPicker.fromItems kind items)
                     with _ ->
-                        picker <- None
+                        return None
                 }
 
             let snapshotRenderer () : DotRender.RendererState = lock rendererGate (fun () -> renderer)
@@ -292,23 +284,28 @@ let runSpikeAsync
                             SessionState.Idle
 
                     let status = DotShell.statusText engine.CurrentSessionId engine.CurrentModel state
-                    let key = (width, height, editor, picker, view, status, scrollOffset)
+                    let key = (width, height, input.Editor, input.Picker, view, status, scrollOffset)
 
                     if lastPaintKey <> Some key then
-                        let slash = (DotInput.cursorLine editor).StartsWith("/", StringComparison.Ordinal)
+                        let slash =
+                            (DotInput.cursorLine input.Editor).StartsWith("/", StringComparison.Ordinal)
 
                         if slash && not wasSlash then
                             templates <- DotTemplates.listTemplates Environment.CurrentDirectory
 
                         wasSlash <- slash
-                        let hints = DotInput.queryHints (DotInput.cursorLine editor) templates
+                        let hints = DotInput.queryHints (DotInput.cursorLine input.Editor) templates
 
                         let inputRows, cursor =
-                            match picker with
+                            match DotTuiRouting.visiblePicker view input with
                             | Some shown -> DotShell.renderPickerOverlay (width - 1) false shown
                             | None ->
                                 let rows, cursor =
-                                    DotInput.renderInputRegion (width - 1) (max 3 (min 10 (height / 3))) editor hints
+                                    DotInput.renderInputRegion
+                                        (width - 1)
+                                        (max 3 (min 10 (height / 3)))
+                                        input.Editor
+                                        hints
                                 // The welcome screen documents shortcuts; keep the composer quiet.
                                 rows |> List.take (max 1 (rows.Length - 1)), cursor
 
@@ -355,99 +352,22 @@ let runSpikeAsync
                 with _ ->
                     ()
 
-            let route (intent: DotInput.InputIntent) : Task =
-                task {
-                    let view = snapshotRenderer ()
+            let routing: DotTuiRouting.Callbacks =
+                {
+                    SnapshotRenderer = snapshotRenderer
+                    UpdateRenderer = fun update -> lock rendererGate (fun () -> renderer <- update renderer)
+                    HandleLineAsync =
+                        fun line ->
+                            if not (line.StartsWith("/", StringComparison.Ordinal)) then
+                                scrollOffset <- 0
+                                lock rendererGate (fun () -> renderer <- DotRender.addUserMessage renderer line)
 
-                    match DotRender.firstQuestion view with
-                    | Some pending when intent <> DotInput.QuitTui ->
-                        match intent with
-                        | DotInput.SubmitText text ->
-                            // Verbatim like the REPL console reader: the
-                            // blank drop is bypassed, so a blank answer
-                            // resumes "" through the same ReplyAsync path.
-                            let answer = DotRender.answerForSubmit text
-
-                            try
-                                do! engine.ReplyQuestionAsync(pending.QuestionId, answer, cancellationToken)
-                            with _ ->
-                                ()
-
-                            editor <- DotInput.empty
-                        | DotInput.AbortTurn ->
-                            let! _ = engine.HandleLineAsync("/abort", cancellationToken)
-                            ()
-                        | DotInput.QuitTui ->
-                            let! keepGoing = engine.HandleLineAsync("/quit", cancellationToken)
-                            go <- go && keepGoing
-                        | DotInput.SteerText _
-                        | DotInput.Noop -> ()
-                    | _ ->
-                        match intent with
-                        | DotInput.SubmitText text ->
-                            match DotInput.submitLine text with
-                            | Some line ->
-                                if not (line.StartsWith("/", StringComparison.Ordinal)) then
-                                    scrollOffset <- 0
-                                    lock rendererGate (fun () -> renderer <- DotRender.addUserMessage renderer line)
-
-                                match DotPicker.progressFor line with
-                                | Some progress ->
-                                    // Long-running commands paint their
-                                    // start marker and route
-                                    // fire-and-forget, so the key pump
-                                    // never blocks: the completion line
-                                    // lands through the ring while input
-                                    // stays routable and /abort still lands.
-                                    lock rendererGate (fun () ->
-                                        renderer <-
-                                            match progress with
-                                            | DotPicker.CompactProgress -> DotRender.markCompactRunning renderer
-                                            | DotPicker.ExportProgress target ->
-                                                DotRender.markExportRunning renderer target)
-
-                                    let _ =
-                                        task {
-                                            try
-                                                let! _ = engine.HandleLineAsync(line, cancellationToken)
-                                                ()
-                                            with _ ->
-                                                ()
-                                        }
-
-                                    ()
-                                | None ->
-                                    let! keepGoing = engine.HandleLineAsync(line, cancellationToken)
-                                    go <- go && keepGoing
-
-                                    // Bare selection commands routed
-                                    // verbatim first (identical lines),
-                                    // then open the shared picker for
-                                    // one-key follow-up; Esc dismisses.
-                                    match DotPicker.pickerForBare line with
-                                    | Some kind -> do! openPickerAsync kind
-                                    | None -> ()
-                            | None -> ()
-                        | DotInput.SteerText text ->
-                            match DotInput.steerLine text with
-                            | Some routed ->
-                                let! keepGoing = engine.HandleLineAsync(routed, cancellationToken)
-                                go <- go && keepGoing
-                            | None -> ()
-                        | DotInput.AbortTurn ->
-                            let! _ = engine.HandleLineAsync("/abort", cancellationToken)
-                            ()
-                        | DotInput.QuitTui ->
-                            let! keepGoing = engine.HandleLineAsync("/quit", cancellationToken)
-                            go <- go && keepGoing
-                        | DotInput.Noop -> ()
+                            engine.HandleLineAsync(line, cancellationToken)
+                    ReplyQuestionAsync = fun id answer -> engine.ReplyQuestionAsync(id, answer, cancellationToken)
+                    ReplyPermissionAsync =
+                        fun id decision -> engine.ReplyPermissionAsync(id, decision, cancellationToken)
+                    OpenPickerAsync = openPickerAsync
                 }
-
-            // True when the modifiers carry exactly Control (plus optionally
-            // Shift, which terminals report for Ctrl+Shift+letter).
-            let isCtrlOnly (modifiers: ConsoleModifiers) : bool =
-                modifiers.HasFlag(ConsoleModifiers.Control)
-                && not (modifiers.HasFlag(ConsoleModifiers.Alt))
 
             // Key pump: inline approvals first (single owner), then the pure
             // decoder. A pending permission answers from a/s/d without
@@ -459,109 +379,36 @@ let runSpikeAsync
             // never blocks or throws out of the loop.
             let pollKeys () : Task =
                 task {
-                    if entered && go && not quitRequested then
+                    if entered && input.Go && not quitRequested then
                         try
                             let mutable readCount = 0
 
-                            while Console.KeyAvailable && go && readCount < 256 do
+                            while Console.KeyAvailable && input.Go && readCount < 256 do
                                 readCount <- readCount + 1
                                 let key = Console.ReadKey(true)
-                                let view = snapshotRenderer ()
 
-                                match picker with
-                                | _ when DotInput.isExitKey key ->
-                                    go <- false
+                                let editorFocused =
+                                    DotTuiRouting.visiblePicker (snapshotRenderer ()) input |> Option.isNone
+
+                                if DotInput.isExitKey key then
+                                    input.Go <- false
                                     quitRequested <- true
                                     breakCts.Cancel()
-                                | Some shown ->
-                                    // Picker focus: the picker owns
-                                    // Up/Down/Enter/Esc and the editor
-                                    // stays suspended. A pick resolves to
-                                    // the verbatim engine line typing the
-                                    // id would send.
-                                    let next, outcome = DotPicker.applyPickerKey shown key
-
-                                    match outcome with
-                                    | DotPicker.Stay -> picker <- Some next
-                                    | DotPicker.Cancel -> picker <- None
-                                    | DotPicker.Pick item ->
-                                        picker <- None
-
-                                        let line = DotPicker.commandLineFor shown.Kind item.Key
-
-                                        if line <> "" then
-                                            let! _ = engine.HandleLineAsync(line, cancellationToken)
-                                            ()
-                                | None when key.Key = ConsoleKey.PageUp ->
+                                elif editorFocused && key.Key = ConsoleKey.PageUp then
                                     scrollOffset <- scrollOffset + max 1 (snd (windowSize ()) / 2)
-                                | None when key.Key = ConsoleKey.PageDown ->
+                                elif editorFocused && key.Key = ConsoleKey.PageDown then
                                     scrollOffset <- max 0 (scrollOffset - max 1 (snd (windowSize ()) / 2))
-                                | None when key.Key = ConsoleKey.End && DotInput.isBlank editor -> scrollOffset <- 0
-                                | None ->
-                                    match DotRender.firstPermission view with
-                                    | Some pending ->
-                                        match DotRender.decisionForKey key with
-                                        | Some decision ->
-                                            try
-                                                do!
-                                                    engine.ReplyPermissionAsync(
-                                                        pending.RequestId,
-                                                        decision,
-                                                        cancellationToken
-                                                    )
-                                            with _ ->
-                                                ()
-                                        | None ->
-                                            let nextEditor, nextHistory, intent = DotInput.applyKey editor history key
-
-                                            editor <- nextEditor
-                                            history <- nextHistory
-                                            do! route intent
-                                    | None ->
-                                        match DotRender.firstQuestion view with
-                                        | Some pending when DotInput.isBlank editor && DotInput.isPlainEnter key ->
-                                            // Blank answers resume ""
-                                            // verbatim like the REPL
-                                            // console reader (a blank
-                                            // buffer otherwise decodes to
-                                            // Noop and would idle).
-                                            try
-                                                do! engine.ReplyQuestionAsync(pending.QuestionId, "", cancellationToken)
-                                            with _ ->
-                                                ()
-
-                                            editor <- DotInput.empty
-                                        | _ when
-                                            isCtrlOnly key.Modifiers
-                                            && (key.Key = ConsoleKey.T || key.KeyChar = '\u0014')
-                                            ->
-                                            let current = snapshotRenderer ()
-
-                                            let target =
-                                                current.Order
-                                                |> List.tryFind (fun id ->
-                                                    match current.Tools.TryFind id with
-                                                    | Some card when card.Overflow > 0 -> true
-                                                    | _ -> false)
-
-                                            match target with
-                                            | Some id ->
-                                                lock rendererGate (fun () ->
-                                                    renderer <- DotRender.toggleExpanded renderer id)
-                                            | None -> ()
-                                        | _ ->
-                                            let nextEditor, nextHistory, intent = DotInput.applyKey editor history key
-
-                                            editor <- nextEditor
-                                            history <- nextHistory
-                                            do! route intent
+                                elif editorFocused && key.Key = ConsoleKey.End && DotInput.isBlank input.Editor then
+                                    scrollOffset <- 0
+                                else
+                                    do! DotTuiRouting.handleKeyAsync routing input key
                         with _ ->
                             ()
                 }
 
             paint ()
 
-            while go && not quitRequested && not cancellationToken.IsCancellationRequested do
+            while input.Go && not quitRequested && not cancellationToken.IsCancellationRequested do
                 do! pollKeys ()
                 drainRing ()
                 paint ()
