@@ -38,6 +38,7 @@
           "index.md",
           "getting-started-cli.md",
           "getting-started-hosted.md",
+          "host-abort.md",
           "configuration.md",
           "architecture-overview.md",
           "api/index.md",
