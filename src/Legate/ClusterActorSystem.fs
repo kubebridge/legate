@@ -1119,14 +1119,27 @@ type internal ClusterActorSystemService
                                     return max storeRunning trackedRunning
                                 }
 
-                    do!
-                        ClusterActorSystem.waitForDrainAsync
-                            countRunning
-                            clusterOptions.ShutdownGraceSeconds
-                            clusterOptions.HostExitDeadline
-                            timeProvider
-                            stopStart
-                            cancellationToken
+                    // A drain expiry is reported, never acted on by skipping
+                    // termination: the node below still leaves the cluster and
+                    // releases its remoting port so the same address can be
+                    // rebound after a restart or relocation. The retained
+                    // failure is rethrown after termination so a timeout is
+                    // never mistaken for reached quiescence.
+                    let mutable stopFailure: exn option = None
+
+                    try
+                        do!
+                            ClusterActorSystem.waitForDrainAsync
+                                countRunning
+                                clusterOptions.ShutdownGraceSeconds
+                                clusterOptions.HostExitDeadline
+                                timeProvider
+                                stopStart
+                                cancellationToken
+                    with
+                    | :? OperationCanceledException -> ()
+                    | :? DeadlineExceededException as drainExpired ->
+                        stopFailure <- Some(drainExpired :> exn)
 
                     let elapsed = timeProvider.GetElapsedTime stopStart
                     let remainingDeadline = clusterOptions.HostExitDeadline - elapsed
@@ -1140,7 +1153,14 @@ type internal ClusterActorSystemService
                             else
                                 remainingDeadline
 
-                        do! current.DrainAsync(drainBound, timeProvider, cancellationToken)
+                        try
+                            do! current.DrainAsync(drainBound, timeProvider, cancellationToken)
+                        with
+                        | :? OperationCanceledException -> ()
+                        | :? DeadlineExceededException as contextExpired ->
+                            match stopFailure with
+                            | None -> stopFailure <- Some(contextExpired :> exn)
+                            | Some _ -> ()
 
                     // The shutdown wait stays inside the remaining deadline.
                     // Timeout and cancellation remain failures; the actor
@@ -1179,6 +1199,12 @@ type internal ClusterActorSystemService
                     regionOpt <- None
 
                     lock gate (fun () -> proxies <- Map.empty)
+
+                    match stopFailure with
+                    | None -> ()
+                    | Some failure ->
+                        ExceptionDispatchInfo.Capture(failure).Throw()
+                        return ()
             }
             :> Task
 
