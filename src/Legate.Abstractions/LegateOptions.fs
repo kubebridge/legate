@@ -589,6 +589,9 @@ type CompletionOptions() =
     /// another owner may claim the row. Default 60 s.
     member val ClaimLeaseDuration: TimeSpan = TimeSpan.FromSeconds 60.0 with get, set
 
+    /// Total bound for one awaited completion acknowledgement, including custom sinks.
+    member val AttemptTimeout: TimeSpan = TimeSpan.FromSeconds 30.0 with get, set
+
     /// Returns null when every knob is in range, otherwise a message for the
     /// first violation.
     /// <returns>The first violation's message, or null when the settings are valid.</returns>
@@ -605,6 +608,8 @@ type CompletionOptions() =
                     "RedriveInterval must be positive."
                 if this.ClaimLeaseDuration <= TimeSpan.Zero then
                     "ClaimLeaseDuration must be positive."
+                if this.AttemptTimeout <= TimeSpan.Zero then
+                    "AttemptTimeout must be positive."
             |]
 
         if violations.Length = 0 then

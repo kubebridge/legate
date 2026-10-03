@@ -3,6 +3,28 @@ namespace Legate
 
 open System
 open System.Collections.Generic
+open System.Text.Json
+open System.Text.Json.Serialization
+
+/// Syntax for opaque, ordinal case-sensitive completion destination identifiers.
+[<AbstractClass; Sealed>]
+type CompletionDestinationRules =
+    /// True for 1-128 ASCII letters, digits, dots, underscores or hyphens,
+    /// with an initial letter or digit. Null is not a destination identifier.
+    static member IsValid(destinationId: string | null) : bool =
+        match destinationId with
+        | null -> false
+        | id ->
+            System.Text.RegularExpressions.Regex.IsMatch(
+                id,
+                "\\A[A-Za-z0-9][A-Za-z0-9._-]{0,127}\\z",
+                System.Text.RegularExpressions.RegexOptions.CultureInvariant
+            )
+
+    /// Rejects invalid required identifiers without retaining the input in diagnostics.
+    static member Validate(destinationId: string | null) : unit =
+        if not (CompletionDestinationRules.IsValid destinationId) then
+            raise (CompletionRoutingException(Nullable(), Nullable(), null, CompletionRoutingReason.Invalid))
 
 // Session contracts. A Session is one conversation with one agent that
 // lives until it is closed or expires: identity, tenant, title, lifecycle
@@ -81,7 +103,12 @@ type OnCrashResume =
 /// <see cref="P:Legate.SessionOptions.AutoClose" /> is false and
 /// <see cref="P:Legate.SessionOptions.Outcome" /> is
 /// <see cref="F:Legate.SessionOutcomeMode.None" />.
+[<JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)>]
 type SessionOptions() =
+
+    /// Required current persistence and wire format. Unsupported prerelease data requires a clean start.
+    [<JsonRequired>]
+    member val FormatVersion: int = 1 with get, set
 
     /// The session's display title, or null when the host supplies none and
     /// the runtime titles the session itself.
@@ -96,20 +123,14 @@ type SessionOptions() =
     /// to <see cref="F:Legate.SessionOutcomeMode.None" />.
     member val Outcome: SessionOutcomeMode = SessionOutcomeMode.None with get, set
 
-    /// The permission policy the session's tool calls are evaluated
-    /// against, or null to use the runtime default. The policy contract is
-    /// <see cref="T:Legate.IPermissionPolicy" />.
-    member val Permissions: IPermissionPolicy | null = null with get, set
-
     /// The ask_user headless policy the session's questions are answered
     /// against, or null to use the runtime default from configuration.
     /// The policy contract is <see cref="T:Legate.AskUserOptions" />.
     member val AskUser: AskUserOptions | null = null with get, set
 
-    /// The sink notified when a headless session completes, or null when
-    /// the host observes completion another way. The sink contract is
-    /// <see cref="T:Legate.ISessionCompletionSink" />.
-    member val CompletionSink: ISessionCompletionSink | null = null with get, set
+    /// The exact tenant-scoped destination registered by every participating host.
+    /// Null alone is sinkless. Never an endpoint, secret, runtime object or authority token.
+    member val CompletionDestinationId: string | null = null with get, set
 
     /// The most model iterations a single turn may spend. 0 means the
     /// runtime default from configuration, never an unbounded turn.
@@ -138,6 +159,67 @@ type SessionOptions() =
     /// interrupted turn resumes as a new attempt under a fresh claim token
     /// with its tool cells dropped and an in-memory resumption note.
     member val OnCrashResume: OnCrashResume = OnCrashResume.ResumeAttempt with get, set
+
+    /// Rejects unsupported or malformed data without resolving host configuration.
+    member this.ValidatePersistence() =
+        if this.FormatVersion <> 1 then
+            raise (CompletionRoutingException(Nullable(), Nullable(), null, CompletionRoutingReason.UnsupportedFormat))
+
+        match this.CompletionDestinationId with
+        | null -> ()
+        | id -> CompletionDestinationRules.Validate id
+
+    interface IJsonOnSerializing with
+        member this.OnSerializing() = this.ValidatePersistence()
+
+    interface IJsonOnDeserialized with
+        member this.OnDeserialized() = this.ValidatePersistence()
+
+/// Strict data-only options serialization shared by store implementations.
+[<AbstractClass; Sealed>]
+type SessionOptionsPersistence =
+    /// Reads only the current non-null format, checking the marker before construction.
+    static member Deserialize(json: string) : SessionOptions =
+        try
+            use document = JsonDocument.Parse json
+            let root = document.RootElement
+            let mutable version = Unchecked.defaultof<JsonElement>
+
+            if
+                root.ValueKind <> JsonValueKind.Object
+                || not (root.TryGetProperty("FormatVersion", &version))
+                || version.ValueKind <> JsonValueKind.Number
+                || version.GetInt32() <> 1
+            then
+                raise (
+                    CompletionRoutingException(Nullable(), Nullable(), null, CompletionRoutingReason.UnsupportedFormat)
+                )
+
+            match JsonSerializer.Deserialize<SessionOptions>(json) with
+            | null ->
+                raise (
+                    CompletionRoutingException(Nullable(), Nullable(), null, CompletionRoutingReason.UnsupportedFormat)
+                )
+            | options -> options
+        with
+        | :? JsonException
+        | :? NotSupportedException
+        | :? ArgumentException
+        | :? InvalidOperationException
+        | :? FormatException ->
+            raise (CompletionRoutingException(Nullable(), Nullable(), null, CompletionRoutingReason.UnsupportedFormat))
+
+    /// Serializes a validated current-format snapshot, never live policy or sink instances.
+    static member Serialize(options: SessionOptions) : string =
+        if isNull (box options) then
+            raise (CompletionRoutingException(Nullable(), Nullable(), null, CompletionRoutingReason.UnsupportedFormat))
+
+        options.ValidatePersistence()
+        JsonSerializer.Serialize options
+
+    /// Copies nested mutable settings, metadata and instruction paths.
+    static member Snapshot(options: SessionOptions) : SessionOptions =
+        SessionOptionsPersistence.Deserialize(SessionOptionsPersistence.Serialize options)
 
 /// The durable state of one conversation with one agent: what the runtime
 /// journals and what the store epic persists. Options is the snapshot taken

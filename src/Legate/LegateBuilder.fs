@@ -511,6 +511,56 @@ type LegateBuilder internal (services: IServiceCollection) as this =
     member _.Services: IServiceCollection = services
 
     /// Configures the LLM providers the coordinator resolves models through.
+    /// Registers one exact tenant/destination singleton with DI-owned lifetime.
+    /// Participating hosts must preserve the ID's logical receiver; there is no fallback.
+    /// <param name="tenant">The authorized tenant.</param>
+    /// <param name="destinationId">An ordinal logical ID.</param>
+    /// <param name="factory">Creates a new sink from host-only configuration.</param>
+    /// <returns>This builder.</returns>
+    member _.AddCompletionDestination
+        (tenant: TenantId, destinationId: string, factory: Func<IServiceProvider, ISessionCompletionSink>)
+        : LegateBuilder =
+        TenantId.Create(tenant.ToString()) |> ignore
+        CompletionDestinationRules.Validate destinationId
+        ArgumentNullException.ThrowIfNull(factory)
+        let key = box (tenant, destinationId)
+
+        if
+            services
+            |> Seq.exists (fun descriptor ->
+                descriptor.IsKeyedService
+                && descriptor.ServiceType = typeof<ISessionCompletionSink>
+                && Object.Equals(descriptor.ServiceKey, key))
+        then
+            raise (
+                ArgumentException(
+                    "A completion destination is already registered for this tenant.",
+                    nameof destinationId
+                )
+            )
+
+        services.AddKeyedSingleton<ISessionCompletionSink>(
+            key,
+            Func<IServiceProvider, obj, ISessionCompletionSink>(fun provider _ ->
+                let sink = factory.Invoke provider
+
+                if isNull (box sink) then
+                    raise (
+                        CompletionRoutingException(
+                            Nullable tenant,
+                            Nullable(),
+                            destinationId,
+                            CompletionRoutingReason.Unavailable
+                        )
+                    )
+
+                sink)
+        )
+        |> ignore
+
+        this
+
+    /// Configures the LLM providers the coordinator resolves models through.
     member _.Llm: LlmBuilder = llm
 
     /// Configures session storage and the artifact quota.

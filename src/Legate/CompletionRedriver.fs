@@ -11,221 +11,196 @@ open Microsoft.Extensions.Logging
 open Microsoft.Extensions.Logging.Abstractions
 open Microsoft.Extensions.Options
 
-// Completion re-drive service (issue 84). The session actor enqueues one
-// outbox row per settlement and notifies the sink inline with the same
-// stable idempotency key; this background service lease-claims pending rows
-// and redelivers at-least-once through the session's stored sink, so a
-// delivery survives a restart between the settlement and the inline Notify.
-// Delivered rows are retained for CompletionOptions.DeliveredRetention for
-// idempotency, then purged. No external services: only ISessionStore, the
-// TimeProvider clock, and the ILlmDelay seam, so Legate still builds and
-// tests with no Redis, Docker, Postgres, or Kubernetes.
-
-// ──────────────────────────────────────────────────────────────────────────
-// One pass
-
-/// One re-drive pass over the completion outbox. Internal so no store type
-/// ever crosses the public API; tests drive <c>passOnceAsync</c> directly
-/// under virtual time.
+/// Sole external completion delivery path. Rows, not current sessions, determine routing.
 module internal CompletionRedriver =
-
-    /// How many rows one pass claims at most: bounded batches keep a
-    /// sink-down backlog from growing the pass without bound.
     [<Literal>]
     let MaxBatchSize = 50
 
-    /// Delivers one claimed row when its lease still holds: resolves the
-    /// sink from the stored session snapshot, verifies the lease owner at
-    /// the last moment, notifies, then marks delivered under the same
-    /// owner. A stale owner notifies nothing and marks nothing (zero
-    /// effects); a throwing sink keeps the row pending for the next pass.
-    /// <param name="store">The durable store.</param>
-    /// <param name="owner">This re-driver's delivery owner identity.</param>
-    /// <param name="entry">The claimed row to deliver.</param>
-    /// <param name="cancellationToken">Abandons the delivery.</param>
-    /// <returns>True when the row was delivered and marked.</returns>
     let private deliverOneAsync
         (store: ISessionStore)
+        (routes: CompletionDestinations)
         (owner: string)
         (entry: CompletionOutboxEntry)
-        (cancellationToken: CancellationToken)
+        (settings: CompletionOptions)
+        (clock: TimeProvider)
+        (delay: ILlmDelay)
+        (log: ILogger)
+        (ct: CancellationToken)
         : Task<bool> =
         task {
-            let! session = store.GetSession(entry.Tenant, entry.SessionId, cancellationToken)
+            try
+                let destination =
+                    match entry.DestinationId with
+                    | null ->
+                        raise (
+                            CompletionRoutingException(
+                                Nullable entry.Tenant,
+                                Nullable entry.SessionId,
+                                null,
+                                CompletionRoutingReason.UnsupportedFormat
+                            )
+                        )
+                    | id -> id
 
-            match session with
-            | null -> return false
-            | live when isNull (box live.Options) -> return false
-            | live ->
-                match live.Options.CompletionSink with
-                | null -> return false
-                | sink ->
-                    let! liveLease =
-                        store.VerifyCompletionClaim(entry.Tenant, entry.IdempotencyKey, owner, cancellationToken)
+                let sink = routes.Resolve(entry.Tenant, Nullable entry.SessionId, destination)
 
-                    if not liveLease then
-                        return false
-                    else
-                        let notified =
+                if String.IsNullOrWhiteSpace entry.IdempotencyKey then
+                    raise (InvalidOperationException("Unsupported delivery identity."))
+
+                use deadline = new CancellationTokenSource(settings.AttemptTimeout, clock)
+                use attempt = CancellationTokenSource.CreateLinkedTokenSource(ct, deadline.Token)
+                let! live = store.VerifyCompletionClaim(entry.Tenant, entry.IdempotencyKey, owner, attempt.Token)
+
+                if not live then
+                    return false
+                else
+                    let mutable lost = false
+
+                    let heartbeat: Task =
+                        task {
                             try
-                                sink.Notify(entry.Completion)
-                                true
-                            with _ ->
-                                false
+                                while not attempt.IsCancellationRequested do
+                                    do!
+                                        delay.Delay(
+                                            TimeSpan.FromTicks(max 1L (settings.ClaimLeaseDuration.Ticks / 3L)),
+                                            attempt.Token
+                                        )
 
-                        if not notified then
+                                    let! renewed =
+                                        store.RenewCompletionClaim(
+                                            entry.Tenant,
+                                            entry.IdempotencyKey,
+                                            owner,
+                                            settings.ClaimLeaseDuration,
+                                            attempt.Token
+                                        )
+
+                                    if not renewed then
+                                        lost <- true
+                                        attempt.Cancel()
+                            with
+                            | :? OperationCanceledException -> ()
+                            | _ ->
+                                lost <- true
+                                attempt.Cancel()
+                        }
+
+                    try
+                        // The provider receives the same token that bounds our wait.
+                        do! sink.NotifyAsync(entry.Completion, attempt.Token).WaitAsync(attempt.Token)
+                        attempt.Token.ThrowIfCancellationRequested()
+
+                        if lost then
                             return false
                         else
-                            let! marked =
-                                store.MarkCompletionDelivered(
-                                    entry.Tenant,
-                                    entry.IdempotencyKey,
-                                    owner,
-                                    cancellationToken
-                                )
+                            return!
+                                store.MarkCompletionDelivered(entry.Tenant, entry.IdempotencyKey, owner, attempt.Token)
+                    finally
+                        attempt.Cancel()
+                        // Observe completion without blocking a broken delay seam or sink.
+                        heartbeat.ContinueWith(
+                            (fun (completed: Task) ->
+                                if completed.IsFaulted then
+                                    completed.Exception |> ignore),
+                            TaskScheduler.Default
+                        )
+                        |> ignore
+            with
+            | :? CompletionRoutingException as refusal ->
+                log.LogWarning(
+                    "Completion pending for tenant {Tenant}, session {SessionId}: routing {Reason}.",
+                    entry.Tenant,
+                    entry.SessionId,
+                    refusal.Reason
+                )
 
-                            return marked
+                return false
+            | :? OperationCanceledException -> return false
+            | _ ->
+                log.LogWarning(
+                    "Completion pending for tenant {Tenant}, session {SessionId}: delivery not acknowledged.",
+                    entry.Tenant,
+                    entry.SessionId
+                )
+
+                return false
         }
 
-    /// Claims and delivers one bounded batch of pending rows under this
-    /// re-driver's lease.
-    /// <param name="store">The durable store.</param>
-    /// <param name="owner">This re-driver's delivery owner identity.</param>
-    /// <param name="leaseDuration">How long each claimed lease lasts.</param>
-    /// <param name="cancellationToken">Abandons the batch.</param>
-    /// <returns>How many rows were delivered and marked.</returns>
-    let deliverPendingAsync
-        (store: ISessionStore)
-        (owner: string)
-        (leaseDuration: TimeSpan)
-        (cancellationToken: CancellationToken)
-        : Task<int> =
+    let deliverPendingAsync store routes owner (settings: CompletionOptions) clock delay log ct : Task<int> =
         task {
-            let! claimed = store.ClaimCompletionOutbox(owner, MaxBatchSize, leaseDuration, cancellationToken)
+            let! claimed =
+                (store: ISessionStore).ClaimCompletionOutbox(owner, MaxBatchSize, settings.ClaimLeaseDuration, ct)
+
             let mutable delivered = 0
 
-            if not (isNull (box claimed)) then
-                for entry in claimed do
-                    if not (isNull (box entry)) then
-                        let! ok = deliverOneAsync store owner entry cancellationToken
+            for entry in claimed do
+                ct.ThrowIfCancellationRequested()
+                let! marked = deliverOneAsync store routes owner entry settings clock delay log ct
 
-                        if ok then
-                            delivered <- delivered + 1
+                if marked then
+                    delivered <- delivered + 1
 
             return delivered
         }
 
-    /// Purges delivered rows older than the retention window; pending rows
-    /// are never removed, however old.
-    /// <param name="store">The durable store.</param>
-    /// <param name="retention">How long delivered rows are retained.</param>
-    /// <param name="clock">The clock the cutoff reads.</param>
-    /// <param name="cancellationToken">Abandons the purge.</param>
-    /// <returns>How many rows were removed.</returns>
-    let purgeDeliveredAsync
-        (store: ISessionStore)
-        (retention: TimeSpan)
-        (clock: TimeProvider)
-        (cancellationToken: CancellationToken)
-        : Task<int> =
-        task {
-            let cutoff = clock.GetUtcNow() - retention
-            return! store.PurgeDeliveredCompletions(cutoff, cancellationToken)
-        }
+    let purgeDeliveredAsync (store: ISessionStore) retention (clock: TimeProvider) ct =
+        store.PurgeDeliveredCompletions(clock.GetUtcNow() - retention, ct)
 
-    /// Runs one full pass: delivers the bounded pending batch, then purges
-    /// delivered rows past the retention window.
-    /// <param name="store">The durable store.</param>
-    /// <param name="owner">This re-driver's delivery owner identity.</param>
-    /// <param name="completion">The completion redrive knobs.</param>
-    /// <param name="clock">The clock the purge cutoff reads.</param>
-    /// <param name="cancellationToken">Abandons the pass.</param>
-    /// <returns>A task that completes once the pass has run.</returns>
-    let passOnceAsync
-        (store: ISessionStore)
-        (owner: string)
-        (completion: CompletionOptions)
-        (clock: TimeProvider)
-        (cancellationToken: CancellationToken)
-        : Task =
+    let passOnceAsync store routes owner (settings: CompletionOptions) clock delay log ct : Task =
         task {
-            ArgumentNullException.ThrowIfNull(store)
-            ArgumentNullException.ThrowIfNull(owner)
-            ArgumentNullException.ThrowIfNull(completion)
-            ArgumentNullException.ThrowIfNull(clock)
-
-            let! _ = deliverPendingAsync store owner completion.ClaimLeaseDuration cancellationToken
-            let! _ = purgeDeliveredAsync store completion.DeliveredRetention clock cancellationToken
+            let! _ = deliverPendingAsync store routes owner settings clock delay log ct
+            let! _ = purgeDeliveredAsync store settings.DeliveredRetention clock ct
             return ()
         }
 
-// ──────────────────────────────────────────────────────────────────────────
-// Hosted service
-
-/// Singleton hosted service owning the completion re-drive loop. Polls the
-/// outbox every <c>Completion:RedriveInterval</c> through
-/// <see cref="M:Legate.CompletionRedriver.passOnceAsync*" /> over the
-/// injected delay seam, so virtual-time tests advance it without sleeping.
-/// A pass failure is retried next interval; host stop cancels the wait and
-/// the in-flight pass. The session store resolves lazily from the provider
-/// at loop start (never at construction), so an empty host still fails
-/// startup with the required-registration message instead of a resolution
-/// error. Operational visibility rides the sinks' own logs: like
-/// LocalActorSystemService this service takes no logger, so it stays
-/// constructible on containers without logging; undelivered rows stay
-/// observable in the store.
 type internal CompletionRedriverService
-    (serviceProvider: IServiceProvider, options: IOptions<LegateOptions>, timeProvider: TimeProvider, delay: ILlmDelay)
-    =
-
-    do
-        ArgumentNullException.ThrowIfNull(serviceProvider)
-        ArgumentNullException.ThrowIfNull(options)
-        ArgumentNullException.ThrowIfNull(timeProvider)
-        ArgumentNullException.ThrowIfNull(delay)
-
-    let log: ILogger = NullLogger.Instance :> ILogger
-
-    let owner = Guid.NewGuid().ToString("N")
+    (provider: IServiceProvider, options: IOptions<LegateOptions>, clock: TimeProvider, delay: ILlmDelay) =
     let lifetime = new CancellationTokenSource()
     let mutable loop: Task | null = null
+    let owner = Guid.NewGuid().ToString("N")
 
-    /// This service's delivery owner identity: what its claims stamp.
-    member _.Owner: string = owner
+    let log: ILogger =
+        match provider.GetService<ILogger<CompletionRedriverService>>() with
+        | null -> NullLogger.Instance
+        | logger -> logger
 
-    /// Runs the poll loop until host stop.
-    /// <returns>A task that completes once the loop exits.</returns>
-    member private this.RunAsync() : Task =
+    member _.Owner = owner
+
+    member private _.RunAsync() : Task =
         task {
-            let store = serviceProvider.GetRequiredService<ISessionStore>()
-            let mutable running = true
+            let store = provider.GetRequiredService<ISessionStore>()
+            let routes = provider.GetRequiredService<CompletionDestinations>()
 
-            while running && not lifetime.Token.IsCancellationRequested do
+            while not lifetime.IsCancellationRequested do
                 try
-                    let completion = options.Value.Completion
-
-                    do! CompletionRedriver.passOnceAsync store owner completion timeProvider lifetime.Token
+                    // A new owner for each batch prevents stale in-flight attempts from reusing authority.
+                    do!
+                        CompletionRedriver.passOnceAsync
+                            store
+                            routes
+                            (owner + Guid.NewGuid().ToString("N"))
+                            options.Value.Completion
+                            clock
+                            delay
+                            log
+                            lifetime.Token
                 with
-                | :? OperationCanceledException -> running <- false
-                | failed ->
-                    log.LogWarning(
-                        "Completion re-drive pass failed and will retry next interval: {Reason}",
-                        failed.Message
-                    )
+                | :? OperationCanceledException -> ()
+                | _ -> log.LogWarning("Completion redrive pass failed; pending rows will retry.")
 
-                if running && not lifetime.Token.IsCancellationRequested then
+                if not lifetime.IsCancellationRequested then
                     try
                         do! delay.Delay(options.Value.Completion.RedriveInterval, lifetime.Token)
                     with :? OperationCanceledException ->
-                        running <- false
+                        ()
         }
 
     interface IHostedService with
-        member this.StartAsync(_cancellationToken: CancellationToken) =
+        member this.StartAsync(_) =
             loop <- Task.Run(Func<Task>(fun () -> this.RunAsync()), lifetime.Token)
             Task.CompletedTask
 
-        member _.StopAsync(cancellationToken: CancellationToken) =
+        member _.StopAsync(ct) : Task =
             task {
                 lifetime.Cancel()
 
@@ -233,25 +208,17 @@ type internal CompletionRedriverService
                 | null -> ()
                 | running ->
                     try
-                        do! running.WaitAsync(cancellationToken)
-                    with
-                    | :? OperationCanceledException -> ()
-                    | :? TimeoutException -> ()
+                        do! running.WaitAsync(ct)
+                    with :? OperationCanceledException ->
+                        ()
             }
-            :> Task
 
-// ──────────────────────────────────────────────────────────────────────────
-// Registration
+    interface IDisposable with
+        member _.Dispose() =
+            lifetime.Cancel()
+            lifetime.Dispose()
 
-/// Registers the completion re-drive hosted service.
 module internal CompletionRedriverRegistration =
-
-    /// Registers CompletionRedriverService as a singleton hosted service,
-    /// only when the host has not already supplied its own registration
-    /// for the same implementation.
-    /// <param name="services">The container to add the service to.</param>
-    let register (services: IServiceCollection) : unit =
-        ArgumentNullException.ThrowIfNull(services)
-
+    let register (services: IServiceCollection) =
         services.TryAddEnumerable(ServiceDescriptor.Singleton<IHostedService, CompletionRedriverService>())
         |> ignore

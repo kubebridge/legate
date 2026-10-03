@@ -99,6 +99,7 @@ type LegateServiceCollectionExtensions =
         | _ -> ()
 
         LegateDefaultRegistration.register services
+        services.TryAddSingleton<CompletionDestinations>() |> ignore
 
         services.TryAddSingleton<ISessionHostContexts, SessionHostContextRegistry>()
         |> ignore

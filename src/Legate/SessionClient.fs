@@ -108,6 +108,22 @@ type SessionClient
     let mutable autoTitle: AutoTitleDeps option = None
     let mutable subscribeRouter: ISubscribeRouter option = None
     let mutable completionEra: CompletionEra.CompletionEraMarker option = None
+    let mutable destinations: CompletionDestinations option = None
+
+    member internal _.CompletionDestinations
+        with get () = destinations
+        and set value = destinations <- value
+
+    member internal _.ValidateCompletionRoute(session: Session) =
+        session.Options.ValidatePersistence()
+
+        match destinations, session.Options.CompletionDestinationId with
+        | _, null -> ()
+        | Some routes, _ -> routes.Validate session
+        | None, id ->
+            raise (
+                CompletionRoutingException(Nullable tenant, Nullable session.Id, id, CompletionRoutingReason.Unknown)
+            )
 
     /// The durable store prompts, aborts, and session reads go through.
     member internal _.Store: ISessionStore = store
@@ -473,6 +489,12 @@ type SessionClientExtensions =
             let mutable promptError: exn option = None
 
             try
+                let! current = store.GetSession(tenant, sessionId, cancellationToken)
+
+                match current with
+                | null -> raise (SessionNotFoundException(sessionId, "The session does not exist."))
+                | live -> client.ValidateCompletionRoute live
+
                 let! resolved = client.Resolve(sessionId, cancellationToken)
 
                 let hub = PromptWaitHubs.GetOrAddScoped client.Tenant sessionId

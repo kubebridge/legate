@@ -9,6 +9,7 @@
   <ItemGroup>
     <Compile Include="AssemblyInfo.fs" />
     <Compile Include="ControlTargetProtocol.fs" />
+    <Compile Include="RecoveryCandidateCursor.fs" />
     <Compile Include="InMemoryDatabase.fs" />
     <Compile Include="InMemoryCompletionEra.fs" />
     <Compile Include="InMemorySessionStore.fs" />

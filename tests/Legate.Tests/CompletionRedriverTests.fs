@@ -9,17 +9,21 @@ open FsUnit.Xunit
 open Legate
 open Legate.Storage.InMemory
 open Legate.Testing
+open Microsoft.Extensions.DependencyInjection
+open Microsoft.Extensions.Logging
+open Microsoft.Extensions.Logging.Abstractions
 open Xunit
 
-// Completion re-drive service (issue 84): leased at-least-once delivery
-// that survives restarts via the store, retention purge of delivered rows,
-// takeover loser-zero-effects, and inline/re-drive dedupe on the shared
-// idempotency key. All time advances through the TestClock the
-// in-memory database reads: never sleeps.
+// Completion re-drive service (issue 378): the sole external completion
+// delivery path. Rows carry an immutable tenant destination snapshot;
+// the redriver resolves the row's destination from host registration,
+// awaits receiver acknowledgement, then marks delivered under the same
+// fenced owner. Unsupported, unknown, or unavailable routes stay pending
+// with safe diagnostics, never rerouted or marked.
 
 let tenant = TenantId.Create "acme"
 
-/// Recording sink that keeps every Notify payload: the test asserts
+/// Recording sink that keeps every acknowledged payload: the test asserts
 /// at-least-once delivery (every row delivered) and dedupe (one unique
 /// key) separately.
 type DedupingSink() =
@@ -27,10 +31,11 @@ type DedupingSink() =
     let gate = obj ()
 
     interface ISessionCompletionSink with
-        member _.Notify(completion: SessionCompletion) =
+        member _.NotifyAsync(completion: SessionCompletion, _cancellationToken: CancellationToken) =
             lock gate (fun () -> received.Add(completion))
+            Task.CompletedTask
 
-    /// Every Notify payload, in call order.
+    /// Every acknowledged payload, in call order.
     member _.Received: IReadOnlyList<SessionCompletion> =
         received :> IReadOnlyList<SessionCompletion>
 
@@ -42,8 +47,12 @@ type DedupingSink() =
             |> Seq.distinct
             |> Seq.length)
 
-/// A session row carrying the sink, the snapshot the re-driver resolves.
-let sampleSessionWithSink (sink: ISessionCompletionSink) =
+/// A session row carrying a data-only destination id, the snapshot the
+/// settlement persists. No live sink travels in options.
+let sampleSessionWithDestination () =
+    let options = SessionOptions()
+    options.CompletionDestinationId <- "test-receiver"
+
     {
         Id = SessionId.New()
         Tenant = tenant
@@ -55,11 +64,11 @@ let sampleSessionWithSink (sink: ISessionCompletionSink) =
         UpdatedAt = DateTimeOffset.MinValue
         ClosedAt = Unchecked.defaultof<Nullable<DateTimeOffset>>
         WorkspaceBinding = null
-        Options = SessionOptions(CompletionSink = sink)
+        Options = options
         PermissionGrants = ResizeArray<string>() :> IReadOnlyList<string>
     }
 
-/// A session row with no sink: the re-driver resolves nothing.
+/// A session row with no destination: settlement enqueues nothing.
 let sampleSessionWithoutSink () =
     {
         Id = SessionId.New()
@@ -98,29 +107,61 @@ let createStore () =
     let store = InMemoryStoreFactory.sessionStore (InMemoryDatabase(clock))
     store, clock
 
+/// A destination resolver over exactly the supplied tenant registrations.
+let private routesFor (registrations: (TenantId * string * ISessionCompletionSink) list) =
+    let services = ServiceCollection()
+
+    for tenantId, destinationId, sink in registrations do
+        services.AddKeyedSingleton<ISessionCompletionSink>(box (tenantId, destinationId), sink)
+        |> ignore
+
+    CompletionDestinations(services.BuildServiceProvider())
+
+let private drive (store: ISessionStore) (routes: CompletionDestinations) (owner: string) (clock: TestClock) =
+    CompletionRedriver.passOnceAsync
+        store
+        routes
+        owner
+        (CompletionOptions())
+        clock
+        (TurnLoopTests.NeverDelay() :> ILlmDelay)
+        (NullLogger.Instance :> ILogger)
+        CancellationToken.None
+
 [<Fact>]
 let ``Redrive delivers a pending row at-least-once under the shared key`` () =
     task {
         let store, clock = createStore ()
         let sink = DedupingSink()
 
-        let! created =
-            store.CreateSession(tenant, sampleSessionWithSink (sink :> ISessionCompletionSink), CancellationToken.None)
+        let routes =
+            routesFor
+                [
+                    tenant, "test-receiver", (sink :> ISessionCompletionSink)
+                ]
 
-        // The settlement crashed before its inline Notify: the row is
-        // pending and the sink observed nothing.
-        let! _ = store.EnqueueCompletionOutbox(tenant, sampleCompletion created.Id "key-1", CancellationToken.None)
+        let! created = store.CreateSession(tenant, sampleSessionWithDestination (), CancellationToken.None)
+
+        // The settlement enqueued the immutable route snapshot; the sink
+        // observed nothing until the redriver delivers.
+        let! _ =
+            store.EnqueueCompletionOutbox(
+                tenant,
+                "test-receiver",
+                sampleCompletion created.Id "key-1",
+                CancellationToken.None
+            )
 
         Assert.Equal(0, sink.Received.Count)
 
-        do! CompletionRedriver.passOnceAsync store "redriver-a" (CompletionOptions()) clock CancellationToken.None
+        do! drive store routes "redriver-a" clock
 
         Assert.Equal(1, sink.Received.Count)
         Assert.Equal("key-1", sink.Received[0].IdempotencyKey)
         Assert.Equal(created.Id, sink.Received[0].SessionId)
 
         // A second pass redelivers nothing: the row is marked delivered.
-        do! CompletionRedriver.passOnceAsync store "redriver-a" (CompletionOptions()) clock CancellationToken.None
+        do! drive store routes "redriver-a" clock
 
         Assert.Equal(1, sink.Received.Count)
         Assert.Equal(1, sink.UniqueKeys)
@@ -134,13 +175,24 @@ let ``Redelivery survives a restart: a new owner claims the expired lease`` () =
         let first = InMemoryStoreFactory.sessionStore database
         let sink = DedupingSink()
 
-        let! created =
-            first.CreateSession(tenant, sampleSessionWithSink (sink :> ISessionCompletionSink), CancellationToken.None)
+        let routes =
+            routesFor
+                [
+                    tenant, "test-receiver", (sink :> ISessionCompletionSink)
+                ]
 
-        let! _ = first.EnqueueCompletionOutbox(tenant, sampleCompletion created.Id "key-1", CancellationToken.None)
+        let! created = first.CreateSession(tenant, sampleSessionWithDestination (), CancellationToken.None)
+
+        let! _ =
+            first.EnqueueCompletionOutbox(
+                tenant,
+                "test-receiver",
+                sampleCompletion created.Id "key-1",
+                CancellationToken.None
+            )
 
         // The first owner claims the row, then its process dies before the
-        // Notify lands.
+        // acknowledgement lands.
         let! claimed = first.ClaimCompletionOutbox("crashed-owner", 10, TimeSpan.FromMinutes 5., CancellationToken.None)
 
         Assert.Single(claimed) |> ignore
@@ -151,13 +203,7 @@ let ``Redelivery survives a restart: a new owner claims the expired lease`` () =
 
         let restarted = InMemoryStoreFactory.sessionStore database
 
-        do!
-            CompletionRedriver.passOnceAsync
-                restarted
-                "restarted-owner"
-                (CompletionOptions())
-                clock
-                CancellationToken.None
+        do! drive restarted routes "restarted-owner" clock
 
         Assert.Equal(1, sink.Received.Count)
         Assert.Equal("key-1", sink.Received[0].IdempotencyKey)
@@ -169,17 +215,34 @@ let ``Delivered rows purge after the retention window while pending rows survive
         let store, clock = createStore ()
         let sink = DedupingSink()
 
-        let! created =
-            store.CreateSession(tenant, sampleSessionWithSink (sink :> ISessionCompletionSink), CancellationToken.None)
+        let routes =
+            routesFor
+                [
+                    tenant, "test-receiver", (sink :> ISessionCompletionSink)
+                ]
 
-        let! _ = store.EnqueueCompletionOutbox(tenant, sampleCompletion created.Id "old", CancellationToken.None)
+        let! created = store.CreateSession(tenant, sampleSessionWithDestination (), CancellationToken.None)
 
-        do! CompletionRedriver.passOnceAsync store "redriver-a" (CompletionOptions()) clock CancellationToken.None
+        let! _ =
+            store.EnqueueCompletionOutbox(
+                tenant,
+                "test-receiver",
+                sampleCompletion created.Id "old",
+                CancellationToken.None
+            )
+
+        do! drive store routes "redriver-a" clock
 
         Assert.Equal(1, sink.Received.Count)
 
         // A newer row stays pending while the delivered one ages out.
-        let! _ = store.EnqueueCompletionOutbox(tenant, sampleCompletion created.Id "pending", CancellationToken.None)
+        let! _ =
+            store.EnqueueCompletionOutbox(
+                tenant,
+                "test-receiver",
+                sampleCompletion created.Id "pending",
+                CancellationToken.None
+            )
 
         clock.Advance(TimeSpan.FromDays 8.)
 
@@ -190,7 +253,7 @@ let ``Delivered rows purge after the retention window while pending rows survive
 
         // The pending row redrives after the purge: retention never removes
         // pending rows, however old the delivered ones beside them are.
-        do! CompletionRedriver.passOnceAsync store "redriver-a" (CompletionOptions()) clock CancellationToken.None
+        do! drive store routes "redriver-a" clock
 
         Assert.Equal(2, sink.Received.Count)
         Assert.Equal("pending", sink.Received[1].IdempotencyKey)
@@ -202,10 +265,21 @@ let ``Takeover loser redrives nothing: zero effects`` () =
         let store, clock = createStore ()
         let sink = DedupingSink()
 
-        let! created =
-            store.CreateSession(tenant, sampleSessionWithSink (sink :> ISessionCompletionSink), CancellationToken.None)
+        let routes =
+            routesFor
+                [
+                    tenant, "test-receiver", (sink :> ISessionCompletionSink)
+                ]
 
-        let! _ = store.EnqueueCompletionOutbox(tenant, sampleCompletion created.Id "key-1", CancellationToken.None)
+        let! created = store.CreateSession(tenant, sampleSessionWithDestination (), CancellationToken.None)
+
+        let! _ =
+            store.EnqueueCompletionOutbox(
+                tenant,
+                "test-receiver",
+                sampleCompletion created.Id "key-1",
+                CancellationToken.None
+            )
 
         // The loser claims the row, then stalls past its lease.
         let! _ = store.ClaimCompletionOutbox("loser", 10, TimeSpan.FromMinutes 5., CancellationToken.None)
@@ -213,7 +287,7 @@ let ``Takeover loser redrives nothing: zero effects`` () =
         clock.Advance(TimeSpan.FromMinutes 6.)
 
         // The loser verifies false on its lapsed lease: fenced out before
-        // any Notify, with zero effects (the row stays pending).
+        // any acknowledgement, with zero effects (the row stays pending).
         let! loserLive = store.VerifyCompletionClaim(tenant, "key-1", "loser", CancellationToken.None)
         Assert.False(loserLive)
 
@@ -227,37 +301,41 @@ let ``Takeover loser redrives nothing: zero effects`` () =
         // The winner's pass delivers and marks under its own live lease.
         clock.Advance(TimeSpan.FromMinutes 6.)
 
-        do! CompletionRedriver.passOnceAsync store "winner" (CompletionOptions()) clock CancellationToken.None
+        do! drive store routes "winner" clock
 
         Assert.Equal(1, sink.Received.Count)
 
         // The loser's own pass claims nothing delivered, so zero sink
         // effects too.
-        do! CompletionRedriver.passOnceAsync store "loser" (CompletionOptions()) clock CancellationToken.None
+        do! drive store routes "loser" clock
 
         Assert.Equal(1, sink.Received.Count)
         Assert.Equal(1, sink.UniqueKeys)
     }
 
 [<Fact>]
-let ``Inline and redrive share one key: the sink dedupes`` () =
+let ``Failed acknowledgement keeps the row pending for durable redelivery`` () =
     task {
         let store, clock = createStore ()
         let sink = DedupingSink()
 
-        let! created =
-            store.CreateSession(tenant, sampleSessionWithSink (sink :> ISessionCompletionSink), CancellationToken.None)
+        let routes =
+            routesFor
+                [
+                    tenant, "test-receiver", (sink :> ISessionCompletionSink)
+                ]
+
+        let! created = store.CreateSession(tenant, sampleSessionWithDestination (), CancellationToken.None)
 
         let completion = sampleCompletion created.Id "key-1"
 
-        let! _ = store.EnqueueCompletionOutbox(tenant, completion, CancellationToken.None)
+        let! _ = store.EnqueueCompletionOutbox(tenant, "test-receiver", completion, CancellationToken.None)
 
-        // The settlement's inline Notify lands first with the stored key.
-        (sink :> ISessionCompletionSink).Notify(completion)
+        // A direct acknowledgement outside the redriver carries the stored
+        // key; the redriver still delivers and marks exactly once.
+        do! (sink :> ISessionCompletionSink).NotifyAsync(completion, CancellationToken.None)
 
-        // The re-drive overlaps with the same key: at-least-once delivery
-        // the receiver deduplicates.
-        do! CompletionRedriver.passOnceAsync store "redriver-a" (CompletionOptions()) clock CancellationToken.None
+        do! drive store routes "redriver-a" clock
 
         Assert.Equal(2, sink.Received.Count)
         Assert.Equal(1, sink.UniqueKeys)
@@ -266,27 +344,51 @@ let ``Inline and redrive share one key: the sink dedupes`` () =
     }
 
 [<Fact>]
-let ``A sinkless session keeps its row pending for a later sink`` () =
+let ``An unknown destination keeps its row pending without delivery`` () =
     task {
         let store, clock = createStore ()
+        // No host registered test-receiver on this redriver.
+        let routes = routesFor []
 
-        let! created = store.CreateSession(tenant, sampleSessionWithoutSink (), CancellationToken.None)
+        let! created = store.CreateSession(tenant, sampleSessionWithDestination (), CancellationToken.None)
 
-        let! _ = store.EnqueueCompletionOutbox(tenant, sampleCompletion created.Id "key-1", CancellationToken.None)
+        let! _ =
+            store.EnqueueCompletionOutbox(
+                tenant,
+                "test-receiver",
+                sampleCompletion created.Id "key-1",
+                CancellationToken.None
+            )
 
-        // No sink resolves: the pass delivers nothing and marks nothing,
-        // so the row stays pending under the pass lease.
-        do! CompletionRedriver.passOnceAsync store "redriver-a" (CompletionOptions()) clock CancellationToken.None
+        // Unknown routing refuses the row: nothing delivered, nothing
+        // marked, so the row stays pending for a correctly configured host.
+        do! drive store routes "redriver-a" clock
 
         let! stillLeased = store.VerifyCompletionClaim(tenant, "key-1", "redriver-a", CancellationToken.None)
         Assert.True(stillLeased)
 
         // Once that lease lapses the row is claimable again: pending rows
-        // are never dropped, however many sinkless passes run.
+        // are never dropped, however many refused passes run.
         clock.Advance(TimeSpan.FromMinutes 2.)
 
         let! stillPending = store.ClaimCompletionOutbox("probe", 10, TimeSpan.FromMinutes 5., CancellationToken.None)
 
         Assert.Single(stillPending) |> ignore
         Assert.Equal("key-1", (Seq.head stillPending).IdempotencyKey)
+        Assert.Equal("test-receiver", (Seq.head stillPending).DestinationId)
+
+        // Once the destination registers, the unchanged row redelivers.
+        let sink = DedupingSink()
+
+        let restored =
+            routesFor
+                [
+                    tenant, "test-receiver", (sink :> ISessionCompletionSink)
+                ]
+
+        clock.Advance(TimeSpan.FromMinutes 6.)
+        do! drive store restored "redriver-b" clock
+
+        Assert.Equal(1, sink.Received.Count)
+        Assert.Equal("key-1", sink.Received[0].IdempotencyKey)
     }

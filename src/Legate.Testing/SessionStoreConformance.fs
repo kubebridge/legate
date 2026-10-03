@@ -1388,6 +1388,7 @@ type SessionStoreConformance(store: ISessionStore, clock: TestClock, tenant: Ten
             let! first =
                 store.EnqueueCompletionOutbox(
                     tenant,
+                    "receiver-a",
                     this.SampleCompletion(created.Id, "key-1"),
                     CancellationToken.None
                 )
@@ -1397,11 +1398,13 @@ type SessionStoreConformance(store: ISessionStore, clock: TestClock, tenant: Ten
             let! retry =
                 store.EnqueueCompletionOutbox(
                     tenant,
+                    "receiver-b",
                     this.SampleCompletion(created.Id, "key-1"),
                     CancellationToken.None
                 )
 
             Assert.Equal(first.CreatedAt, retry.CreatedAt)
+            Assert.Equal("receiver-a", retry.DestinationId)
 
             let! claimed = store.ClaimCompletionOutbox("owner-a", 10, TimeSpan.FromMinutes 5., CancellationToken.None)
 
@@ -1426,6 +1429,7 @@ type SessionStoreConformance(store: ISessionStore, clock: TestClock, tenant: Ten
             let! _ =
                 store.EnqueueCompletionOutbox(
                     tenant,
+                    "receiver-a",
                     this.SampleCompletion(created.Id, "key-1"),
                     CancellationToken.None
                 )
@@ -1451,7 +1455,12 @@ type SessionStoreConformance(store: ISessionStore, clock: TestClock, tenant: Ten
             let! created = store.CreateSession(tenant, this.SampleSession(), CancellationToken.None)
 
             let! _ =
-                store.EnqueueCompletionOutbox(tenant, this.SampleCompletion(created.Id, "old"), CancellationToken.None)
+                store.EnqueueCompletionOutbox(
+                    tenant,
+                    "receiver-a",
+                    this.SampleCompletion(created.Id, "old"),
+                    CancellationToken.None
+                )
 
             this.Clock.Advance(TimeSpan.FromSeconds 1.)
 
@@ -1461,6 +1470,7 @@ type SessionStoreConformance(store: ISessionStore, clock: TestClock, tenant: Ten
             let! _ =
                 store.EnqueueCompletionOutbox(
                     tenant,
+                    "receiver-a",
                     this.SampleCompletion(created.Id, "pending"),
                     CancellationToken.None
                 )
@@ -1476,4 +1486,111 @@ type SessionStoreConformance(store: ISessionStore, clock: TestClock, tenant: Ten
 
             Assert.Single(pending) |> ignore
             Assert.Equal("pending", pending |> Seq.head |> (fun row -> row.IdempotencyKey))
+        }
+
+    [<Fact>]
+    member this.``Recovery candidates walk finite ordinal identities without pending input``() =
+        task {
+            let ids =
+                [|
+                    for i in 1..7 -> SessionId.Parse((string i).PadLeft(26, '0'))
+                |]
+
+            for id in ids do
+                let! _ = store.CreateSession(tenant, { this.SampleSession() with Id = id }, CancellationToken.None)
+
+                let! _ =
+                    store.AppendInboxMessage(
+                        tenant,
+                        id,
+                        UserMessagePayload(UserMessage.Text "prime"),
+                        DeliveryMode.Queue,
+                        CancellationToken.None
+                    )
+
+                let! _ = store.ClaimNextTurn(tenant, id, "owner", TimeSpan.FromMinutes 5., CancellationToken.None)
+                let! _ = store.UpdateSessionState(tenant, id, SessionState.Idle, CancellationToken.None)
+                ()
+
+            let! first = store.ListRecoveryCandidates(tenant, SessionState.Idle, 2, null, CancellationToken.None)
+            Assert.Equal<SessionId>(ids[0..1], first.Items)
+            Assert.NotNull(first.Continuation)
+            let tail = SessionId.Parse("00000000000000000000000008")
+            let! _ = store.CreateSession(tenant, { this.SampleSession() with Id = tail }, CancellationToken.None)
+
+            let! _ =
+                store.AppendInboxMessage(
+                    tenant,
+                    tail,
+                    UserMessagePayload(UserMessage.Text "prime"),
+                    DeliveryMode.Queue,
+                    CancellationToken.None
+                )
+
+            let! _ = store.ClaimNextTurn(tenant, tail, "owner", TimeSpan.FromMinutes 5., CancellationToken.None)
+            let! _ = store.UpdateSessionState(tenant, tail, SessionState.Idle, CancellationToken.None)
+            let seen = ResizeArray<SessionId>(first.Items)
+            let mutable cursor = first.Continuation
+
+            while not (isNull cursor) do
+                let! page = store.ListRecoveryCandidates(tenant, SessionState.Idle, 2, cursor, CancellationToken.None)
+                Assert.InRange(page.Items.Count, 1, 2)
+                Assert.False(String.Equals(cursor, page.Continuation, StringComparison.Ordinal))
+                seen.AddRange(page.Items)
+                cursor <- page.Continuation
+
+            Assert.Equal<SessionId>(ids, seen)
+            let! fresh = store.ListRecoveryCandidates(tenant, SessionState.Idle, 1000, null, CancellationToken.None)
+            Assert.Equal(8, fresh.Items.Count)
+            Assert.Null(fresh.Continuation)
+
+            let! absent =
+                store.ListRecoveryCandidates(
+                    TenantId.Create "other",
+                    SessionState.Idle,
+                    2,
+                    null,
+                    CancellationToken.None
+                )
+
+            Assert.Empty(absent.Items)
+            Assert.Null(absent.Continuation)
+            let! running = store.ListRecoveryCandidates(tenant, SessionState.Running, 2, null, CancellationToken.None)
+            Assert.Empty(running.Items)
+        }
+
+    [<Fact>]
+    member this.``Recovery discovery rejects invalid and cross-scope cursors and cancellation``() =
+        task {
+            let invoke size token state tenant ct =
+                task {
+                    let! _ = store.ListRecoveryCandidates(tenant, state, size, token, ct)
+                    return ()
+                }
+                :> Task
+
+            let! _ =
+                Assert.ThrowsAsync<ArgumentOutOfRangeException>(fun () ->
+                    invoke 0 null SessionState.Idle tenant CancellationToken.None)
+
+            let! _ =
+                Assert.ThrowsAsync<ArgumentOutOfRangeException>(fun () ->
+                    invoke 1001 null SessionState.Idle tenant CancellationToken.None)
+
+            let! _ =
+                Assert.ThrowsAsync<ArgumentOutOfRangeException>(fun () ->
+                    invoke 1 null (enum<SessionState> 99) tenant CancellationToken.None)
+
+            let! _ =
+                Assert.ThrowsAsync<ArgumentException>(fun () ->
+                    invoke 1 "not-a-cursor" SessionState.Idle tenant CancellationToken.None)
+
+            use cancelled = new CancellationTokenSource()
+            cancelled.Cancel()
+
+            let! _ =
+                Assert.ThrowsAnyAsync<OperationCanceledException>(fun () ->
+                    invoke 1 null SessionState.Idle tenant cancelled.Token)
+
+            return ()
         }

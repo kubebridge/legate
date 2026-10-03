@@ -392,7 +392,7 @@ let issue395ExhaustiveWireScopeRefusalMatrixIsTypedAndFailClosed () =
 // ────────────────── Manifest table ──────────────────
 
 [<Fact>]
-let ``Manifest table versions only the targeted abort payloads at v2`` () =
+let ``Manifest table versions session-bearing and targeted routing payloads at v2`` () =
     let manifests = WireManifests.cases |> List.map WireManifests.manifestOf
 
     manifests.Length |> should equal 43
@@ -409,6 +409,9 @@ let ``Manifest table versions only the targeted abort payloads at v2`` () =
                 || wireCase.Name = "ScopedRequest"
                 || wireCase.Name = "ScopedResponse"
                 || wireCase.Name = "EventBatch"
+                || wireCase.Name = "SessionClosed"
+                || wireCase.Name = "SetAgentApplied"
+                || wireCase.Name = "SetAgentPending"
             then
                 2
             else
@@ -445,6 +448,86 @@ let ``Legacy untargeted abort manifests and missing targeted versions fail close
         WireDtos.toWire (AbortSession(StopCause.ExplicitAbort, "local", CancellationToken.None))
         |> ignore)
     |> ignore
+
+[<Fact>]
+let ``Superseded session-bearing v1 manifests fail closed without a minus-one read`` () =
+    use system = createWireSystem ()
+    let serializer = envelopeSerializerOf system
+
+    let bytes = System.Text.Encoding.UTF8.GetBytes("{\"Session\":null}")
+
+    for manifest in
+        [
+            "legate.actor.SessionClosed.v1"
+            "legate.entity.SetAgentApplied.v1"
+            "legate.entity.SetAgentPending.v1"
+        ] do
+        let refused =
+            Assert.Throws<WireManifests.WireRejectedException>(fun () ->
+                serializer.FromBinary(bytes, manifest) |> ignore)
+
+        Assert.Equal(Telemetry.RejectionFailed, refused.Reason)
+
+[<Fact>]
+let ``Completion routing refusals cross scoped responses as kind 22`` () =
+    let tenant = TenantId.Create "acme"
+    let sessionId = SessionId.New()
+
+    let refusal =
+        {
+            Tenant = tenant
+            SessionId = sessionId
+            DestinationId = "receiver-a"
+            Reason = CompletionRoutingReason.Unknown
+        }
+
+    let response: SessionRouteResponse =
+        {
+            Address = SessionAddress(tenant, sessionId).Key
+            Owner = "owner-a"
+            Payload = refusal :> obj
+        }
+
+    let dto = WireDtos.toWire (response :> obj) :?> WireDtos.ScopedResponseDto
+
+    dto.Kind |> should equal 22
+    dto.SessionId.Value |> should equal sessionId
+    dto.DestinationId |> should equal "receiver-a"
+    dto.RoutingReason |> should equal CompletionRoutingReason.Unknown
+
+    match WireDtos.ofWire dto with
+    | :? SessionRouteResponse as back ->
+        match back.Payload with
+        | :? CompletionRoutingRefused as rebuilt ->
+            rebuilt.Tenant |> should equal tenant
+            rebuilt.SessionId |> should equal sessionId
+            rebuilt.DestinationId |> should equal "receiver-a"
+            rebuilt.Reason |> should equal CompletionRoutingReason.Unknown
+        | other -> failwith $"Expected a routing refusal but rebuilt '{other.GetType().Name}'."
+    | other -> failwith $"Expected a scoped response but rebuilt '{other.GetType().Name}'."
+
+[<Fact>]
+let ``Routing refusal decoding rejects unknown reasons and missing scope`` () =
+    let tenant = TenantId.Create "acme"
+    let sessionId = SessionId.New()
+
+    let invalidReason = WireDtos.ScopedResponseDto()
+    invalidReason.Format <- 2
+    invalidReason.Address <- SessionAddress(tenant, sessionId).Key
+    invalidReason.Kind <- 22
+    invalidReason.SessionId <- Nullable sessionId
+    invalidReason.RoutingReason <- enum<CompletionRoutingReason> 99
+
+    (fun () -> WireDtos.ofWire invalidReason |> ignore)
+    |> should throw typeof<InvalidOperationException>
+
+    let missingSession = WireDtos.ScopedResponseDto()
+    missingSession.Format <- 2
+    missingSession.Address <- SessionAddress(tenant, sessionId).Key
+    missingSession.Kind <- 22
+
+    (fun () -> WireDtos.ofWire missingSession |> ignore)
+    |> should throw typeof<InvalidOperationException>
 
 [<Fact>]
 let ``No manifests stay reserved after the subscription promotion`` () =

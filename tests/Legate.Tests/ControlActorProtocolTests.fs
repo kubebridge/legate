@@ -12,6 +12,10 @@ open Legate
 open Legate.Storage.InMemory
 open Legate.Storage.Sqlite
 open Legate.Testing
+open Legate.Tests.TurnLoopTests
+open Microsoft.Extensions.DependencyInjection
+open Microsoft.Extensions.Logging
+open Microsoft.Extensions.Logging.Abstractions
 open Xunit
 
 /// Fault/barrier decorator retaining the real provider's claim and control operations.
@@ -375,6 +379,9 @@ module ControlActorProtocolTests =
         let observed = ConcurrentQueue<TurnResult>()
         let sinks = ConcurrentQueue<SessionCompletion>()
 
+        let mutable routes: CompletionDestinations =
+            Unchecked.defaultof<CompletionDestinations>
+
         let runs =
             ConcurrentQueue<InboxEntry * TurnId * TaskCompletionSource<TurnLoop.TurnLoopCompletion>>()
 
@@ -384,12 +391,22 @@ module ControlActorProtocolTests =
         let options = SessionOptions(AutoClose = autoClose)
 
         do
+            options.CompletionDestinationId <- "control-receiver"
             proxy.Inner <- inner
 
-            options.CompletionSink <-
+            let sink =
                 { new ISessionCompletionSink with
-                    member _.Notify completion = sinks.Enqueue completion
+                    member _.NotifyAsync(completion, _) =
+                        sinks.Enqueue completion
+                        Task.CompletedTask
                 }
+
+            let services = ServiceCollection()
+
+            services.AddKeyedSingleton<ISessionCompletionSink>(box (tenant, "control-receiver"), sink)
+            |> ignore
+
+            routes <- CompletionDestinations(services.BuildServiceProvider())
 
         let created =
             inner.CreateSession(tenant, session options, ct).GetAwaiter().GetResult()
@@ -448,6 +465,20 @@ module ControlActorProtocolTests =
         member _.Observed = observed
         member _.Sinks = sinks
         member _.Settled = settled.Task
+
+        /// Runs one durable redrive pass over the rig's store: the sole
+        /// delivery path for the enqueued route snapshot.
+        member _.Deliver() =
+            CompletionRedriver.passOnceAsync
+                store
+                routes
+                "rig-redriver"
+                (CompletionOptions())
+                clock
+                (TurnLoopTests.NeverDelay() :> ILlmDelay)
+                (NullLogger.Instance :> ILogger)
+                ct
+
         member _.Actor = actor
         member _.Journal = journal
 
@@ -512,6 +543,7 @@ module ControlActorProtocolTests =
                 | _ -> ()
             else
                 Assert.Single(rig.Observed) |> ignore
+                do! rig.Deliver()
                 Assert.Single(rig.Sinks) |> ignore
 
             Assert.Single(rig.Runs) |> ignore
@@ -574,6 +606,7 @@ module ControlActorProtocolTests =
             Assert.Equal(HostAbortOutcome.AlreadyTerminal, late.Outcome)
             Assert.Equal(Nullable TurnStatus.Completed, late.TerminalStatus)
             Assert.Single(rig.Observed) |> ignore
+            do! rig.Deliver()
             Assert.Single(rig.Sinks) |> ignore
         }
 

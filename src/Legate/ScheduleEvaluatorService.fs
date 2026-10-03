@@ -301,8 +301,6 @@ module internal ScheduleFire =
             sessionOptions.AutoClose <- true
             sessionOptions.Title <- sprintf "Scheduled run of agent %s at %O" agent.Name occurrenceUtc
 
-            sessionOptions.Permissions <- AllowAllPermissionPolicy() :> IPermissionPolicy
-
             let! session = client.OpenSessionAsync(agent.Id, sessionOptions, cancellationToken)
 
             let! _ =

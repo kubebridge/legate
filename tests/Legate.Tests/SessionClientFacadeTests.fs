@@ -2948,3 +2948,167 @@ let ``OpenSessionAsync succeeds when the era marker fails`` () : Task =
                     (isNull (box created)) |> should equal false
                 })
     }
+
+// ──────────────────────────────────────────────────────────────────────────
+// Completion route gates (issue 378)
+
+/// A sink the tests register for exactly one tenant destination.
+type private GateSink() =
+
+    interface ISessionCompletionSink with
+        member _.NotifyAsync(_completion: SessionCompletion, _cancellationToken: CancellationToken) = Task.CompletedTask
+
+/// Stores a session row carrying the destination without facade
+/// validation: storage persists data, it never resolves host DI.
+let private storeRoutedSession (client: SessionClient) (destinationId: string) : Task<Session> =
+    task {
+        let options = SessionOptions()
+        options.CompletionDestinationId <- destinationId
+
+        let template =
+            {
+                Id = SessionId.New()
+                Tenant = client.Tenant
+                AgentId = AgentId.New()
+                Title = "routed"
+                State = SessionState.Idle
+                CurrentTurnId = Unchecked.defaultof<Nullable<TurnId>>
+                CreatedAt = DateTimeOffset.UtcNow
+                UpdatedAt = DateTimeOffset.UtcNow
+                ClosedAt = Unchecked.defaultof<Nullable<DateTimeOffset>>
+                WorkspaceBinding = null
+                Options = options
+                PermissionGrants = ResizeArray<string>() :> IReadOnlyList<string>
+            }
+
+        return! client.Store.CreateSession(client.Tenant, template, CancellationToken.None)
+    }
+
+[<Fact>]
+let ``OpenSessionAsync refuses unknown routes before persisting`` () : Task =
+    task {
+        use provider =
+            (createServices (scripted [ ScriptStep.Text "done" ]) (sourced [])).BuildServiceProvider()
+
+        return!
+            withClient provider (fun client ->
+                task {
+                    let options = SessionOptions()
+                    options.CompletionDestinationId <- "unknown-receiver"
+
+                    let! refusal =
+                        Assert.ThrowsAsync<CompletionRoutingException>(fun () ->
+                            SessionClientOperations.OpenSessionAsync(
+                                client,
+                                AgentId.New(),
+                                options,
+                                CancellationToken.None
+                            ))
+
+                    Assert.Equal(CompletionRoutingReason.Unknown, refusal.Reason)
+
+                    // Nothing persisted: the refusal preceded the store write.
+                    let! listed =
+                        client.Store.ListSessions(
+                            client.Tenant,
+                            Nullable(SessionState.Idle),
+                            Nullable<AgentId>(),
+                            Nullable<DateTimeOffset>(),
+                            Nullable<DateTimeOffset>(),
+                            100,
+                            null,
+                            CancellationToken.None
+                        )
+
+                    Assert.Empty(listed.Items)
+                })
+    }
+
+[<Fact>]
+let ``OpenSessionAsync accepts registered and sinkless routes`` () : Task =
+    task {
+        let services = createServices (scripted [ ScriptStep.Text "done" ]) (sourced [])
+
+        // The builder registration is covered in BuilderTests; here the
+        // exact tenant key carries the receiver the gate resolves.
+        services.AddKeyedSingleton<ISessionCompletionSink>(
+            box (TenantId.Default, "webhook"),
+            GateSink() :> ISessionCompletionSink
+        )
+        |> ignore
+
+        use provider = services.BuildServiceProvider()
+
+        return!
+            withClient provider (fun client ->
+                task {
+                    let options = SessionOptions()
+                    options.CompletionDestinationId <- "webhook"
+
+                    let! created =
+                        SessionClientOperations.OpenSessionAsync(
+                            client,
+                            AgentId.New(),
+                            options,
+                            CancellationToken.None
+                        )
+
+                    created.Options.CompletionDestinationId |> should equal "webhook"
+
+                    let! sinkless = openSession client
+                    (isNull sinkless.Options.CompletionDestinationId) |> should equal true
+                })
+    }
+
+[<Fact>]
+let ``PromptAsync refuses unknown routes before accepting work`` () : Task =
+    task {
+        use provider =
+            (createServices (scripted [ ScriptStep.Text "done" ]) (sourced [])).BuildServiceProvider()
+
+        return!
+            withClient provider (fun client ->
+                task {
+                    let! created = storeRoutedSession client "unknown-receiver"
+
+                    let! refusal =
+                        Assert.ThrowsAsync<CompletionRoutingException>(fun () ->
+                            SessionClientOperations.PromptAsync(
+                                client,
+                                created.Id,
+                                UserMessage.Text "hello",
+                                DeliveryMode.Queue,
+                                CancellationToken.None
+                            ))
+
+                    Assert.Equal(CompletionRoutingReason.Unknown, refusal.Reason)
+
+                    // No inbox mutation: the refusal preceded acceptance.
+                    let! pending = client.Store.ReadPendingInbox(client.Tenant, created.Id, CancellationToken.None)
+                    Assert.Empty(pending)
+                })
+    }
+
+[<Fact>]
+let ``ReplyAsync refuses unknown routes before consuming input`` () : Task =
+    task {
+        use provider =
+            (createServices (scripted [ ScriptStep.Text "done" ]) (sourced [])).BuildServiceProvider()
+
+        return!
+            withClient provider (fun client ->
+                task {
+                    let! created = storeRoutedSession client "unknown-receiver"
+
+                    let! refusal =
+                        Assert.ThrowsAsync<CompletionRoutingException>(fun () ->
+                            SessionClientOperations.ReplyAsync(
+                                client,
+                                created.Id,
+                                PermissionDecision("req-1", PermissionDecisionKind.AllowOnce),
+                                CancellationToken.None
+                            ))
+
+                    Assert.Equal(CompletionRoutingReason.Unknown, refusal.Reason)
+                })
+    }

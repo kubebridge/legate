@@ -108,7 +108,7 @@ type SqliteSessionStore(database: SqliteDatabase) =
 
         let optionsJson = reader.GetString(10)
         let grantsJson = reader.GetString(11)
-        let options = SqliteJson.deserialize<SessionOptions> optionsJson
+        let options = SessionOptionsPersistence.Deserialize optionsJson
         let grants = SqliteJson.deserialize<List<string>> grantsJson
 
         {
@@ -170,6 +170,7 @@ type SqliteSessionStore(database: SqliteDatabase) =
         {
             Tenant = tenant
             SessionId = completion.SessionId
+            DestinationId = if reader.IsDBNull(9) then null else reader.GetString(9)
             IdempotencyKey = key
             Completion = completion
             CreatedAt = createdAt
@@ -549,7 +550,7 @@ type SqliteSessionStore(database: SqliteDatabase) =
 
                             let now = database.UtcNow
                             let storedGrants = grantsOf session
-                            let optionsJson = SqliteJson.serialize session.Options
+                            let optionsJson = SessionOptionsPersistence.Serialize session.Options
                             let grantsJson = SqliteJson.serialize storedGrants
 
                             use insert = connection.CreateCommand()
@@ -634,6 +635,48 @@ type SqliteSessionStore(database: SqliteDatabase) =
                 | :? SqliteException as sql -> return raise (mapSql sql)
             }
 
+        member _.ListRecoveryCandidates(tenant, state, size, token, ct) =
+            ct.ThrowIfCancellationRequested()
+            RecoveryCandidateCursor.validate state size
+            let cursor = RecoveryCandidateCursor.decode tenant state token
+
+            lock database.Gate (fun () ->
+                use connection = database.OpenConnection()
+                use cmd = connection.CreateCommand()
+
+                cmd.CommandText <-
+                    $"WITH fence AS (SELECT COALESCE($upper, (SELECT MAX(id COLLATE BINARY) FROM \"%s{sessionsTable ()}\" WHERE tenant = $tenant)) AS upper_id) SELECT s.id, f.upper_id FROM \"%s{sessionsTable ()}\" s CROSS JOIN fence f WHERE s.tenant = $tenant AND s.state = $state AND s.current_turn_id IS NOT NULL AND s.id COLLATE BINARY > $last AND s.id COLLATE BINARY <= f.upper_id ORDER BY s.id COLLATE BINARY LIMIT $take"
+
+                cmd.Parameters.AddWithValue("$tenant", tenant.Value) |> ignore
+                cmd.Parameters.AddWithValue("$state", stateName state) |> ignore
+                cmd.Parameters.AddWithValue("$take", size + 1) |> ignore
+
+                cmd.Parameters.AddWithValue(
+                    "$upper",
+                    cursor
+                    |> Option.map (fun c -> box c.Upper)
+                    |> Option.defaultValue (box DBNull.Value)
+                )
+                |> ignore
+
+                cmd.Parameters.AddWithValue("$last", cursor |> Option.map (fun c -> c.Last) |> Option.defaultValue "")
+                |> ignore
+
+                ct.ThrowIfCancellationRequested()
+                use reader = cmd.ExecuteReader()
+                let mutable upper = ""
+
+                let rows =
+                    [
+                        while reader.Read() do
+                            ct.ThrowIfCancellationRequested()
+                            upper <- reader.GetString(1)
+                            yield reader.GetString(0)
+                    ]
+
+                RecoveryCandidateCursor.page tenant state size upper rows)
+            |> Task.FromResult
+
         member _.ListSessions(tenant, state, agentId, createdFrom, createdTo, pageSize, continuation, _) =
             task {
                 if pageSize <= 0 then
@@ -693,7 +736,7 @@ type SqliteSessionStore(database: SqliteDatabase) =
                             let hasMore = remaining.Length > page.Length
 
                             {
-                                Items = page :> IReadOnlyList<Session>
+                                SessionPage.Items = page :> IReadOnlyList<Session>
                                 Continuation =
                                     (match hasMore, List.tryLast page with
                                      | true, Some last -> tokenOf last
@@ -1453,8 +1496,10 @@ type SqliteSessionStore(database: SqliteDatabase) =
                 | :? SqliteException as sql -> return raise (mapSql sql)
             }
 
-        member _.EnqueueCompletionOutbox(tenant, completion, _) =
+        member _.EnqueueCompletionOutbox(tenant, destinationId, completion, _) =
             task {
+                CompletionDestinationRules.Validate destinationId
+
                 if isNull (box completion) then
                     raise (ArgumentNullException(nameof completion))
 
@@ -1477,7 +1522,7 @@ type SqliteSessionStore(database: SqliteDatabase) =
                             check.Transaction <- transaction
 
                             check.CommandText <-
-                                $"SELECT idempotency_key, tenant, session_id, completion_json, created_at, delivered, delivered_at, lease_owner, lease_expires_at FROM \"%s{outboxTable ()}\" WHERE idempotency_key = $key"
+                                $"SELECT idempotency_key, tenant, session_id, completion_json, created_at, delivered, delivered_at, lease_owner, lease_expires_at, destination_id FROM \"%s{outboxTable ()}\" WHERE idempotency_key = $key"
 
                             check.Parameters.AddWithValue("$key", completion.IdempotencyKey) |> ignore
 
@@ -1485,6 +1530,12 @@ type SqliteSessionStore(database: SqliteDatabase) =
 
                             if reader.Read() then
                                 let entry = readOutboxEntry reader
+
+                                if entry.Tenant <> tenant || entry.SessionId <> completion.SessionId then
+                                    raise (
+                                        ArgumentException("The idempotency key belongs to another session or tenant.")
+                                    )
+
                                 transaction.Rollback()
                                 entry
                             else
@@ -1496,21 +1547,23 @@ type SqliteSessionStore(database: SqliteDatabase) =
                                 insert.Transaction <- transaction
 
                                 insert.CommandText <-
-                                    $"INSERT INTO \"%s{outboxTable ()}\" (idempotency_key, tenant, session_id, completion_json, created_at, delivered, delivered_at, lease_owner, lease_expires_at) VALUES ($key, $tenant, $session, $completion, $created, 0, NULL, NULL, NULL)"
+                                    $"INSERT INTO \"%s{outboxTable ()}\" (idempotency_key, tenant, session_id, completion_json, created_at, delivered, delivered_at, lease_owner, lease_expires_at, destination_id) VALUES ($key, $tenant, $session, $completion, $created, 0, NULL, NULL, NULL, $destination)"
 
                                 insert.Parameters.AddWithValue("$key", completion.IdempotencyKey) |> ignore
                                 insert.Parameters.AddWithValue("$tenant", tenant.Value) |> ignore
                                 insert.Parameters.AddWithValue("$session", completion.SessionId.Value) |> ignore
                                 insert.Parameters.AddWithValue("$completion", completionJson) |> ignore
                                 insert.Parameters.AddWithValue("$created", toIso now) |> ignore
+                                insert.Parameters.AddWithValue("$destination", destinationId) |> ignore
                                 insert.ExecuteNonQuery() |> ignore
                                 transaction.Commit()
 
                                 {
                                     Tenant = tenant
                                     SessionId = completion.SessionId
+                                    DestinationId = destinationId
                                     IdempotencyKey = completion.IdempotencyKey
-                                    Completion = completion
+                                    Completion = SqliteJson.deserialize<SessionCompletion> completionJson
                                     CreatedAt = now
                                     Delivered = false
                                     DeliveredAt = Nullable()
@@ -1545,7 +1598,7 @@ type SqliteSessionStore(database: SqliteDatabase) =
                             pick.Transaction <- transaction
 
                             pick.CommandText <-
-                                $"SELECT idempotency_key FROM \"%s{outboxTable ()}\" WHERE delivered = 0 AND (lease_owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= $now) ORDER BY created_at LIMIT $limit"
+                                $"SELECT idempotency_key FROM \"%s{outboxTable ()}\" WHERE delivered = 0 AND (lease_owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= $now) ORDER BY CASE WHEN lease_expires_at IS NULL THEN 0 ELSE 1 END, lease_expires_at, created_at, idempotency_key LIMIT $limit"
 
                             pick.Parameters.AddWithValue("$now", nowText) |> ignore
                             pick.Parameters.AddWithValue("$limit", maxBatch) |> ignore
@@ -1577,7 +1630,7 @@ type SqliteSessionStore(database: SqliteDatabase) =
                                 fetch.Transaction <- transaction
 
                                 fetch.CommandText <-
-                                    $"SELECT idempotency_key, tenant, session_id, completion_json, created_at, delivered, delivered_at, lease_owner, lease_expires_at FROM \"%s{outboxTable ()}\" WHERE idempotency_key = $key"
+                                    $"SELECT idempotency_key, tenant, session_id, completion_json, created_at, delivered, delivered_at, lease_owner, lease_expires_at, destination_id FROM \"%s{outboxTable ()}\" WHERE idempotency_key = $key"
 
                                 fetch.Parameters.AddWithValue("$key", key) |> ignore
 
@@ -1632,6 +1685,31 @@ type SqliteSessionStore(database: SqliteDatabase) =
                 | :? LegateException as ex -> return raise ex
                 | :? SqliteException as sql -> return raise (mapSql sql)
             }
+
+        member _.RenewCompletionClaim(tenant, key, owner, duration, ct) =
+            ct.ThrowIfCancellationRequested()
+
+            if duration <= TimeSpan.Zero then
+                raise (ArgumentOutOfRangeException(nameof duration))
+
+            lock database.Gate (fun () ->
+                use connection = database.OpenConnection()
+                use cmd = connection.CreateCommand()
+
+                cmd.CommandText <-
+                    $"UPDATE \"%s{outboxTable ()}\" SET lease_expires_at = $expires WHERE tenant = $tenant AND idempotency_key = $key AND delivered = 0 AND lease_owner = $owner AND lease_expires_at > $now"
+
+                cmd.Parameters.AddWithValue("$tenant", tenant.Value) |> ignore
+                cmd.Parameters.AddWithValue("$key", key) |> ignore
+                cmd.Parameters.AddWithValue("$owner", owner) |> ignore
+                cmd.Parameters.AddWithValue("$now", toIso database.UtcNow) |> ignore
+
+                cmd.Parameters.AddWithValue("$expires", toIso (database.UtcNow + duration))
+                |> ignore
+
+                ct.ThrowIfCancellationRequested()
+                cmd.ExecuteNonQuery() = 1)
+            |> Task.FromResult
 
         member _.MarkCompletionDelivered(tenant, idempotencyKey, owner, _) =
             task {

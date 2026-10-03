@@ -3,6 +3,7 @@ namespace Legate.Storage.InMemory
 
 open System
 open System.Collections.Generic
+open System.Text.Json
 open System.Threading
 open System.Threading.Tasks
 open Legate
@@ -31,6 +32,21 @@ type InMemorySessionStore(database: InMemoryDatabase) =
     let mintToken () = Ulid.NewUlid().ToString()
 
     let ok value = Task.FromResult value
+
+    let copySession (session: Session) =
+        { session with
+            Options = SessionOptionsPersistence.Snapshot session.Options
+            PermissionGrants =
+                if isNull (box session.PermissionGrants) then
+                    List<string>()
+                else
+                    List<string>(session.PermissionGrants)
+        }
+
+    let copyCompletion (completion: SessionCompletion) : SessionCompletion =
+        match JsonSerializer.Deserialize<SessionCompletion>(JsonSerializer.Serialize completion) with
+        | null -> raise (InvalidOperationException("Completion snapshot must be non-null."))
+        | copied -> copied
 
     let sessionRow (tenant: TenantId) (sessionId: SessionId) =
         match database.Sessions.TryGetValue((tenant, sessionId)) with
@@ -133,8 +149,9 @@ type InMemorySessionStore(database: InMemoryDatabase) =
         {
             Tenant = row.Tenant
             SessionId = row.Completion.SessionId
+            DestinationId = row.DestinationId
             IdempotencyKey = row.Completion.IdempotencyKey
-            Completion = row.Completion
+            Completion = copyCompletion row.Completion
             CreatedAt = row.CreatedAt
             Delivered = row.Delivered
             DeliveredAt = row.DeliveredAt
@@ -158,6 +175,7 @@ type InMemorySessionStore(database: InMemoryDatabase) =
 
     let controlContext tenant sessionId =
         let session = requireSession tenant sessionId
+        session.Options.ValidatePersistence()
 
         let prime =
             match database.LiveClaims.TryGetValue((tenant, sessionId)) with
@@ -284,6 +302,8 @@ type InMemorySessionStore(database: InMemoryDatabase) =
             if isNull (box session) then
                 raise (ArgumentNullException(nameof session))
 
+            let session = copySession session
+
             lock database.Gate (fun () ->
                 match
                     database.Sessions.Values
@@ -316,11 +336,51 @@ type InMemorySessionStore(database: InMemoryDatabase) =
                     database.ControlStates[(tenant, session.Id)] <-
                         ControlTargetProtocol.encode (ControlTargetProtocol.fresh ())
 
-                    stored)
+                    copySession stored)
             |> ok
 
         member _.GetSession(tenant, sessionId, _) =
-            lock database.Gate (fun () -> sessionRow tenant sessionId) |> Option.toObj |> ok
+            lock database.Gate (fun () -> sessionRow tenant sessionId |> Option.map copySession)
+            |> Option.toObj
+            |> ok
+
+        member _.ListRecoveryCandidates(tenant, state, size, token, ct) =
+            ct.ThrowIfCancellationRequested()
+            RecoveryCandidateCursor.validate state size
+            let cursor = RecoveryCandidateCursor.decode tenant state token
+
+            lock database.Gate (fun () ->
+                ct.ThrowIfCancellationRequested()
+
+                let identities =
+                    database.Sessions.Values |> Seq.filter (fun session -> session.Tenant = tenant)
+
+                let upper =
+                    match cursor with
+                    | Some cursor -> cursor.Upper
+                    | None ->
+                        identities
+                        |> Seq.map (fun session -> session.Id.ToString())
+                        |> Seq.sortWith (fun a b -> StringComparer.Ordinal.Compare(a, b))
+                        |> Seq.tryLast
+                        |> Option.defaultValue ""
+
+                let last =
+                    cursor |> Option.map (fun cursor -> cursor.Last) |> Option.defaultValue ""
+
+                let rows =
+                    identities
+                    |> Seq.filter (fun session -> session.State = state && session.CurrentTurnId.HasValue)
+                    |> Seq.map (fun session -> session.Id.ToString())
+                    |> Seq.filter (fun id ->
+                        StringComparer.Ordinal.Compare(id, last) > 0
+                        && StringComparer.Ordinal.Compare(id, upper) <= 0)
+                    |> Seq.sortWith (fun a b -> StringComparer.Ordinal.Compare(a, b))
+                    |> Seq.truncate (size + 1)
+                    |> Seq.toList
+
+                RecoveryCandidateCursor.page tenant state size upper rows)
+            |> ok
 
         member _.ListSessions(tenant, state, agentId, createdFrom, createdTo, pageSize, continuation, _) =
             if pageSize <= 0 then
@@ -361,7 +421,7 @@ type InMemorySessionStore(database: InMemoryDatabase) =
                 let hasMore = remaining.Length > page.Length
 
                 {
-                    Items = page :> IReadOnlyList<Session>
+                    SessionPage.Items = (page |> List.map copySession) :> IReadOnlyList<Session>
                     Continuation =
                         (match hasMore, List.tryLast page with
                          | true, Some last -> tokenOf last
@@ -393,7 +453,7 @@ type InMemorySessionStore(database: InMemoryDatabase) =
                     }
 
                 database.Sessions[(tenant, sessionId)] <- updated
-                updated)
+                copySession updated)
             |> ok
 
         member _.CloseSession(tenant, sessionId, _) =
@@ -402,7 +462,7 @@ type InMemorySessionStore(database: InMemoryDatabase) =
                 requireNoBinding tenant sessionId
 
                 if session.State = SessionState.Closed then
-                    session
+                    copySession session
                 else
                     let now = database.UtcNow
 
@@ -415,7 +475,7 @@ type InMemorySessionStore(database: InMemoryDatabase) =
                         }
 
                     database.Sessions[(tenant, sessionId)] <- updated
-                    updated)
+                    copySession updated)
             |> ok
 
         member _.GrantSessionTool(tenant, sessionId, toolName, _) =
@@ -446,7 +506,7 @@ type InMemorySessionStore(database: InMemoryDatabase) =
                     }
 
                 database.Sessions[(tenant, sessionId)] <- updated
-                updated)
+                copySession updated)
             |> ok
 
         member _.SetSessionAgent(tenant, sessionId, agentId, _) =
@@ -782,7 +842,9 @@ type InMemorySessionStore(database: InMemoryDatabase) =
                 | Choice3Of3() -> TurnLeaseMissing claim.TurnId :> TurnLeaseState)
             |> ok
 
-        member _.EnqueueCompletionOutbox(tenant, completion, _) =
+        member _.EnqueueCompletionOutbox(tenant, destinationId, completion, _) =
+            CompletionDestinationRules.Validate destinationId
+
             if isNull (box completion) then
                 raise (ArgumentNullException(nameof completion))
 
@@ -795,9 +857,15 @@ type InMemorySessionStore(database: InMemoryDatabase) =
                 requireSession tenant completion.SessionId |> ignore
 
                 match database.Outbox.TryGetValue((tenant, completion.IdempotencyKey)) with
-                | true, row -> outboxEntry row
+                | true, row ->
+                    if row.Completion.SessionId <> completion.SessionId then
+                        raise (ArgumentException("The idempotency key belongs to another session."))
+
+                    outboxEntry row
                 | false, _ ->
-                    let row = OutboxRow(tenant, completion, database.UtcNow)
+                    let row =
+                        OutboxRow(tenant, destinationId, copyCompletion completion, database.UtcNow)
+
                     database.Outbox[(tenant, completion.IdempotencyKey)] <- row
                     outboxEntry row)
             |> ok
@@ -821,7 +889,11 @@ type InMemorySessionStore(database: InMemoryDatabase) =
                     isNull (box row.LeaseOwner)
                     || not row.LeaseExpiresAt.HasValue
                     || row.LeaseExpiresAt.Value <= now)
-                |> Seq.sortBy (fun row -> row.CreatedAt)
+                |> Seq.sortBy (fun row ->
+                    row.LeaseExpiresAt.HasValue,
+                    row.LeaseExpiresAt.GetValueOrDefault(),
+                    row.CreatedAt,
+                    row.Completion.IdempotencyKey)
                 |> Seq.truncate maxBatch
                 |> Seq.map (fun row ->
                     row.LeaseOwner <- owner
@@ -847,6 +919,25 @@ type InMemorySessionStore(database: InMemoryDatabase) =
                     && String.Equals(row.LeaseOwner, owner, StringComparison.Ordinal)
                     && row.LeaseExpiresAt.HasValue
                     && row.LeaseExpiresAt.Value > database.UtcNow)
+            |> ok
+
+        member _.RenewCompletionClaim(tenant, key, owner, duration, ct) =
+            ct.ThrowIfCancellationRequested()
+
+            if duration <= TimeSpan.Zero then
+                raise (ArgumentOutOfRangeException(nameof duration))
+
+            lock database.Gate (fun () ->
+                match database.Outbox.TryGetValue((tenant, key)) with
+                | true, row when
+                    not row.Delivered
+                    && row.LeaseOwner = owner
+                    && row.LeaseExpiresAt.HasValue
+                    && row.LeaseExpiresAt.Value > database.UtcNow
+                    ->
+                    row.LeaseExpiresAt <- Nullable(database.UtcNow + duration)
+                    true
+                | _ -> false)
             |> ok
 
         member _.MarkCompletionDelivered(tenant, idempotencyKey, owner, _) =

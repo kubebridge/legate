@@ -268,16 +268,12 @@ type SessionClientOperations =
                 options.AutoClose <- from.AutoClose
                 options.Outcome <- from.Outcome
 
-                match Option.ofObj from.Permissions with
-                | Some permissions -> options.Permissions <- permissions
-                | None -> ()
-
                 match Option.ofObj from.AskUser with
                 | Some askUser -> options.AskUser <- askUser
                 | None -> ()
 
-                match Option.ofObj from.CompletionSink with
-                | Some completionSink -> options.CompletionSink <- completionSink
+                match Option.ofObj from.CompletionDestinationId with
+                | Some destinationId -> options.CompletionDestinationId <- destinationId
                 | None -> ()
 
                 options.MaxIterations <- from.MaxIterations
@@ -407,7 +403,7 @@ type SessionClientOperations =
             let effective =
                 match options with
                 | null -> SessionOptions()
-                | present -> present
+                | present -> SessionOptionsPersistence.Snapshot present
 
             let title =
                 match effective.Title with
@@ -433,6 +429,7 @@ type SessionClientOperations =
                     PermissionGrants = ResizeArray<string>() :> IReadOnlyList<string>
                 }
 
+            client.ValidateCompletionRoute session
             let! created = client.Store.CreateSession(tenant, session, cancellationToken)
 
             // Completion era (issue 289): mark after a successful create;
@@ -486,7 +483,8 @@ type SessionClientOperations =
             raise (ArgumentNullException(nameof message))
 
         task {
-            let! _ = SessionClientOperations.RequireAsync(client, sessionId, cancellationToken)
+            let! current = SessionClientOperations.RequireAsync(client, sessionId, cancellationToken)
+            client.ValidateCompletionRoute current
 
             // Titling never blocks or fails the prompt: the shared helper
             // no-ops unless the host opted in and the stored title is
@@ -555,7 +553,8 @@ type SessionClientOperations =
             raise (ArgumentNullException(nameof reply))
 
         task {
-            let! _ = SessionClientOperations.RequireAsync(client, sessionId, cancellationToken)
+            let! current = SessionClientOperations.RequireAsync(client, sessionId, cancellationToken)
+            client.ValidateCompletionRoute current
             let! actor = client.Resolve(sessionId, cancellationToken)
             return! SessionActor.replyAsync client.Store client.Tenant sessionId actor reply cancellationToken
         }
@@ -752,6 +751,7 @@ type SessionClientOperations =
                     PermissionGrants = ResizeArray<string>() :> IReadOnlyList<string>
                 }
 
+            client.ValidateCompletionRoute forked
             let! created = client.Store.CreateSession(tenant, forked, cancellationToken)
 
             // Completion era (issue 289): mark after a successful create;
@@ -1740,6 +1740,7 @@ module internal SessionClientWiring =
         ArgumentNullException.ThrowIfNull(workTracker)
 
         let store = provider.GetRequiredService<ISessionStore>()
+        let routes = provider.GetRequiredService<CompletionDestinations>()
         let bus = provider.GetRequiredService<SessionEventBus>()
 
         let legateOptions =
@@ -1879,7 +1880,8 @@ module internal SessionClientWiring =
                 )
 
             let entityFactory =
-                SessionActor.spawnSuspendFactory
+                SessionActor.spawnSuspendFactoryRouted
+                    (Some routes)
                     store
                     clientOptions.Tenant
                     eventStore
@@ -1962,6 +1964,7 @@ module internal SessionClientWiring =
 
                  built.AutoTitle <- Some autoTitle
                  built.CompletionEra <- marker
+                 built.CompletionDestinations <- Some routes
 
                  built.SubscribeRouter <-
                      Some(

@@ -222,7 +222,7 @@ module internal ClaimFence =
                 let! state = verifyAsync store tenant claim cancellationToken
 
                 if isLiveState state then
-                    sink.Notify(completion)
+                    do! sink.NotifyAsync(completion, cancellationToken)
                     return true
                 else
                     return false

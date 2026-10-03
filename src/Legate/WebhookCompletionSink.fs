@@ -113,28 +113,8 @@ type WebhookCompletionSinkOptions() =
     /// the sink's lifetime token.
     member val Timeout: TimeSpan = TimeSpan.FromSeconds(30.0) with get, set
 
-    /// The delivery attempts a completion gets. 0 means the
-    /// <see cref="P:Legate.CompletionOptions.MaxDeliveryAttempts" />
-    /// default (3). Attempts are bounded: delivery is at-most-N.
-    member val MaxDeliveryAttempts: int = 0 with get, set
-
-    /// The backoff before the first retry; doubles every retry. Defaults
-    /// to 2 seconds. The 30 second <c>CompletionOptions.RetryDelay</c> is
-    /// deliberately not reused verbatim: it is a re-drive cadence, far
-    /// too slow for a per-delivery backoff base.
-    member val BaseRetryDelay: TimeSpan = TimeSpan.FromSeconds(2.0) with get, set
-
-    /// The cap every backoff is clamped to. Defaults to 30 seconds.
-    member val MaxRetryDelay: TimeSpan = TimeSpan.FromSeconds(30.0) with get, set
-
     /// The default per-attempt bound: 30 seconds.
     static member DefaultTimeout: TimeSpan = TimeSpan.FromSeconds(30.0)
-
-    /// The default backoff before the first retry: 2 seconds.
-    static member DefaultBaseRetryDelay: TimeSpan = TimeSpan.FromSeconds(2.0)
-
-    /// The default backoff cap: 30 seconds.
-    static member DefaultMaxRetryDelay: TimeSpan = TimeSpan.FromSeconds(30.0)
 
     /// Returns null when every knob is in range, otherwise a message for
     /// the first violation. A missing or empty secret is a violation
@@ -167,14 +147,6 @@ type WebhookCompletionSinkOptions() =
                     "SigningSecret is required unless AllowUnsignedDelivery is true."
                 if this.Timeout <= TimeSpan.Zero then
                     "Timeout must be positive."
-                if this.MaxDeliveryAttempts < 0 then
-                    "MaxDeliveryAttempts must not be negative: 0 falls back to CompletionOptions.MaxDeliveryAttempts."
-                if this.BaseRetryDelay < TimeSpan.Zero then
-                    "BaseRetryDelay must not be negative."
-                if this.MaxRetryDelay < TimeSpan.Zero then
-                    "MaxRetryDelay must not be negative."
-                elif this.MaxRetryDelay < this.BaseRetryDelay then
-                    "MaxRetryDelay must not be less than BaseRetryDelay."
             |]
 
         if violations.Length = 0 then
@@ -526,15 +498,6 @@ type WebhookCompletionSink
             null
         )
 
-    /// How many attempts this delivery gets: the configured count, or
-    /// the <c>CompletionOptions.MaxDeliveryAttempts</c> default when
-    /// unset (0).
-    member private _.AttemptBudget: int =
-        if options.MaxDeliveryAttempts > 0 then
-            options.MaxDeliveryAttempts
-        else
-            CompletionOptions().MaxDeliveryAttempts
-
     /// Whether a signing secret is configured: null or empty reads as
     /// missing, matching the options validation.
     member private _.HasSecret: bool =
@@ -550,133 +513,56 @@ type WebhookCompletionSink
         | Some live when live.Length = 0 -> null
         | Some live -> WebhookDeliveryTransport.sign live body
 
-    /// Delivers one queued completion in the background: up to the
-    /// attempt budget, backing off over the delay seam between attempts.
-    /// Permanent failures stop immediately; every terminal outcome is
-    /// logged with the attempt count, and nothing here ever throws or
-    /// carries secrets.
-    member private this.DeliverAsync(completion: SessionCompletion, body: byte[]) : Task =
-        task {
-            try
-                let sessionId = completion.SessionId.ToString()
-
-                let key = completion.IdempotencyKey
-
-                let idempotencyKey =
-                    if isNull (box key) || String.IsNullOrWhiteSpace key then
-                        Guid.NewGuid().ToString("N")
-                    else
-                        key
-
-                if not this.HasSecret && not options.AllowUnsignedDelivery then
-                    log.LogWarning(
-                        "Webhook completion delivery skipped for session {SessionId}: no signing secret and unsigned delivery is not allowed.",
-                        sessionId
-                    )
-                else
-                    match Option.ofObj options.Endpoint with
-                    | None ->
-                        log.LogWarning(
-                            "Webhook completion delivery skipped for session {SessionId}: no webhook endpoint is configured.",
-                            sessionId
-                        )
-                    | Some endpoint ->
-                        let budget = this.AttemptBudget
-                        let signature = this.SignatureFor(body)
-                        let mutable attempt = 0
-                        let mutable finished = false
-
-                        while not finished do
-                            attempt <- attempt + 1
-
-                            let! outcome =
-                                WebhookDeliveryTransport.postOnceAsync
-                                    resolver
-                                    guardOptions
-                                    endpoint
-                                    body
-                                    signature
-                                    idempotencyKey
-                                    options.Timeout
-                                    lifetime.Token
-
-                            match outcome with
-                            | Ok _ ->
-                                log.LogDebug(
-                                    "Webhook completion delivered for session {SessionId} on attempt {Attempt}.",
-                                    sessionId,
-                                    attempt
-                                )
-
-                                finished <- true
-                            | Error failure when failure.IsTransient && attempt < budget ->
-                                log.LogWarning(
-                                    "Webhook completion delivery for session {SessionId} failed on attempt {Attempt} of {Budget}, retrying: {Reason}",
-                                    sessionId,
-                                    attempt,
-                                    budget,
-                                    failure.ToBoundedString()
-                                )
-
-                                let backoff =
-                                    WebhookDeliveryTransport.backoffFor
-                                        options.BaseRetryDelay
-                                        options.MaxRetryDelay
-                                        attempt
-
-                                try
-                                    do! delay.Delay(backoff, lifetime.Token)
-                                with :? OperationCanceledException ->
-                                    log.LogError(
-                                        "Webhook completion delivery for session {SessionId} canceled on attempt {Attempt} of {Budget}.",
-                                        sessionId,
-                                        attempt,
-                                        budget
-                                    )
-
-                                    finished <- true
-                            | Error failure ->
-                                log.LogError(
-                                    "Webhook completion delivery for session {SessionId} failed permanently after {Attempt} of {Budget} attempts (idempotency key {IdempotencyKey}): {Reason}",
-                                    sessionId,
-                                    attempt,
-                                    budget,
-                                    idempotencyKey,
-                                    failure.ToBoundedString()
-                                )
-
-                                finished <- true
-            with failed ->
-                log.LogError(
-                    "Webhook completion delivery failed with an unexpected error: {Reason}",
-                    WebhookDeliveryTransport.truncate failed.Message
-                )
-        }
-
     /// Receives one completion delivery: maps the documented wire payload
     /// and queues a bounded background delivery, then returns without
     /// blocking. At-least-once per call: receivers deduplicate on the
     /// idempotency key.
     /// <param name="completion">The session's structured completion. Must not be null.</param>
     interface ISessionCompletionSink with
-        member this.Notify(completion: SessionCompletion) =
+        member this.NotifyAsync(completion: SessionCompletion, cancellationToken: CancellationToken) =
             ArgumentNullException.ThrowIfNull(completion)
 
             if disposed then
                 raise (ObjectDisposedException(nameof WebhookCompletionSink))
 
-            let payload = WebhookCompletionPayloadMapping.map completion (clock.GetUtcNow())
+            task {
+                if String.IsNullOrWhiteSpace completion.IdempotencyKey then
+                    raise (ArgumentException("A completion requires its original nonblank idempotency key."))
 
-            let body = WebhookCompletionPayloadMapping.serialize payload
+                match options.Validate() with
+                | null -> ()
+                | _ -> raise (InvalidOperationException("Webhook configuration is unavailable."))
 
-            try
-                Task.Run(Func<Task>(fun () -> this.DeliverAsync(completion, body))) |> ignore
-            with failed ->
-                log.LogError(
-                    "Webhook completion delivery for session {SessionId} could not start: {Reason}",
-                    completion.SessionId.ToString(),
-                    WebhookDeliveryTransport.truncate failed.Message
-                )
+                use linked =
+                    CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, lifetime.Token)
+
+                linked.Token.ThrowIfCancellationRequested()
+
+                let body =
+                    WebhookCompletionPayloadMapping.map completion (clock.GetUtcNow())
+                    |> WebhookCompletionPayloadMapping.serialize
+
+                match options.Endpoint with
+                | null -> raise (InvalidOperationException("Webhook configuration is unavailable."))
+                | endpoint ->
+                    let! outcome =
+                        WebhookDeliveryTransport.postOnceAsync
+                            resolver
+                            guardOptions
+                            endpoint
+                            body
+                            (this.SignatureFor body)
+                            completion.IdempotencyKey
+                            options.Timeout
+                            linked.Token
+
+                    linked.Token.ThrowIfCancellationRequested()
+
+                    match outcome with
+                    | Ok _ -> log.LogDebug("Webhook completion accepted for session {SessionId}.", completion.SessionId)
+                    | Error _ -> raise (InvalidOperationException("Webhook receiver did not acknowledge delivery."))
+            }
+            :> Task
 
     /// Cancels in-flight delivery work. Deliveries already handed to the
     /// endpoint are not recalled.

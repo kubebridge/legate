@@ -45,6 +45,8 @@ let ``Defaults validate to null and describe a single node`` () =
     options.Completion.ClaimLeaseDuration
     |> should equal (TimeSpan.FromSeconds 60.0)
 
+    options.Completion.AttemptTimeout |> should equal (TimeSpan.FromSeconds 30.0)
+
     options.Pruning.ReservedBufferTokens |> should equal 10_000
     options.Pruning.KeepLastAssistantTurns |> should equal 2
 
@@ -288,6 +290,9 @@ let ``Completion Validate flags attempts and negative delay`` () =
 
     CompletionOptions(ClaimLeaseDuration = TimeSpan.Zero).Validate()
     |> should equal "ClaimLeaseDuration must be positive."
+
+    CompletionOptions(AttemptTimeout = TimeSpan.Zero).Validate()
+    |> should equal "AttemptTimeout must be positive."
 
     CompletionOptions().Validate() |> should equal null
 

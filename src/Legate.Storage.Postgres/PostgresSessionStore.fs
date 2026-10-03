@@ -146,7 +146,7 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
         "id, tenant, agent_id, title, state, current_turn_id, created_at, updated_at, closed_at, workspace_binding, options_json, permission_grants_json"
 
     member private _.OutboxColumns =
-        "idempotency_key, tenant, session_id, completion_json, created_at, delivered, delivered_at, lease_owner, lease_expires_at"
+        "idempotency_key, tenant, session_id, completion_json, created_at, delivered, delivered_at, lease_owner, lease_expires_at, destination_id"
 
     /// Statuses a turn is still said to be open under, as the quoted
     /// filter text for IN lists: anything not terminal.
@@ -188,16 +188,7 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
 
                 this.StoredGrants(items :> IReadOnlyList<string>)
 
-        let optionsValue: SessionOptions =
-            if optionsText = "null" then
-                // A host that persisted a null options snapshot reads back
-                // as default options; the store itself always writes
-                // non-null.
-                SessionOptions()
-            else
-                match JsonSerializer.Deserialize(optionsText, jsonOptions) with
-                | null -> raise (InvalidOperationException("The stored session options are null."))
-                | decoded -> decoded
+        let optionsValue = SessionOptionsPersistence.Deserialize optionsText
 
         {
             Id = SessionId.Parse(reader.GetString(0))
@@ -234,6 +225,7 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
         {
             Tenant = TenantId.Create(reader.GetString(1))
             SessionId = SessionId.Parse(reader.GetString(2))
+            DestinationId = getTextOrNull reader 9
             IdempotencyKey = reader.GetString(0)
             Completion = completion
             CreatedAt = parseStamp (reader.GetString(4))
@@ -574,7 +566,7 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
                 textParam insertCmd "created" nowText
                 textParam insertCmd "updated" nowText
                 textParam insertCmd "binding" stored.WorkspaceBinding
-                textParam insertCmd "options" (serialize<SessionOptions> stored.Options)
+                textParam insertCmd "options" (SessionOptionsPersistence.Serialize stored.Options)
                 textParam insertCmd "grants" (serialize<List<string>> (List<string>(grants)))
                 insertCmd.ExecuteNonQuery() |> ignore
                 RelationalControlTarget.initialize connection transaction this.ControlTable tenant stored.Id
@@ -605,6 +597,39 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
 
                 reader.Close()
                 row |> Option.toObj)
+            |> Task.FromResult
+
+        member this.ListRecoveryCandidates(tenant, state, size, token, ct) =
+            ct.ThrowIfCancellationRequested()
+            RecoveryCandidateCursor.validate state size
+            let cursor = RecoveryCandidateCursor.decode tenant state token
+            this.EnsureMigrated()
+
+            transact options (fun connection transaction ->
+                use cmd =
+                    command
+                        connection
+                        transaction
+                        $"WITH fence AS (SELECT COALESCE(@upper, (SELECT MAX(id COLLATE \"C\") FROM {this.SessionsTable} WHERE tenant = @t)) AS upper_id) SELECT s.id, f.upper_id FROM {this.SessionsTable} s CROSS JOIN fence f WHERE s.tenant = @t AND s.state = @state AND s.current_turn_id IS NOT NULL AND s.id COLLATE \"C\" > @last AND s.id COLLATE \"C\" <= f.upper_id COLLATE \"C\" ORDER BY s.id COLLATE \"C\" LIMIT @take"
+
+                textParam cmd "t" (tenant.ToString())
+                textParam cmd "state" (state.ToString())
+                textParam cmd "upper" (cursor |> Option.map (fun c -> c.Upper) |> Option.toObj)
+                textParam cmd "last" (cursor |> Option.map (fun c -> c.Last) |> Option.defaultValue "")
+                intParam cmd "take" (size + 1)
+                ct.ThrowIfCancellationRequested()
+                use reader = cmd.ExecuteReader()
+                let mutable upper = ""
+
+                let rows =
+                    [
+                        while reader.Read() do
+                            ct.ThrowIfCancellationRequested()
+                            upper <- reader.GetString(1)
+                            yield reader.GetString(0)
+                    ]
+
+                RecoveryCandidateCursor.page tenant state size upper rows)
             |> Task.FromResult
 
         member this.ListSessions(tenant, state, agentId, createdFrom, createdTo, pageSize, continuation, _) =
@@ -655,7 +680,7 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
 
                 if bogus then
                     {
-                        Items = [] :> IReadOnlyList<Session>
+                        SessionPage.Items = [] :> IReadOnlyList<Session>
                         Continuation = null
                     }
                 else
@@ -691,7 +716,7 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
                     let hasMore = rows.Length > page.Length
 
                     {
-                        Items = page :> IReadOnlyList<Session>
+                        SessionPage.Items = page :> IReadOnlyList<Session>
                         Continuation =
                             match hasMore, List.tryLast page with
                             | true, Some last -> this.PageToken(last)
@@ -1542,7 +1567,9 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
                 | Choice3Of3() -> TurnLeaseMissing claim.TurnId :> TurnLeaseState)
             |> Task.FromResult
 
-        member this.EnqueueCompletionOutbox(tenant, completion, _) =
+        member this.EnqueueCompletionOutbox(tenant, destinationId, completion, _) =
+            CompletionDestinationRules.Validate destinationId
+
             if isNull (box completion) then
                 raise (ArgumentNullException(nameof completion))
 
@@ -1575,6 +1602,12 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
                         None
 
                 findReader.Close()
+
+                match row with
+                | Some existing when existing.SessionId <> completion.SessionId ->
+                    raise (ArgumentException("The idempotency key belongs to another session."))
+                | _ -> ()
+
                 row
 
             let insertAttempt () =
@@ -1590,13 +1623,14 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
                             command
                                 connection
                                 transaction
-                                $"INSERT INTO {this.OutboxTable} (idempotency_key, tenant, session_id, completion_json, created_at, delivered, delivered_at, lease_owner, lease_expires_at) VALUES (@key, @t, @sid, @completion, @created, FALSE, NULL, NULL, NULL)"
+                                $"INSERT INTO {this.OutboxTable} (idempotency_key, tenant, session_id, completion_json, created_at, delivered, delivered_at, lease_owner, lease_expires_at, destination_id) VALUES (@key, @t, @sid, @completion, @created, FALSE, NULL, NULL, NULL, @destination)"
 
                         textParam insertCmd "key" completion.IdempotencyKey
                         textParam insertCmd "t" (tenant.ToString())
                         textParam insertCmd "sid" (completion.SessionId.ToString())
                         textParam insertCmd "completion" (serialize<SessionCompletion> completion)
                         textParam insertCmd "created" nowText
+                        textParam insertCmd "destination" destinationId
                         insertCmd.ExecuteNonQuery() |> ignore
 
                         Choice2Of2())
@@ -1639,7 +1673,7 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
                     command
                         connection
                         transaction
-                        $"SELECT idempotency_key, tenant FROM {this.OutboxTable} WHERE delivered = FALSE AND (lease_owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= @now) ORDER BY created_at, idempotency_key LIMIT @take FOR UPDATE SKIP LOCKED"
+                        $"SELECT idempotency_key, tenant FROM {this.OutboxTable} WHERE delivered = FALSE AND (lease_owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= @now) ORDER BY CASE WHEN lease_expires_at IS NULL THEN 0 ELSE 1 END, lease_expires_at, created_at, idempotency_key LIMIT @take FOR UPDATE SKIP LOCKED"
 
                 textParam claimCmd "now" nowText
                 intParam claimCmd "take" maxBatch
@@ -1716,6 +1750,30 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
                         | _ -> false
 
                 live)
+            |> Task.FromResult
+
+        member this.RenewCompletionClaim(tenant, key, owner, duration, ct) =
+            ct.ThrowIfCancellationRequested()
+
+            if duration <= TimeSpan.Zero then
+                raise (ArgumentOutOfRangeException(nameof duration))
+
+            this.EnsureMigrated()
+
+            transact options (fun connection transaction ->
+                use cmd =
+                    command
+                        connection
+                        transaction
+                        $"UPDATE {this.OutboxTable} SET lease_expires_at = @expires WHERE tenant = @t AND idempotency_key = @key AND delivered = FALSE AND lease_owner = @owner AND lease_expires_at > @now"
+
+                textParam cmd "t" (tenant.ToString())
+                textParam cmd "key" key
+                textParam cmd "owner" owner
+                textParam cmd "now" (stamp this.UtcNow)
+                textParam cmd "expires" (stamp (this.UtcNow + duration))
+                ct.ThrowIfCancellationRequested()
+                cmd.ExecuteNonQuery() = 1)
             |> Task.FromResult
 
         member this.MarkCompletionDelivered(tenant, idempotencyKey, owner, _) =
