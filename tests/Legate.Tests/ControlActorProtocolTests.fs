@@ -369,6 +369,88 @@ module ControlActorProtocolTests =
                 SqliteTestFixture.deleteDatabaseFiles path
         }
 
+    [<Fact>]
+    let ``factory refuses unknown routes before priming and still serves inspection`` () =
+        task {
+            let clock = TestClock()
+            let database = InMemoryDatabase(clock)
+            let store = InMemorySessionStore(database) :> ISessionStore
+            let journal = InMemorySessionEventStore(database) :> ISessionEventStore
+            // No destination is registered on this receiving host.
+            let routes = CompletionDestinations(ServiceCollection().BuildServiceProvider())
+
+            let routed options =
+                {
+                    Id = SessionId.New()
+                    Tenant = tenant
+                    AgentId = AgentId.New()
+                    Title = "routed"
+                    State = SessionState.Idle
+                    CurrentTurnId = Nullable()
+                    CreatedAt = DateTimeOffset.MinValue
+                    UpdatedAt = DateTimeOffset.MinValue
+                    ClosedAt = Nullable()
+                    WorkspaceBinding = null
+                    Options = options
+                    PermissionGrants = [||]
+                }
+
+            let refusedOptions = SessionOptions()
+            refusedOptions.CompletionDestinationId <- "unknown-receiver"
+            let! refused = store.CreateSession(tenant, routed refusedOptions, ct)
+
+            let runner: SessionActor.SuspendableRunner =
+                fun _ _ _ _ _ _ _ _ _ _ _ ->
+                    Task.FromException<TurnLoop.TurnLoopCompletion>(InvalidOperationException("no run"))
+
+            let factory =
+                SessionActor.spawnSuspendFactoryRouted
+                    (Some routes)
+                    store
+                    tenant
+                    journal
+                    delay
+                    (TimeSpan.FromMinutes 1.0)
+                    "route-probe"
+                    (TimeSpan.FromMinutes 5.0)
+                    runner
+                    (fun _ _ -> None)
+                    null
+                    (fun _ _ _ -> Task.FromResult false)
+
+            use system = ActorSystem.Create("route-" + Guid.NewGuid().ToString("N"))
+
+            try
+                let! child = factoryActor system factory refused.Id
+
+                // Inspection stays route-independent and nonactivating.
+                let! snapshot = child.Ask<obj>(SessionActor.SuspendableGetSnapshot, bound)
+                Assert.IsNotType<CompletionRoutingRefused>(snapshot)
+
+                // Work is refused before any prime, bootstrap, or claim.
+                let! refusal =
+                    child.Ask<obj>(
+                        SessionActor.SuspendableQueuePrompt(
+                            UserMessagePayload(UserMessage.Text "work") :> InboxPayload,
+                            ct
+                        ),
+                        bound
+                    )
+
+                match refusal with
+                | :? CompletionRoutingRefused as routed ->
+                    Assert.Equal(tenant, routed.Tenant)
+                    Assert.Equal(refused.Id, routed.SessionId)
+                    Assert.Equal("unknown-receiver", routed.DestinationId)
+                    Assert.Equal(CompletionRoutingReason.Unknown, routed.Reason)
+                | other -> failwith $"Expected a routing refusal but got '{other.GetType().Name}'."
+
+                let! pending = store.ReadPendingInbox(tenant, refused.Id, ct)
+                Assert.Empty(pending)
+            finally
+                system.Terminate().GetAwaiter().GetResult() |> ignore
+        }
+
     type private Rig(autoClose: bool) =
         let clock = TestClock()
         let db = InMemoryDatabase(clock)

@@ -344,6 +344,39 @@ let ``Failed acknowledgement keeps the row pending for durable redelivery`` () =
     }
 
 [<Fact>]
+let ``Delivery completes after the session closed`` () =
+    task {
+        let store, clock = createStore ()
+        let sink = DedupingSink()
+
+        let routes =
+            routesFor
+                [
+                    tenant, "test-receiver", (sink :> ISessionCompletionSink)
+                ]
+
+        let! created = store.CreateSession(tenant, sampleSessionWithDestination (), CancellationToken.None)
+
+        let! _ =
+            store.EnqueueCompletionOutbox(
+                tenant,
+                "test-receiver",
+                sampleCompletion created.Id "key-1",
+                CancellationToken.None
+            )
+
+        // The redriver resolves the row alone: closing the session never
+        // recalls the enqueued snapshot.
+        let! _ = store.CloseSession(tenant, created.Id, CancellationToken.None)
+
+        do! drive store routes "redriver-a" clock
+
+        Assert.Equal(1, sink.Received.Count)
+        Assert.Equal("key-1", sink.Received[0].IdempotencyKey)
+        Assert.Equal(created.Id, sink.Received[0].SessionId)
+    }
+
+[<Fact>]
 let ``An unknown destination keeps its row pending without delivery`` () =
     task {
         let store, clock = createStore ()
