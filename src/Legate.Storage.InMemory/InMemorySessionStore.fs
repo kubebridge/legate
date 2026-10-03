@@ -296,6 +296,265 @@ type InMemorySessionStore(database: InMemoryDatabase) =
             control tenant sessionId ct (fun context state ->
                 ControlTargetProtocol.retire context state turn position claim id)
 
+    interface ISessionSettlementStore with
+        member _.SupportsSettlementJournal(eventStore) =
+            match eventStore with
+            | :? InMemorySessionEventStore as journal -> Object.ReferenceEquals(database, journal.Database)
+            | _ -> false
+
+        member _.AdmitExecution(tenant, sessionId, position, claim, _) =
+            if isNull (box claim) then
+                raise (ArgumentNullException(nameof claim))
+
+            lock database.Gate (fun () ->
+                let session =
+                    match sessionRow tenant sessionId with
+                    | Some row -> row
+                    | None ->
+                        raise (
+                            SessionNotFoundException(
+                                sessionId,
+                                sprintf "No session %O exists in tenant %O." sessionId tenant
+                            )
+                        )
+
+                if session.State = SessionState.Closed then
+                    false
+                else
+                    let entryExists =
+                        match database.Inboxes.TryGetValue((tenant, sessionId)) with
+                        | true, entries -> entries |> Seq.exists (fun entry -> entry.Position = position)
+                        | false, _ -> false
+
+                    if not entryExists then
+                        false
+                    else
+                        match resolve tenant claim with
+                        | Choice1Of3(id, live) when id = sessionId && live.ExpiresAt > database.UtcNow ->
+                            let key = (tenant, sessionId, position)
+
+                            match database.ExecutionAdmissions.TryGetValue key with
+                            | true, admitted ->
+                                admitted.TurnId = claim.TurnId
+                                && admitted.Token = claim.Token
+                                && admitted.Attempt = claim.Attempt
+                            | _ ->
+                                database.ExecutionAdmissions[key] <- claim
+                                true
+                        | _ -> false)
+            |> ok
+
+        member _.SettleExecution(tenant, request, _) =
+            if isNull (box request) then
+                raise (ArgumentNullException(nameof request))
+
+            if isNull (box request.Claim) then
+                raise (ArgumentNullException(nameof request))
+
+            if isNull (box request.Result) then
+                raise (ArgumentNullException(nameof request))
+
+            if String.IsNullOrWhiteSpace request.CompletionKey then
+                raise (ArgumentException("The completion key must be a non-empty string.", nameof request))
+
+            lock database.Gate (fun () ->
+                let sessionId = request.SessionId
+                let key = (tenant, sessionId, request.Position)
+
+                let session =
+                    match sessionRow tenant sessionId with
+                    | Some row -> row
+                    | None ->
+                        raise (
+                            SessionNotFoundException(
+                                sessionId,
+                                sprintf "No session %O exists in tenant %O." sessionId tenant
+                            )
+                        )
+
+                let emptyEvents = Array.empty<SessionEvent> :> IReadOnlyList<SessionEvent>
+
+                let rejected () =
+                    SessionSettlementOutcome(
+                        SessionSettlementStatus.Rejected,
+                        session.State,
+                        Unchecked.defaultof<TurnResult>,
+                        Unchecked.defaultof<SessionCompletion>,
+                        Unchecked.defaultof<InboxEntry>,
+                        emptyEvents,
+                        null
+                    )
+
+                let fingerprint =
+                    sprintf
+                        "%O|%d|%O|%s|%d|%O|%O|%s"
+                        sessionId
+                        request.Position
+                        request.Claim.TurnId
+                        request.Claim.Token
+                        request.Claim.Attempt
+                        request.ExecutionId
+                        request.Result.Status
+                        request.CompletionKey
+
+                match database.ExecutionSettlements.TryGetValue key with
+                | true, (prior, outcome) when prior = fingerprint ->
+                    SessionSettlementOutcome(
+                        SessionSettlementStatus.AlreadyApplied,
+                        outcome.State,
+                        outcome.Result,
+                        outcome.Completion,
+                        outcome.Following,
+                        emptyEvents,
+                        outcome.JournalReason
+                    )
+                | true, _ -> rejected ()
+                | false, _ ->
+                    if session.State = SessionState.Closed then
+                        rejected ()
+                    else
+                        let claim = request.Claim
+
+                        let admitted =
+                            match database.ExecutionAdmissions.TryGetValue key with
+                            | true, prior ->
+                                prior.TurnId = claim.TurnId
+                                && prior.Token = claim.Token
+                                && prior.Attempt = claim.Attempt
+                            | _ -> false
+
+                        match resolve tenant claim with
+                        | Choice1Of3(id, _) when id = sessionId && admitted ->
+                            let result = request.Result
+
+                            match result.Status with
+                            | TurnStatus.Completed
+                            | TurnStatus.Aborted
+                            | TurnStatus.Failed -> ()
+                            | _ -> raise (ArgumentException("Settlement requires a terminal result.", nameof request))
+
+                            let entryExists =
+                                match database.Inboxes.TryGetValue((tenant, sessionId)) with
+                                | true, entries ->
+                                    entries |> Seq.exists (fun entry -> entry.Position = request.Position)
+                                | false, _ -> false
+
+                            if not entryExists then
+                                rejected ()
+                            else
+                                let mutable events = emptyEvents
+                                let mutable journalReason: string | null = null
+
+                                match request.TerminalEvent with
+                                | null -> ()
+                                | terminalEvent ->
+                                    let journal = InMemorySessionEventStore(database) :> ISessionEventStore
+                                    let batch = [| terminalEvent |] :> IReadOnlyList<SessionEvent>
+
+                                    try
+                                        match
+                                            journal
+                                                .Append(tenant, sessionId, claim.Token, batch, CancellationToken.None)
+                                                .GetAwaiter()
+                                                .GetResult()
+                                        with
+                                        | :? EventAppended as appended -> events <- appended.Events
+                                        | _ -> journalReason <- "rejected"
+                                    with
+                                    | :? EventLimitExceededException -> journalReason <- "rejected"
+                                    | _ -> journalReason <- "failed"
+
+                                consume tenant sessionId request.Position
+
+                                let following =
+                                    pendingInOrder tenant sessionId
+                                    |> List.filter (fun entry ->
+                                        not (isNull (box entry)) && (entry.Payload :? UserMessagePayload))
+                                    |> List.sortBy (fun entry ->
+                                        (if entry.Delivery = DeliveryMode.Interrupt then 0 else 1), entry.Position)
+                                    |> List.tryHead
+
+                                let autoClose =
+                                    result.Status = TurnStatus.Completed
+                                    && not (isNull (box session.Options))
+                                    && session.Options.AutoClose
+
+                                let state =
+                                    if autoClose then SessionState.Closed
+                                    elif following.IsSome then SessionState.Running
+                                    else SessionState.Idle
+
+                                let completion: SessionCompletion | null =
+                                    if isNull (box session.Options) then
+                                        Unchecked.defaultof<SessionCompletion>
+                                    else
+                                        match session.Options.CompletionDestinationId with
+                                        | null -> Unchecked.defaultof<SessionCompletion>
+                                        | destinationId ->
+                                            if not (CompletionDestinationRules.IsValid destinationId) then
+                                                Unchecked.defaultof<SessionCompletion>
+                                            else
+                                                let payload =
+                                                    {
+                                                        SessionId = sessionId
+                                                        TurnResult = result
+                                                        Metadata = session.Options.Metadata
+                                                        IdempotencyKey = request.CompletionKey
+                                                    }
+
+                                                match database.Outbox.TryGetValue((tenant, request.CompletionKey)) with
+                                                | true, row -> copyCompletion row.Completion
+                                                | false, _ ->
+                                                    let row =
+                                                        OutboxRow(
+                                                            tenant,
+                                                            destinationId,
+                                                            copyCompletion payload,
+                                                            database.UtcNow
+                                                        )
+
+                                                    database.Outbox[(tenant, request.CompletionKey)] <- row
+                                                    copyCompletion row.Completion
+
+                                database.UsageCheckpoints[(tenant, sessionId, claim.TurnId)] <- result.Usage
+
+                                if state <> SessionState.Running then
+                                    applySettlement tenant sessionId claim result.Status result.Outcome
+
+                                let stored = requireSession tenant sessionId
+
+                                database.Sessions[(tenant, sessionId)] <-
+                                    { stored with
+                                        State = state
+                                        UpdatedAt = database.UtcNow
+                                        ClosedAt =
+                                            (if autoClose then
+                                                 Nullable database.UtcNow
+                                             else
+                                                 stored.ClosedAt)
+                                        PermissionGrants =
+                                            (if autoClose then
+                                                 Array.empty<string> :> IReadOnlyList<string>
+                                             else
+                                                 stored.PermissionGrants)
+                                    }
+
+                                let outcome =
+                                    SessionSettlementOutcome(
+                                        SessionSettlementStatus.Applied,
+                                        state,
+                                        result,
+                                        completion,
+                                        (following |> Option.defaultValue Unchecked.defaultof<InboxEntry>),
+                                        events,
+                                        journalReason
+                                    )
+
+                                database.ExecutionSettlements[key] <- (fingerprint, outcome)
+                                outcome
+                        | _ -> rejected ())
+            |> ok
+
     interface ISessionStore with
 
         member _.CreateSession(tenant, session, _) =

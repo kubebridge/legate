@@ -69,6 +69,8 @@ type SqliteSessionStore(database: SqliteDatabase) =
     let turnsTable () = database.Table "turns"
     let outboxTable () = database.Table "outbox"
     let eraTable () = database.Table "turn_completion_era"
+    let settlementsTable () = database.Table "execution_settlements"
+    let eventsTable () = database.Table "events"
 
     let grantsOf (session: Session) : List<string> =
         if isNull (box session.PermissionGrants) then

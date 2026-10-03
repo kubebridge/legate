@@ -182,6 +182,10 @@ type SqliteServiceCollectionExtensions =
             SqliteSessionEventStore(provider.GetRequiredService<SqliteDatabase>()) :> ISessionEventStore)
         |> ignore
 
+        services.AddSingleton<ISessionSettlementStore>(fun provider ->
+            SqliteSessionSettlementStore(provider.GetRequiredService<SqliteDatabase>()) :> ISessionSettlementStore)
+        |> ignore
+
         services.AddSingleton<SqliteAgentStore>(fun provider ->
             SqliteAgentStore(provider.GetRequiredService<SqliteDatabase>()))
         |> ignore

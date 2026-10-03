@@ -92,6 +92,15 @@ module internal PostgresRegistration =
         |> ignore
 
         services.Replace(
+            ServiceDescriptor.Singleton<ISessionSettlementStore>(
+                Func<IServiceProvider, ISessionSettlementStore>(fun provider ->
+                    PostgresSessionSettlementStore(resolveOptions provider, resolveClock provider)
+                    :> ISessionSettlementStore)
+            )
+        )
+        |> ignore
+
+        services.Replace(
             ServiceDescriptor.Singleton<IAgentStore>(
                 Func<IServiceProvider, IAgentStore>(fun provider ->
                     PostgresAgentStore(resolveOptions provider, resolveClock provider) :> IAgentStore)

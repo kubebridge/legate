@@ -166,7 +166,7 @@ let ``Migration options reject a null prefix`` () =
 // Baseline round-trip
 
 [<Fact>]
-let ``Migrations create all eleven tables with their indexes`` () =
+let ``Migrations create all twelve tables with their indexes`` () =
     let keepAlive, connectionString = openDatabase ()
     use _keep = keepAlive
 
@@ -185,6 +185,7 @@ let ``Migrations create all eleven tables with their indexes`` () =
             "cleanup_claims"
             "custom_tools"
             "events"
+            "execution_settlements"
             "inbox"
             "outbox"
             "schedule_occurrences"
@@ -217,6 +218,7 @@ let ``Migrations create all eleven tables with their indexes`` () =
             "IX_outbox_delivered_at"
             "IX_session_grants_uq_grant"
             "IX_turn_completion_era_pk_session"
+            "IX_execution_settlements_pk_entry"
         ] do
         indexes |> should contain expected
 

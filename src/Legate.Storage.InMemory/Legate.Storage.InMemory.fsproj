@@ -12,8 +12,8 @@
     <Compile Include="RecoveryCandidateCursor.fs" />
     <Compile Include="InMemoryDatabase.fs" />
     <Compile Include="InMemoryCompletionEra.fs" />
-    <Compile Include="InMemorySessionStore.fs" />
     <Compile Include="InMemorySessionEventStore.fs" />
+    <Compile Include="InMemorySessionStore.fs" />
     <Compile Include="InMemoryAgentStore.fs" />
     <Compile Include="InMemoryBlobStore.fs" />
     <Compile Include="InMemoryAgentPackageStore.fs" />

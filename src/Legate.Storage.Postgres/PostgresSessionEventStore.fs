@@ -42,6 +42,9 @@ type PostgresSessionEventStore(options: PostgresOptions, timeProvider: TimeProvi
     /// The options the store was constructed with.
     member private _.Options = options
 
+    /// The options for settlement composition checks. Internal: same-shape journals share the boundary.
+    member internal _.SettlementOptions = options
+
     /// The clock lease expiry reads.
     member private _.TimeProvider = timeProvider
 

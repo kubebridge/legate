@@ -318,6 +318,7 @@ let ``Empty host fails startup with the complete execution diagnostic`` () =
         [
             "ILlmProvider"
             "ISessionStore"
+            "ISessionSettlementStore"
             "ISessionEventStore"
             "IChatClient"
             "IWorkspaceRuntime"

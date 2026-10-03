@@ -37,6 +37,7 @@
     <Compile Include="SessionsStore.fs" />
     <Compile Include="SessionAbortControl.fs" />
     <Compile Include="SessionEventStore.fs" />
+    <Compile Include="SessionSettlement.fs" />
     <Compile Include="AgentStore.fs" />
     <Compile Include="AgentPackages.fs" />
     <Compile Include="SsrfGuard.fs" />

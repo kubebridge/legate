@@ -135,7 +135,28 @@ type internal LegateStartupValidation(serviceProvider: IServiceProvider) =
                 elif not (store :? ISessionAbortControlStore) then
                     missing.Add("ISessionAbortControlStore")
 
-                if isNull (box (serviceProvider.GetService<ISessionEventStore>())) then
+                let settlement: ISessionSettlementStore | null =
+                    let registered = serviceProvider.GetService(typeof<ISessionSettlementStore>)
+
+                    if not (isNull registered) then
+                        registered :?> ISessionSettlementStore | null
+                    else
+                        match box store with
+                        | :? ISessionSettlementStore as capable -> capable
+                        | _ -> null
+
+                match settlement with
+                | null -> missing.Add("ISessionSettlementStore")
+                | capable ->
+                    match box (serviceProvider.GetService(typeof<ISessionEventStore>)) with
+                    | null -> ()
+                    | journalObj ->
+                        let journal = journalObj :?> ISessionEventStore
+
+                        if not (capable.SupportsSettlementJournal journal) then
+                            missing.Add("ISessionSettlementStore(ISessionEventStore incompatible)")
+
+                if isNull (box (serviceProvider.GetService(typeof<ISessionEventStore>))) then
                     missing.Add("ISessionEventStore")
 
                 if isNull (box (serviceProvider.GetService<Microsoft.Extensions.AI.IChatClient>())) then

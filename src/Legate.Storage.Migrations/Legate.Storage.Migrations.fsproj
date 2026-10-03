@@ -16,6 +16,7 @@
     <Compile Include="TurnCompletionEra.fs" />
     <Compile Include="SessionControlTargets.fs" />
     <Compile Include="CompletionDestination.fs" />
+    <Compile Include="ExecutionSettlements.fs" />
     <Compile Include="MigrationServiceExtensions.fs" />
   </ItemGroup>
 

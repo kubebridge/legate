@@ -14,6 +14,7 @@
     <Compile Include="PostgresSql.fs" />
     <Compile Include="PostgresSessionStore.fs" />
     <Compile Include="PostgresSessionEventStore.fs" />
+    <Compile Include="PostgresSessionSettlementStore.fs" />
     <Compile Include="PostgresAgentStore.fs" />
     <Compile Include="PostgresRegistration.fs" />
   </ItemGroup>
