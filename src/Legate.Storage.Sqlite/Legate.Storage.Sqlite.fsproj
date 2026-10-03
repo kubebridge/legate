@@ -16,6 +16,7 @@
     <Compile Include="SqliteDatabase.fs" />
     <Compile Include="SqliteSessionStore.fs" />
     <Compile Include="SqliteSessionEventStore.fs" />
+    <Compile Include="SqliteSessionSettlementStore.fs" />
     <Compile Include="SqliteAgentStore.fs" />
     <Compile Include="SqliteBlobStore.fs" />
     <Compile Include="SqliteAgentPackageStore.fs" />

@@ -248,6 +248,9 @@ type SqliteSessionEventStore(database: SqliteDatabase) =
             :> SessionEvent
         | _ -> raise (ArgumentException("The event batch carries an unknown event kind.", nameof event))
 
+    /// The shared database this journal fences through. Internal: settlement composition checks identity.
+    member internal _.Database = database
+
     interface ISessionEventStore with
 
         member _.Append(tenant, sessionId, claimToken, events, _) =

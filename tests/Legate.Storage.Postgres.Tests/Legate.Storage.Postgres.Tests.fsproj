@@ -25,6 +25,7 @@
     <Compile Include="PostgresTenantIsolationTests.fs" Condition="'$(OS)' != 'Windows_NT' or '$(LegatePostgresDocker)' == 'true'" />
     <Compile Include="PostgresClaimFencingTests.fs" Condition="'$(OS)' != 'Windows_NT' or '$(LegatePostgresDocker)' == 'true'" />
     <Compile Include="PostgresLimitTests.fs" Condition="'$(OS)' != 'Windows_NT' or '$(LegatePostgresDocker)' == 'true'" />
+    <Compile Include="PostgresSessionSettlementTests.fs" Condition="'$(OS)' != 'Windows_NT' or '$(LegatePostgresDocker)' == 'true'" />
     <Compile Include="PostgresRegistrationTests.fs" />
   </ItemGroup>
 

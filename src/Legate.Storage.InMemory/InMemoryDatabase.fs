@@ -79,6 +79,16 @@ type InMemoryDatabase(timeProvider: TimeProvider, options: InMemoryStoreOptions)
     // outcome wins; retries observe it.
     let settlements = Dictionary<(TenantId * SessionId * TurnId), TurnStatus>()
 
+    // Atomic terminal settlement receipts per (tenant, session id, inbox
+    // position): the narrow provider-supported settlement bookkeeping
+    // (issue 363). Keyed by immutable entry position because multiple real
+    // entries share one prime; identical retry returns AlreadyApplied with
+    // the recorded result and key, conflicting verdict rejects.
+    let executionAdmissions = Dictionary<(TenantId * SessionId * int64), TurnClaim>()
+
+    let executionSettlements =
+        Dictionary<(TenantId * SessionId * int64), string * SessionSettlementOutcome>()
+
     // Usage checkpoints per (tenant, session id, turn id): last write wins.
     let usageCheckpoints = Dictionary<(TenantId * SessionId * TurnId), UsageSummary>()
 
@@ -152,6 +162,12 @@ type InMemoryDatabase(timeProvider: TimeProvider, options: InMemoryStoreOptions)
 
     /// The terminal settlement per (tenant, session id, turn id).
     member internal _.Settlements = settlements
+
+    /// The atomic execution admissions per (tenant, session id, position).
+    member internal _.ExecutionAdmissions = executionAdmissions
+
+    /// The atomic execution settlement receipts per (tenant, session id, position).
+    member internal _.ExecutionSettlements = executionSettlements
 
     /// The last usage checkpoint per (tenant, session id, turn id).
     member internal _.UsageCheckpoints = usageCheckpoints

@@ -51,6 +51,9 @@ type InMemorySessionEventStore(database: InMemoryDatabase) =
             && live.ExpiresAt > database.UtcNow
         | false, _ -> false
 
+    /// The shared database this journal fences through. Internal: settlement composition checks identity.
+    member internal _.Database = database
+
     interface ISessionEventStore with
 
         member _.Append(tenant, sessionId, claimToken, events, _) =
