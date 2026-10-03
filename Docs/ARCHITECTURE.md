@@ -131,8 +131,14 @@ provider-owned event bus; its static journal hook detaches idempotently. Do not
 re-register borrowed disposables in the node container.
 
 There is no job type. A headless run is a session opened with `AutoClose`,
-an `AllowAll` permission policy, an optional completion sink, and optionally
+an `AllowAll` permission policy, an optional completion destination id
+registered on every participating host, and optionally
 `Outcome = Structured` (which gives the agent `finish`/`fail` tools).
+Settlement snapshots the destination id into the completion outbox; a
+durable redriver resolves the row's snapshot on the delivery host, awaits
+receiver acknowledgement, then marks delivered under the same fenced
+owner. At-least-once delivery: receivers deduplicate on the stable
+idempotency key.
 
 ### Client API
 
@@ -427,8 +433,11 @@ version, and a per-case byte bound. The unchanged 393 abort cases remain
 `legate.actor.AbortSession.v2` and
 `legate.entity.SuspendableAbortSession.v2`. The structurally changed 395
 routing and subscription cases, including `ScopedRequest`, `ScopedResponse`,
-and `EventBatch`, are current-only and do not use the current-minus-one
-reader exception. Other unchanged cases retain their current-minus-one rule.
+and `EventBatch`, are current-only, as are the 378 session-bearing cases
+`SessionClosed`, `SetAgentApplied`, and `SetAgentPending`, whose embedded
+session options moved to the data-only destination format. `ScopedResponse`
+also carries the tenant-scoped completion routing refusal (kind 22) with
+its stable reason. Other unchanged cases retain their current-minus-one rule.
 The manifest table is the source of truth for the exact current version of
 each case, so this document's listing must match that table.
 
@@ -477,7 +486,7 @@ Small bound is 32,768 bytes (control DTOs); large bound is 1,048,576 bytes
 | `legate.actor.PromptAccepted.v1` | `WireDtos.PromptAcceptedDto` | 1 | large |
 | `legate.actor.PromptRejected.v1` | `WireDtos.PromptRejectedDto` | 1 | small |
 | `legate.actor.QueuePrompt.v1` | `WireDtos.QueuePromptDto` | 1 | large |
-| `legate.actor.SessionClosed.v1` | `WireDtos.SessionClosedDto` | 1 | large |
+| `legate.actor.SessionClosed.v2` | `WireDtos.SessionClosedDto` | 2, current-only | large |
 | `legate.actor.SessionSnapshot.v1` | `WireDtos.SnapshotDto` | 1 | small |
 | `legate.actor.TurnFaulted.v1` | `WireDtos.TurnFaultedDto` | 1 | large |
 | `legate.actor.TurnSettled.v1` | `WireDtos.TurnSettledDto` | 1 | large |
@@ -485,8 +494,8 @@ Small bound is 32,768 bytes (control DTOs); large bound is 1,048,576 bytes
 | `legate.entity.ReplyAccepted.v1` | `WireDtos.ReplyAcceptedDto` | 1 | large |
 | `legate.entity.ReplyEntry.v1` | `WireDtos.ReplyEntryDto` | 1 | large |
 | `legate.entity.ReplyRejected.v1` | `WireDtos.ReplyRejectedDto` | 1 | small |
-| `legate.entity.SetAgentApplied.v1` | `WireDtos.SetAgentAppliedDto` | 1 | large |
-| `legate.entity.SetAgentPending.v1` | `WireDtos.SetAgentPendingDto` | 1 | large |
+| `legate.entity.SetAgentApplied.v2` | `WireDtos.SetAgentAppliedDto` | 2, current-only | large |
+| `legate.entity.SetAgentPending.v2` | `WireDtos.SetAgentPendingDto` | 2, current-only | large |
 | `legate.entity.SetAgentRejected.v1` | `WireDtos.SetAgentRejectedDto` | 1 | small |
 | `legate.entity.SuspendTimedOut.v1` | `WireDtos.SuspendTimedOutDto` | 1 | small |
 | `legate.entity.SuspendableAbortSession.v2` | `WireDtos.SuspendableAbortSessionDto` | 2 | large |

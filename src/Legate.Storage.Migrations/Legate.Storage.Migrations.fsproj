@@ -15,6 +15,7 @@
     <Compile Include="ScheduleOccurrenceKey.fs" />
     <Compile Include="TurnCompletionEra.fs" />
     <Compile Include="SessionControlTargets.fs" />
+    <Compile Include="CompletionDestination.fs" />
     <Compile Include="MigrationServiceExtensions.fs" />
   </ItemGroup>
 

@@ -162,11 +162,27 @@ package additionally binds named presets from
 
 | Key | Default | Meaning |
 |---|---|---|
-| `MaxDeliveryAttempts` | `3` | Delivery attempts per headless completion |
-| `RetryDelay` | `30s` | Wait between delivery attempts |
+| `MaxDeliveryAttempts` | `3` | Retained knob; durable redrive owns retries |
+| `RetryDelay` | `30s` | Re-drive cadence between passes |
 | `DeliveredRetention` | `7d` | How long delivered outbox rows are retained for idempotency |
 | `RedriveInterval` | `30s` | How often the re-drive service polls the outbox |
 | `ClaimLeaseDuration` | `60s` | Re-drive delivery lease before another owner may claim the row |
+| `AttemptTimeout` | `30s` | Total bound for one awaited completion acknowledgement, including custom sinks |
+
+Headless completion delivery is data-only. Sessions carry a
+`CompletionDestinationId` (null alone is sinkless); every participating
+host registers the same id for the same logical receiver in that tenant
+with `LegateBuilder.AddCompletionDestination`. The settlement step
+snapshots the id into the outbox row, and the redriver resolves the row's
+snapshot, awaits one bounded acknowledgement, then marks delivered under
+the same fenced owner. Unknown, missing, or unavailable routes stay
+pending; they are never rerouted, marked, or silently dropped.
+
+Breaking 0.1.0 change: persisted sessions and outbox rows written before
+this version use an unsupported format and are explicitly rejected.
+Start clean (fresh database) and register the same destination ids on
+every node; there are no compatibility shims, no legacy rebinding, and
+no mixed-version support.
 
 ## `Legate:AskUser` (`AskUserOptions`)
 

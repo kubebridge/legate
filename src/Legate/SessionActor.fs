@@ -1020,18 +1020,15 @@ module internal SessionActor =
     /// <returns>A fresh stable key for one settlement.</returns>
     let private mintCompletionKey () : string = Guid.NewGuid().ToString("N")
 
-    /// Enqueues the settlement's completion row and notifies the session's
-    /// sink inline with the same stored key, in the actor's settlement
-    /// step. Only sessions carrying a CompletionSink enqueue: sinkless
-    /// sessions notify nothing and store nothing. Best-effort and guarded:
-    /// a store failure skips the Notify (no key was shared, so the
-    /// re-drive has nothing to duplicate), a throwing sink never kills the
-    /// actor, and the actor-thread sequencing is the fence: this actor
-    /// holds no TurnClaim, so ClaimFence.notifyIfLiveAsync has nothing to
-    /// verify, and the re-drive deduplicates on the shared key.
+    /// Enqueues the settlement's immutable route-snapshot completion row and
+    /// returns the stored completion: the durable redriver is the sole
+    /// delivery path, so this step performs no inline notification. Only
+    /// sessions carrying a completion destination id enqueue: sinkless
+    /// sessions store nothing. Best-effort and guarded: a store failure
+    /// stores nothing, and the actor-thread sequencing is the fence.
     /// <param name="props">The session actor dependencies.</param>
     /// <param name="result">The settled turn result to deliver.</param>
-    /// <returns>The delivered completion, or None when sinkless or best-effort failed.</returns>
+    /// <returns>The stored completion, or None when sinkless or best-effort failed.</returns>
     let private dispatchCompletion (props: SessionActorProps) (result: TurnResult) : SessionCompletion option =
         try
             if isNull (box result) then
@@ -1041,9 +1038,9 @@ module internal SessionActor =
                 | null -> None
                 | session when isNull (box session.Options) -> None
                 | session ->
-                    match session.Options.CompletionSink with
+                    match session.Options.CompletionDestinationId with
                     | null -> None
-                    | sink ->
+                    | destinationId ->
                         let completion =
                             {
                                 SessionId = props.SessionId
@@ -1057,6 +1054,7 @@ module internal SessionActor =
                                 awaitTask (
                                     props.Store.EnqueueCompletionOutbox(
                                         props.Tenant,
+                                        destinationId,
                                         completion,
                                         CancellationToken.None
                                     )
@@ -1067,13 +1065,7 @@ module internal SessionActor =
 
                         match stored with
                         | None -> None
-                        | Some row ->
-                            try
-                                sink.Notify(row.Completion)
-                            with _ ->
-                                ()
-
-                            Some row.Completion
+                        | Some row -> Some row.Completion
         with _ ->
             None
 
@@ -2488,11 +2480,14 @@ module internal SessionActor =
     /// <param name="suspend">The suspend dependencies.</param>
     /// <param name="mailbox">The actor mailbox, injected by spawn.</param>
     /// <returns>The Akka.FSharp actor computation to spawn.</returns>
-    let behaviorWithSuspend
+    let behaviorWithSuspendRouted
+        (validateRoute: unit -> unit)
         (props: SessionActorProps)
         (suspend: SuspendDeps)
         (mailbox: Actor<SuspendableActorMessage>)
         =
+        validateRoute ()
+
         if isNull (box props.Store) then
             raise (ArgumentNullException(nameof props))
 
@@ -4296,6 +4291,7 @@ module internal SessionActor =
         /// only fresh-turn starts gate.
         /// <returns>The next loop state.</returns>
         let rec drainAfterRefusal () : SessionState =
+            validateRoute ()
             tryApplyPendingWhenIdle ()
 
             let pending =
@@ -4339,7 +4335,31 @@ module internal SessionActor =
             actor {
                 let! message = mailbox.Receive()
 
+                let refusal =
+                    match message with
+                    | SuspendableQueuePrompt _
+                    | SuspendableInjectPrompt _
+                    | SuspendableInterruptPrompt _
+                    | SessionReplyPayload _
+                    | ReplyEntry _
+                    | SuspendableCheckInbox ->
+                        try
+                            validateRoute ()
+                            None
+                        with :? CompletionRoutingException as error ->
+                            Some
+                                {
+                                    Tenant = props.Tenant
+                                    SessionId = props.SessionId
+                                    DestinationId = error.DestinationId
+                                    Reason = error.Reason
+                                }
+                    | _ -> None
+
                 match message with
+                | _ when refusal.IsSome ->
+                    mailbox.Sender() <! refusal.Value
+                    return! loop state suspended resolved
                 | SessionReplyPayload reply ->
                     let sender = mailbox.Sender()
 
@@ -5414,6 +5434,9 @@ module internal SessionActor =
             loop SessionState.Running None (HashSet<string>())
         | _ -> loop initialState initialSuspended (HashSet<string>())
 
+    let behaviorWithSuspend props suspend mailbox =
+        behaviorWithSuspendRouted (fun () -> ()) props suspend mailbox
+
     /// Asks a suspendable actor with the shared timeout, honouring the
     /// caller's cancellation. Mirrors askAsync for the suspendable protocol.
     /// <param name="session">The suspendable session actor.</param>
@@ -5431,8 +5454,11 @@ module internal SessionActor =
             use linkedCts =
                 CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token)
 
-            let! reply = session.Ask<'Reply>(message, linkedCts.Token)
-            return reply
+            let! reply = session.Ask<obj>(message, linkedCts.Token)
+
+            match reply with
+            | :? CompletionRoutingRefused as refusal -> return raise refusal.Exception
+            | _ -> return unbox<'Reply> reply
         }
 
     /// Prompts a suspendable session actor: appends the Queue inbox entry
@@ -5650,12 +5676,15 @@ module internal SessionActor =
                     )
                 )
 
-            let! answer =
-                session.Ask<SessionReplyReply>(SessionReplyPayload reply, TimeSpan.FromSeconds 30.0, cancellationToken)
+            let! answer = session.Ask<obj>(SessionReplyPayload reply, TimeSpan.FromSeconds 30.0, cancellationToken)
 
             match answer with
-            | ReplyAccepted entry -> return entry
-            | ReplyRejected error -> return raise error
+            | :? CompletionRoutingRefused as refusal -> return raise refusal.Exception
+            | :? SessionReplyReply as replyReply ->
+                match replyReply with
+                | ReplyAccepted entry -> return entry
+                | ReplyRejected error -> return raise error
+            | _ -> return raise (InvalidOperationException("The session actor returned an unexpected reply."))
         }
 
     /// Closes a suspendable session: the client boundary. Valid in every
@@ -5946,7 +5975,8 @@ module internal SessionActor =
     /// <param name="agentStore">The agent catalog the per-turn authority gate reads, or null when the host runs without one: the gate is skipped then.</param>
     /// <param name="eraMarked">Reads the completion era the entity-start probe consults (issue 289). Never null.</param>
     /// <returns>A factory mapping a session id string to a suspendable child spawn.</returns>
-    let spawnSuspendFactory
+    let spawnSuspendFactoryRouted
+        (routes: CompletionDestinations option)
         (store: ISessionStore)
         (tenant: TenantId)
         (eventStore: ISessionEventStore)
@@ -6007,7 +6037,22 @@ module internal SessionActor =
             try
                 match store.GetSession(tenant, sessionId, CancellationToken.None).GetAwaiter().GetResult() with
                 | null -> None
-                | _ ->
+                | session ->
+                    session.Options.ValidatePersistence()
+
+                    match routes, session.Options.CompletionDestinationId with
+                    | Some registry, _ -> registry.Validate session
+                    | None, null -> ()
+                    | None, id ->
+                        raise (
+                            CompletionRoutingException(
+                                Nullable tenant,
+                                Nullable sessionId,
+                                id,
+                                CompletionRoutingReason.Unknown
+                            )
+                        )
+
                     let bootstrap =
                         UserMessagePayload(UserMessage.Text "legate journal prime") :> InboxPayload
 
@@ -6081,14 +6126,75 @@ module internal SessionActor =
             if SessionId.TryParse(sessionId, &parsed) then
                 let captured = parsed
 
-                let recovery = recoverTarget captured
+                let validateRoute () =
+                    match store.GetSession(tenant, captured, CancellationToken.None).GetAwaiter().GetResult() with
+                    | null -> raise (SessionNotFoundException(captured, "The session does not exist."))
+                    | session ->
+                        session.Options.ValidatePersistence()
+
+                        match routes, session.Options.CompletionDestinationId with
+                        | Some registry, _ -> registry.Validate session
+                        | None, null -> ()
+                        | None, id ->
+                            raise (
+                                CompletionRoutingException(
+                                    Nullable tenant,
+                                    Nullable captured,
+                                    id,
+                                    CompletionRoutingReason.Unknown
+                                )
+                            )
+
+                let refusal =
+                    try
+                        validateRoute ()
+                        None
+                    with :? CompletionRoutingException as error ->
+                        Some
+                            {
+                                Tenant = tenant
+                                SessionId = captured
+                                DestinationId = error.DestinationId
+                                Reason = error.Reason
+                            }
+
+                let blocked (error: CompletionRoutingRefused) (mailbox: Actor<SuspendableActorMessage>) =
+                    let rec loop () =
+                        actor {
+                            let! message = mailbox.Receive()
+
+                            match message with
+                            | SuspendableGetSnapshot ->
+                                let session =
+                                    awaitTask (requireSessionAsync store tenant captured CancellationToken.None)
+
+                                let pending =
+                                    awaitTask (store.ReadPendingInbox(tenant, captured, CancellationToken.None))
+
+                                mailbox.Sender()
+                                <! {
+                                       SessionId = captured
+                                       State = session.State
+                                       PendingCount = pending.Count
+                                       RunningPosition = None
+                                       PendingRequestId = null
+                                   }
+                            | _ -> mailbox.Sender() <! error
+
+                            return! loop ()
+                        }
+
+                    loop ()
+
+                let recovery = if refusal.IsNone then recoverTarget captured else null
 
                 let primed =
                     match recovery with
-                    | null -> primeClaim captured
+                    | null when refusal.IsNone -> primeClaim captured
+                    | null -> None
                     | recovery -> recovery.Claim |> Option.ofObj
 
-                if primed.IsNone then
+                if primed.IsNone && refusal.IsNone then
                     raise (
                         InvalidSessionStateException(
                             captured,
@@ -6129,6 +6235,35 @@ module internal SessionActor =
                         EraMarked = eraMarked
                     }
 
-                spawn context name (behaviorWithSuspend props suspend)
+                match refusal with
+                | Some error -> spawn context name (blocked error)
+                | None -> spawn context name (behaviorWithSuspendRouted validateRoute props suspend)
             else
                 spawn context name (actorOf (fun (_: obj) -> ()))
+
+    let spawnSuspendFactory
+        store
+        tenant
+        eventStore
+        delay
+        askTimeout
+        claimOwner
+        leaseDuration
+        runSuspendable
+        compactFor
+        agentStore
+        eraMarked
+        =
+        spawnSuspendFactoryRouted
+            None
+            store
+            tenant
+            eventStore
+            delay
+            askTimeout
+            claimOwner
+            leaseDuration
+            runSuspendable
+            compactFor
+            agentStore
+            eraMarked

@@ -379,6 +379,10 @@ let ``Baseline columns carry the contract shapes`` () =
             "delivered_at"
             "lease_owner"
             "lease_expires_at"
+            // The completion destination migration (issue 378) snapshots
+            // the immutable tenant route per row; old null rows stay
+            // unsupported and pending.
+            "destination_id"
         ]
 
     columnNames keepAlive "session_grants"

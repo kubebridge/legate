@@ -94,7 +94,11 @@ module internal WireManifests =
             Family = family
             Name = name
             DtoType = dtoType
-            Version = 1
+            Version =
+                if name = "SessionClosed" || name = "SetAgentApplied" || name = "SetAgentPending" then
+                    2
+                else
+                    1
             MaxBytes = maxBytes
         }
 

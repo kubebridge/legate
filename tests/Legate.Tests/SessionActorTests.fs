@@ -13,6 +13,9 @@ open Legate
 open Legate.Storage.InMemory
 open Legate.Testing
 open Microsoft.Extensions.AI
+open Microsoft.Extensions.DependencyInjection
+open Microsoft.Extensions.Logging
+open Microsoft.Extensions.Logging.Abstractions
 open Microsoft.Extensions.Options
 open Microsoft.Extensions.Hosting
 open Xunit
@@ -3019,33 +3022,46 @@ let ``AutoClose closes a suspendable session after its first Completed turn`` ()
 // ──────────────────────────────────────────────────────────────────────────
 // Completion outbox (issue 84)
 
-/// Recording completion sink: keeps every Notify payload in call order.
+/// Recording completion sink: keeps every acknowledged payload in order.
 type FakeCompletionSink() =
     let completions = ResizeArray<SessionCompletion>()
 
     interface ISessionCompletionSink with
-        member _.Notify(completion: SessionCompletion) = completions.Add(completion)
+        member _.NotifyAsync(completion: SessionCompletion, _cancellationToken: CancellationToken) =
+            completions.Add(completion)
+            Task.CompletedTask
 
-    /// Every Notify payload, in call order.
+    /// Every acknowledged payload, in call order.
     member _.Completions: IReadOnlyList<SessionCompletion> =
         completions :> IReadOnlyList<SessionCompletion>
 
-/// Creates a session row carrying the completion sink, mirroring
-/// createAutoCloseSession.
-let private createSinkSession (store: ISessionStore) (sink: ISessionCompletionSink) : Session =
-    let options = SessionOptions(CompletionSink = sink)
+/// Creates a session row carrying a data-only completion destination,
+/// mirroring createAutoCloseSession.
+let private createSinkSession (store: ISessionStore) : Session =
+    let options = SessionOptions(CompletionDestinationId = "test-receiver")
 
     let template = sampleSession ()
     let session = { template with Options = options }
 
     store.CreateSession(tenant, session, CancellationToken.None).GetAwaiter().GetResult()
 
+/// A destination resolver over exactly the supplied tenant registrations.
+let private routesFor (registrations: (TenantId * string * ISessionCompletionSink) list) =
+    let services = ServiceCollection()
+
+    for tenantId, destinationId, sink in registrations do
+        services.AddKeyedSingleton<ISessionCompletionSink>(box (tenantId, destinationId), sink)
+        |> ignore
+
+    CompletionDestinations(services.BuildServiceProvider())
+
 [<Fact>]
-let ``Settlement writes the outbox row in the same step under the shared inline key`` () =
+let ``Settlement snapshots the route and the redriver delivers the stored key`` () =
     use system = createSystem ()
-    let store = createStore ()
+    let clock = TestClock()
+    let store = InMemorySessionStore(InMemoryDatabase(clock)) :> ISessionStore
     let sink = FakeCompletionSink()
-    let created = createSinkSession store (sink :> ISessionCompletionSink)
+    let created = createSinkSession store
     let runner = ScriptedRunner([ "hello" ])
     let session = spawnSession system store created.Id runner.Func
 
@@ -3057,11 +3073,11 @@ let ``Settlement writes the outbox row in the same step under the shared inline 
 
         settled |> should equal true
 
-        // The settlement step consumed the entry, stored the outbox row,
-        // and notified inline together: no intermediate state is
-        // observable afterwards.
+        // The settlement step consumed the entry and stored the immutable
+        // route snapshot: no inline delivery exists, so the sink observed
+        // nothing yet.
         (pendingOf store created.Id).Count |> should equal 0
-        sink.Completions.Count |> should equal 1
+        sink.Completions.Count |> should equal 0
 
         let rows =
             store
@@ -3070,9 +3086,35 @@ let ``Settlement writes the outbox row in the same step under the shared inline 
                 .GetResult()
 
         rows.Count |> should equal 1
-        rows[0].IdempotencyKey |> should equal sink.Completions[0].IdempotencyKey
+        rows[0].DestinationId |> should equal "test-receiver"
         rows[0].Completion.TurnResult.Status |> should equal TurnStatus.Completed
         rows[0].Delivered |> should equal false
+        String.IsNullOrWhiteSpace(rows[0].IdempotencyKey) |> should equal false
+
+        // The durable redriver resolves the row's snapshot and awaits the
+        // receiver acknowledgement before marking. The inspection claim
+        // above leased the row, so advance past it first.
+        clock.Advance(TimeSpan.FromMinutes 6.)
+
+        let routes =
+            routesFor
+                [
+                    tenant, "test-receiver", (sink :> ISessionCompletionSink)
+                ]
+
+        CompletionRedriver.passOnceAsync
+            store
+            routes
+            "redriver-a"
+            (CompletionOptions())
+            clock
+            (TurnLoopTests.NeverDelay() :> ILlmDelay)
+            (NullLogger.Instance :> ILogger)
+            CancellationToken.None
+        |> fun task -> task.GetAwaiter().GetResult()
+
+        sink.Completions.Count |> should equal 1
+        sink.Completions[0].IdempotencyKey |> should equal rows[0].IdempotencyKey
 
         let delivered = sink.Completions[0]
         delivered.SessionId |> should equal created.Id

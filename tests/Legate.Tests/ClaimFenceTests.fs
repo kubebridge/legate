@@ -85,7 +85,9 @@ type RecordingSink() =
     let calls = ResizeArray<SessionCompletion>()
 
     interface ISessionCompletionSink with
-        member _.Notify(completion) = calls.Add(completion)
+        member _.NotifyAsync(completion, _) =
+            calls.Add(completion)
+            Task.CompletedTask
 
     member _.Calls: IReadOnlyList<SessionCompletion> =
         calls :> IReadOnlyList<SessionCompletion>

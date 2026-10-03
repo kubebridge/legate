@@ -242,7 +242,9 @@ and internal OpenTurnRow(turnId: TurnId, attempt: int) =
 /// the mark lands; a delivered row stays until the retention purge removes
 /// it. The lease owner and expiry fence Notify: only the live owner
 /// delivers and marks.
-and internal OutboxRow(tenant: TenantId, completion: SessionCompletion, createdAt: DateTimeOffset) =
+and internal OutboxRow
+    (tenant: TenantId, destinationId: string, completion: SessionCompletion, createdAt: DateTimeOffset) =
+    member _.DestinationId = destinationId
 
     /// The tenant the session belongs to.
     member val Tenant = tenant with get, set

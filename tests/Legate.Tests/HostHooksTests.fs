@@ -85,8 +85,9 @@ type FakeCompletionSink() =
     let mutable completions: SessionCompletion list = []
 
     interface ISessionCompletionSink with
-        member _.Notify(completion: SessionCompletion) =
+        member _.NotifyAsync(completion: SessionCompletion, _cancellationToken: CancellationToken) =
             completions <- completion :: completions
+            Task.CompletedTask
 
     /// The completions in arrival order.
     member _.Completions = List.rev completions
@@ -179,12 +180,15 @@ let ``A sink receives every completion delivered to it`` () =
     let fake = FakeCompletionSink()
     let sink = fake :> ISessionCompletionSink
 
-    sink.Notify(sampleCompletion ())
+    sink.NotifyAsync(sampleCompletion (), CancellationToken.None) |> await
 
-    sink.Notify
+    sink.NotifyAsync(
         { sampleCompletion () with
             IdempotencyKey = "completion-2"
-        }
+        },
+        CancellationToken.None
+    )
+    |> await
 
     fake.Completions
     |> List.map (fun c -> c.IdempotencyKey)
@@ -197,22 +201,19 @@ let ``Deliveries carry the idempotency key sinks deduplicate on`` () =
     let fake = FakeCompletionSink()
     let sink = fake :> ISessionCompletionSink
 
-    sink.Notify(sampleCompletion ())
+    sink.NotifyAsync(sampleCompletion (), CancellationToken.None) |> await
 
     fake.Completions[0].IdempotencyKey |> should equal "completion-1"
 
 [<Fact>]
-let ``SessionOptions.CompletionSink keeps the ISessionCompletionSink type identity`` () =
-    let fake = FakeCompletionSink()
-    let sink = fake :> ISessionCompletionSink
+let ``SessionOptions.CompletionDestinationId keeps the data-only routing identity`` () =
+    let options = SessionOptions(CompletionDestinationId = "receiver-a")
 
-    let options = SessionOptions(CompletionSink = sink)
+    options.CompletionDestinationId |> should equal "receiver-a"
 
-    options.CompletionSink |> should equal sink
-
-    match options.CompletionSink with
-    | null -> failwith "CompletionSink was null"
-    | stored -> box stored :? ISessionCompletionSink |> should equal true
+    match options.CompletionDestinationId with
+    | null -> failwith "CompletionDestinationId was null"
+    | stored -> stored |> should equal "receiver-a"
 
 // ───────────────────────────────────────────────────────────────────────────
 // IAgentAuditSink

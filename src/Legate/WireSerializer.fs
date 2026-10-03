@@ -367,6 +367,9 @@ type internal WireSerializer(system: ExtendedActorSystem) =
                         && name <> "ScopedRequest"
                         && name <> "ScopedResponse"
                         && name <> "EventBatch"
+                        && name <> "SessionClosed"
+                        && name <> "SetAgentApplied"
+                        && name <> "SetAgentPending"
                     )
                 then
                     this.refuse

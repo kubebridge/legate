@@ -1153,6 +1153,175 @@ let ``control candidate refusal cannot starve later eligible sessions on repeate
         | target -> Assert.Equal(turn, target.TurnId)
     }
 
+/// A route validator with an empty registry: sinkless sessions pass,
+/// configured destinations refuse. Mirrors SessionClient with no
+/// AddCompletionDestination registrations.
+let private sinklessRoute (session: Session) : bool =
+    try
+        session.Options.ValidatePersistence()
+        isNull session.Options.CompletionDestinationId
+    with :? CompletionRoutingException ->
+        false
+
+/// A session row carrying an unregistered destination: every admission
+/// refuses it before any effect.
+let private routedSession (agentId: AgentId) (destinationId: string) =
+    let options = SessionOptions()
+    options.CompletionDestinationId <- destinationId
+
+    { sampleSession agentId with
+        Options = options
+    }
+
+[<Fact>]
+let ``route refused candidates cannot starve later eligible sessions on repeated sweeps`` () =
+    task {
+        let clock = TestClock()
+        let database = InMemoryDatabase(clock)
+        let store = InMemoryStoreFactory.sessionStore database
+        let journal = InMemoryStoreFactory.eventStore database
+
+        let! first =
+            store.CreateSession(tenant, routedSession (AgentId.New()) "unknown-receiver", CancellationToken.None)
+
+        let! refused =
+            store.AppendInboxMessage(
+                tenant,
+                first.Id,
+                UserMessagePayload(UserMessage.Text "refused"),
+                DeliveryMode.Queue,
+                CancellationToken.None
+            )
+
+        let! later = store.CreateSession(tenant, sampleSession (AgentId.New()), CancellationToken.None)
+
+        let! _ =
+            store.AppendInboxMessage(
+                tenant,
+                later.Id,
+                UserMessagePayload(UserMessage.Text "eligible"),
+                DeliveryMode.Queue,
+                CancellationToken.None
+            )
+
+        let resolve = RecordingResolve()
+
+        for _ in 1..3 do
+            let! result =
+                Dispatcher.passOnceRoutedAsync
+                    sinklessRoute
+                    store
+                    journal
+                    (fun _ _ _ -> Task.FromResult false)
+                    tenant
+                    (SessionsOptions())
+                    (DispatcherOptions())
+                    resolve.Func
+                    clock
+                    CancellationToken.None
+
+            Assert.True(result.Started >= 1)
+
+        Assert.Equal(3, resolve.Resolved |> Seq.filter ((=) later.Id) |> Seq.length)
+        Assert.Equal(0, resolve.Resolved |> Seq.filter ((=) first.Id) |> Seq.length)
+
+        // The refused candidate kept its inbox untouched: no consumption,
+        // no bootstrap, no claim.
+        let! pending = store.ReadPendingInbox(tenant, first.Id, CancellationToken.None)
+        Assert.Single(pending) |> ignore
+        Assert.Equal(refused.Position, pending[0].Position)
+    }
+
+[<Fact>]
+let ``orphan sweep advances past entirely refused pages without effects`` () =
+    task {
+        let clock = TestClock()
+        let database = InMemoryDatabase(clock)
+        let store = InMemoryStoreFactory.sessionStore database
+        let journal = InMemoryStoreFactory.eventStore database
+
+        // Three refused orphans sort before the supported sinkless orphan:
+        // every page of the sweep is a refusal until the last candidate.
+        // IDs sort ordinally, so fixed prefixes control the page order.
+        let refusedIds =
+            [|
+                "00000000000000000000000001"
+                "00000000000000000000000002"
+                "00000000000000000000000003"
+            |]
+            |> Array.map SessionId.Parse
+
+        for id in refusedIds do
+            let! created =
+                store.CreateSession(
+                    tenant,
+                    { routedSession (AgentId.New()) "unknown-receiver" with
+                        Id = id
+                    },
+                    CancellationToken.None
+                )
+
+            let! _ =
+                store.AppendInboxMessage(
+                    tenant,
+                    created.Id,
+                    UserMessagePayload(UserMessage.Text "prime"),
+                    DeliveryMode.Queue,
+                    CancellationToken.None
+                )
+
+            let! _ = store.ClaimNextTurn(tenant, created.Id, "owner", TimeSpan.FromMinutes 5.0, CancellationToken.None)
+            let! _ = store.UpdateSessionState(tenant, created.Id, SessionState.Idle, CancellationToken.None)
+            ()
+
+        let! later =
+            store.CreateSession(
+                tenant,
+                { sampleSession (AgentId.New()) with
+                    Id = SessionId.Parse("00000000000000000000000004")
+                },
+                CancellationToken.None
+            )
+
+        let! _ =
+            store.AppendInboxMessage(
+                tenant,
+                later.Id,
+                UserMessagePayload(UserMessage.Text "prime"),
+                DeliveryMode.Queue,
+                CancellationToken.None
+            )
+
+        let! _ = store.ClaimNextTurn(tenant, later.Id, "owner", TimeSpan.FromMinutes 5.0, CancellationToken.None)
+        let! _ = store.UpdateSessionState(tenant, later.Id, SessionState.Idle, CancellationToken.None)
+
+        let resolve = RecordingResolve()
+        let options = DispatcherOptions()
+        options.MaxBatchSize <- 2
+
+        // Repeated finite sweeps terminate and never poke a refused
+        // orphan: no bootstrap, no claim, no runner.
+        for _ in 1..3 do
+            let! _ =
+                Dispatcher.passOnceRoutedAsync
+                    sinklessRoute
+                    store
+                    journal
+                    (fun _ _ _ -> Task.FromResult false)
+                    tenant
+                    (SessionsOptions())
+                    options
+                    resolve.Func
+                    clock
+                    CancellationToken.None
+
+            ()
+
+        for id in refusedIds do
+            let! pending = store.ReadPendingInbox(tenant, id, CancellationToken.None)
+            Assert.Empty(pending)
+    }
+
 /// Builds the container the dispatcher service runs on: the store, the
 /// facade tenant, the options, the wake sink, and a client resolving to
 /// the given actor.

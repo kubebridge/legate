@@ -486,3 +486,178 @@ let ``Cluster UseKubernetes fails fast on invalid options`` () =
 
     let ex = Assert.Throws<InvalidOperationException>(register)
     ex.Message.Contains("ManagementPort") |> should equal true
+
+// ──────────────────────────────────────────────────────────────────────────
+// Completion destinations (issue 378)
+
+/// A completion sink carrying an identity: resolution returns the exact
+/// registered instance.
+type StubCompletionSink() =
+
+    interface ISessionCompletionSink with
+        member _.NotifyAsync(_completion: SessionCompletion, _cancellationToken: CancellationToken) = Task.CompletedTask
+
+/// A completion sink recording disposal: DI owns the factory lifetime.
+type DisposableCompletionSink() =
+    let mutable disposed = 0
+
+    interface ISessionCompletionSink with
+        member _.NotifyAsync(_completion: SessionCompletion, _cancellationToken: CancellationToken) = Task.CompletedTask
+
+    interface IDisposable with
+        member _.Dispose() = disposed <- disposed + 1
+
+    /// How many times the container disposed the sink.
+    member _.Disposed = disposed
+
+[<Fact>]
+let ``AddCompletionDestination resolves exact tenant destinations with no fallback`` () =
+    let tenantA = TenantId.Create "tenant-a"
+    let tenantB = TenantId.Create "tenant-b"
+    let sinkA = StubCompletionSink() :> ISessionCompletionSink
+    let sinkB = StubCompletionSink() :> ISessionCompletionSink
+    let services = ServiceCollection()
+
+    addLegateFSharp services (fun builder ->
+        builder.AddCompletionDestination(
+            tenantA,
+            "webhook",
+            Func<IServiceProvider, ISessionCompletionSink>(fun _ -> sinkA)
+        )
+        |> ignore
+
+        builder.AddCompletionDestination(
+            tenantB,
+            "webhook",
+            Func<IServiceProvider, ISessionCompletionSink>(fun _ -> sinkB)
+        )
+        |> ignore)
+
+    use provider = services.BuildServiceProvider()
+    let routes = provider.GetRequiredService<CompletionDestinations>()
+
+    routes.Resolve(tenantA, Nullable(), "webhook") |> should equal sinkA
+    routes.Resolve(tenantB, Nullable(), "webhook") |> should equal sinkB
+
+    // Same id in another tenant is a different route: no global fallback.
+    let unknownTenant =
+        Assert.Throws<CompletionRoutingException>(fun () ->
+            routes.Resolve(TenantId.Create "tenant-c", Nullable(), "webhook") |> ignore)
+
+    Assert.Equal(CompletionRoutingReason.Unknown, unknownTenant.Reason)
+
+    let unknownId =
+        Assert.Throws<CompletionRoutingException>(fun () -> routes.Resolve(tenantA, Nullable(), "other") |> ignore)
+
+    Assert.Equal(CompletionRoutingReason.Unknown, unknownId.Reason)
+
+[<Fact>]
+let ``AddCompletionDestination rejects invalid duplicate and null registrations`` () =
+    let tenant = TenantId.Create "acme"
+
+    for invalid in
+        [
+            Unchecked.defaultof<string>
+            ""
+            " "
+            " leading"
+            "-leading"
+            "https://receiver.example/hook"
+        ] do
+        let services = ServiceCollection()
+
+        let register () =
+            addLegateFSharp services (fun builder ->
+                builder.AddCompletionDestination(
+                    tenant,
+                    invalid,
+                    Func<IServiceProvider, ISessionCompletionSink>(fun _ -> StubCompletionSink())
+                )
+                |> ignore)
+
+        let refused = Assert.Throws<CompletionRoutingException>(register)
+        Assert.Equal(CompletionRoutingReason.Invalid, refused.Reason)
+
+    let duplicate = ServiceCollection()
+
+    addLegateFSharp duplicate (fun builder ->
+        builder.AddCompletionDestination(
+            tenant,
+            "webhook",
+            Func<IServiceProvider, ISessionCompletionSink>(fun _ -> StubCompletionSink())
+        )
+        |> ignore
+
+        (fun () ->
+            builder.AddCompletionDestination(
+                tenant,
+                "webhook",
+                Func<IServiceProvider, ISessionCompletionSink>(fun _ -> StubCompletionSink())
+            )
+            |> ignore)
+        |> should throw typeof<ArgumentException>)
+
+    let missingFactory = ServiceCollection()
+
+    (fun () ->
+        addLegateFSharp missingFactory (fun builder ->
+            builder.AddCompletionDestination(
+                tenant,
+                "webhook",
+                Unchecked.defaultof<Func<IServiceProvider, ISessionCompletionSink>>
+            )
+            |> ignore))
+    |> should throw typeof<ArgumentNullException>
+
+[<Fact>]
+let ``Throwing and null factories read as unavailable routing`` () =
+    let tenant = TenantId.Create "acme"
+    let services = ServiceCollection()
+
+    addLegateFSharp services (fun builder ->
+        builder.AddCompletionDestination(
+            tenant,
+            "throwing",
+            Func<IServiceProvider, ISessionCompletionSink>(fun _ -> failwith "boom")
+        )
+        |> ignore
+
+        builder.AddCompletionDestination(
+            tenant,
+            "nulling",
+            Func<IServiceProvider, ISessionCompletionSink>(fun _ -> Unchecked.defaultof<ISessionCompletionSink>)
+        )
+        |> ignore)
+
+    use provider = services.BuildServiceProvider()
+    let routes = provider.GetRequiredService<CompletionDestinations>()
+
+    for destinationId in [ "throwing"; "nulling" ] do
+        let unavailable =
+            Assert.Throws<CompletionRoutingException>(fun () ->
+                routes.Resolve(tenant, Nullable(), destinationId) |> ignore)
+
+        Assert.Equal(CompletionRoutingReason.Unavailable, unavailable.Reason)
+
+[<Fact>]
+let ``DI disposes factory sinks once`` () =
+    let tenant = TenantId.Create "acme"
+    let sink = new DisposableCompletionSink()
+    let services = ServiceCollection()
+
+    addLegateFSharp services (fun builder ->
+        builder.AddCompletionDestination(
+            tenant,
+            "webhook",
+            Func<IServiceProvider, ISessionCompletionSink>(fun _ -> sink :> ISessionCompletionSink)
+        )
+        |> ignore)
+
+    let provider = services.BuildServiceProvider()
+    let routes = provider.GetRequiredService<CompletionDestinations>()
+
+    routes.Resolve(tenant, Nullable(), "webhook")
+    |> should equal (sink :> ISessionCompletionSink)
+
+    provider.Dispose()
+    sink.Disposed |> should equal 1

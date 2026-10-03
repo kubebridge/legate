@@ -110,8 +110,11 @@ hosted service swaps in the durable pieces through configuration (see the
 - `Legate:Storage:S3` for blobs and agent packages.
 - `Legate:Workspace:Docker` for sandboxed per-session workspaces.
 - `Legate:Cluster` (`StaticSeeds` or `Kubernetes` mode) to scale past one
-  node; headless sessions with `AutoClose` plus a completion sink deliver
-  webhooks for one-shot style work.
+  node; headless sessions with `AutoClose` plus a registered completion
+  destination deliver webhooks for one-shot style work. Register the same
+  destination id for the same receiver on every node with
+  `LegateBuilder.AddCompletionDestination`; hosts on 0.1.0 prerelease data
+  start clean (fresh database), with no mixed-version support.
 
 Cluster formation for the sample's Kubernetes manifests and the k3d
 runbook is documented in `samples/MinimalHost/README.md`. Never commit

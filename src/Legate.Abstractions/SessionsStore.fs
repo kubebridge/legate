@@ -308,6 +308,8 @@ type CompletionOutboxEntry =
         Tenant: TenantId
         /// The session that completed.
         SessionId: SessionId
+        /// Immutable tenant destination captured by the first enqueue. Null means unsupported old data.
+        DestinationId: string | null
         /// The stable key the runtime minted at settlement; sinks
         /// deduplicate on it because delivery is at-least-once. Never null.
         IdempotencyKey: string
@@ -394,6 +396,17 @@ type CompletionOutboxEntry =
 /// marks delivered under the same owner; a stale owner notifies nothing
 /// and marks nothing, and an inline delivery overlapping a re-drive
 /// deduplicates on the shared idempotency key.</para>
+/// One bounded recovery-discovery page. IDs are evidence, never execution authority.
+[<CLIMutable; NoComparison>]
+type SessionCandidatePage =
+    {
+        /// Tenant-scoped matching IDs, in immutable ordinal ascending order.
+        Items: IReadOnlyList<SessionId>
+        /// Versioned scope-bound continuation with a finite upper ID fence, or null at end.
+        Continuation: string | null
+    }
+
+/// Required durable session and recovery-discovery contract for custom providers.
 type ISessionStore =
 
     // ── Sessions ──
@@ -445,6 +458,26 @@ type ISessionStore =
         continuation: string | null *
         cancellationToken: CancellationToken ->
             Task<SessionPage>
+
+    /// Discovers IDs using only exact tenant, state and a non-null current turn.
+    /// Does not decode options, inbox or control records. Strict reads validate each candidate separately.
+    /// Uses ordinal immutable-ID keyset paging and a finite upper fence captured on the first page.
+    /// Concurrent eligibility changes are rechecked on load; this is not a cross-page snapshot.
+    /// <param name="tenant">The exact tenant scope.</param>
+    /// <param name="state">A defined lifecycle state.</param>
+    /// <param name="pageSize">Maximum emitted IDs, from 1 through 1000.</param>
+    /// <param name="continuation">The previous page's scope-bound cursor, or null for a fresh sweep.</param>
+    /// <param name="cancellationToken">Cancels this read-only scan.</param>
+    /// <returns>A bounded independent ID list and advancing cursor, or null continuation at end.</returns>
+    /// <exception cref="T:System.ArgumentException">The cursor is malformed or belongs to another tenant/state.</exception>
+    /// <exception cref="T:System.ArgumentOutOfRangeException">The page size or state is invalid.</exception>
+    abstract ListRecoveryCandidates:
+        tenant: TenantId *
+        state: SessionState *
+        pageSize: int *
+        continuation: string | null *
+        cancellationToken: CancellationToken ->
+            Task<SessionCandidatePage>
 
     /// Updates a session's lifecycle state and stamps
     /// <see cref="T:Legate.Session" />.UpdatedAt. Atomic: the state change
@@ -688,8 +721,23 @@ type ISessionStore =
     /// <exception cref="T:System.ArgumentException">The completion's idempotency key is null, empty, or whitespace.</exception>
     /// <exception cref="T:Legate.SessionNotFoundException">The session id does not exist in this tenant.</exception>
     abstract EnqueueCompletionOutbox:
-        tenant: TenantId * completion: SessionCompletion * cancellationToken: CancellationToken ->
+        tenant: TenantId * destinationId: string * completion: SessionCompletion * cancellationToken: CancellationToken ->
             Task<CompletionOutboxEntry>
+
+    /// Renews only the still-live owner's completion delivery lease. Expiry or takeover returns false.
+    /// <param name="tenant">The delivery tenant.</param>
+    /// <param name="idempotencyKey">The original immutable key.</param>
+    /// <param name="owner">The unique delivery attempt owner.</param>
+    /// <param name="leaseDuration">The positive lease extension.</param>
+    /// <param name="cancellationToken">Cancels renewal.</param>
+    /// <returns>True only if the current lease was extended atomically.</returns>
+    abstract RenewCompletionClaim:
+        tenant: TenantId *
+        idempotencyKey: string *
+        owner: string *
+        leaseDuration: TimeSpan *
+        cancellationToken: CancellationToken ->
+            Task<bool>
 
     /// Claims pending completion rows under a delivery lease, oldest first,
     /// bounded to one batch the re-driver may act on at once. Process-wide

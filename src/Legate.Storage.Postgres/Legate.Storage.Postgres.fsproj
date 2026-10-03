@@ -8,6 +8,7 @@
   <!-- Compile order is explicit: register every new file here, in dependency order. -->
   <ItemGroup>
     <Compile Include="../Legate.Storage.InMemory/ControlTargetProtocol.fs" Link="ControlTargetProtocol.fs" />
+    <Compile Include="../Legate.Storage.InMemory/RecoveryCandidateCursor.fs" Link="RecoveryCandidateCursor.fs" />
     <Compile Include="../Legate.Storage.InMemory/RelationalControlTarget.fs" Link="RelationalControlTarget.fs" />
     <Compile Include="PostgresOptions.fs" />
     <Compile Include="PostgresSql.fs" />

@@ -187,7 +187,8 @@ module internal Dispatcher =
     /// <param name="clock">The clock dispatch latency reads.</param>
     /// <param name="cancellationToken">Abandons the pass.</param>
     /// <returns>What the pass woke and what stayed queued behind each limit.</returns>
-    let passOnceAsync
+    let passOnceRoutedAsync
+        (validateRoute: Session -> bool)
         (store: ISessionStore)
         (eventStore: ISessionEventStore)
         (eraMarked: CompletionEra.CompletionEraReader)
@@ -303,6 +304,7 @@ module internal Dispatcher =
 
                             match session with
                             | null -> () // Vanished mid-pass: stays out of this pass.
+                            | live when not (validateRoute live) -> ()
                             | live ->
                                 let! agentCount, agentStarted = agentCountsAsync live.AgentId
 
@@ -373,12 +375,9 @@ module internal Dispatcher =
 
             while orphanPaging && orphanBudget > 0 do
                 let! page =
-                    store.ListSessions(
+                    store.ListRecoveryCandidates(
                         tenant,
-                        Nullable(SessionState.Idle),
-                        Nullable<AgentId>(),
-                        Nullable<DateTimeOffset>(),
-                        Nullable<DateTimeOffset>(),
+                        SessionState.Idle,
                         maxBatch,
                         orphanContinuation,
                         cancellationToken
@@ -387,12 +386,12 @@ module internal Dispatcher =
                 if isNull (box page) || isNull (box page.Items) then
                     orphanPaging <- false
                 else
-                    for row in page.Items do
-                        if orphanBudget > 0 && not (isNull (box row)) && row.CurrentTurnId.HasValue then
+                    for candidateId in page.Items do
+                        if orphanBudget > 0 then
                             try
                                 match store with
                                 | :? ISessionAbortControlStore as control ->
-                                    let! target = control.ReadAbortTarget(tenant, row.Id, cancellationToken)
+                                    let! target = control.ReadAbortTarget(tenant, candidateId, cancellationToken)
 
                                     if
                                         match target with
@@ -402,18 +401,20 @@ module internal Dispatcher =
                                     then
                                         raise (
                                             InvalidSessionStateException(
-                                                row.Id,
+                                                candidateId,
                                                 "controlPending",
                                                 "Dispatcher orphan prime is forbidden for unresolved control work."
                                             )
                                         )
                                 | _ -> ()
 
-                                let! fresh = store.GetSession(tenant, row.Id, cancellationToken)
+                                let! fresh = store.GetSession(tenant, candidateId, cancellationToken)
 
                                 match fresh with
                                 | null -> ()
-                                | current when current.State = SessionState.Closed -> ()
+                                | current when current.State <> SessionState.Idle || not current.CurrentTurnId.HasValue ->
+                                    ()
+                                | current when not (validateRoute current) -> ()
                                 | current ->
                                     let! agentCount, agentStarted = agentCountsAsync current.AgentId
 
@@ -589,6 +590,24 @@ module internal Dispatcher =
                 }
         }
 
+    let passOnceAsync store eventStore eraMarked tenant sessions dispatcher resolve clock ct =
+        passOnceRoutedAsync
+            (fun session ->
+                try
+                    session.Options.ValidatePersistence()
+                    isNull session.Options.CompletionDestinationId
+                with :? CompletionRoutingException ->
+                    false)
+            store
+            eventStore
+            eraMarked
+            tenant
+            sessions
+            dispatcher
+            resolve
+            clock
+            ct
+
 // ──────────────────────────────────────────────────────────────────────────
 // Hosted service
 
@@ -676,7 +695,13 @@ type internal DispatcherService
                 client.Resolve(sessionId, candidateToken)
 
             return!
-                Dispatcher.passOnceAsync
+                Dispatcher.passOnceRoutedAsync
+                    (fun session ->
+                        try
+                            client.ValidateCompletionRoute session
+                            true
+                        with :? CompletionRoutingException ->
+                            false)
                     store
                     eventStore
                     eraMarked

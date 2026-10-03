@@ -493,6 +493,10 @@ module internal WireDtos =
         member val SessionId: Nullable<SessionId> = Nullable() with get, set
         member val Limit = 0 with get, set
         member val Category = "" with get, set
+        /// Stable completion routing refusal category for kind 22.
+        member val RoutingReason: CompletionRoutingReason = CompletionRoutingReason.Unknown with get, set
+        /// Logical completion destination id for kind 22, or null when the format is unsupported.
+        member val DestinationId: string | null = null with get, set
 
     // ────────────────── Translation ──────────────────
 
@@ -905,6 +909,11 @@ module internal WireDtos =
                 dto.SessionId <- error.SessionId
                 dto.Limit <- error.Limit
             | :? Exception -> dto.Kind <- 21
+            | :? CompletionRoutingRefused as refusal ->
+                dto.Kind <- 22
+                dto.SessionId <- Nullable refusal.SessionId
+                dto.DestinationId <- refusal.DestinationId
+                dto.RoutingReason <- refusal.Reason
             | _ -> invalidOp "Unknown scoped response operation."
 
             dto :> obj
@@ -1190,6 +1199,26 @@ module internal WireDtos =
                     )
                     :> obj
                 | 21 -> InvalidOperationException("The receiving session operation failed.") :> obj
+                | 22 ->
+                    if not dto.SessionId.HasValue then
+                        raise (InvalidOperationException("The scoped routing refusal carries no session id."))
+
+                    if not (Enum.IsDefined(typeof<CompletionRoutingReason>, dto.RoutingReason)) then
+                        raise (InvalidOperationException("The scoped routing refusal carries an unknown reason."))
+
+                    let tenant =
+                        match SessionAddress.TryParse dto.Address with
+                        | Some address -> address.Tenant
+                        | None ->
+                            raise (InvalidOperationException("The scoped routing refusal carries no valid address."))
+
+                    {
+                        CompletionRoutingRefused.Tenant = tenant
+                        SessionId = dto.SessionId.Value
+                        DestinationId = dto.DestinationId
+                        Reason = dto.RoutingReason
+                    }
+                    :> obj
                 | _ -> invalidOp "Unknown scoped response operation."
 
             {
