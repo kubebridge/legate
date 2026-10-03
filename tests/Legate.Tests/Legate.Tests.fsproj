@@ -56,6 +56,11 @@
     <Compile Include="LegateOptionsBindingTests.fs" />
     <Compile Include="BuilderTests.fs" />
     <Compile Include="ActorSystemColdStartTests.fs" />
+    <Compile Include="SessionAddressTests.fs" />
+    <Compile Include="SessionHostBindingTests.fs" />
+    <Compile Include="ProductionSessionHostBindingTests.fs" />
+    <Compile Include="SessionHostLifetimeTests.fs" />
+    <Compile Include="ExecutionWorkTrackerTests.fs" />
     <Compile Include="ClusterShardingTests.fs" />
     <Compile Include="ClusterActorSystemTests.fs" />
     <Compile Include="ClusterHealthTests.fs" />
@@ -139,6 +144,8 @@
     <Compile Include="DotTuiRoutingTests.fs" />
     <Compile Include="MigrationTests.fs" />
     <Compile Include="SqliteTestFixture.fs" />
+    <Compile Include="TenantRemotingAcceptanceTests.fs" />
+    <Compile Include="TenantRoutingDuplicateTests.fs" />
     <Compile Include="SqliteSessionStoreTests.fs" />
     <Compile Include="ControlActorProtocolTests.fs" />
     <Compile Include="SqliteSessionListTests.fs" />

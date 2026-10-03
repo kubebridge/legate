@@ -196,7 +196,7 @@ module internal SessionAutoTitle =
     /// generation fires per session per process. Entries clear when the
     /// call fails or yields nothing, so a later prompt retries; a titled
     /// session never refires because the stored title is non-empty.
-    let private fired = ConcurrentDictionary<SessionId, byte>()
+    let private fired = ConcurrentDictionary<TenantId * SessionId, byte>()
 
     /// Concatenates a message's text parts with newlines, mirroring the
     /// transcript folding; a message with no text parts reads as empty.
@@ -322,7 +322,7 @@ module internal SessionAutoTitle =
 
                             if String.IsNullOrWhiteSpace promptText then
                                 ()
-                            elif not (fired.TryAdd(sessionId, 0uy)) then
+                            elif not (fired.TryAdd((client.Tenant, sessionId), 0uy)) then
                                 ()
                             else
                                 let mutable keep = false
@@ -398,7 +398,7 @@ module internal SessionAutoTitle =
                                         log deps.Logger true sessionId (sprintf "failed: %s" reason)
                                 finally
                                     if not keep then
-                                        fired.TryRemove(sessionId) |> ignore
+                                        fired.TryRemove((client.Tenant, sessionId)) |> ignore
             with _ ->
                 ()
         }
@@ -475,7 +475,7 @@ type SessionClientExtensions =
             try
                 let! resolved = client.Resolve(sessionId, cancellationToken)
 
-                let hub = PromptWaitHubs.GetOrAdd(sessionId)
+                let hub = PromptWaitHubs.GetOrAddScoped client.Tenant sessionId
                 waiterOpt <- Some(hub.EnqueueSettle())
 
                 let! _ = SessionActor.promptSuspendableAsync store tenant sessionId resolved message cancellationToken
@@ -488,7 +488,7 @@ type SessionClientExtensions =
                 ()
             with ex ->
                 match waiterOpt with
-                | Some waiter -> (PromptWaitHubs.GetOrAdd(sessionId)).Cancel(waiter)
+                | Some waiter -> (PromptWaitHubs.GetOrAddScoped client.Tenant sessionId).Cancel(waiter)
                 | None -> ()
 
                 // Wait-abandonment (issue 85 decision): a cancellation racing
@@ -514,7 +514,7 @@ type SessionClientExtensions =
 
                 match session with
                 | null ->
-                    (PromptWaitHubs.GetOrAdd(sessionId)).Cancel(waiter)
+                    (PromptWaitHubs.GetOrAddScoped client.Tenant sessionId).Cancel(waiter)
                     return raise (SessionNotFoundException(sessionId, "The session does not exist."))
                 | live ->
                     let bound = SessionClientExtensions.BoundOf(live, client.DefaultBound)
@@ -581,7 +581,7 @@ type SessionClientExtensions =
         task {
             let tenant = client.Tenant
             let bus = client.EventBus
-            let hub = PromptWaitHubs.GetOrAdd(sessionId)
+            let hub = PromptWaitHubs.GetOrAddScoped client.Tenant sessionId
 
             use subscribeCts = new CancellationTokenSource()
             use boundCts = new CancellationTokenSource()

@@ -239,6 +239,9 @@ let private buildValidationProvider (blobStore: IBlobStore | null) (expiry: Null
     services.AddSingleton<ISessionStore>(InMemoryStoreFactory.sessionStore database)
     |> ignore
 
+    services.AddSingleton<ISessionEventStore>(InMemoryStoreFactory.eventStore database)
+    |> ignore
+
     let workspaceRoot =
         System.IO.Path.Combine(System.IO.Path.GetTempPath(), sprintf "legate-expiry-%s" (Ulid.NewUlid().ToString()))
 
@@ -251,6 +254,9 @@ let private buildValidationProvider (blobStore: IBlobStore | null) (expiry: Null
 
     services.AddSingleton<IWorkspaceRuntime>(runtime) |> ignore
     services.AddSingleton<ILlmProvider>(StubProvider()) |> ignore
+
+    services.AddSingleton<IChatClient>(new ScriptedChatClient(Array.empty<ScriptStep> :> IReadOnlyList<ScriptStep>))
+    |> ignore
 
     if not (isNull (box blobStore)) then
         match blobStore with

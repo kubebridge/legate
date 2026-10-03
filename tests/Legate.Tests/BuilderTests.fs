@@ -9,6 +9,7 @@ open FsUnit.Xunit
 open Legate
 open Legate.Cluster
 open Legate.Storage.InMemory
+open Legate.Testing
 open Microsoft.Extensions.AI
 open Microsoft.Extensions.Configuration
 open Microsoft.Extensions.DependencyInjection
@@ -130,7 +131,16 @@ let private buildSection (pairs: (string * string) seq) : IConfigurationSection 
 let private registerRequired (builder: LegateBuilder) : unit =
     builder.Llm.AddProvider(StubLlmProvider()) |> ignore
 
-    builder.Storage.UseSessionStore(InMemorySessionStore(InMemoryDatabase()))
+    let database = InMemoryDatabase()
+
+    builder.Storage.UseSessionStore(InMemorySessionStore(database)) |> ignore
+
+    builder.Services.AddSingleton<ISessionEventStore>(InMemorySessionEventStore(database))
+    |> ignore
+
+    builder.Services.AddSingleton<IChatClient>(
+        new ScriptedChatClient(Array.empty<ScriptStep> :> IReadOnlyList<ScriptStep>)
+    )
     |> ignore
 
     builder.Workspace.UseRuntime(StubWorkspaceRuntime()) |> ignore
@@ -297,16 +307,22 @@ let ``Generic overloads construct container types`` () =
 // Startup validation
 
 [<Fact>]
-let ``Empty host fails startup with one message naming every missing registration`` () =
+let ``Empty host fails startup with the complete execution diagnostic`` () =
     let services = ServiceCollection()
     addLegateFSharp services (fun _ -> ())
     use provider = services.BuildServiceProvider()
 
     let ex = Assert.Throws<InvalidOperationException>(fun () -> startHosted provider)
 
-    ex.Message.Contains("ILlmProvider") |> should equal true
-    ex.Message.Contains("ISessionStore") |> should equal true
-    ex.Message.Contains("IWorkspaceRuntime") |> should equal true
+    for dependency in
+        [
+            "ILlmProvider"
+            "ISessionStore"
+            "ISessionEventStore"
+            "IChatClient"
+            "IWorkspaceRuntime"
+        ] do
+        ex.Message.Contains(dependency) |> should equal true
 
 [<Fact>]
 let ``Partial host fails startup naming only what is missing`` () =

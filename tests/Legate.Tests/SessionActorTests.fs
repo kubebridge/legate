@@ -3251,7 +3251,8 @@ let ``Suspendable Inject starts an Idle turn with Inject delivery`` () : Task =
 
         use! harness = SessionHarness.CreateAsync(client, suspendSourced [])
 
-        let waiter = PromptWaitHubs.GetOrAdd(harness.SessionId).EnqueueSettle()
+        let waiter =
+            (PromptWaitHubs.GetOrAddScoped harness.Tenant harness.SessionId).EnqueueSettle()
 
         let! entry =
             SessionActor.injectSuspendableAsync
@@ -3287,7 +3288,9 @@ let ``Suspendable Abort on Idle answers the snapshot with no effects`` () : Task
                 CancellationToken.None
 
         snapshot.State |> should equal SessionState.Idle
-        PromptWaitHubs.GetOrAdd(harness.SessionId).Settled.Count |> should equal 0
+
+        (PromptWaitHubs.GetOrAddScoped harness.Tenant harness.SessionId).Settled.Count
+        |> should equal 0
     }
 
 [<Fact>]

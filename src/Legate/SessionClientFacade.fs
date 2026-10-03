@@ -880,7 +880,7 @@ type SessionClientOperations =
             raise (ArgumentOutOfRangeException(nameof bound, "The settle wait bound must be positive."))
 
         task {
-            let hub = PromptWaitHubs.GetOrAdd(sessionId)
+            let hub = PromptWaitHubs.GetOrAddScoped client.Tenant sessionId
             let waiter = hub.EnqueueSettle()
 
             use boundCts = new CancellationTokenSource()
@@ -1113,6 +1113,11 @@ module internal ClusterSubscriptions =
     /// hot-polling the owner; the caller's cancellation abandons the wait.
     let pollDelay = TimeSpan.FromMilliseconds 50.0
 
+    /// The maximum time spent acknowledging an unsubscribe at the owning
+    /// entity. A refusal is a typed scope failure; transport loss is the
+    /// only case that degrades to best-effort detach.
+    let detachTimeout = TimeSpan.FromSeconds 5.0
+
     /// One cluster-mode subscription: entity batches with a direct store
     /// fallback, resumed from the last delivered sequence.
     type private ClusterSubscribeEnumerator
@@ -1138,26 +1143,51 @@ module internal ClusterSubscriptions =
         let mutable current: SessionEvent = Unchecked.defaultof<SessionEvent>
         let mutable finished = false
         let mutable detached = false
+        let detachGate = obj ()
+        let mutable detachTask: Task option = None
         let mutable proxyOpt: IActorRef option = None
 
-        let detachBestEffort () =
-            if not detached then
-                detached <- true
+        let detachBestEffort () : Task =
+            lock detachGate (fun () ->
+                match detachTask with
+                | Some pending -> pending
+                | None ->
+                    detached <- true
 
-                try
-                    match proxyOpt with
-                    | Some proxy ->
-                        let unsubscribe: CrossNodeSubscriptions.CrossNodeUnsubscribe =
-                            {
-                                Tenant = tenant
-                                SessionId = sessionId
-                                SubscriberToken = token
-                            }
+                    let pending =
+                        task {
+                            try
+                                match proxyOpt with
+                                | Some proxy ->
+                                    let unsubscribe: CrossNodeSubscriptions.CrossNodeUnsubscribe =
+                                        {
+                                            Tenant = tenant
+                                            SessionId = sessionId
+                                            SubscriberToken = token
+                                        }
 
-                        proxy.Tell(unsubscribe :> obj)
-                    | None -> ()
-                with _ ->
-                    ()
+                                    use detachCts = new CancellationTokenSource(detachTimeout)
+                                    let! reply = proxy.Ask<obj>(unsubscribe :> obj, detachCts.Token)
+
+                                    match reply with
+                                    | :? SessionRouteAccepted -> ()
+                                    | :? Exception as error -> raise error
+                                    | _ ->
+                                        raise (
+                                            InvalidOperationException("The owning entity did not acknowledge detach.")
+                                        )
+                                | None -> ()
+                            with
+                            | :? SessionScopeRejectedException as refusal -> return raise refusal
+                            | _ ->
+                                // Disposal is best effort when the owner has
+                                // already moved or stopped; the single-flight
+                                // task still prevents repeated detach effects.
+                                ()
+                        }
+
+                    detachTask <- Some pending
+                    pending)
 
         let throwForReply (reply: obj) : unit =
             match reply with
@@ -1168,16 +1198,28 @@ module internal ClusterSubscriptions =
                 raise (InvalidOperationException("The owning entity answered the subscription with an unknown reply."))
 
         let enqueueBatch (batch: CrossNodeSubscriptions.CrossNodeEventBatch) : unit =
-            if not (isNull (box batch.Events)) then
-                for evt in batch.Events do
-                    if not (isNull (box evt)) then
-                        if evt.Sequence.HasValue && evt.Sequence.Value <= lastDelivered then
-                            ()
-                        else
-                            queue.Enqueue(evt)
+            if batch.Tenant <> tenant || batch.SessionId <> sessionId then
+                raise (SessionScopeRejectedException(SessionScopeRejectionReason.ResponseMismatch))
 
-                            if evt.Sequence.HasValue && evt.Sequence.Value > resumeCursor then
-                                resumeCursor <- evt.Sequence.Value
+            if
+                String.IsNullOrWhiteSpace batch.SubscriberToken
+                || batch.SubscriberToken <> token
+            then
+                raise (SessionScopeRejectedException(SessionScopeRejectionReason.ResponseMismatch))
+
+            if isNull (box batch.Events) then
+                raise (SessionScopeRejectedException(SessionScopeRejectionReason.ResponseMismatch))
+
+            for evt in batch.Events do
+                if isNull (box evt) || evt.SessionId <> sessionId then
+                    raise (SessionScopeRejectedException(SessionScopeRejectionReason.ResponseMismatch))
+                elif evt.Sequence.HasValue && evt.Sequence.Value <= lastDelivered then
+                    ()
+                else
+                    queue.Enqueue(evt)
+
+                    if evt.Sequence.HasValue && evt.Sequence.Value > resumeCursor then
+                        resumeCursor <- evt.Sequence.Value
 
             if batch.NextCursor > resumeCursor then
                 resumeCursor <- batch.NextCursor
@@ -1274,7 +1316,7 @@ module internal ClusterSubscriptions =
 
                                 if next :? SessionClosedEvent then
                                     finished <- true
-                                    detachBestEffort ()
+                                    do! detachBestEffort ()
 
                                 step <- Some true
                             else
@@ -1296,7 +1338,7 @@ module internal ClusterSubscriptions =
                                                     task {
                                                         let! resolved =
                                                             resolver.ResolveSessionAsync(
-                                                                sessionId.ToString(),
+                                                                SessionAddress(tenant, sessionId),
                                                                 linkedCts.Token
                                                             )
 
@@ -1322,17 +1364,18 @@ module internal ClusterSubscriptions =
                                         with
                                         | :? OperationCanceledException as canceled ->
                                             if linkedCts.Token.IsCancellationRequested then
-                                                detachBestEffort ()
+                                                do! detachBestEffort ()
                                                 return raise canceled
                                             else
                                                 proxyOpt <- None
                                                 do! fallbackPageAsync linkedCts.Token
                                                 return None
+                                        | :? SessionScopeRejectedException
                                         | :? SessionNotFoundException
                                         | :? SessionJournalExpiredException
                                         | :? SessionSubscriptionLimitExceededException
                                         | :? EventLimitExceededException as fatal ->
-                                            detachBestEffort ()
+                                            do! detachBestEffort ()
                                             return raise fatal
                                         | _ ->
                                             proxyOpt <- None
@@ -1346,7 +1389,7 @@ module internal ClusterSubscriptions =
                                     try
                                         do! Task.Delay(pollDelay, linkedCts.Token)
                                     with :? OperationCanceledException as canceled ->
-                                        detachBestEffort ()
+                                        do! detachBestEffort ()
                                         raise canceled
 
                         match step with
@@ -1355,9 +1398,7 @@ module internal ClusterSubscriptions =
                 }
             )
 
-        member _.DisposeAsync() : ValueTask =
-            detachBestEffort ()
-            ValueTask.CompletedTask
+        member _.DisposeAsync() : ValueTask = ValueTask(detachBestEffort ())
 
         interface IAsyncEnumerator<SessionEvent> with
             member this.Current = this.Current
@@ -1687,8 +1728,16 @@ module internal SessionClientWiring =
     /// the client resolving through the session router.
     /// <param name="provider">The container to build from. Must not be null.</param>
     /// <returns>The DI-owned session client.</returns>
-    let buildClient (provider: IServiceProvider) : SessionClient =
+    let assembleContext
+        (provider: IServiceProvider)
+        (resolver: ISessionResolver)
+        (nodeMode: ClusterMode)
+        (subscriptionLifetime: SessionSubscriptionLifetime)
+        (workTracker: ExecutionWorkTracker)
+        : SessionExecutionContext =
         ArgumentNullException.ThrowIfNull(provider)
+        ArgumentNullException.ThrowIfNull(subscriptionLifetime)
+        ArgumentNullException.ThrowIfNull(workTracker)
 
         let store = provider.GetRequiredService<ISessionStore>()
         let bus = provider.GetRequiredService<SessionEventBus>()
@@ -1697,78 +1746,43 @@ module internal SessionClientWiring =
             match provider.GetService<IOptions<LegateOptions>>() with
             | null -> LegateOptions()
             | options when isNull (box options.Value) -> LegateOptions()
-            | options -> options.Value
+            | options ->
+                System.Text.Json.JsonSerializer.Deserialize<LegateOptions>(
+                    System.Text.Json.JsonSerializer.Serialize(options.Value)
+                )
+                |> function
+                    | null -> invalidOp "LegateOptions snapshot was null."
+                    | snapshot -> snapshot
 
         let clientOptions =
             match provider.GetService<SessionClientOptions>() with
             | null -> SessionClientOptions()
-            | options -> options
+            | options ->
+                System.Text.Json.JsonSerializer.Deserialize<SessionClientOptions>(
+                    System.Text.Json.JsonSerializer.Serialize(options)
+                )
+                |> function
+                    | null -> invalidOp "SessionClientOptions snapshot was null."
+                    | snapshot -> snapshot
 
         match clientOptions.Validate() with
         | null -> ()
         | violation -> raise (InvalidOperationException($"Invalid SessionClientOptions: %s{violation}"))
-
-        let hostedServices = provider.GetServices<IHostedService>() |> List.ofSeq
-
-        let localService =
-            match
-                hostedServices
-                |> List.tryPick (fun service ->
-                    match service with
-                    | :? LocalActorSystemService as typed -> Some typed
-                    | _ -> None)
-            with
-            | Some service -> service
-            | None ->
-                raise (
-                    InvalidOperationException(
-                        "The Legate local actor system is not registered: AddLegate registers it, so a replaced service collection breaks the session client."
-                    )
-                )
-
-        let clusterService =
-            match
-                hostedServices
-                |> List.tryPick (fun service ->
-                    match service with
-                    | :? ClusterActorSystemService as typed -> Some typed
-                    | _ -> None)
-            with
-            | Some service -> service
-            | None ->
-                raise (
-                    InvalidOperationException(
-                        "The Legate cluster actor system is not registered: AddLegate registers it, so a replaced service collection breaks the session client."
-                    )
-                )
-
-        // The mode seam: Local resolves through the in-process router,
-        // the cluster modes through the shard region proxy. Both spawn
-        // the same SessionActor through the factory wired below.
-        let resolver: ISessionResolver =
-            match legateOptions.Cluster.Mode with
-            | ClusterMode.Local -> localService :> ISessionResolver
-            | ClusterMode.StaticSeeds
-            | ClusterMode.Kubernetes -> clusterService :> ISessionResolver
-            | _ ->
-                raise (
-                    InvalidOperationException(
-                        $"Unknown Legate cluster mode '%O{legateOptions.Cluster.Mode}'. Expected one of: Local, StaticSeeds, Kubernetes."
-                    )
-                )
 
         let delay =
             match provider.GetService<ILlmDelay>() with
             | null -> SystemLlmDelay(TimeProvider.System) :> ILlmDelay
             | seam -> seam
 
-        // Opt-in: without a chat client the identity-only children stay and
-        // the client still serves Open and the reads. The same client
-        // serves the auto-title call; without one titling no-ops.
-        let titleClient = provider.GetService<IChatClient>()
+        // A complete execution binding always owns a chat client.  Startup
+        // validation enforces this before actor creation; resolving it here
+        // keeps the production factory free of an identity-only fallback.
+        let titleClient: IChatClient = provider.GetRequiredService<IChatClient>()
+
+        let mutable spawnContext =
+            Unchecked.defaultof<SessionAddress -> IActorContext -> string -> IActorRef>
 
         match titleClient with
-        | null -> ()
         | client ->
             let sources =
                 provider.GetServices<IToolSource>()
@@ -1818,30 +1832,35 @@ module internal SessionClientWiring =
 
             let runner: SessionActor.SuspendableRunner =
                 fun entry attempt allowed cursor reply seed token started usage skill turnId ->
-                    task {
-                        let! model = modelForEntryAsync store agentStore clientOptions.Tenant entry token
-                        let! available = agentsForEntryAsync agentStore clientOptions.Tenant token
+                    workTracker.Track(fun () ->
+                        task {
+                            let! model = modelForEntryAsync store agentStore clientOptions.Tenant entry token
+                            let! available = agentsForEntryAsync agentStore clientOptions.Tenant token
 
-                        let selected =
-                            model
-                            |> Option.map (fun model -> modelClients.Resolve(model, client))
-                            |> Option.defaultValue client
+                            let selected =
+                                model
+                                |> Option.map (fun model -> modelClients.Resolve(model, client))
+                                |> Option.defaultValue client
 
-                        let run =
-                            SessionPermissions.createRunner
-                                selected
-                                store
-                                clientOptions.Tenant
-                                (inputs available)
-                                delay
-                                policy
-                                (Some(systemPromptFor store clientOptions.Tenant))
+                            let run =
+                                SessionPermissions.createRunner
+                                    selected
+                                    store
+                                    clientOptions.Tenant
+                                    (inputs available)
+                                    delay
+                                    policy
+                                    (Some(systemPromptFor store clientOptions.Tenant))
 
-                        return! run entry attempt allowed cursor reply seed token started usage skill turnId
-                    }
+                            return! run entry attempt allowed cursor reply seed token started usage skill turnId
+                        })
 
             let eventStore = bus.EventStore
             let model = sessionModelOf clientOptions legateOptions
+
+            let catalog = provider.GetService<ILlmModelCatalog>()
+            let observer = provider.GetService<IUsageObserver>()
+            let modelPolicy = provider.GetService<IModelPolicy>()
 
             let compactFor (_sessionId: SessionId) (journalToken: string) : CompactDeps option =
                 Some(
@@ -1849,10 +1868,10 @@ module internal SessionClientWiring =
                         Llm = legateOptions.Llm
                         ReservedBufferTokens = legateOptions.Pruning.ReservedBufferTokens
                         SessionModel = model
-                        Catalog = provider.GetService<ILlmModelCatalog>()
+                        Catalog = catalog
                         Client = client
-                        Observer = provider.GetService<IUsageObserver>()
-                        Policy = provider.GetService<IModelPolicy>()
+                        Observer = observer
+                        Policy = modelPolicy
                         EventStore = eventStore
                         JournalToken = journalToken
                         Force = Compaction.CompactForce()
@@ -1860,46 +1879,32 @@ module internal SessionClientWiring =
                 )
 
             let entityFactory =
-                Some(
-                    SessionActor.spawnSuspendFactory
-                        store
-                        clientOptions.Tenant
-                        eventStore
-                        delay
-                        legateOptions.Permissions.AskTimeout
-                        clientOptions.ClaimOwner
-                        clientOptions.LeaseDuration
-                        runner
-                        compactFor
-                        (provider.GetService<IAgentStore>())
-                        (eraReaderOf provider)
-                )
+                SessionActor.spawnSuspendFactory
+                    store
+                    clientOptions.Tenant
+                    eventStore
+                    delay
+                    legateOptions.Permissions.AskTimeout
+                    clientOptions.ClaimOwner
+                    clientOptions.LeaseDuration
+                    runner
+                    compactFor
+                    agentStore
+                    (eraReaderOf provider)
 
-            // The factory lands on the mode-active service only; the idle
-            // service keeps identity children either way. The cluster
-            // service also takes the store so its stop path can poll
-            // running turns while draining.
-            match resolver with
-            | :? LocalActorSystemService as local -> local.SessionChildFactory <- entityFactory
-            | :? ClusterActorSystemService as clustered ->
-                clustered.SessionEntityFactory <- entityFactory
-                clustered.SessionStore <- Some store
-            | _ ->
-                raise (
-                    InvalidOperationException(
-                        "The Legate actor system resolver is neither local nor clustered: AddLegate registers both, so a replaced service collection breaks the session client."
-                    )
-                )
+            spawnContext <-
+                fun address context name ->
+                    if address.Tenant <> clientOptions.Tenant then
+                        raise (SessionScopeRejectedException(SessionScopeRejectionReason.AddressMismatch))
+
+                    entityFactory address.SessionId.Value context name
 
         let resolve (sessionId: SessionId) (cancellationToken: CancellationToken) : Task<IActorRef> =
-            resolver.ResolveSessionAsync(sessionId.ToString(), cancellationToken)
+            resolver.ResolveSessionAsync(SessionAddress(clientOptions.Tenant, sessionId), cancellationToken)
 
         // The agent catalog SetAgent validates against, or None when the
         // host runs without one: validation is skipped then.
         let agents = Option.ofObj (provider.GetService<IAgentStore>())
-
-        let built =
-            new SessionClient(store, clientOptions.Tenant, resolve, bus, clientOptions.DefaultWaitBound, delay, agents)
 
         // Auto-title rides the resolved options: off unless the host opts
         // in, the title model falling back to the compaction model and
@@ -1915,19 +1920,17 @@ module internal SessionClientWiring =
             | null -> LlmOptions()
             | _ -> legateOptions.Llm
 
-        built.AutoTitle <-
-            Some(
-                {
-                    Enabled = sessions.AutoTitle
-                    TitleModel = sessions.AutoTitleModel
-                    CompactionModel = llm.Compaction
-                    FacadeDefaultModel = clientOptions.DefaultModel
-                    LlmDefaultModel = llm.DefaultModel
-                    FallbackModel = AgentFileParser.defaultModel
-                    ChatClient = titleClient
-                    Logger = provider.GetService<ILogger<SessionClient>>()
-                }
-            )
+        let autoTitle =
+            {
+                Enabled = sessions.AutoTitle
+                TitleModel = sessions.AutoTitleModel
+                CompactionModel = llm.Compaction
+                FacadeDefaultModel = clientOptions.DefaultModel
+                LlmDefaultModel = llm.DefaultModel
+                FallbackModel = AgentFileParser.defaultModel
+                ChatClient = titleClient
+                Logger = provider.GetService<ILogger<SessionClient>>()
+            }
 
         // Cross-node subscriptions (issue 133): subscriber, cache, and
         // payload bounds bind from the host Sessions options into the
@@ -1938,31 +1941,80 @@ module internal SessionClientWiring =
         // SubscribeRouter stays None and Subscribe delegates to the bus.
         let subscriptionOptions = subscriptionOptionsOf sessions
 
-        match resolver with
-        | :? ClusterActorSystemService as clustered ->
-            clustered.SubscriptionEventStore <- Some bus.EventStore
-            clustered.SubscriptionOptions <- Some subscriptionOptions
-        | _ -> ()
-
-        match legateOptions.Cluster.Mode with
-        | ClusterMode.StaticSeeds
-        | ClusterMode.Kubernetes ->
-            built.SubscribeRouter <-
-                Some(
-                    ClusterSubscriptions.ClusterSubscribeRouter(resolver, bus.EventStore, subscriptionOptions)
-                    :> ISubscribeRouter
-                )
-        | _ -> ()
-
         // Completion era (issue 289): the marker Open and Fork call after
         // a successful CreateSession, captured here like the event store
         // and delay above. Absent (or marker-less) gate registration
         // leaves the client unmarked: pre-era quiet.
-        match eraMarkerOf provider with
-        | None -> ()
-        | Some marker -> built.CompletionEra <- Some marker
+        let marker = eraMarkerOf provider
 
-        built
+        let client =
+            lazy
+                (let built =
+                    new SessionClient(
+                        store,
+                        clientOptions.Tenant,
+                        resolve,
+                        bus,
+                        clientOptions.DefaultWaitBound,
+                        delay,
+                        agents
+                    )
+
+                 built.AutoTitle <- Some autoTitle
+                 built.CompletionEra <- marker
+
+                 built.SubscribeRouter <-
+                     Some(
+                         { new ISubscribeRouter with
+                             member _.Subscribe(tenant, sessionId, fromSequence, token) =
+                                 subscriptionLifetime.Wrap(
+                                     token,
+                                     fun linkedToken -> bus.Subscribe(tenant, sessionId, fromSequence, linkedToken)
+                                 )
+                         }
+                     )
+
+                 match nodeMode with
+                 | ClusterMode.StaticSeeds
+                 | ClusterMode.Kubernetes ->
+                     built.SubscribeRouter <-
+                         Some(
+                             { new ISubscribeRouter with
+                                 member _.Subscribe(tenant, sessionId, fromSequence, token) =
+                                     subscriptionLifetime.Wrap(
+                                         token,
+                                         fun linkedToken ->
+                                             (ClusterSubscriptions.ClusterSubscribeRouter(
+                                                 resolver,
+                                                 bus.EventStore,
+                                                 subscriptionOptions
+                                             )
+                                             :> ISubscribeRouter)
+                                                 .Subscribe(tenant, sessionId, fromSequence, linkedToken)
+                                     )
+                             }
+                         )
+                 | _ -> ()
+
+                 built :> obj)
+
+        {
+            Tenant = clientOptions.Tenant
+            Store = store
+            EventStore = bus.EventStore
+            SubscriptionOptions = subscriptionOptions
+            SubscriptionLifetime = subscriptionLifetime
+            WorkTracker = workTracker
+            Spawn = spawnContext
+            Client = client
+        }
+
+    let buildClient (provider: IServiceProvider) : SessionClient =
+        let contexts = provider.GetRequiredService<ISessionHostContexts>()
+        // Facade construction is read-only. Initialization belongs to the
+        // hosted startup lifecycle; resolving this service must not assemble
+        // providers or start actor infrastructure as a lazy side effect.
+        contexts.Get(contexts.DefaultTenant).Client.Value :?> SessionClient
 
 /// Registers the session client facade: the options default, the event
 /// bus over the durable journal, and the DI-owned client with its router

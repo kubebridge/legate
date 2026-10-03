@@ -564,7 +564,7 @@ type SessionHarness
                         OnTurnSettled =
                             Some(fun result ->
                                 signals.ObserveSettled result
-                                PromptWaitHubs.ObserveSettled created.Id result)
+                                PromptWaitHubs.ObserveSettledScoped resolved.Tenant created.Id result)
                         OnInjectJournaled = None
                         Logger = null
                         Compact = None

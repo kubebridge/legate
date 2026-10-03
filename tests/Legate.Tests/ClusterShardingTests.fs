@@ -101,7 +101,7 @@ let ``Shard ids reject null ids and empty counts`` () =
 
 [<Fact>]
 let ``Version stamp is stable for identical inputs`` () =
-    SessionSharding.versionStamp 1 128 |> should equal "1.1.128"
+    SessionSharding.versionStamp 1 128 |> should equal "2.1.128"
 
     SessionSharding.versionStamp 2 32
     |> should equal (SessionSharding.versionStamp 2 32)
@@ -146,8 +146,10 @@ let ``Extractor rejects a non-positive shard count`` () =
 
 [<Fact>]
 let ``Extractor reads the entity id from envelopes and bare strings`` () =
-    SessionSharding.entityIdForMessage (enveloped "session-alpha" (42 :> obj))
-    |> should equal "session-alpha"
+    let address = SessionAddress(TenantId.Default, SessionId.New())
+
+    SessionSharding.entityIdForMessage (enveloped address.Key (42 :> obj))
+    |> should equal address.Key
 
     SessionSharding.entityIdForMessage "session-alpha"
     |> should equal "session-alpha"
@@ -162,7 +164,10 @@ let ``Extractor reads the entity id from envelopes and bare strings`` () =
 let ``Extractor unwraps the entity message from envelopes`` () =
     let payload: obj = 42 :> obj
 
-    Assert.Same(payload, SessionSharding.entityMessageFor (enveloped "session-alpha" payload))
+    let address = SessionAddress(TenantId.Default, SessionId.New())
+    let extracted = SessionSharding.entityMessageFor (enveloped address.Key payload)
+    let ingress = Assert.IsType<SessionAddressedIngress>(extracted)
+    Assert.Same(payload, ingress.Request)
 
     Assert.Same(payload, SessionSharding.entityMessageFor payload)
 

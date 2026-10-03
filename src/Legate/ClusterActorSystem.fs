@@ -391,6 +391,8 @@ module internal ClusterActorSystem =
 
                     serve.ContinueWith(fun (completed: Task<CrossNodeSubscriptions.CrossNodeBatchOutcome>) ->
                         if completed.IsFaulted then
+                            hub.Detach(request.SubscriberToken)
+
                             let inner =
                                 match completed.Exception with
                                 | null -> Exception("The cross-node subscription failed.")
@@ -399,30 +401,40 @@ module internal ClusterActorSystem =
 
                             sender.Tell(inner :> obj)
                         elif completed.IsCanceled then
+                            hub.Detach(request.SubscriberToken)
                             sender.Tell(OperationCanceledException() :> obj)
                         else
                             try
                                 CrossNodeSubscriptions.raiseForOutcome request.Tenant completed.Result
 
                                 match completed.Result with
-                                | CrossNodeSubscriptions.BatchPage batch -> sender.Tell(batch :> obj)
+                                | CrossNodeSubscriptions.BatchPage batch ->
+                                    sender.Tell(
+                                        ({ batch with
+                                            SubscriberToken = request.SubscriberToken
+                                        }
+                                        :> obj)
+                                    )
                                 | _ ->
                                     sender.Tell(
                                         InvalidOperationException("The cross-node subscription resolved with no page.")
                                         :> obj
                                     )
                             with ex ->
+                                hub.Detach(request.SubscriberToken)
                                 sender.Tell(ex :> obj))
                     |> ignore
 
-        let serveUnsubscribe (request: CrossNodeSubscriptions.CrossNodeUnsubscribe) : unit =
+        let serveUnsubscribe (request: CrossNodeSubscriptions.CrossNodeUnsubscribe) (sender: IActorRef) : unit =
             match subscriptionDeps with
-            | None -> ()
+            | None -> sender.Tell(InvalidOperationException("Cross-node subscriptions are unavailable.") :> obj)
             | Some deps ->
                 if not (isNull (box deps.Hubs)) then
                     match deps.Hubs.TryGetValue((request.Tenant, entityId)) with
                     | true, hub -> hub.Detach(request.SubscriberToken)
                     | false, _ -> ()
+
+                sender.Tell(SessionRouteAccepted :> obj)
 
         let rec loop (child: IActorRef option) =
             actor {
@@ -437,7 +449,7 @@ module internal ClusterActorSystem =
                     serveSubscribe subscribe (mailbox.Sender())
                     return! loop child
                 | :? CrossNodeSubscriptions.CrossNodeUnsubscribe as unsubscribe ->
-                    serveUnsubscribe unsubscribe
+                    serveUnsubscribe unsubscribe (mailbox.Sender())
                     return! loop child
                 | _ ->
                     let live = ensure child
@@ -500,9 +512,9 @@ module internal ClusterActorSystem =
 
     /// Waits for running turns to settle: polls the count until it reads
     /// zero, the grace elapses, or the deadline measured from the stop
-    /// start elapses, whichever comes first. Cancellation abandons the
-    /// wait so shutdown proceeds. Store failures propagate to the
-    /// caller; only cancellation is absorbed here.
+    /// start elapses, whichever comes first. A grace/deadline expiry or
+    /// cancellation is surfaced to the caller so live actor-system
+    /// references remain retained for a retry.
     /// <param name="countRunning">Reads the running-turn count.</param>
     /// <param name="grace">The running-turn wait bound.</param>
     /// <param name="deadline">The total stop bound from the stop start.</param>
@@ -530,9 +542,19 @@ module internal ClusterActorSystem =
                 let totalElapsed = timeProvider.GetElapsedTime stopStartTimestamp
 
                 if totalElapsed >= deadline then
-                    settled <- true
+                    raise (
+                        DeadlineExceededException(
+                            "ClusterDrain",
+                            "The cluster running-work drain exceeded the configured host exit deadline."
+                        )
+                    )
                 elif graceElapsed >= grace then
-                    settled <- true
+                    raise (
+                        DeadlineExceededException(
+                            "ClusterDrain",
+                            "The cluster running-work drain exceeded the configured shutdown grace period."
+                        )
+                    )
                 else
                     let! running = countRunning cancellationToken
 
@@ -557,10 +579,7 @@ module internal ClusterActorSystem =
                         if wait <= TimeSpan.Zero then
                             settled <- true
                         else
-                            try
-                                do! Task.Delay(wait, timeProvider, cancellationToken)
-                            with :? OperationCanceledException ->
-                                settled <- true
+                            do! Task.Delay(wait, timeProvider, cancellationToken)
         }
 
     /// The startup quorum poll cadence: how often the start path re-reads
@@ -649,6 +668,12 @@ module internal ClusterActorSystem =
 
         loop ()
 
+    let guardedEntityProps entityKey contexts hubs =
+        Props.Create(
+            Linq.Expression.ToExpression(fun () ->
+                new FunActor<obj, unit>(SessionRouting.gateBehavior entityKey contexts hubs))
+        )
+
 // ──────────────────────────────────────────────────────────────────────────
 // Hosted service
 
@@ -671,6 +696,10 @@ type internal ClusterActorSystemService
     let mutable proxies: Map<string, Task<IActorRef>> = Map.empty
     let mutable nextProxy = 0
     let mutable draining = false
+    let mutable started = false
+
+    let mutable sessionEntityFactory: (string -> IActorContext -> string -> IActorRef) option =
+        None
 
     /// Initialises the service without a container: no bootstrap hook
     /// ever resolves, so Kubernetes mode keeps today's singleton
@@ -707,12 +736,6 @@ type internal ClusterActorSystemService
     /// between 0 and 65535.
     member val RemotingPort: int = 0 with get, set
 
-    /// The session store polled for running turns during the drain wait,
-    /// or None when no store is wired (the drain wait then observes zero
-    /// running turns). The session client facade wires this alongside the
-    /// entity factory; tests set it directly. Set before StartAsync.
-    member val SessionStore: ISessionStore option = None with get, set
-
     /// The journal cross-node subscription batches fall back to past the
     /// entity replay cache, or None until the session client facade wires
     /// it (entities then run the legacy pure-delegator behavior and serve
@@ -746,7 +769,15 @@ type internal ClusterActorSystemService
     /// client facade owns setting this once it can supply the store and
     /// turn runner. Read per entity instantiation, so setting it before
     /// the first prompt is enough. Set before StartAsync.
-    member val SessionEntityFactory: (string -> IActorContext -> string -> IActorRef) option = None with get, set
+    member _.SessionEntityFactory
+        with get () = sessionEntityFactory
+        and set value =
+            if not (isNull (box provider)) then
+                invalidOp "SessionEntityFactory is a unit-test seam and is unavailable with a production context."
+            elif started then
+                invalidOp "SessionEntityFactory cannot be changed after StartAsync."
+            else
+                sessionEntityFactory <- value
 
     /// Reads the current entity spawn: the facade-wired factory, or the
     /// legacy identity spawn until the facade configures one.
@@ -796,7 +827,17 @@ type internal ClusterActorSystemService
                             spawn
                                 created
                                 $"%s{ClusterActorSystem.proxyPrefix}%d{nextProxy}"
-                                (ClusterActorSystem.clusterProxy sessionId regionRef)
+                                (match provider with
+                                 | null -> ClusterActorSystem.clusterProxy sessionId regionRef
+                                 | _ ->
+                                     match SessionAddress.TryParse sessionId with
+                                     | None ->
+                                         raise (
+                                             SessionScopeRejectedException(SessionScopeRejectionReason.InvalidScope)
+                                         )
+                                     | Some address ->
+                                         SessionRouting.boundProxy address (fun request sender ->
+                                             regionRef.Tell(ShardingEnvelope(sessionId, request), sender)))
 
                         nextProxy <- nextProxy + 1
 
@@ -818,7 +859,14 @@ type internal ClusterActorSystemService
                                             timeoutCts.Token
                                         )
 
-                                    let! _ = proxy.Ask<IActorRef>(sessionId, linkedCts.Token)
+                                    match provider with
+                                    | null ->
+                                        let! _ = proxy.Ask<IActorRef>(sessionId, linkedCts.Token)
+                                        ()
+                                    | _ ->
+                                        let! _ = proxy.Ask<SessionRouteAccepted>(SessionRouteProbe, linkedCts.Token)
+                                        ()
+
                                     return proxy
                                 with ex ->
                                     lock gate (fun () -> proxies <- Map.remove sessionId proxies)
@@ -847,8 +895,8 @@ type internal ClusterActorSystemService
         this.resolveInner sessionId cancellationToken
 
     interface ISessionResolver with
-        member this.ResolveSessionAsync(sessionId, cancellationToken) =
-            this.resolveInner sessionId cancellationToken
+        member this.ResolveSessionAsync(address, cancellationToken) =
+            this.resolveInner address.Key cancellationToken
 
     interface IHostedService with
         member _.StartAsync(cancellationToken: CancellationToken) =
@@ -856,9 +904,22 @@ type internal ClusterActorSystemService
             let spawnNow () = this.currentSpawn ()
 
             task {
+                started <- true
+
                 match options.Value.Cluster.Mode with
                 | ClusterMode.StaticSeeds
                 | ClusterMode.Kubernetes as mode ->
+                    let contexts =
+                        match provider with
+                        | null -> None
+                        | root -> root.GetService<ISessionHostContexts>() |> Option.ofObj
+
+                    match contexts with
+                    | Some contexts ->
+                        contexts.OpenAdmission()
+                        do! contexts.InitializeAsync cancellationToken
+                    | None -> ()
+
                     let clusterOptions = options.Value.Cluster
 
                     // The seam wins when set; otherwise the options-owned
@@ -947,8 +1008,10 @@ type internal ClusterActorSystemService
 
                         let entityPropsFactory =
                             System.Func<string, Props>(fun entityId ->
-                                match this.SubscriptionEventStore, this.SubscriptionOptions with
-                                | Some eventStore, Some subscriptionOptions ->
+                                match contexts, this.SubscriptionEventStore, this.SubscriptionOptions with
+                                | Some contexts, _, _ ->
+                                    ClusterActorSystem.guardedEntityProps entityId contexts this.SubscriptionHubs
+                                | None, Some eventStore, Some subscriptionOptions ->
                                     ClusterActorSystem.entityPropsWithSubscriptions
                                         entityId
                                         (spawnNow ())
@@ -1015,6 +1078,21 @@ type internal ClusterActorSystemService
                 // Fail readiness FIRST so the orchestrator stops routing
                 // before the running-turn wait starts.
                 this.BeginDrain()
+
+                let contexts =
+                    match provider with
+                    | null -> None
+                    | root when options.Value.Cluster.Mode <> ClusterMode.Local ->
+                        root.GetService<ISessionHostContexts>() |> Option.ofObj
+                    | _ -> None
+
+                contexts |> Option.iter (fun current -> current.CloseAdmission())
+
+                for entry in this.SubscriptionHubs do
+                    entry.Value.DetachAll()
+
+                this.SubscriptionHubs.Clear()
+
                 let stopStart = timeProvider.GetTimestamp()
 
                 match systemOpt with
@@ -1023,9 +1101,31 @@ type internal ClusterActorSystemService
                     let clusterOptions = options.Value.Cluster
 
                     let countRunning =
-                        match this.SessionStore with
+                        match contexts with
                         | None -> fun (_: CancellationToken) -> Task.FromResult 0
-                        | Some store -> fun (ct: CancellationToken) -> store.CountRunningSessions(ct)
+                        | Some current ->
+                            fun (ct: CancellationToken) ->
+                                task {
+                                    let stores =
+                                        current.All |> Array.map (fun context -> context.Store.CountRunningSessions(ct))
+
+                                    let! storeCounts = Task.WhenAll stores
+
+                                    let storeRunning = storeCounts |> Array.sum
+
+                                    let trackedRunning =
+                                        current.All |> Array.sumBy (fun context -> context.WorkTracker.RunningCount)
+
+                                    return max storeRunning trackedRunning
+                                }
+
+                    // A drain expiry is reported, never acted on by skipping
+                    // termination: the node below still leaves the cluster and
+                    // releases its remoting port so the same address can be
+                    // rebound after a restart or relocation. The retained
+                    // failure is rethrown after termination so a timeout is
+                    // never mistaken for reached quiescence.
+                    let mutable stopFailure: exn option = None
 
                     try
                         do!
@@ -1036,16 +1136,34 @@ type internal ClusterActorSystemService
                                 timeProvider
                                 stopStart
                                 cancellationToken
-                    with :? OperationCanceledException ->
-                        ()
+                    with
+                    | :? OperationCanceledException -> ()
+                    | :? DeadlineExceededException as drainExpired -> stopFailure <- Some(drainExpired :> exn)
 
                     let elapsed = timeProvider.GetElapsedTime stopStart
                     let remainingDeadline = clusterOptions.HostExitDeadline - elapsed
 
-                    // The shutdown wait stays inside the remaining deadline
-                    // so the whole stop never exceeds HostExitDeadline; when
-                    // the drain already spent it, the wait bounds to zero and
-                    // termination proceeds in the background.
+                    match contexts with
+                    | None -> ()
+                    | Some current ->
+                        let drainBound =
+                            if remainingDeadline <= TimeSpan.Zero then
+                                TimeSpan.Zero
+                            else
+                                remainingDeadline
+
+                        try
+                            do! current.DrainAsync(drainBound, timeProvider, cancellationToken)
+                        with
+                        | :? OperationCanceledException -> ()
+                        | :? DeadlineExceededException as contextExpired ->
+                            match stopFailure with
+                            | None -> stopFailure <- Some(contextExpired :> exn)
+                            | Some _ -> ()
+
+                    // The shutdown wait stays inside the remaining deadline.
+                    // Timeout and cancellation remain failures; the actor
+                    // system references stay live until termination confirms.
                     let bound =
                         if remainingDeadline <= TimeSpan.Zero then
                             TimeSpan.Zero
@@ -1054,24 +1172,38 @@ type internal ClusterActorSystemService
                         else
                             remainingDeadline
 
-                    try
-                        // Termination drives coordinated shutdown (the
-                        // cluster HOCON keeps run-by-actor-system-terminate
-                        // on, which leaves the cluster first). A null
-                        // from-phase runs every shutdown phase.
-                        let shutdown =
-                            CoordinatedShutdown.Get(created).Run(CoordinatedShutdown.ClrExitReason.Instance, null)
+                    // Termination drives coordinated shutdown (the cluster
+                    // HOCON keeps run-by-actor-system-terminate on, which
+                    // leaves the cluster first).
+                    let shutdown =
+                        CoordinatedShutdown.Get(created).Run(CoordinatedShutdown.ClrExitReason.Instance, null)
 
-                        let! _ = shutdown.WaitAsync(bound, cancellationToken)
-                        ()
-                    with
-                    | :? TimeoutException -> ()
-                    | :? OperationCanceledException -> ()
+                    do!
+                        NodeBoundedWait.awaitTask
+                            "ClusterActorSystemShutdown"
+                            shutdown
+                            bound
+                            timeProvider
+                            cancellationToken
+
+                    do!
+                        NodeBoundedWait.awaitTask
+                            "ClusterActorSystemTermination"
+                            created.WhenTerminated
+                            bound
+                            timeProvider
+                            cancellationToken
 
                     systemOpt <- None
                     regionOpt <- None
 
                     lock gate (fun () -> proxies <- Map.empty)
+
+                    match stopFailure with
+                    | None -> ()
+                    | Some failure ->
+                        ExceptionDispatchInfo.Capture(failure).Throw()
+                        return ()
             }
             :> Task
 

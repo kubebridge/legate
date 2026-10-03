@@ -25,6 +25,15 @@ AlreadyAccepted with the original receipt, including after retirement or session
 A missing/purged session remains missing. AlreadyTerminal identifies a committed
 control verdict, not complete cleanup or publication.
 
+The direct 393 path, `ReadAbortTarget` followed by exact-target
+`RequestHostAbort`, remains tenant-scoped and route-independent. It addresses
+the durable target identified by the shared global `SessionId`, returns
+durable receipts, retries the same target, and preserves pending control
+barriers. It is non-activating: reading a target or persisted intent does not
+wake an actor, claim a turn, or manufacture claim authority. Scoped routing
+hints can carry the address, but they only read persisted intent and cannot
+change the target or create control authority.
+
 ## Runtime control attribution
 
 The journal prime is retained as the execution authority. Each selected real inbox
@@ -64,10 +73,14 @@ target and handle a receipt rather than Task-only or snapshot-only success. Cust
 stores must implement the required control capability with the same atomicity rules.
 
 Abort actor/entity wire payloads are version 2 exact-tenant/session/target wake hints.
-Their old untargeted version 1 manifests and payloads are rejected, including the usual
-current-minus-one reader exception. A wake hint reads stored intent and cannot create
-authority or stop a different target. Local-only legacy actor helpers are not the
-supported public host-control API and cannot be serialized remotely.
+Their old untargeted version 1 manifests and payloads are rejected. The unchanged
+393 abort manifests retain version 2 and reject version 1, including the
+current-minus-one reader exception;
+the current-only rule for structurally changed 395 routing and subscription
+envelopes does not weaken exact-target abort semantics. A wake hint reads stored
+intent and cannot create authority or stop a different target. Local-only legacy
+actor helpers are not the supported public host-control API and cannot be
+serialized remotely.
 
 Current control records use explicit format version 1. The additive shared migration
 creates `session_control`; new session creation writes the current version. Existing
@@ -76,3 +89,13 @@ binding and ambiguous original-entry associations fail closed with a clean-start
 diagnostic. There is no guessed backfill, legacy rebinding, manufactured history or
 automatic database deletion. Preserve old databases for inspection and use new
 sessions/current-format storage for execution. Landed migrations are not changed.
+
+This contract does not solve completion destinations (378), actual-turn claim
+integration (374), terminal settlement (363), or durable observation (364).
+
+Deployment and restart require a coordinated drain. Stop closes admission,
+detaches node subscriptions and quiesces actors and subscriptions. The host
+then disposes provider-owned event buses and their static journal hooks.
+Homogeneous upgrades and clean restarts
+must use the same `s2` keyspace. Mixed runtime versions, mixed migrations,
+backfills, legacy adapters, and database deletion are unsupported.

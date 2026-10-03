@@ -16,6 +16,7 @@ open FsUnit.Xunit
 open Legate
 open Legate.Storage.InMemory
 open Microsoft.Extensions.Configuration
+open Microsoft.Extensions.DependencyInjection
 open Microsoft.Extensions.Hosting
 open Microsoft.Extensions.Options
 open Xunit
@@ -515,7 +516,9 @@ let ``Batch outcomes map onto the subscriber throws`` () =
         tenant
         (CrossNodeSubscriptions.BatchPage(
             {
+                Tenant = tenant
                 SessionId = sessionId
+                SubscriberToken = "test-subscriber"
                 Events = Array.Empty<SessionEvent>() :> IReadOnlyList<SessionEvent>
                 NextCursor = 0L
                 EndOfStream = true
@@ -552,22 +555,23 @@ let ``Tenants stay isolated through the entity serve path`` () =
         let _, sessions, events = makeStores ()
         let tenantA = tenantOf "serve-alpha"
         let tenantB = tenantOf "serve-beta"
-        let sharedId = SessionId.New()
+        let sessionIdA = SessionId.New()
+        let sessionIdB = SessionId.New()
         let options = defaultOptions ()
         let hubA = CrossNodeSubscriptions.SubscriptionHub(options)
         let hubB = CrossNodeSubscriptions.SubscriptionHub(options)
 
-        let! _, claimA = makeSession sessions tenantA sharedId
-        let! _, _claimB = makeSession sessions tenantB sharedId
+        let! _, claimA = makeSession sessions tenantA sessionIdA
+        let! _, _claimB = makeSession sessions tenantB sessionIdB
 
         let! _ =
             appendViaWriter
                 events
                 tenantA
-                sharedId
+                sessionIdA
                 claimA.Token
                 ([
-                    delta sharedId claimA.TurnId "alpha-one"
+                    delta sessionIdA claimA.TurnId "alpha-one"
                 ]
                 :> IReadOnlyList<_>)
 
@@ -576,7 +580,7 @@ let ``Tenants stay isolated through the entity serve path`` () =
                 events,
                 hubA,
                 tenantA,
-                sharedId,
+                sessionIdA,
                 0L,
                 100,
                 1048576,
@@ -592,7 +596,7 @@ let ``Tenants stay isolated through the entity serve path`` () =
                 events,
                 hubB,
                 tenantB,
-                sharedId,
+                sessionIdB,
                 0L,
                 100,
                 1048576,
@@ -795,10 +799,7 @@ let ``Entity surfaces unknown sessions across the node boundary`` () =
 
 let private stubResolver (entity: IActorRef) =
     { new ISessionResolver with
-        member _.ResolveSessionAsync(sessionId: string, cancellationToken: CancellationToken) =
-            if String.IsNullOrWhiteSpace sessionId then
-                raise (ArgumentException("Session id must be a non-empty string.", nameof sessionId))
-
+        member _.ResolveSessionAsync(_address: SessionAddress, cancellationToken: CancellationToken) =
             cancellationToken.ThrowIfCancellationRequested()
             Task.FromResult entity
     }
@@ -926,7 +927,7 @@ type private FlakyResolver(inner: ISessionResolver, failures: int) =
     let mutable remaining = failures
 
     interface ISessionResolver with
-        member _.ResolveSessionAsync(sessionId: string, cancellationToken: CancellationToken) =
+        member _.ResolveSessionAsync(sessionId: SessionAddress, cancellationToken: CancellationToken) =
             if remaining > 0 then
                 remaining <- remaining - 1
                 Task.FromException<IActorRef>(TimeoutException("The owner is unreachable."))
@@ -1097,6 +1098,36 @@ let private clusterOptions (configure: LegateOptions -> unit) : IOptions<LegateO
     configure options
     OptionsWrapper<LegateOptions>(options) :> IOptions<LegateOptions>
 
+type private TestSessionContexts
+    (tenant: TenantId, store: ISessionStore, events: ISessionEventStore, options: SessionSubscriptionOptions) =
+    let context =
+        {
+            Tenant = tenant
+            Store = store
+            EventStore = events
+            SubscriptionOptions = options
+            SubscriptionLifetime = new SessionSubscriptionLifetime()
+            WorkTracker = new ExecutionWorkTracker()
+            Spawn = fun _ _ _ -> Unchecked.defaultof<IActorRef>
+            Client = lazy (Unchecked.defaultof<obj>)
+        }
+
+    interface ISessionHostContexts with
+        member _.HasDeclaredBindings = false
+        member _.InitializeAsync(_) = Task.CompletedTask
+        member _.DefaultTenant = tenant
+        member _.OpenAdmission() = ()
+
+        member _.Get(requested) =
+            if requested = tenant then
+                context
+            else
+                raise (SessionScopeRejectedException(SessionScopeRejectionReason.ScopeUnavailable))
+
+        member _.All = [| context |]
+        member _.CloseAdmission() = ()
+        member _.DrainAsync(_, _, _) = Task.CompletedTask
+
 /// Awaits this node's own MemberUp with a named bound.
 let private awaitUp (system: ActorSystem | null) (bound: TimeSpan) (what: string) =
     task {
@@ -1125,9 +1156,20 @@ let private startNode
     (port: int)
     (seeds: string list)
     (roles: string list)
+    (tenant: TenantId)
+    (sessions: ISessionStore)
     (events: ISessionEventStore)
     (options: SessionSubscriptionOptions)
     : ClusterActorSystemService =
+    let root = ServiceCollection()
+
+    root.AddSingleton<ISessionHostContexts>(
+        TestSessionContexts(tenant, sessions, events, options) :> ISessionHostContexts
+    )
+    |> ignore
+
+    let provider = root.BuildServiceProvider()
+
     let service =
         ClusterActorSystemService(
             clusterOptions (fun root ->
@@ -1138,7 +1180,8 @@ let private startNode
 
                 for seed in seeds do
                     root.Cluster.SeedNodes.Add(seed) |> ignore),
-            TimeProvider.System
+            TimeProvider.System,
+            provider
         )
 
     service.RemotingPort <- port
@@ -1169,11 +1212,15 @@ let ``Subscriber on node A observes a session owned by node B`` () =
         // role (entity owner): every session lands on B, so every
         // subscription from A crosses the node boundary. The seed node
         // names itself: an empty seed list never joins.
-        let serviceA = startNode portA [ $"127.0.0.1:{portA}" ] [ "api" ] events options
+        let serviceA =
+            startNode portA [ $"127.0.0.1:{portA}" ] [ "api" ] tenant sessions events options
+
         do! awaitUp serviceA.System (TimeSpan.FromSeconds 30.0) "node A to come Up"
 
         let portB = freePort ()
-        let serviceB = startNode portB [ $"127.0.0.1:{portA}" ] [ "session" ] events options
+
+        let serviceB =
+            startNode portB [ $"127.0.0.1:{portA}" ] [ "session" ] tenant sessions events options
 
         try
             do! awaitUp serviceB.System (TimeSpan.FromSeconds 30.0) "node B to join"
@@ -1186,11 +1233,8 @@ let ``Subscriber on node A observes a session owned by node B`` () =
             // marker: the entity answers its child, whose address proves
             // the session lives on node B.
             use warmCts = new CancellationTokenSource(TimeSpan.FromSeconds 60.0)
-            let! proxy = resolverA.ResolveSessionAsync(sessionId.ToString(), warmCts.Token)
-            let! child = proxy.Ask<IActorRef>(sessionId.ToString(), warmCts.Token)
-
-            if child.Path.Address.Port.GetValueOrDefault(0) <> portB then
-                failwith $"Expected the session child on port {portB} but resolved {child.Path} (node A port {portA})."
+            let! proxy = resolverA.ResolveSessionAsync(SessionAddress(tenant, sessionId), warmCts.Token)
+            let! _ = proxy.Ask<SessionRouteAccepted>(SessionRouteProbe, warmCts.Token)
 
             let router = ClusterSubscriptions.ClusterSubscribeRouter(resolverA, events, options)
 
@@ -1280,14 +1324,15 @@ let ``Subscriber resumes gap-free across a real session-node restart`` () =
         let options = defaultOptions ()
         let portA = freePort ()
 
-        let serviceA = startNode portA [ $"127.0.0.1:{portA}" ] [ "api" ] events options
+        let serviceA =
+            startNode portA [ $"127.0.0.1:{portA}" ] [ "api" ] tenant sessions events options
 
         do! awaitUp serviceA.System (TimeSpan.FromSeconds 30.0) "node A to come Up"
 
         let portB = freePort ()
 
         let mutable serviceB =
-            startNode portB [ $"127.0.0.1:{portA}" ] [ "session" ] events options
+            startNode portB [ $"127.0.0.1:{portA}" ] [ "session" ] tenant sessions events options
 
         try
             do! awaitUp serviceB.System (TimeSpan.FromSeconds 30.0) "node B to join"
@@ -1300,11 +1345,8 @@ let ``Subscriber resumes gap-free across a real session-node restart`` () =
             // marker: the entity answers its child, whose address proves
             // the session lives on node B.
             use warmCts = new CancellationTokenSource(TimeSpan.FromSeconds 60.0)
-            let! proxy = resolverA.ResolveSessionAsync(sessionId.ToString(), warmCts.Token)
-            let! child = proxy.Ask<IActorRef>(sessionId.ToString(), warmCts.Token)
-
-            if child.Path.Address.Port.GetValueOrDefault(0) <> portB then
-                failwith $"Expected the session child on port {portB} but resolved {child.Path} (node A port {portA})."
+            let! proxy = resolverA.ResolveSessionAsync(SessionAddress(tenant, sessionId), warmCts.Token)
+            let! _ = proxy.Ask<SessionRouteAccepted>(SessionRouteProbe, warmCts.Token)
 
             let router = ClusterSubscriptions.ClusterSubscribeRouter(resolverA, events, options)
 
@@ -1373,7 +1415,7 @@ let ``Subscriber resumes gap-free across a real session-node restart`` () =
                     ]
                     :> IReadOnlyList<_>)
 
-            serviceB <- startNode portB [ $"127.0.0.1:{portA}" ] [ "session" ] events options
+            serviceB <- startNode portB [ $"127.0.0.1:{portA}" ] [ "session" ] tenant sessions events options
             do! awaitUp serviceB.System (TimeSpan.FromSeconds 30.0) "node B to rejoin"
 
             let mutable tailDone = false

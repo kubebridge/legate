@@ -452,10 +452,11 @@ let ``Tenants stay isolated on the bus and the store`` () =
         let tenantA = tenantOf "alpha"
         let tenantB = tenantOf "beta"
         let sharedId = SessionId.New()
+        let otherId = SessionId.New()
         use bus = new SessionEventBus(events)
 
         let! _, claimA = makeSession sessions tenantA sharedId
-        let! _, claimB = makeSession sessions tenantB sharedId
+        let! _, claimB = makeSession sessions tenantB otherId
 
         let! _ =
             appendViaWriter
@@ -470,13 +471,13 @@ let ``Tenants stay isolated on the bus and the store`` () =
         let! fromA = bus.ReadEventsAsync(tenantA, sharedId, 0L, 10, CancellationToken.None)
         fromA.Count |> should equal 1
 
-        let! fromB = bus.ReadEventsAsync(tenantB, sharedId, 0L, 10, CancellationToken.None)
+        let! fromB = bus.ReadEventsAsync(tenantB, otherId, 0L, 10, CancellationToken.None)
         fromB.Count |> should equal 0
 
         let! _ =
-            appendViaWriter events tenantB sharedId claimB.Token ([ closed sharedId claimB.TurnId ] :> IReadOnlyList<_>)
+            appendViaWriter events tenantB otherId claimB.Token ([ closed otherId claimB.TurnId ] :> IReadOnlyList<_>)
 
-        let! receivedB = collectAll (bus.Subscribe(tenantB, sharedId, 0L, CancellationToken.None))
+        let! receivedB = collectAll (bus.Subscribe(tenantB, otherId, 0L, CancellationToken.None))
         receivedB.Count |> should equal 1
         (receivedB[0] :? SessionClosedEvent) |> should equal true
     }

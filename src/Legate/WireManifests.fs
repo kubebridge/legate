@@ -103,6 +103,12 @@ module internal WireManifests =
     /// resolve; entity rows cover the suspendable protocol and its replies.
     let cases: WireCase list =
         [
+            { row RouterFamily "ScopedRequest" typeof<WireDtos.ScopedRequestDto> LargeWireBytes with
+                Version = 2
+            }
+            { row RouterFamily "ScopedResponse" typeof<WireDtos.ScopedResponseDto> LargeWireBytes with
+                Version = 2
+            }
             { row ActorFamily "AbortSession" typeof<WireDtos.AbortSessionDto> LargeWireBytes with
                 Version = 2
             }
@@ -146,7 +152,9 @@ module internal WireManifests =
             row EntityFamily "SuspendableSetAgent" typeof<WireDtos.SuspendableSetAgentDto> SmallWireBytes
             row SubscriptionFamily "Subscribe" typeof<WireDtos.SubscribeDto> SmallWireBytes
             row SubscriptionFamily "Unsubscribe" typeof<WireDtos.UnsubscribeDto> SmallWireBytes
-            row SubscriptionFamily "EventBatch" typeof<WireDtos.EventBatchDto> LargeWireBytes
+            { row SubscriptionFamily "EventBatch" typeof<WireDtos.EventBatchDto> LargeWireBytes with
+                Version = 2
+            }
             row EventFamily "SessionEvent" typeof<WireDtos.SessionEventDto> LargeWireBytes
         ]
 

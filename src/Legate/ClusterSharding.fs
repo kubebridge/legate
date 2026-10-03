@@ -32,7 +32,7 @@ type internal ISessionResolver =
     /// <param name="sessionId">The session whose actor to resolve.</param>
     /// <param name="cancellationToken">Cancels the resolve.</param>
     /// <returns>The session actor.</returns>
-    abstract ResolveSessionAsync: sessionId: string * cancellationToken: CancellationToken -> Task<IActorRef>
+    abstract ResolveSessionAsync: address: SessionAddress * cancellationToken: CancellationToken -> Task<IActorRef>
 
 // ──────────────────────────────────────────────────────────────────────────
 // Sharding math
@@ -92,7 +92,7 @@ module internal SessionSharding =
         if shardCount < 1 then
             raise (ArgumentOutOfRangeException(nameof shardCount, "The shard count must be at least 1."))
 
-        $"1.%d{hashVersion}.%d{shardCount}"
+        $"2.%d{hashVersion}.%d{shardCount}"
 
     /// Reads the entity id from a region message: the envelope's id,
     /// a bare string by its own value (the wire-safe resolve marker),
@@ -104,7 +104,10 @@ module internal SessionSharding =
         ArgumentNullException.ThrowIfNull(message)
 
         match message with
-        | :? ShardingEnvelope as envelope -> envelope.EntityId
+        | :? ShardingEnvelope as envelope ->
+            match SessionAddress.TryParse envelope.EntityId with
+            | Some _ -> envelope.EntityId
+            | None -> "scope-refusal"
         | :? string as sessionId -> sessionId
         | _ -> null
 
@@ -117,7 +120,12 @@ module internal SessionSharding =
         ArgumentNullException.ThrowIfNull(message)
 
         match message with
-        | :? ShardingEnvelope as envelope -> envelope.Message
+        | :? ShardingEnvelope as envelope ->
+            {
+                EntityKey = envelope.EntityId
+                Request = envelope.Message
+            }
+            : SessionAddressedIngress
         | _ -> message
 
     /// Extracts the session entity and shard from region messages. The

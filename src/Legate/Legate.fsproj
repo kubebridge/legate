@@ -20,6 +20,7 @@
     <Compile Include="CompletionEra.fs" />
     <Compile Include="JournalWriter.fs" />
     <Compile Include="LoggingScopes.fs" />
+    <Compile Include="ExecutionWorkTracker.fs" />
     <Compile Include="LlmCoordinator.fs" />
     <Compile Include="SessionArtifactEnrichment.fs" />
     <Compile Include="Transcripts.fs" />
@@ -43,10 +44,14 @@
     <Compile Include="Compaction.fs" />
     <Compile Include="LegateOptionsBinding.fs" />
     <Compile Include="LegateDefaults.fs" />
-    <Compile Include="LegateStartupValidation.fs" />
     <Compile Include="PromptWaitHub.fs" />
     <Compile Include="SessionActor.fs" />
+    <Compile Include="SessionRouteMessages.fs" />
     <Compile Include="SessionPermissions.fs" />
+    <Compile Include="SessionAddress.fs" />
+    <Compile Include="SessionHostContexts.fs" />
+    <Compile Include="SessionRouting.fs" />
+    <Compile Include="LegateStartupValidation.fs" />
     <Compile Include="ClusterSharding.fs" />
     <Compile Include="LocalActorSystem.fs" />
     <Compile Include="WireDtos.fs" />
@@ -68,6 +73,7 @@
     <Compile Include="ClusterHealth.fs" />
     <Compile Include="LlmCoordinationHealth.fs" />
     <Compile Include="SessionClientFacade.fs" />
+    <Compile Include="SessionHostBinding.fs" />
     <Compile Include="JournalArchiveOptions.fs" />
     <Compile Include="JournalArchiveWorker.fs" />
     <Compile Include="SessionExpiryService.fs" />
