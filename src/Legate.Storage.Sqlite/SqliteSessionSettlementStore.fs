@@ -6,6 +6,7 @@ open System.Collections.Generic
 open System.Threading
 open System.Threading.Tasks
 open Legate
+open Legate.Storage
 open Microsoft.Data.Sqlite
 
 /// The SQLite atomic terminal settlement capability (issue 363): validates captured claim
@@ -51,6 +52,56 @@ type SqliteSessionSettlementStore(database: SqliteDatabase) =
             request.ExecutionId
             request.Result.Status
             request.CompletionKey
+
+    let controlTable () = database.Table "session_control"
+
+    /// Releases the prime turn claim and current-turn tracking for a
+    /// quiescent terminal settlement (issue 363): stamps the turn terminal
+    /// and clears its claim plus the session's current turn. Queued chains
+    /// and pending control retirements skip this and keep the prime: chains
+    /// settle next under the same authority, and a pending control
+    /// retirement keeps authority for the actor's retireControl with the
+    /// existing prime settle releasing afterwards, exactly as before.
+    let releasePrime
+        (connection: SqliteConnection)
+        (transaction: SqliteTransaction)
+        (claim: TurnClaim)
+        (result: TurnResult)
+        (tenant: TenantId)
+        (sessionId: SessionId)
+        =
+        use turnUpdate = connection.CreateCommand()
+        turnUpdate.Transaction <- transaction
+
+        turnUpdate.CommandText <-
+            $"UPDATE \"%s{turnsTable ()}\" SET status = $status, outcome_json = $outcome, completed_at = $completed, claim_token = NULL, claim_owner = NULL, claim_expires_at = NULL WHERE turn_id = $turn"
+
+        turnUpdate.Parameters.AddWithValue("$status", turnStatusName result.Status)
+        |> ignore
+
+        let outcomeValue =
+            if isNull (box result.Outcome) then
+                box DBNull.Value
+            else
+                box (SqliteJson.serialize result.Outcome)
+
+        turnUpdate.Parameters.AddWithValue("$outcome", outcomeValue) |> ignore
+
+        turnUpdate.Parameters.AddWithValue("$completed", toIso database.UtcNow)
+        |> ignore
+
+        turnUpdate.Parameters.AddWithValue("$turn", claim.TurnId.Value) |> ignore
+        turnUpdate.ExecuteNonQuery() |> ignore
+
+        use clearCurrent = connection.CreateCommand()
+        clearCurrent.Transaction <- transaction
+
+        clearCurrent.CommandText <-
+            $"UPDATE \"%s{sessionsTable ()}\" SET current_turn_id = NULL WHERE id = $id AND tenant = $tenant"
+
+        clearCurrent.Parameters.AddWithValue("$id", sessionId.Value) |> ignore
+        clearCurrent.Parameters.AddWithValue("$tenant", tenant.Value) |> ignore
+        clearCurrent.ExecuteNonQuery() |> ignore
 
     interface ISessionSettlementStore with
 
@@ -495,6 +546,47 @@ type SqliteSessionSettlementStore(database: SqliteDatabase) =
                                             consume.Parameters.AddWithValue("$session", sessionId.Value) |> ignore
                                             consume.Parameters.AddWithValue("$pos", request.Position) |> ignore
                                             consume.ExecuteNonQuery() |> ignore
+
+                                            // A decided-but-unretired control verdict still owns
+                                            // the entry (issue 363 plus #393): the actor's
+                                            // retireControl must run before the prime is
+                                            // released, so the quiescent release below defers
+                                            // while this holds. Missing state reads as
+                                            // nothing pending.
+                                            let controlPending =
+                                                try
+                                                    use controlCmd = connection.CreateCommand()
+                                                    controlCmd.Transaction <- transaction
+
+                                                    controlCmd.CommandText <-
+                                                        $"SELECT control_json FROM \"%s{controlTable ()}\" WHERE tenant = $tenant AND session_id = $session"
+
+                                                    controlCmd.Parameters.AddWithValue("$tenant", tenant.Value)
+                                                    |> ignore
+
+                                                    controlCmd.Parameters.AddWithValue("$session", sessionId.Value)
+                                                    |> ignore
+
+                                                    use controlReader = controlCmd.ExecuteReader()
+
+                                                    if controlReader.Read() then
+                                                        let json = controlReader.GetString(0)
+                                                        controlReader.Close()
+
+                                                        try
+                                                            let state = ControlTargetProtocol.decode sessionId json
+
+                                                            ControlTargetProtocol.retirementPendingFor
+                                                                state
+                                                                request.Position
+                                                        with _ ->
+                                                            false
+                                                    else
+                                                        controlReader.Close()
+                                                        false
+                                                with _ ->
+                                                    false
+
                                             use followingQuery = connection.CreateCommand()
                                             followingQuery.Transaction <- transaction
 
@@ -647,37 +739,19 @@ type SqliteSessionSettlementStore(database: SqliteDatabase) =
                                                         outboxInsert.ExecuteNonQuery() |> ignore
                                                         payload
 
-                                            use turnUpdate = connection.CreateCommand()
-                                            turnUpdate.Transaction <- transaction
+                                            // Prime release (issue 363): the turn row is stamped
+                                            // terminal and its claim plus the session's
+                                            // current turn clear only at quiescence with no
+                                            // control retirement pending. Queued chains keep
+                                            // the prime for the next admit and settle; a
+                                            // pending control retirement keeps the row
+                                            // pristine for the actor's retireControl and the
+                                            // existing prime settle, exactly as before. (A
+                                            // stamped-terminal row resolves as Absent, so a
+                                            // partial stamp would strand the prime.)
+                                            if nextState <> SessionState.Running && not controlPending then
+                                                releasePrime connection transaction claim result tenant sessionId
 
-                                            turnUpdate.CommandText <-
-                                                $"UPDATE \"%s{turnsTable ()}\" SET status = $status, outcome_json = $outcome, completed_at = $completed, claim_token = NULL, claim_owner = NULL, claim_expires_at = NULL WHERE turn_id = $turn"
-
-                                            turnUpdate.Parameters.AddWithValue("$status", turnStatusName result.Status)
-                                            |> ignore
-
-                                            let outcomeValue =
-                                                if isNull (box result.Outcome) then
-                                                    box DBNull.Value
-                                                else
-                                                    box (SqliteJson.serialize result.Outcome)
-
-                                            turnUpdate.Parameters.AddWithValue("$outcome", outcomeValue) |> ignore
-
-                                            turnUpdate.Parameters.AddWithValue("$completed", toIso database.UtcNow)
-                                            |> ignore
-
-                                            turnUpdate.Parameters.AddWithValue("$turn", claim.TurnId.Value) |> ignore
-                                            turnUpdate.ExecuteNonQuery() |> ignore
-                                            use clearCurrent = connection.CreateCommand()
-                                            clearCurrent.Transaction <- transaction
-
-                                            clearCurrent.CommandText <-
-                                                $"UPDATE \"%s{sessionsTable ()}\" SET current_turn_id = NULL WHERE id = $id AND tenant = $tenant"
-
-                                            clearCurrent.Parameters.AddWithValue("$id", sessionId.Value) |> ignore
-                                            clearCurrent.Parameters.AddWithValue("$tenant", tenant.Value) |> ignore
-                                            clearCurrent.ExecuteNonQuery() |> ignore
                                             let now = database.UtcNow
                                             use sessionUpdate = connection.CreateCommand()
                                             sessionUpdate.Transaction <- transaction

@@ -7,6 +7,7 @@ open System.Text.Json
 open System.Threading
 open System.Threading.Tasks
 open Legate
+open Legate.Storage
 open Npgsql
 open PostgresSql
 
@@ -37,6 +38,7 @@ type PostgresSessionSettlementStore(options: PostgresOptions, timeProvider: Time
     member private _.OutboxTable = qualified options "outbox"
     member private _.EventsTable = qualified options "events"
     member private _.SettlementsTable = qualified options "execution_settlements"
+    member private _.ControlTable = qualified options "session_control"
 
     member private _.Deserialize<'T>(json: string) : 'T =
         let boxed = JsonSerializer.Deserialize(json, typeof<'T>, jsonOptions)
@@ -45,6 +47,51 @@ type PostgresSessionSettlementStore(options: PostgresOptions, timeProvider: Time
             raise (JsonException "Storage JSON must not be null.")
         else
             unbox<'T> boxed
+
+    /// Releases the prime turn row and current-turn tracking for a quiescent
+    /// terminal settlement (issue 363): stamps the turn terminal and clears
+    /// its claim plus the session's current turn. Queued chains and pending
+    /// control retirements skip this and keep the prime: chains settle next
+    /// under the same authority, and a pending control retirement keeps
+    /// authority for the actor's retireControl with the existing prime settle
+    /// releasing afterwards, exactly as before.
+    member private this.ReleasePrime
+        (
+            connection: NpgsqlConnection,
+            transaction: NpgsqlTransaction,
+            claim: TurnClaim,
+            result: TurnResult,
+            tenant: TenantId,
+            sessionId: SessionId
+        ) =
+        use turnUpdate =
+            command
+                connection
+                transaction
+                $"UPDATE {this.TurnsTable} SET status = @status, outcome_json = @outcome, completed_at = @completed, claim_token = NULL, claim_owner = NULL, claim_expires_at = NULL WHERE turn_id = @tid"
+
+        textParam turnUpdate "status" (result.Status.ToString())
+
+        let outcomeValue =
+            if isNull (box result.Outcome) then
+                null
+            else
+                serialize result.Outcome
+
+        textParam turnUpdate "outcome" outcomeValue
+        textParam turnUpdate "completed" (stamp this.UtcNow)
+        textParam turnUpdate "tid" (claim.TurnId.ToString())
+        turnUpdate.ExecuteNonQuery() |> ignore
+
+        use clearCurrent =
+            command
+                connection
+                transaction
+                $"UPDATE {this.SessionsTable} SET current_turn_id = NULL WHERE id = @id AND tenant = @t"
+
+        textParam clearCurrent "id" (sessionId.ToString())
+        textParam clearCurrent "t" (tenant.ToString())
+        clearCurrent.ExecuteNonQuery() |> ignore
 
     member private _.Fingerprint(request: SessionSettlementRequest) =
         sprintf
@@ -493,6 +540,43 @@ type PostgresSessionSettlementStore(options: PostgresOptions, timeProvider: Time
                                         longParam consume "pos" request.Position
                                         consume.ExecuteNonQuery() |> ignore
 
+                                        // A decided-but-unretired control verdict still owns
+                                        // the entry (issue 363 plus #393): the actor's
+                                        // retireControl must run before the prime is
+                                        // released, so the quiescent release below defers
+                                        // while this holds. Missing state reads as
+                                        // nothing pending.
+                                        let controlPending =
+                                            try
+                                                use controlCmd =
+                                                    command
+                                                        connection
+                                                        transaction
+                                                        $"SELECT control_json FROM {this.ControlTable} WHERE tenant = @t AND session_id = @sid"
+
+                                                textParam controlCmd "t" (tenant.ToString())
+                                                textParam controlCmd "sid" (sessionId.ToString())
+
+                                                use controlReader = controlCmd.ExecuteReader()
+
+                                                if controlReader.Read() then
+                                                    let json = controlReader.GetString(0)
+                                                    controlReader.Close()
+
+                                                    try
+                                                        let state = ControlTargetProtocol.decode sessionId json
+
+                                                        ControlTargetProtocol.retirementPendingFor
+                                                            state
+                                                            request.Position
+                                                    with _ ->
+                                                        false
+                                                else
+                                                    controlReader.Close()
+                                                    false
+                                            with _ ->
+                                                false
+
                                         use followingQuery =
                                             command
                                                 connection
@@ -616,34 +700,26 @@ type PostgresSessionSettlementStore(options: PostgresOptions, timeProvider: Time
                                                     outboxInsert.ExecuteNonQuery() |> ignore
                                                     payload
 
-                                        use turnUpdate =
-                                            command
-                                                connection
-                                                transaction
-                                                $"UPDATE {this.TurnsTable} SET status = @status, outcome_json = @outcome, completed_at = @completed, claim_token = NULL, claim_owner = NULL, claim_expires_at = NULL WHERE turn_id = @tid"
+                                        // Prime release (issue 363): the turn row is stamped
+                                        // terminal and its claim plus the session's
+                                        // current turn clear only at quiescence with no
+                                        // control retirement pending. Queued chains keep
+                                        // the prime for the next admit and settle; a
+                                        // pending control retirement keeps the row
+                                        // pristine for the actor's retireControl and the
+                                        // existing prime settle, exactly as before. (A
+                                        // stamped-terminal row resolves as Absent, so a
+                                        // partial stamp would strand the prime.)
+                                        if nextState <> SessionState.Running && not controlPending then
+                                            this.ReleasePrime(
+                                                connection,
+                                                transaction,
+                                                claim,
+                                                result,
+                                                tenant,
+                                                sessionId
+                                            )
 
-                                        textParam turnUpdate "status" (result.Status.ToString())
-
-                                        let outcomeValue =
-                                            if isNull (box result.Outcome) then
-                                                null
-                                            else
-                                                serialize result.Outcome
-
-                                        textParam turnUpdate "outcome" outcomeValue
-                                        textParam turnUpdate "completed" (stamp this.UtcNow)
-                                        textParam turnUpdate "tid" (claim.TurnId.ToString())
-                                        turnUpdate.ExecuteNonQuery() |> ignore
-
-                                        use clearCurrent =
-                                            command
-                                                connection
-                                                transaction
-                                                $"UPDATE {this.SessionsTable} SET current_turn_id = NULL WHERE id = @id AND tenant = @t"
-
-                                        textParam clearCurrent "id" (sessionId.ToString())
-                                        textParam clearCurrent "t" (tenant.ToString())
-                                        clearCurrent.ExecuteNonQuery() |> ignore
                                         let now = this.UtcNow
 
                                         use sessionUpdate =

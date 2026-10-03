@@ -220,6 +220,29 @@ module internal ControlTargetProtocol =
     let decision turn state =
         state.Decisions |> Array.tryFind (fun decision -> decision.TurnId = turn)
 
+    /// Whether a decided-but-unretired control verdict still owns the entry
+    /// (issue 363): the actor's retireControl must run before the prime is
+    /// released, so a quiescent terminal settlement defers prime release
+    /// while this holds and the existing retire-then-prime-settle order is
+    /// preserved. Pure: never touches the store.
+    /// <param name="state">The decoded control state.</param>
+    /// <param name="position">The settling inbox entry position.</param>
+    /// <returns>True when retirement of this entry is still pending.</returns>
+    let retirementPendingFor (state: ControlState) (position: int64) =
+        match state.Binding with
+        | null -> false
+        | target when
+            target.InboxPosition = position
+            && target.State = ControlTargetState.TerminalPendingRetirement
+            && state.Decisions
+               |> Array.exists (fun decision ->
+                   not (isNull (box decision))
+                   && decision.InboxPosition = position
+                   && not decision.Retired)
+            ->
+            true
+        | _ -> false
+
     let requireTransition sessionId lifecycle state =
         validate sessionId state
 

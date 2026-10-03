@@ -4329,6 +4329,123 @@ module internal SessionActor =
 
                 SessionState.Idle
 
+        /// Resolves the atomic terminal settlement capability the store
+        /// exposes (issue 363): the same provider the startup validation
+        /// requires. None only for direct test constructions over a bare
+        /// ISessionStore that never registered the capability; production
+        /// activation always carries it.
+        /// <returns>The settlement capability, or None when absent.</returns>
+        let settlementStore: ISessionSettlementStore option =
+            match props.Store with
+            | :? ISessionSettlementStore as capable -> Some capable
+            | _ -> None
+
+        /// Resolves the captured claim authority one suspendable entry
+        /// executes under (issue 363): the per-entry bound claim when the
+        /// control target bound it, else the primed claim. Local
+        /// correlation only; the store validates it as durable authority.
+        /// <param name="entry">The entry the attempt executed.</param>
+        /// <returns>The captured claim, or None for unclaimed shells.</returns>
+        let settlementClaimFor (entry: InboxEntry) : TurnClaim option =
+            match controlReports.TryGetValue entry.Position with
+            | true, (_, claim, _) when not (isNull (box claim)) -> Some claim
+            | _ ->
+                match controlPrime with
+                | Some claim when not (isNull (box claim)) -> Some claim
+                | _ -> None
+
+        /// Admits one suspendable entry under its captured claim (issue
+        /// 363): records the execution admission the terminal settlement
+        /// requires, so a settle without a prior start-time admit still
+        /// commits. Idempotent for the same claim; best-effort, since the
+        /// settlement itself enforces authority and a stale admission
+        /// settles Rejected with zero effects.
+        /// <param name="entry">The entry to admit.</param>
+        let admitSettlementExecution (entry: InboxEntry) : unit =
+            match settlementStore, settlementClaimFor entry with
+            | Some capable, Some claim ->
+                try
+                    awaitTask (
+                        capable.AdmitExecution(
+                            props.Tenant,
+                            props.SessionId,
+                            entry.Position,
+                            claim,
+                            CancellationToken.None
+                        )
+                    )
+                    |> ignore
+                with _ ->
+                    ()
+            | _ -> ()
+
+        /// Settles one suspendable attempt through the atomic capability
+        /// (issue 363): validates the captured claim authority and commits
+        /// terminal consumption, lifecycle and prime disposition, completion
+        /// deduplication and outbox, and settlement bookkeeping under the
+        /// same takeover-serializing boundary. The terminal event rides
+        /// null here; the committed path journals best-effort afterwards as
+        /// before, so no second terminal event is ever emitted. Returns
+        /// None when no capability or claim is available, or when the call
+        /// itself faults: the caller then falls back to the legacy
+        /// unclaimed-shell path. A Rejected outcome is Some, never None: a
+        /// stale loser observes it and performs zero effects.
+        /// <param name="entry">The entry the attempt executed.</param>
+        /// <param name="result">The decided terminal result.</param>
+        /// <param name="executionId">The settling turn id, or None when no loop id ever existed.</param>
+        /// <returns>The committed disposition, or None when unsettleable here.</returns>
+        let trySettleSuspendable
+            (entry: InboxEntry)
+            (result: TurnResult)
+            (executionId: TurnId option)
+            : SessionSettlementOutcome option =
+            match settlementStore, settlementClaimFor entry with
+            | Some capable, Some claim ->
+                try
+                    admitSettlementExecution entry
+
+                    let execution =
+                        match executionId with
+                        | Some id -> Nullable id
+                        | None -> Nullable()
+
+                    let request =
+                        SessionSettlementRequest(
+                            props.SessionId,
+                            entry.Position,
+                            claim,
+                            execution,
+                            result,
+                            mintCompletionKey (),
+                            null
+                        )
+
+                    let outcome =
+                        awaitTask (capable.SettleExecution(props.Tenant, request, CancellationToken.None))
+
+                    Some outcome
+                with _ ->
+                    None
+            | _ -> None
+
+        /// Drains the committed settlement's authoritative following entry
+        /// (issue 363): the provider-selected runnable candidate, never an
+        /// actor-computed inbox snapshot. Authorized entries start; refused
+        /// ones settle through the existing refusal path and the drain
+        /// recurses.
+        /// <param name="following">The authoritative following entry. Never null.</param>
+        /// <returns>The next loop state.</returns>
+        let drainSettledFollowing (following: InboxEntry) : SessionState =
+            tryApplyPendingWhenIdle ()
+
+            match checkAgentAuthority () with
+            | None ->
+                startSuspendable following 1 (readGrantsNow ()) None
+                SessionState.Running
+            | Some(failure, reason) ->
+                settleAuthorityRefusal following failure reason
+                drainAfterRefusal ()
+
         let mutable replyInFlight = false
 
         let rec loop (state: SessionState) (suspended: SuspendedTurn option) (resolved: HashSet<string>) =
@@ -4740,111 +4857,195 @@ module internal SessionActor =
                             (turnId: TurnId option)
                             : SessionState =
                             let result = decideControl entry result
-                            pendingStop <- None
-                            runningTurnId <- None
-                            let positions = [| entry.Position |] :> IReadOnlyList<int64>
 
-                            awaitTask (
-                                props.Store.MarkInboxConsumed(
-                                    props.Tenant,
-                                    props.SessionId,
-                                    positions,
-                                    CancellationToken.None
-                                )
-                            )
-                            |> ignore
+                            match trySettleSuspendable entry result turnId with
+                            | Some outcome when outcome.Status = SessionSettlementStatus.Applied ->
+                                // Committed winner (issue 363): the atomic
+                                // boundary already consumed the entry, chose
+                                // the lifecycle disposition and the queued
+                                // candidate, enqueued the completion under
+                                // the stable key, and released the prime at
+                                // quiescence. Publish only this winner:
+                                // observe once, journal the terminal event
+                                // best-effort, then drain the authoritative
+                                // following entry or rest at quiescence. No
+                                // unfenced execution cleanup runs here.
+                                pendingStop <- None
+                                runningTurnId <- None
+                                notifySettled result
 
-                            notifySettled result
-                            dispatchCompletion props result |> ignore
+                                // Terminal completion event (issue 289):
+                                // verdict-first (the committed settle above
+                                // decided the terminal kind), journaled
+                                // best-effort under the live token. A prime
+                                // that never ran never reaches here, and a
+                                // fault before any mint (None) journals
+                                // nothing.
+                                match turnId with
+                                | Some tid -> journalSettledCompletion tid result
+                                | None -> ()
 
-                            // Terminal completion event (issue 289):
-                            // verdict-first (the store-first settle above
-                            // decided the terminal kind), journaled
-                            // best-effort under the live token. A prime
-                            // that never ran never reaches here, and a
-                            // fault before any mint (None) journals
-                            // nothing.
-                            match turnId with
-                            | Some tid -> journalSettledCompletion tid result
-                            | None -> ()
+                                retireControl entry
 
-                            retireControl entry
+                                if outcome.State = SessionState.Closed then
+                                    pendingAgent <- None
+                                    SessionState.Closed
+                                elif outcome.State = SessionState.Running then
+                                    match outcome.Following with
+                                    | null ->
+                                        tryApplyPendingWhenIdle ()
 
-                            if result.Status = TurnStatus.Completed && autoCloseEnabled props then
-                                // AutoClose (issue 82): the first Completed
-                                // turn closes the session store-first instead
-                                // of draining; the entry is already consumed
-                                // above. Aborted and Failed results never take
-                                // this path, so failed runs stay open for
-                                // inspection. A recorded rebind dies with
-                                // the session: Closed rejects it.
-                                awaitTask (
-                                    props.Store.CloseSession(props.Tenant, props.SessionId, CancellationToken.None)
-                                )
-                                |> ignore
+                                        if result.Status = TurnStatus.Completed then
+                                            settleCompletedPrimeNow ()
 
-                                pendingAgent <- None
+                                        SessionState.Idle
+                                    | following -> drainSettledFollowing following
+                                else
+                                    // The settled entry is consumed: an empty
+                                    // inbox is quiescent, so a recorded
+                                    // rebind applies before resting, and the
+                                    // Completed-turn prime settle below keeps
+                                    // the facade prime releasable. The
+                                    // lifecycle write already landed in the
+                                    // atomic boundary.
+                                    tryApplyPendingWhenIdle ()
 
-                                SessionState.Closed
-                            else
-                                // The settled entry is consumed: an empty
-                                // inbox is quiescent (the reporting task is
-                                // done and no new turn started), so a
-                                // recorded rebind applies before draining
-                                // next, and stays pending while entries
-                                // remain.
-                                tryApplyPendingWhenIdle ()
-
-                                let pending =
-                                    awaitTask (
-                                        props.Store.ReadPendingInbox(
-                                            props.Tenant,
-                                            props.SessionId,
-                                            CancellationToken.None
-                                        )
-                                    )
-
-                                match selectDrainableEntries pending with
-                                | following :: _ ->
-                                    // The per-turn authority gate runs at this
-                                    // settle-drain boundary only: authorized
-                                    // entries run, refused ones settle Failed
-                                    // without ever invoking the runner and
-                                    // the drain moves on.
-                                    match checkAgentAuthority () with
-                                    | None ->
-                                        startSuspendable following 1 (readGrantsNow ()) None
-                                        SessionState.Running
-                                    | Some(failure, reason) ->
-                                        settleAuthorityRefusal following failure reason
-                                        drainAfterRefusal ()
-                                | [] ->
-                                    // Completed-turn prime settle (issue
-                                    // 313): release the facade prime exactly
-                                    // once at quiescence through the fenced
-                                    // settle, so a later prompt (or a
-                                    // respawn prime after a restart) claims
-                                    // anew instead of observing
-                                    // TurnLeaseMissing. Aborted and Failed
-                                    // results keep their prime, like the
-                                    // fault path; a stale (taken-over) token
-                                    // settles nothing. The terminal event
-                                    // above already journaled under the live
-                                    // token, so the settle lands after it.
                                     if result.Status = TurnStatus.Completed then
                                         settleCompletedPrimeNow ()
 
+                                    SessionState.Idle
+                            | Some outcome when outcome.Status = SessionSettlementStatus.AlreadyApplied ->
+                                // Identical retry already committed: suppress
+                                // every duplicate effect (no second
+                                // observation, journal, retirement, or
+                                // drain) and honor the recorded disposition
+                                // as the loop state only.
+                                pendingStop <- None
+                                runningTurnId <- None
+
+                                if outcome.State = SessionState.Closed then
+                                    pendingAgent <- None
+                                    SessionState.Closed
+                                elif outcome.State = SessionState.Running then
+                                    SessionState.Running
+                                else
+                                    SessionState.Idle
+                            | Some _ ->
+                                // Rejected: a takeover winner owns the turn
+                                // now. Zero effects from this loser: no
+                                // observation, no journal, no completion, no
+                                // control retirement, no lifecycle write.
+                                runningTurnId <- None
+                                state
+                            | None ->
+                                // No capability or claim (unclaimed test
+                                // shells) or a faulted settlement call: the
+                                // legacy store-first path below.
+                                pendingStop <- None
+                                runningTurnId <- None
+                                let positions = [| entry.Position |] :> IReadOnlyList<int64>
+
+                                awaitTask (
+                                    props.Store.MarkInboxConsumed(
+                                        props.Tenant,
+                                        props.SessionId,
+                                        positions,
+                                        CancellationToken.None
+                                    )
+                                )
+                                |> ignore
+
+                                notifySettled result
+                                dispatchCompletion props result |> ignore
+
+                                // Terminal completion event (issue 289):
+                                // verdict-first (the store-first settle above
+                                // decided the terminal kind), journaled
+                                // best-effort under the live token. A prime
+                                // that never ran never reaches here, and a
+                                // fault before any mint (None) journals
+                                // nothing.
+                                match turnId with
+                                | Some tid -> journalSettledCompletion tid result
+                                | None -> ()
+
+                                retireControl entry
+
+                                if result.Status = TurnStatus.Completed && autoCloseEnabled props then
+                                    // AutoClose (issue 82): the first Completed
+                                    // turn closes the session store-first instead
+                                    // of draining; the entry is already consumed
+                                    // above. Aborted and Failed results never take
+                                    // this path, so failed runs stay open for
+                                    // inspection. A recorded rebind dies with
+                                    // the session: Closed rejects it.
                                     awaitTask (
-                                        props.Store.UpdateSessionState(
-                                            props.Tenant,
-                                            props.SessionId,
-                                            SessionState.Idle,
-                                            CancellationToken.None
-                                        )
+                                        props.Store.CloseSession(props.Tenant, props.SessionId, CancellationToken.None)
                                     )
                                     |> ignore
 
-                                    SessionState.Idle
+                                    pendingAgent <- None
+
+                                    SessionState.Closed
+                                else
+                                    // The settled entry is consumed: an empty
+                                    // inbox is quiescent (the reporting task is
+                                    // done and no new turn started), so a
+                                    // recorded rebind applies before draining
+                                    // next, and stays pending while entries
+                                    // remain.
+                                    tryApplyPendingWhenIdle ()
+
+                                    let pending =
+                                        awaitTask (
+                                            props.Store.ReadPendingInbox(
+                                                props.Tenant,
+                                                props.SessionId,
+                                                CancellationToken.None
+                                            )
+                                        )
+
+                                    match selectDrainableEntries pending with
+                                    | following :: _ ->
+                                        // The per-turn authority gate runs at this
+                                        // settle-drain boundary only: authorized
+                                        // entries run, refused ones settle Failed
+                                        // without ever invoking the runner and
+                                        // the drain moves on.
+                                        match checkAgentAuthority () with
+                                        | None ->
+                                            startSuspendable following 1 (readGrantsNow ()) None
+                                            SessionState.Running
+                                        | Some(failure, reason) ->
+                                            settleAuthorityRefusal following failure reason
+                                            drainAfterRefusal ()
+                                    | [] ->
+                                        // Completed-turn prime settle (issue
+                                        // 313): release the facade prime exactly
+                                        // once at quiescence through the fenced
+                                        // settle, so a later prompt (or a
+                                        // respawn prime after a restart) claims
+                                        // anew instead of observing
+                                        // TurnLeaseMissing. Aborted and Failed
+                                        // results keep their prime, like the
+                                        // fault path; a stale (taken-over) token
+                                        // settles nothing. The terminal event
+                                        // above already journaled under the live
+                                        // token, so the settle lands after it.
+                                        if result.Status = TurnStatus.Completed then
+                                            settleCompletedPrimeNow ()
+
+                                        awaitTask (
+                                            props.Store.UpdateSessionState(
+                                                props.Tenant,
+                                                props.SessionId,
+                                                SessionState.Idle,
+                                                CancellationToken.None
+                                            )
+                                        )
+                                        |> ignore
+
+                                        SessionState.Idle
 
                         match completion.Suspension, stop with
                         | Some cursor, None ->
@@ -4949,46 +5150,112 @@ module internal SessionActor =
 
                         let selected = decideControl entry candidate
 
-                        let positions = [| entry.Position |] :> IReadOnlyList<int64>
+                        match trySettleSuspendable entry selected settling with
+                        | Some outcome when outcome.Status = SessionSettlementStatus.Applied ->
+                            // Committed winner (issue 363): the atomic
+                            // boundary already consumed the entry, chose the
+                            // lifecycle disposition and the queued candidate,
+                            // enqueued the completion under the stable key,
+                            // and released the prime at quiescence. Publish
+                            // only this winner: observe once, journal the
+                            // terminal event best-effort, then drain the
+                            // authoritative following entry or rest at
+                            // quiescence. No unfenced execution cleanup runs
+                            // here.
+                            pendingStop <- None
+                            runningTurnId <- None
+                            notifySettled selected
 
-                        awaitTask (
-                            props.Store.MarkInboxConsumed(
-                                props.Tenant,
-                                props.SessionId,
-                                positions,
-                                CancellationToken.None
+                            match settling with
+                            | Some tid -> journalSettledCompletion tid selected
+                            | None -> ()
+
+                            retireControl entry
+
+                            if outcome.State = SessionState.Closed then
+                                pendingAgent <- None
+                                return! loop SessionState.Closed None resolved
+                            elif outcome.State = SessionState.Running then
+                                match outcome.Following with
+                                | null ->
+                                    tryApplyPendingWhenIdle ()
+
+                                    return! loop SessionState.Idle None resolved
+                                | following ->
+                                    let next = drainSettledFollowing following
+                                    return! loop next None resolved
+                            else
+                                // The faulted entry is consumed and the
+                                // lifecycle write already landed in the
+                                // atomic boundary: an empty inbox is
+                                // quiescent, so a recorded rebind applies
+                                // here; entries remaining were drained above.
+                                tryApplyPendingWhenIdle ()
+
+                                return! loop SessionState.Idle None resolved
+                        | Some outcome when outcome.Status = SessionSettlementStatus.AlreadyApplied ->
+                            // Identical retry already committed: suppress
+                            // every duplicate effect and honor the recorded
+                            // disposition as the loop state only.
+                            pendingStop <- None
+                            runningTurnId <- None
+
+                            if outcome.State = SessionState.Closed then
+                                pendingAgent <- None
+                                return! loop SessionState.Closed None resolved
+                            elif outcome.State = SessionState.Running then
+                                return! loop SessionState.Running None resolved
+                            else
+                                return! loop SessionState.Idle None resolved
+                        | Some _ ->
+                            // Rejected: a takeover winner owns the turn now.
+                            // Zero effects from this loser.
+                            runningTurnId <- None
+                            return! loop state None resolved
+                        | None ->
+                            // No capability or claim (unclaimed test shells)
+                            // or a faulted settlement call: the legacy
+                            // store-first path below.
+                            let positions = [| entry.Position |] :> IReadOnlyList<int64>
+
+                            awaitTask (
+                                props.Store.MarkInboxConsumed(
+                                    props.Tenant,
+                                    props.SessionId,
+                                    positions,
+                                    CancellationToken.None
+                                )
                             )
-                        )
-                        |> ignore
+                            |> ignore
 
-                        pendingStop <- None
-                        runningTurnId <- None
-                        notifySettled selected
-                        dispatchCompletion props selected |> ignore
+                            pendingStop <- None
+                            runningTurnId <- None
+                            notifySettled selected
+                            dispatchCompletion props selected |> ignore
 
-                        match settling with
-                        | Some tid -> journalSettledCompletion tid selected
-                        | None -> ()
+                            match settling with
+                            | Some tid -> journalSettledCompletion tid selected
+                            | None -> ()
 
-                        retireControl entry
+                            retireControl entry
 
-                        awaitTask (
-                            props.Store.UpdateSessionState(
-                                props.Tenant,
-                                props.SessionId,
-                                SessionState.Idle,
-                                CancellationToken.None
+                            awaitTask (
+                                props.Store.UpdateSessionState(
+                                    props.Tenant,
+                                    props.SessionId,
+                                    SessionState.Idle,
+                                    CancellationToken.None
+                                )
                             )
-                        )
-                        |> ignore
+                            |> ignore
 
-                        // The faulted entry is consumed and no turn runs:
-                        // an empty inbox is quiescent, so a recorded rebind
-                        // applies here; entries remaining keep it pending
-                        // for the Idle handler.
-                        tryApplyPendingWhenIdle ()
+                            // The faulted entry is consumed and no turn runs:
+                            // an empty inbox is quiescent, so a recorded rebind
+                            // applies here; entries remaining keep it pending
+                            // for the Idle handler.
+                            tryApplyPendingWhenIdle ()
 
-                        return! loop SessionState.Idle None resolved
+                            return! loop SessionState.Idle None resolved
                     | _ -> return! loop state suspended resolved
                 | ReplyEntry replyEntry ->
                     replyInFlight <- false

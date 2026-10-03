@@ -173,6 +173,23 @@ type InMemorySessionStore(database: InMemoryDatabase) =
                 )
             )
 
+    /// Whether a decided-but-unretired control verdict still owns the entry
+    /// (issue 363 plus #393): while this holds the quiescent settlement keeps
+    /// the prime so the actor's retireControl still has authority, and the
+    /// existing prime settle releases it afterwards exactly as before.
+    /// Missing control state reads as nothing pending; an undecodable row
+    /// reads the same (every control operation would already have refused
+    /// it before settlement runs).
+    let controlRetirementPending tenant sessionId position =
+        try
+            match database.ControlStates.TryGetValue((tenant, sessionId)) with
+            | false, _ -> false
+            | true, text ->
+                ControlTargetProtocol.decode sessionId text
+                |> fun state -> ControlTargetProtocol.retirementPendingFor state position
+        with _ ->
+            false
+
     let controlContext tenant sessionId =
         let session = requireSession tenant sessionId
         session.Options.ValidatePersistence()
@@ -518,7 +535,17 @@ type InMemorySessionStore(database: InMemoryDatabase) =
 
                                 database.UsageCheckpoints[(tenant, sessionId, claim.TurnId)] <- result.Usage
 
-                                if state <> SessionState.Running then
+                                // Quiescent release (issue 363): the prime and
+                                // its turn tracking clear only here. While a
+                                // decided-but-unretired control verdict still
+                                // owns the entry (#393), the prime stays so
+                                // the actor's retireControl keeps authority;
+                                // the existing prime settle releases it
+                                // afterwards exactly as before.
+                                if
+                                    state <> SessionState.Running
+                                    && not (controlRetirementPending tenant sessionId request.Position)
+                                then
                                     applySettlement tenant sessionId claim result.Status result.Outcome
 
                                 let stored = requireSession tenant sessionId
