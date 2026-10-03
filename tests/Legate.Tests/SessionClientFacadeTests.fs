@@ -90,7 +90,9 @@ let private createServices (chatClient: ScriptedChatClient) (tools: StaticToolSo
         services,
         ?configure =
             Some(fun (builder: LegateBuilder) ->
+                builder.Llm.AddProvider(BuilderTests.StubLlmProvider()) |> ignore
                 builder.Storage.UseSessionStore(InMemorySessionStore(database)) |> ignore
+                builder.Workspace.UseRuntime(BuilderTests.StubWorkspaceRuntime()) |> ignore
                 builder.Tools.AddSource(tools) |> ignore)
     )
     |> ignore
@@ -117,13 +119,13 @@ let private stopQuietly (service: LocalActorSystemService) : Task =
             ()
     }
 
-/// Resolves the client (triggering the router wiring), starts the local
-/// actor system, runs the work, then stops the system.
+/// Starts the local actor system (which initializes the immutable host
+/// context), resolves the client, runs the work, then stops the system.
 let private withClient (provider: IServiceProvider) (work: SessionClient -> Task<'T>) : Task<'T> =
     task {
-        let client = provider.GetRequiredService<SessionClient>()
         let service = actorServiceOf provider
         do! (service :> IHostedService).StartAsync(CancellationToken.None)
+        let client = provider.GetRequiredService<SessionClient>()
 
         try
             let! outcome = work client
@@ -210,6 +212,8 @@ let ``SetAgent switches the actual provider client on the next prompt`` () : Tas
 
         services.AddLegate(
             Action<LegateBuilder>(fun builder ->
+                builder.Llm.AddProvider(BuilderTests.StubLlmProvider()) |> ignore
+                builder.Workspace.UseRuntime(BuilderTests.StubWorkspaceRuntime()) |> ignore
                 builder.Storage.UseSessionStore(InMemorySessionStore(database)) |> ignore
 
                 builder.Agents.Add(
@@ -305,6 +309,8 @@ let ``Registered providers do not bypass the host chat pipeline without opt-in``
 
         services.AddLegate(
             Action<LegateBuilder>(fun builder ->
+                builder.Llm.AddProvider(BuilderTests.StubLlmProvider()) |> ignore
+                builder.Workspace.UseRuntime(BuilderTests.StubWorkspaceRuntime()) |> ignore
                 builder.Storage.UseSessionStore(InMemorySessionStore(database)) |> ignore
 
                 builder.Agents.Add(
@@ -400,6 +406,8 @@ let ``Facade runs a delegated sub-agent and returns to its parent`` () : Task =
 
         services.AddLegate(
             Action<LegateBuilder>(fun builder ->
+                builder.Llm.AddProvider(BuilderTests.StubLlmProvider()) |> ignore
+                builder.Workspace.UseRuntime(BuilderTests.StubWorkspaceRuntime()) |> ignore
                 builder.Storage.UseSessionStore(InMemorySessionStore(database)) |> ignore
                 builder.Agents.Add("parent", Func<Agent, Agent>(id)) |> ignore
 
@@ -530,7 +538,7 @@ let ``Prompt queues and settles through the DI runner`` () : Task =
     }
 
 [<Fact>]
-let ``Resume after a completed turn prompts again`` () : Task =
+let ``A settled turn can be prompted again without restarting the host`` () : Task =
     task {
         let chat =
             scripted
@@ -540,9 +548,9 @@ let ``Resume after a completed turn prompts again`` () : Task =
                 ]
 
         use provider = (createServices chat (sourced [])).BuildServiceProvider()
-        let client = provider.GetRequiredService<SessionClient>()
         let service = actorServiceOf provider
         do! (service :> IHostedService).StartAsync(CancellationToken.None)
+        let client = provider.GetRequiredService<SessionClient>()
 
         try
             let! created = openSession client
@@ -574,11 +582,6 @@ let ``Resume after a completed turn prompts again`` () : Task =
             // token against the still-live prime.
             let! stored = storedOf client created.Id
             stored.CurrentTurnId.HasValue |> should equal false
-
-            // Restart: the actor system stops and starts over the same
-            // stores, mirroring a process exit and --resume.
-            do! stopQuietly service
-            do! (service :> IHostedService).StartAsync(CancellationToken.None)
 
             let secondWaiter = settleWaiter created.Id
 
@@ -1496,6 +1499,8 @@ let ``DI registers the client bus and suspend wiring`` () =
     let chat = scripted [ ScriptStep.Text "done" ]
     use provider = (createServices chat (sourced [])).BuildServiceProvider()
 
+    let service = actorServiceOf provider
+    (service :> IHostedService).StartAsync(CancellationToken.None).GetAwaiter().GetResult()
     let client = provider.GetRequiredService<SessionClient>()
     (isNull (box client)) |> should equal false
 
@@ -1503,11 +1508,10 @@ let ``DI registers the client bus and suspend wiring`` () =
     (isNull (box bus)) |> should equal false
     (bus.EventStore :? InMemorySessionEventStore) |> should equal true
 
-    let service = actorServiceOf provider
-    (service.SessionChildFactory.IsSome) |> should equal true
+    (service.SessionChildFactory.IsNone) |> should equal true
 
 [<Fact>]
-let ``Without a chat client the router keeps identity children`` () =
+let ``Without a chat client startup fails explicitly`` () =
     let database = InMemoryDatabase()
     let services = ServiceCollection() :> IServiceCollection
 
@@ -1515,7 +1519,9 @@ let ``Without a chat client the router keeps identity children`` () =
         services,
         ?configure =
             Some(fun (builder: LegateBuilder) ->
-                builder.Storage.UseSessionStore(InMemorySessionStore(database)) |> ignore)
+                builder.Storage.UseSessionStore(InMemorySessionStore(database)) |> ignore
+                builder.Llm.AddProvider(BuilderTests.StubLlmProvider()) |> ignore
+                builder.Workspace.UseRuntime(BuilderTests.StubWorkspaceRuntime()) |> ignore)
     )
     |> ignore
 
@@ -1523,12 +1529,10 @@ let ``Without a chat client the router keeps identity children`` () =
     |> ignore
 
     use provider = services.BuildServiceProvider()
-
-    let client = provider.GetRequiredService<SessionClient>()
-    (isNull (box client)) |> should equal false
-
     let service = actorServiceOf provider
-    (service.SessionChildFactory.IsNone) |> should equal true
+
+    (fun () -> (service :> IHostedService).StartAsync(CancellationToken.None).GetAwaiter().GetResult())
+    |> should throw typeof<InvalidOperationException>
 
 [<Fact>]
 let ``Invalid facade options fail client resolution`` () =
@@ -1561,7 +1565,9 @@ let private createServicesWithAgents
         services,
         ?configure =
             Some(fun (builder: LegateBuilder) ->
+                builder.Llm.AddProvider(BuilderTests.StubLlmProvider()) |> ignore
                 builder.Storage.UseSessionStore(InMemorySessionStore(database)) |> ignore
+                builder.Workspace.UseRuntime(BuilderTests.StubWorkspaceRuntime()) |> ignore
                 builder.Tools.AddSource(tools) |> ignore
                 builder.Agents.UseStore(agents) |> ignore)
     )
@@ -2689,6 +2695,8 @@ let ``buildClient wires auto-title from Sessions options`` () =
     |> ignore
 
     use provider = services.BuildServiceProvider()
+    let service = actorServiceOf provider
+    (service :> IHostedService).StartAsync(CancellationToken.None).GetAwaiter().GetResult()
     let client = provider.GetRequiredService<SessionClient>()
 
     match client.AutoTitle with
@@ -2855,6 +2863,8 @@ let ``Public DI abort accepts without a started actor system or any route resolu
         use provider =
             (createServices (scripted [ ScriptStep.Text "must not run" ]) (sourced [])).BuildServiceProvider()
 
+        let contexts = provider.GetRequiredService<ISessionHostContexts>()
+        do! contexts.InitializeAsync(CancellationToken.None)
         let client = provider.GetRequiredService<SessionClient>()
         // Opening succeeds despite unavailable resolution; no host or actor system is started.
         let! session = openSession client
@@ -2915,7 +2925,7 @@ let ``Public DI abort accepts without a started actor system or any route resolu
 
         let! after = client.Store.ReadPendingInbox(client.Tenant, session.Id, CancellationToken.None)
         Assert.Equal<int64>(before |> Seq.map _.Position, after |> Seq.map _.Position)
-        Assert.Empty(PromptWaitHubs.GetOrAdd(session.Id).Settled)
+        Assert.Empty((PromptWaitHubs.GetOrAddScoped client.Tenant session.Id).Settled)
         let! stillOwned = client.Store.VerifyClaim(client.Tenant, claim, CancellationToken.None)
         Assert.IsType<TurnLeaseHeld>(stillOwned) |> ignore
     }

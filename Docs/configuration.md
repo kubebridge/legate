@@ -35,6 +35,39 @@ Conventions:
 | `Pruning` | `ContextPruningOptions` | Context-window pruning reserve and markers |
 | `Schedules` | `ScheduleOptions` | Schedule evaluator sweep |
 
+## Tenant session host bindings
+
+For a multi-tenant node, construct one independent, long-lived provider graph
+per tenant in the host, then register one immutable `SessionHostBinding` for
+each graph with `AddLegateSessionBinding`. The descriptor contains the trusted
+tenant and a callback that returns that already-built singleton provider graph.
+The callback runs once before actor traffic. It must not build a provider,
+create a scope or resource, or return a request-scoped provider.
+
+Every explicit binding provider must contain `SessionClientOptions` for the
+same tenant, `ILlmProvider`, `IChatClient`, `ISessionStore` plus
+`ISessionAbortControlStore`, `ISessionEventStore`, `IWorkspaceRuntime`, and
+that tenant's tools, permission policy, model policy, and other execution
+dependencies. Providers are host-owned borrowed services and are not disposed
+by the node. The context assembler does not resolve or start unrelated hosted
+services from the binding provider.
+
+Explicit bindings suppress the default self-binding. The default is allowed
+only when no explicit bindings exist and the root has the complete execution
+dependency set. A receiving-only root can omit execution dependencies because
+it performs routing and non-activating admission only. `SessionHostBinding.Client`
+is unavailable before successful `StartAsync` and is a read-only lazy value.
+Binding and facade assembly perform no lazy writes.
+Bindings cannot be retargeted, added, removed, replaced, or reused after
+initialization. A restart requires fresh descriptors.
+
+Shutdown order is host-controlled: close admission, drain and quiesce actors
+and subscriptions, detach node subscriptions, dispose the provider event bus,
+then dispose borrowed providers exactly once. A timeout is not quiescence, so
+providers remain alive until completion or process exit. Static journal hooks
+detach idempotently and remain host-owned. Do not re-register borrowed
+disposables in the node container.
+
 ## `Legate:Sessions` (`SessionsOptions`)
 
 | Key | Default | Meaning |
@@ -162,6 +195,11 @@ package additionally binds named presets from
 | `JoinTimeout` | `5s` | Seed-node join wait (`akka.cluster.seed-node-timeout`); also bounds the startup quorum wait |
 | `HostExitDeadline` | `60s` | Legate-level total bound on the cluster hosted service's stop; never rendered into HOCON |
 | `MinimumMembers` | `1` | Up members awaited before `StartAsync` completes |
+
+The session shard identity is the global session id qualified by the trusted
+tenant address `s2.<base64url(UTF-8 tenant)>.<canonical ULID>`. Callers do not
+choose the tenant through the route key. Authentication and authorization
+must establish tenant permission before a request is admitted.
 
 ## `Legate:Pruning` (`ContextPruningOptions`)
 

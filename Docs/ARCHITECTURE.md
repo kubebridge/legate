@@ -20,6 +20,116 @@ conventions live in `Docs/agents/code-rules.md`.
 
 Session state machine: `Idle -> Running -> (Idle | WaitingForInput | Closed)`.
 
+### Global session identity and tenant routing
+
+`SessionId` is globally unique in the shared store. It is not allocated from
+tenant-local sequences, and no tenant-local session id may be substituted for
+it. Relational stores retain tenant-qualified keys, indexes, and migration
+history for isolation and query locality, while the session identity remains
+globally unique. Existing relational keys and landed migrations are retained;
+future changes are additive migrations only.
+
+The cluster entity key is the canonical tenant-qualified address:
+
+```text
+s2.<base64url(UTF-8 tenant.Value)>.<canonical ULID SessionId>
+```
+
+The `s2` prefix identifies the addressing format. The shard schema stamp is
+`2.<hash version>.<shard count>`. The tenant segment uses unpadded
+base64url with strict UTF-8, and the session segment is canonical ULID text.
+The tenant in this address is trusted host binding metadata, not a
+caller-selected routing hint. Authentication and authorization decide whether
+the caller may use a tenant; routing does not grant that permission.
+
+A receiving node performs complete admission before actor activation. It
+validates the address, carried scope, operation, and corresponding host
+binding, then performs a non-activating durable existence probe. A rejected
+scope throws `SessionScopeRejectedException` with one stable reason:
+`InvalidScope`, `AddressMismatch`, `ScopeUnavailable`, `ResponseMismatch`,
+`UnsupportedOperation`, or `NodeStopping`. The probe and all rejection paths
+are non-mutating and do not manufacture claim authority. The node must have
+the full dependency closure for every declared binding even when it only
+receives traffic for that tenant.
+
+### Host-owned execution bindings
+
+`SessionHostBinding` is an immutable, sealed descriptor containing a trusted
+`TenantId` and `Func<IServiceProvider, IServiceProvider>`. Register it on the
+node root with `AddLegateSessionBinding`. The callback returns an existing,
+host-owned, long-lived singleton provider graph exactly once during node
+initialization.
+It must not call `BuildServiceProvider` or create scopes or resources. An
+explicit descriptor may return the node root when that root supplies the
+tenant's complete execution graph. Legate borrows external providers and
+never disposes them. The callback
+runs before actor traffic, and the bound `Client` is published only after
+successful startup. Reading `Client` before startup succeeds is a read-only
+lazy access that throws. Binding and facade assembly perform no lazy writes.
+
+Each binding provider must register `SessionClientOptions` with the same
+tenant, `ILlmProvider`, `IChatClient`, `ISessionStore` implementing
+`ISessionAbortControlStore`, `ISessionEventStore`, `IWorkspaceRuntime`, and
+the tenant's tools, permission policy, model policy, and other execution
+dependencies. Explicit bindings suppress the default binding. The default
+self-binding is used only when there are no explicit bindings and the host
+has supplied the complete execution dependency set. A receiving-only node may
+therefore have a root container with only routing and cluster dependencies.
+
+The root provider is never an execution fallback for a declared tenant. The
+host owns construction and lifetime of each independent tenant provider, and
+the tenant option must equal the binding tenant. The context assembler does
+not resolve or start unrelated `IHostedService` implementations; other tenant
+workers and administrative services remain the host's responsibility.
+
+Bindings and their options are frozen after initialization. A running node
+cannot retarget a descriptor, add or remove bindings, replace providers, or
+reuse a descriptor on another node lifetime. A restarted node gets fresh
+binding descriptors. `SessionHostBinding` is ordinary ownership for the root
+self-binding, so shutdown must not double-dispose it.
+
+This is the intended C# composition shape. The host constructs the independent
+providers before registering the node bindings, and keeps ownership of them:
+
+```csharp
+static async Task<IHost> StartNodeAsync(
+    IServiceProvider tenantAProvider,
+    IServiceProvider tenantBProvider)
+{
+    var tenantA = TenantId.Create("tenant-a");
+    var tenantB = TenantId.Create("tenant-b");
+
+    var descriptorA = new SessionHostBinding(
+        tenantA,
+        new Func<IServiceProvider, IServiceProvider>(_ => tenantAProvider));
+    var descriptorB = new SessionHostBinding(
+        tenantB,
+        new Func<IServiceProvider, IServiceProvider>(_ => tenantBProvider));
+
+    var builder = Host.CreateApplicationBuilder();
+    LegateServiceCollectionExtensions.AddLegate(builder.Services);
+    builder.Services.AddLegateSessionBinding(descriptorA)
+        .AddLegateSessionBinding(descriptorB);
+
+    // The host builds the node from node plus its cluster and routing
+    // services. The tenant providers were already built by the host and
+    // contain the complete dependency closure described above.
+    var host = builder.Build();
+    await host.StartAsync();
+    SessionClient tenantAClient = descriptorA.Client;
+    // The caller retains host and the borrowed providers, stops host before
+    // disposing the providers, and can use tenantAClient while host is live.
+    return host;
+}
+```
+
+The host must stop and drain the node, quiesce actors and subscriptions, and
+only then dispose each borrowed provider exactly once. A stop timeout is not
+quiescence: retain providers until completion or process exit. Stop closes
+admission and detaches node subscriptions. The host later disposes each
+provider-owned event bus; its static journal hook detaches idempotently. Do not
+re-register borrowed disposables in the node container.
+
 There is no job type. A headless run is a session opened with `AutoClose`,
 an `AllowAll` permission policy, an optional completion sink, and optionally
 `Outcome = Structured` (which gives the agent `finish`/`fail` tools).
@@ -221,16 +331,26 @@ Every index traces to a store query:
 `cleanup_claims(session_id)` needs no secondary index: claim, complete, and
 defer are all point lookups by session.
 
+The shared relational store uses one global `SessionId` identity across
+tenants. Tenant columns remain on session, inbox, turn, event, and control
+records wherever the store contract requires them, so relational isolation
+and tenant-qualified indexes are retained. No migration introduces a
+tenant-local session id or rewrites landed keys. Schema changes are additive,
+versioned UTC `yyyymmddHHMM` migrations only.
+
 ## Cluster
 
-`StaticSeeds` mode joins the named seed nodes and shards session entities
-by session id; `Kubernetes` mode bootstraps through the registered
+`StaticSeeds` mode joins the named seed nodes and shards session entities by
+the `s2` tenant-qualified address; `Kubernetes` mode bootstraps through the registered
 `IClusterBootstrap` hook (Akka.Management plus Kubernetes discovery, owned
 by `Legate.Cluster.Kubernetes`), or runs as a singleton when no hook is
 registered. `StartAsync` completes only once `Cluster:MinimumMembers`
-members are Up, bounded by `Cluster:JoinTimeout`. Every node stamps its
-shard version as the member app-version and fails closed (leaves first)
-on a peer stamp mismatch.
+members are Up, bounded by `Cluster:JoinTimeout`. Every node stamps its shard
+version with the `s2` keyspace, configured shard count and hash version, and
+member app-version, and fails closed (leaves first) on a peer stamp mismatch.
+A coordinated drain is required for stop, homogeneous upgrade, and clean
+restart. Mixed versions, mixed migrations, backfills, legacy adapters, and
+database deletion are not supported.
 
 ### Split-brain resolution
 
@@ -302,13 +422,23 @@ whole stop never exceeds `HostExitDeadline`.
 
 Actor, router, and entity protocol messages cross a node boundary only as
 token-less DTOs under a versioned envelope. Each wire case owns one
-`legate.<family>.<MessageName>.v<version>` manifest, one DTO type, one
-version (all v1 today), and one per-case byte bound. The reader accepts the
-current and the current-minus-one version and refuses anything newer or
-older; older-than-current records `failed`. Every refusal (unknown
-manifest, newer version, oversized payload, failed deserialisation or
-mapping) records `legate.serialization.rejected` with its reason tag, logs
-a warning, and throws so Akka drops the message: fail-closed throughout.
+`legate.<family>.<MessageName>.v<version>` manifest, one DTO type, a current
+version, and a per-case byte bound. The unchanged 393 abort cases remain
+`legate.actor.AbortSession.v2` and
+`legate.entity.SuspendableAbortSession.v2`. The structurally changed 395
+routing and subscription cases, including `ScopedRequest`, `ScopedResponse`,
+and `EventBatch`, are current-only and do not use the current-minus-one
+reader exception. Other unchanged cases retain their current-minus-one rule.
+The manifest table is the source of truth for the exact current version of
+each case, so this document's listing must match that table.
+
+Every refusal (unknown manifest, structurally unsupported version, oversized
+payload, corrupt bytes, failed deserialisation, or failed mapping) records
+`legate.serialization.rejected` with its reason tag, logs a warning, and
+throws so Akka drops the message. Corrupt bytes, malformed manifests, and
+byte-bound violations are transport failures and fail closed before typed
+decoding. A well-formed envelope that decodes but violates tenant or session
+scope is a distinct typed scope failure, also fail closed.
 Oversized payloads are refused before deserialising. The global
 `Cluster:MaxWirePayloadBytes` (default 1 MiB) caps every manifest on top of
 its per-case bound. JSON is field-additive, so minor payload changes cross
@@ -331,6 +461,8 @@ Small bound is 32,768 bytes (control DTOs); large bound is 1,048,576 bytes
 
 | Manifest | DTO type | Version | Bound |
 |---|---|---|---|
+| `legate.router.ScopedRequest.v2` | `WireDtos.ScopedRequestDto` | 2, current-only | large |
+| `legate.router.ScopedResponse.v2` | `WireDtos.ScopedResponseDto` | 2, current-only | large |
 | `legate.actor.AbortSession.v2` | `WireDtos.AbortSessionDto` | 2 | large |
 | `legate.actor.CloseSession.v1` | `WireDtos.CloseSessionDto` | 1 | small |
 | `legate.actor.CompactCompleted.v1` | `WireDtos.CompactCompletedDto` | 1 | small |
@@ -370,7 +502,7 @@ Small bound is 32,768 bytes (control DTOs); large bound is 1,048,576 bytes
 | `legate.entity.SuspendableSetAgent.v1` | `WireDtos.SuspendableSetAgentDto` | 1 | small |
 | `legate.subscription.Subscribe.v1` | `WireDtos.SubscribeDto` | 1 | small |
 | `legate.subscription.Unsubscribe.v1` | `WireDtos.UnsubscribeDto` | 1 | small |
-| `legate.subscription.EventBatch.v1` | `WireDtos.EventBatchDto` | 1 | large |
+| `legate.subscription.EventBatch.v2` | `WireDtos.EventBatchDto` | 2, current-only | large |
 | `legate.event.SessionEvent.v1` | `WireDtos.SessionEventDto` | 1 | large |
 
 No reserved manifests remain: the subscription and event namespaces

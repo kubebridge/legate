@@ -4,6 +4,7 @@ module Legate.Tests.WireSerializationTests
 open System
 open System.Collections.Generic
 open System.Diagnostics.Metrics
+open System.Text
 open System.Text.Json
 open System.Threading
 open Akka.Actor
@@ -126,7 +127,9 @@ let private everyLiveMessage () : obj list =
 
     let eventBatch: CrossNodeSubscriptions.CrossNodeEventBatch =
         {
+            Tenant = session.Tenant
             SessionId = session.Id
+            SubscriberToken = "wire-subscriber"
             Events =
                 [|
                     TextDeltaEvent(session.Id, TurnId.New(), Nullable<int64>(7L), DateTimeOffset.UtcNow, "wire event")
@@ -277,13 +280,122 @@ let private toWireBytes (serializer: WireSerializer) (message: obj) : byte[] * s
     let manifest = serializer.Manifest(message)
     (serializer.ToBinary(message), manifest)
 
+[<Fact>]
+let issue395ExhaustiveWireScopeRefusalMatrixIsTypedAndFailClosed () =
+    let tenantA = TenantId.Create "wire-matrix-a"
+    let tenantB = TenantId.Create "wire-matrix-b"
+    let addressA = SessionAddress(tenantA, SessionId.New())
+    let addressB = SessionAddress(tenantB, addressA.SessionId)
+
+    let subscribe = WireDtos.SubscribeDto()
+    subscribe.Tenant <- " wire-matrix-a "
+    subscribe.SessionId <- addressA.SessionId.ToString()
+    subscribe.SubscriberToken <- "same-token"
+    let decodedSubscribe = WireDtos.ofWire subscribe
+
+    let paddedTenant =
+        Assert.Throws<SessionScopeRejectedException>(fun () -> SessionRouting.validatePayload addressA decodedSubscribe)
+
+    Assert.Equal(SessionScopeRejectionReason.AddressMismatch, paddedTenant.Reason)
+
+    let wrongScopePayload: obj =
+        ({
+            Tenant = tenantB
+            SessionId = addressB.SessionId
+            FromSequence = 0L
+            SubscriberToken = "same-token"
+        }
+        : CrossNodeSubscriptions.CrossNodeSubscribeRequest)
+
+    let wrongScope =
+        Assert.Throws<SessionScopeRejectedException>(fun () ->
+            SessionRouting.validatePayload addressA wrongScopePayload)
+
+    Assert.Equal(SessionScopeRejectionReason.AddressMismatch, wrongScope.Reason)
+
+    let wrongEvent =
+        TextDeltaEvent(SessionId.New(), TurnId.New(), Nullable<int64>(1L), DateTimeOffset.UtcNow, "wrong-session-event")
+        :> SessionEvent
+
+    let responseWithWrongEvent: CrossNodeSubscriptions.CrossNodeEventBatch =
+        {
+            Tenant = tenantA
+            SessionId = addressA.SessionId
+            SubscriberToken = "same-token"
+            Events = [| wrongEvent |] :> IReadOnlyList<SessionEvent>
+            NextCursor = 1L
+            EndOfStream = true
+        }
+
+    let wrongEventId =
+        Assert.Throws<SessionScopeRejectedException>(fun () ->
+            SessionRouting.validateResponse addressA (responseWithWrongEvent :> obj))
+
+    Assert.Equal(SessionScopeRejectionReason.ResponseMismatch, wrongEventId.Reason)
+
+    let wrongBatchTenant =
+        { responseWithWrongEvent with
+            Tenant = tenantB
+        }
+
+    let wrongBatchScope =
+        Assert.Throws<SessionScopeRejectedException>(fun () ->
+            SessionRouting.validateResponse addressA (wrongBatchTenant :> obj))
+
+    Assert.Equal(SessionScopeRejectionReason.ResponseMismatch, wrongBatchScope.Reason)
+
+    let missingToken =
+        { responseWithWrongEvent with
+            Events = Array.empty<SessionEvent> :> IReadOnlyList<SessionEvent>
+            SubscriberToken = ""
+        }
+
+    let wrongToken =
+        Assert.Throws<SessionScopeRejectedException>(fun () ->
+            SessionRouting.validateResponse addressA (missingToken :> obj))
+
+    Assert.Equal(SessionScopeRejectionReason.ResponseMismatch, wrongToken.Reason)
+
+    let dto = WireDtos.EventBatchDto()
+    dto.SessionId <- addressA.SessionId.ToString()
+    dto.SubscriberToken <- "same-token"
+    dto.Events <- [||]
+    let decodedMissingTenant = WireDtos.ofWire dto
+
+    let missingTenant =
+        Assert.Throws<SessionScopeRejectedException>(fun () ->
+            SessionRouting.validateResponse addressA decodedMissingTenant)
+
+    Assert.Equal(SessionScopeRejectionReason.ResponseMismatch, missingTenant.Reason)
+
+    let system = createWireSystem ()
+
+    try
+        let serializer = envelopeSerializerOf system
+
+        let legacy =
+            Assert.Throws<WireManifests.WireRejectedException>(fun () ->
+                serializer.FromBinary(Encoding.UTF8.GetBytes("{}"), "legate.subscription.EventBatch.v1")
+                |> ignore)
+
+        Assert.Equal(Telemetry.RejectionFailed, legacy.Reason)
+
+        let incompatible =
+            Assert.Throws<WireManifests.WireRejectedException>(fun () ->
+                serializer.FromBinary([| 0xFFuy |], "legate.subscription.EventBatch.v2")
+                |> ignore)
+
+        Assert.Equal(Telemetry.RejectionFailed, incompatible.Reason)
+    finally
+        system.Terminate().GetAwaiter().GetResult() |> ignore
+
 // ────────────────── Manifest table ──────────────────
 
 [<Fact>]
 let ``Manifest table versions only the targeted abort payloads at v2`` () =
     let manifests = WireManifests.cases |> List.map WireManifests.manifestOf
 
-    manifests.Length |> should equal 41
+    manifests.Length |> should equal 43
     manifests |> List.distinct |> List.length |> should equal manifests.Length
 
     for wireCase in WireManifests.cases do
@@ -291,7 +403,13 @@ let ``Manifest table versions only the targeted abort payloads at v2`` () =
         manifest.StartsWith("legate.", StringComparison.Ordinal) |> should equal true
 
         let version =
-            if wireCase.Name = "AbortSession" || wireCase.Name = "SuspendableAbortSession" then
+            if
+                wireCase.Name = "AbortSession"
+                || wireCase.Name = "SuspendableAbortSession"
+                || wireCase.Name = "ScopedRequest"
+                || wireCase.Name = "ScopedResponse"
+                || wireCase.Name = "EventBatch"
+            then
                 2
             else
                 1
@@ -396,6 +514,63 @@ let ``Prompt DTO round-trips its payload and drops its token`` () =
             token |> should equal CancellationToken.None
         | other -> failwith $"Expected QueuePrompt but rebuilt '{other.GetType().Name}'."
     | other -> failwith $"Expected a SessionActorMessage but rebuilt '{other.GetType().Name}'."
+
+[<Fact>]
+let ``Scoped route DTOs round-trip only their explicit typed fields`` () =
+    let address = SessionAddress(TenantId.Default, SessionId.New())
+
+    let request: SessionRouteRequest =
+        {
+            Address = address.Key
+            Scope = address.Tenant.Value
+            Payload = SessionRouteProbe
+        }
+
+    let requestDto = WireDtos.toWire request
+
+    let requestJson =
+        JsonSerializer.Serialize(requestDto, requestDto.GetType(), WireSerialization.wireOptions ())
+
+    let requestBack =
+        match JsonSerializer.Deserialize(requestJson, requestDto.GetType(), WireSerialization.wireOptions ()) with
+        | null -> failwith "Expected the scoped request DTO to deserialise."
+        | back -> WireDtos.ofWire back
+
+    match requestBack with
+    | :? SessionRouteRequest as rebuilt ->
+        rebuilt.Address |> should equal address.Key
+        rebuilt.Scope |> should equal address.Tenant.Value
+        rebuilt.Payload |> should equal SessionRouteProbe
+    | other -> failwith $"Expected scoped request but rebuilt '{other.GetType().Name}'."
+
+    let response: SessionRouteResponse =
+        {
+            Address = address.Key
+            Owner = "akka://test@127.0.0.1:2551"
+            Payload = SessionRouteAccepted
+        }
+
+    let responseDto = WireDtos.toWire response
+
+    let responseJson =
+        JsonSerializer.Serialize(responseDto, responseDto.GetType(), WireSerialization.wireOptions ())
+
+    let responseBack =
+        match JsonSerializer.Deserialize(responseJson, responseDto.GetType(), WireSerialization.wireOptions ()) with
+        | null -> failwith "Expected the scoped response DTO to deserialise."
+        | back -> WireDtos.ofWire back
+
+    match responseBack with
+    | :? SessionRouteResponse as rebuilt ->
+        rebuilt.Address |> should equal address.Key
+        rebuilt.Payload |> should equal SessionRouteAccepted
+    | other -> failwith $"Expected scoped response but rebuilt '{other.GetType().Name}'."
+
+    let oldRequest = WireDtos.ScopedRequestDto()
+    oldRequest.Format <- 1
+
+    Assert.Throws<InvalidOperationException>(fun () -> WireDtos.ofWire oldRequest |> ignore)
+    |> ignore
 
 [<Fact>]
 let ``Abort wake DTO carries exact tenant session and target without authority`` () =
@@ -744,7 +919,7 @@ let ``HOCON fragment binds every protocol type to the wire serializer`` () =
         let key = $"{boundType.FullName}, {boundType.Assembly.GetName().Name}"
         fragment.Contains(key, StringComparison.Ordinal) |> should equal true
 
-    WireSerialization.boundTypes.Length |> should equal 13
+    WireSerialization.boundTypes.Length |> should equal 15
 
 [<Fact>]
 let ``Cluster HOCON carries the wire maximum from options`` () =

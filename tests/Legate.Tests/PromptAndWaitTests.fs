@@ -230,7 +230,7 @@ let ``A settle that already won still returns after cancellation`` () : Task =
         // Spin without sleeping until the hub records the settle; the
         // waiter result lands under the same lock, so cancelling after
         // this point always loses to the settlement.
-        let hub = PromptWaitHubs.GetOrAdd harness.SessionId
+        let hub = PromptWaitHubs.GetOrAddScoped harness.Tenant harness.SessionId
         let deadline = DateTimeOffset.UtcNow.AddSeconds(10.0)
 
         while hub.Settled.Count = 0 && DateTimeOffset.UtcNow < deadline do

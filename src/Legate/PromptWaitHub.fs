@@ -78,11 +78,17 @@ type internal PromptWaitHub() =
 // SessionId is globally unique, so it keys the hub without the tenant.
 module internal PromptWaitHubs =
 
-    let private hubs = ConcurrentDictionary<SessionId, PromptWaitHub>()
+    let private hubs = ConcurrentDictionary<TenantId * SessionId, PromptWaitHub>()
+
+    let GetOrAddScoped tenant sessionId =
+        hubs.GetOrAdd((tenant, sessionId), fun _ -> PromptWaitHub())
+
+    let ObserveSettledScoped tenant sessionId result =
+        (GetOrAddScoped tenant sessionId).ObserveSettled(result)
 
     /// Returns the hub for a session, creating it when missing.
     let GetOrAdd (sessionId: SessionId) : PromptWaitHub =
-        hubs.GetOrAdd(sessionId, fun _ -> PromptWaitHub())
+        GetOrAddScoped TenantId.Default sessionId
 
     /// Records a settled result on the session's hub, creating the hub
     /// when no waiter ever queued (a settle with no waiter still records).

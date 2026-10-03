@@ -177,6 +177,8 @@ module internal WireSerialization =
     /// wire are still always DTOs.
     let boundTypes: Type list =
         [
+            typeof<SessionRouteRequest>
+            typeof<SessionRouteResponse>
             typeof<SessionActorMessage>
             typeof<SessionActor.SuspendableActorMessage>
             typeof<SessionPromptReply>
@@ -362,6 +364,9 @@ type internal WireSerializer(system: ExtendedActorSystem) =
                         && version = wireCase.Version - 1
                         && name <> "AbortSession"
                         && name <> "SuspendableAbortSession"
+                        && name <> "ScopedRequest"
+                        && name <> "ScopedResponse"
+                        && name <> "EventBatch"
                     )
                 then
                     this.refuse

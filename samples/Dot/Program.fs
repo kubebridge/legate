@@ -1248,15 +1248,16 @@ let main (argv: string[]) : int =
 
                     use host = application.Build()
 
-                    // Resolve before starting: the resolve triggers the
-                    // session router wiring, which must land before the actor
-                    // system spawns its router.
-                    let client = host.Services.GetRequiredService<SessionClient>()
                     let agents = host.Services.GetRequiredService<IAgentStore>()
                     let packages = host.Services.GetRequiredService<IAgentPackageStore>()
 
                     try
+                        // Validate the selected model client before host
+                        // startup so command-line configuration errors remain
+                        // deterministic and do not start background workers.
+                        host.Services.GetRequiredService<IChatClient>() |> ignore
                         do! host.StartAsync(CancellationToken.None)
+                        let client = host.Services.GetRequiredService<SessionClient>()
 
                         let! exit =
                             task {

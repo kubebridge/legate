@@ -25,10 +25,6 @@ let main (args: string[]) : int =
 
     let app = builder.Build()
 
-    // Resolve before running: the resolve triggers the session router
-    // wiring, which must land before the actor system spawns its router.
-    app.Services.GetRequiredService<SessionClient>() |> ignore
-
     // Readiness on the app port, filtered to the legate-cluster check:
     // the manifest probes this (not the Akka.Management port) for
     // cluster membership. Middleware (not MapHealthChecks: the terminal
@@ -41,5 +37,7 @@ let main (args: string[]) : int =
     app.UseHealthChecks("/ready", readyOptions) |> ignore
 
     app.UseGiraffe(webApp) |> ignore
-    app.Run()
+    app.StartAsync().GetAwaiter().GetResult()
+    app.Services.GetRequiredService<SessionClient>() |> ignore
+    app.Lifetime.ApplicationStopping.WaitHandle.WaitOne() |> ignore
     0

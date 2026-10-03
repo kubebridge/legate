@@ -102,7 +102,9 @@ let private createServices
         services,
         ?configure =
             Some(fun (builder: LegateBuilder) ->
+                builder.Llm.AddProvider(BuilderTests.StubLlmProvider()) |> ignore
                 builder.Storage.UseSessionStore(InMemorySessionStore(database)) |> ignore
+                builder.Workspace.UseRuntime(BuilderTests.StubWorkspaceRuntime()) |> ignore
 
                 builder.Tools.AddSource(StaticToolSource(ResizeArray<AITool>(tools) :> IReadOnlyList<AITool>))
                 |> ignore
@@ -139,13 +141,13 @@ let private actorServiceOf (provider: IServiceProvider) : LocalActorSystemServic
         | :? LocalActorSystemService as local -> Some local
         | _ -> None)
 
-/// Resolves the client (triggering the router wiring), starts the local
-/// actor system, runs the work, then stops the system.
+/// Starts the local actor system, resolves the initialized client, runs the
+/// work, then stops the system.
 let private withClient (provider: IServiceProvider) (work: SessionClient -> Task<'T>) : Task<'T> =
     task {
-        let client = provider.GetRequiredService<SessionClient>()
         let service = actorServiceOf provider
         do! (service :> IHostedService).StartAsync(CancellationToken.None)
+        let client = provider.GetRequiredService<SessionClient>()
 
         try
             let! outcome = work client
@@ -348,7 +350,7 @@ let ``Takeover loser journals nothing and never reaches the provider`` () : Task
                                 CancellationToken.None
                             ))
 
-                    Assert.Equal("controlPending", refused.CurrentState)
+                    Assert.Equal("executionAuthorityUnavailable", refused.CurrentState)
 
                     let settled =
                         waitFor (TimeSpan.FromSeconds 10.0) (fun () ->
@@ -372,7 +374,8 @@ let ``Takeover loser journals nothing and never reaches the provider`` () : Task
 
                     calls.Value |> should equal 0
 
-                    PromptWaitHubs.GetOrAdd(created.Id).Settled.Count |> should equal 0
+                    (PromptWaitHubs.GetOrAddScoped client.Tenant created.Id).Settled.Count
+                    |> should equal 0
 
                     let! pending = client.Store.ReadPendingInbox(client.Tenant, created.Id, CancellationToken.None)
 

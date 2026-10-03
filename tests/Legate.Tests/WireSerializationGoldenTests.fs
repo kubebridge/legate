@@ -143,7 +143,9 @@ let private everyGoldenMessage () : obj list =
 
     let eventBatch: CrossNodeSubscriptions.CrossNodeEventBatch =
         {
+            Tenant = session.Tenant
             SessionId = session.Id
+            SubscriberToken = "golden-subscriber"
             Events = [| goldenEvent |] :> IReadOnlyList<SessionEvent>
             NextCursor = 7L
             EndOfStream = true

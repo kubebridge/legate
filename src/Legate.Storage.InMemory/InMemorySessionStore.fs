@@ -285,13 +285,16 @@ type InMemorySessionStore(database: InMemoryDatabase) =
                 raise (ArgumentNullException(nameof session))
 
             lock database.Gate (fun () ->
-                match sessionRow tenant session.Id with
+                match
+                    database.Sessions.Values
+                    |> Seq.tryFind (fun existing -> existing.Id = session.Id)
+                with
                 | Some _ ->
                     raise (
                         InvalidSessionStateException(
                             session.Id,
                             nameof SessionState,
-                            sprintf "A session %O already exists in tenant %O." session.Id tenant
+                            "The session id already exists in this shared store."
                         )
                     )
                 | None ->

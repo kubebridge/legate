@@ -112,34 +112,51 @@ type internal LegateStartupValidation(serviceProvider: IServiceProvider) =
     do ArgumentNullException.ThrowIfNull(serviceProvider)
 
     interface IHostedService with
-        member _.StartAsync(_cancellationToken: CancellationToken) =
+        member _.StartAsync(cancellationToken: CancellationToken) =
             let missing = ResizeArray<string>()
 
-            if Seq.isEmpty (serviceProvider.GetServices<ILlmProvider>()) then
-                missing.Add "an LLM provider (ILlmProvider): call Llm.AddProvider"
+            let hasBindings =
+                match serviceProvider.GetService<ISessionHostContexts>() with
+                | null -> false
+                | contexts -> contexts.HasDeclaredBindings
 
-            if isNull (box (serviceProvider.GetService<ISessionStore>())) then
-                missing.Add "a session store (ISessionStore): call Storage.UseSessionStore"
-            else
-                match serviceProvider.GetService<ISessionStore>() with
-                | :? ISessionAbortControlStore -> ()
-                | _ -> missing.Add "ISessionAbortControlStore on the configured session store"
+            // Explicit bindings are independent execution boundaries; their
+            // providers are validated atomically by the context registry.
+            // Without explicit bindings the root is the deferred self-binding
+            // and must report the complete aggregate dependency set.
+            if not hasBindings then
+                if serviceProvider.GetServices<ILlmProvider>() |> Seq.isEmpty then
+                    missing.Add("ILlmProvider")
 
-            if isNull (box (serviceProvider.GetService<IWorkspaceRuntime>())) then
-                missing.Add "a workspace runtime (IWorkspaceRuntime): call Workspace.UseRuntime"
+                let store = serviceProvider.GetService<ISessionStore>()
 
-            if missing.Count = 0 then
-                SessionExpiryStartup.requireDurableBlobStore serviceProvider
+                if isNull (box store) then
+                    missing.Add("ISessionStore")
+                elif not (store :? ISessionAbortControlStore) then
+                    missing.Add("ISessionAbortControlStore")
 
-                Task.CompletedTask
-            else
-                let listed = String.Join("; ", missing)
+                if isNull (box (serviceProvider.GetService<ISessionEventStore>())) then
+                    missing.Add("ISessionEventStore")
 
+                if isNull (box (serviceProvider.GetService<Microsoft.Extensions.AI.IChatClient>())) then
+                    missing.Add("IChatClient")
+
+                if isNull (box (serviceProvider.GetService<IWorkspaceRuntime>())) then
+                    missing.Add("IWorkspaceRuntime")
+
+            if missing.Count > 0 then
                 raise (
                     InvalidOperationException(
-                        $"Legate is missing required registrations: %s{listed}. Register them through the AddLegate builder before the host starts."
+                        "Legate startup is missing required registrations: "
+                        + String.Join(", ", missing)
                     )
                 )
+
+            SessionExpiryStartup.requireDurableBlobStore serviceProvider
+
+            match serviceProvider.GetService<ISessionHostContexts>() with
+            | null -> Task.CompletedTask
+            | contexts -> contexts.InitializeAsync(cancellationToken)
 
         member _.StopAsync(_cancellationToken: CancellationToken) = Task.CompletedTask
 

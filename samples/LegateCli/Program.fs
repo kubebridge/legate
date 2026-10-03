@@ -256,12 +256,8 @@ let main (argv: string[]) : int =
 
             use host = application.Build()
 
-            // Resolve before starting: the resolve triggers the session
-            // router wiring, which must land before the actor system spawns
-            // its router.
-            let client = host.Services.GetRequiredService<SessionClient>()
-
             do! host.StartAsync(CancellationToken.None)
+            let client = host.Services.GetRequiredService<SessionClient>()
 
             let! exit =
                 try

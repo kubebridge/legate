@@ -10,8 +10,10 @@ open System.Threading
 open FsUnit.Xunit
 open Legate
 open Legate.Storage.InMemory
+open Legate.Testing
 open Microsoft.Extensions.Configuration
 open Microsoft.Extensions.DependencyInjection
+open Microsoft.Extensions.AI
 open Microsoft.Extensions.Hosting
 open Microsoft.Extensions.Options
 open Xunit
@@ -56,7 +58,16 @@ let private addLegateFSharp (services: IServiceCollection) (configure: LegateBui
 let private registerRequired (builder: LegateBuilder) : unit =
     builder.Llm.AddProvider(BuilderTests.StubLlmProvider()) |> ignore
 
-    builder.Storage.UseSessionStore(InMemorySessionStore(InMemoryDatabase()))
+    let database = InMemoryDatabase()
+
+    builder.Storage.UseSessionStore(InMemorySessionStore(database)) |> ignore
+
+    builder.Services.AddSingleton<ISessionEventStore>(InMemorySessionEventStore(database))
+    |> ignore
+
+    builder.Services.AddSingleton<IChatClient>(
+        new ScriptedChatClient(Array.empty<ScriptStep> :> IReadOnlyList<ScriptStep>)
+    )
     |> ignore
 
     builder.Workspace.UseRuntime(BuilderTests.StubWorkspaceRuntime()) |> ignore

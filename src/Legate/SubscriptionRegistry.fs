@@ -67,8 +67,14 @@ module internal CrossNodeSubscriptions =
     /// nothing more past the cursor right now.
     type CrossNodeEventBatch =
         {
+            /// The tenant the events belong to. The receiver validates this
+            /// before exposing any event to a subscriber.
+            Tenant: TenantId
             /// The session the events belong to.
             SessionId: SessionId
+            /// The subscriber token this batch answers. The receiver must
+            /// reject a batch for another live subscription.
+            SubscriberToken: string
             /// The events in sequence order; empty at end of stream.
             Events: IReadOnlyList<SessionEvent>
             /// The cursor to resume from: the greatest streamed sequence,
@@ -143,6 +149,12 @@ module internal CrossNodeSubscriptions =
         member _.Detach(token: string) : unit =
             if not (String.IsNullOrWhiteSpace token) then
                 lock gate (fun () -> subscribers.Remove(token) |> ignore)
+
+        /// Detaches every subscriber owned by a stopping node.  The hub is
+        /// not disposed: a provider-owned cluster entity may reuse it after
+        /// a node lifetime is rebuilt.
+        member _.DetachAll() : unit =
+            lock gate (fun () -> subscribers.Clear())
 
         /// Appends stamped events to the bounded replay cache, evicting
         /// oldest first past the bound. Null events never land.
@@ -286,7 +298,9 @@ module internal CrossNodeSubscriptions =
 
                     let batch =
                         {
+                            Tenant = tenant
                             SessionId = sessionId
+                            SubscriberToken = ""
                             Events = cached
                             NextCursor = next
                             EndOfStream = cached.Count < bound
@@ -351,7 +365,9 @@ module internal CrossNodeSubscriptions =
 
                             let batch =
                                 {
+                                    Tenant = tenant
                                     SessionId = sessionId
+                                    SubscriberToken = ""
                                     Events = events
                                     NextCursor = next
                                     EndOfStream = events.Count < bound
@@ -362,7 +378,9 @@ module internal CrossNodeSubscriptions =
                     | :? EventReplayEndOfStream ->
                         let batch =
                             {
+                                Tenant = tenant
                                 SessionId = sessionId
+                                SubscriberToken = ""
                                 Events = Array.Empty<SessionEvent>() :> IReadOnlyList<SessionEvent>
                                 NextCursor = fromSequence
                                 EndOfStream = true

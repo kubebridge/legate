@@ -1,6 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 namespace Legate
 
+/// Stable reason a receiving node refused a session scope before execution.
+type SessionScopeRejectionReason =
+    /// The request supplied no valid current session address or trusted scope.
+    | InvalidScope = 0
+    /// The addressed session and the carried scope disagree.
+    | AddressMismatch = 1
+    /// The receiving node has no authorized host binding for the tenant.
+    | ScopeUnavailable = 2
+    /// A response does not belong to the addressed session.
+    | ResponseMismatch = 3
+    /// The operation is not an externally admitted session command.
+    | UnsupportedOperation = 4
+    /// The node is no longer admitting session traffic.
+    | NodeStopping = 5
+
+/// A receiving node refused session routing before activation or mutation.
+[<Sealed>]
+type SessionScopeRejectedException(reason: SessionScopeRejectionReason) =
+    inherit LegateException("The receiving node refused the session scope: " + reason.ToString() + ".")
+
+    /// The stable rejection reason. The message contains no session data.
+    member _.Reason = reason
+
 open System
 open System.Collections.Generic
 

@@ -1636,7 +1636,7 @@ module internal SessionActor =
                         Tenant = tenant
                         SessionId = captured
                         RunTurn = runTurn
-                        OnTurnSettled = Some(fun result -> PromptWaitHubs.ObserveSettled captured result)
+                        OnTurnSettled = Some(fun result -> PromptWaitHubs.ObserveSettledScoped tenant captured result)
                         OnInjectJournaled = None
                         Compact = None
                         Logger = null
@@ -2156,6 +2156,11 @@ module internal SessionActor =
         /// A Reply inbox entry arrived for the suspended turn. Answered with
         /// SessionReplyReply; a mismatch rejects with ReplyMismatchException.
         | ReplyEntry of entry: InboxEntry
+
+        /// Internal direct-actor reply ingress used by the unit-level actor
+        /// seam. Routed production replies are admitted and appended by the
+        /// scoped route gate before it sends ReplyEntry to this actor.
+        | SessionReplyPayload of reply: Reply
 
         /// Reads the suspendable actor's snapshot. Answered with SessionSnapshot.
         | SuspendableGetSnapshot
@@ -4328,11 +4333,61 @@ module internal SessionActor =
 
                 SessionState.Idle
 
+        let mutable replyInFlight = false
+
         let rec loop (state: SessionState) (suspended: SuspendedTurn option) (resolved: HashSet<string>) =
             actor {
                 let! message = mailbox.Receive()
 
                 match message with
+                | SessionReplyPayload reply ->
+                    let sender = mailbox.Sender()
+
+                    let reject requestId message =
+                        sender
+                        <! ReplyRejected(ReplyMismatchException(props.SessionId, requestId, message))
+
+                    let expectedRequestId (parked: SuspendedTurn) : string option =
+                        match parked.Cursor with
+                        | Some cursor -> Some cursor.RequestId
+                        | None ->
+                            match parked.Rebuilt with
+                            | Some rebuilt -> Some rebuilt.RequestId
+                            | None -> None
+
+                    match state, suspended, replyRequestId reply with
+                    | _, _, _ when replyInFlight ->
+                        reject (replyRequestId reply |> Option.defaultValue "") "A reply is already being consumed."
+                    | SessionState.WaitingForInput, Some _, Some requestId when durableStop().IsSome ->
+                        reject requestId "Accepted stop forbids reply consumption or resume."
+                    | SessionState.WaitingForInput, Some parked, Some requestId ->
+                        match expectedRequestId parked with
+                        | Some expected when String.Equals(requestId, expected, StringComparison.Ordinal) ->
+                            // The actor mailbox is the ordinary scoped reply
+                            // gate: validate and append in one serialized
+                            // turn, so concurrent answers cannot both pass a
+                            // snapshot-before-append check.
+                            let appended =
+                                awaitTask (
+                                    props.Store.AppendInboxMessage(
+                                        props.Tenant,
+                                        props.SessionId,
+                                        ReplyPayload(reply),
+                                        DeliveryMode.Queue,
+                                        CancellationToken.None
+                                    )
+                                )
+
+                            replyInFlight <- true
+                            mailbox.Self.Tell(ReplyEntry appended, sender)
+                        | _ -> reject requestId "The reply answered no pending request."
+                    | SessionState.WaitingForInput, Some _, None ->
+                        reject "" "The reply carried no answer for the pending request."
+                    | _ ->
+                        let requestId = replyRequestId reply |> Option.defaultValue ""
+                        reject requestId "The session has no pending request for the reply."
+
+                    return! loop state suspended resolved
                 | SuspendableQueuePrompt(payload, cancellationToken) ->
                     match state with
                     | SessionState.Closed ->
@@ -4916,6 +4971,8 @@ module internal SessionActor =
                         return! loop SessionState.Idle None resolved
                     | _ -> return! loop state suspended resolved
                 | ReplyEntry replyEntry ->
+                    replyInFlight <- false
+
                     match state, suspended with
                     | SessionState.WaitingForInput, Some _ when durableStop().IsSome ->
                         mailbox.Sender()
@@ -5593,11 +5650,8 @@ module internal SessionActor =
                     )
                 )
 
-            let payload = ReplyPayload(reply) :> InboxPayload
-
-            let! appended = store.AppendInboxMessage(tenant, sessionId, payload, DeliveryMode.Queue, cancellationToken)
-
-            let! answer = askSuspendableAsync<SessionReplyReply> session (ReplyEntry appended) cancellationToken
+            let! answer =
+                session.Ask<SessionReplyReply>(SessionReplyPayload reply, TimeSpan.FromSeconds 30.0, cancellationToken)
 
             match answer with
             | ReplyAccepted entry -> return entry
@@ -6054,7 +6108,7 @@ module internal SessionActor =
                         Tenant = tenant
                         SessionId = captured
                         RunTurn = unusedRunTurn
-                        OnTurnSettled = Some(fun result -> PromptWaitHubs.ObserveSettled captured result)
+                        OnTurnSettled = Some(fun result -> PromptWaitHubs.ObserveSettledScoped tenant captured result)
                         OnInjectJournaled = None
                         Compact = compactFor captured token
                         Logger = null
