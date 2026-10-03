@@ -1138,8 +1138,7 @@ type internal ClusterActorSystemService
                                 cancellationToken
                     with
                     | :? OperationCanceledException -> ()
-                    | :? DeadlineExceededException as drainExpired ->
-                        stopFailure <- Some(drainExpired :> exn)
+                    | :? DeadlineExceededException as drainExpired -> stopFailure <- Some(drainExpired :> exn)
 
                     let elapsed = timeProvider.GetElapsedTime stopStart
                     let remainingDeadline = clusterOptions.HostExitDeadline - elapsed

@@ -428,6 +428,7 @@ type internal SessionSubscriptionLifetime() =
                                                 registration |> Option.iter (fun value -> value.Dispose())
                                                 linked.Dispose()
                                         }
+
                                     disposal <- Some pending
                                     pending)
 
