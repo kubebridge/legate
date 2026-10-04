@@ -329,6 +329,131 @@ type SqliteSessionEventStore(database: SqliteDatabase) =
                 | :? SqliteException as sql -> return raise (mapSql sql)
             }
 
+        member _.AppendHostEvents(tenant, sessionId, expectedUpdatedAt, events, _) =
+            task {
+                if isNull (box events) then
+                    raise (ArgumentNullException(nameof events))
+
+                if Seq.isEmpty events then
+                    raise (ArgumentException("The event batch must not be empty.", nameof events))
+
+                for event in events do
+                    if isNull (box event) then
+                        raise (ArgumentNullException(nameof events))
+
+                try
+                    return
+                        lock database.Gate (fun () ->
+                            use connection = database.OpenConnection()
+                            use transaction = connection.BeginTransaction()
+
+                            use sessionCmd = connection.CreateCommand()
+                            sessionCmd.Transaction <- transaction
+
+                            sessionCmd.CommandText <-
+                                $"SELECT state, updated_at FROM \"%s{sessionsTable ()}\" WHERE id = $id AND tenant = $tenant"
+
+                            sessionCmd.Parameters.AddWithValue("$id", sessionId.Value) |> ignore
+                            sessionCmd.Parameters.AddWithValue("$tenant", tenant.Value) |> ignore
+
+                            use sessionReader = sessionCmd.ExecuteReader()
+
+                            if not (sessionReader.Read()) then
+                                sessionReader.Close()
+                                transaction.Rollback()
+
+                                raise (
+                                    SessionNotFoundException(
+                                        sessionId,
+                                        sprintf "No session %O exists in tenant %O." sessionId tenant
+                                    )
+                                )
+                            else
+                                let state = Enum.Parse<SessionState>(sessionReader.GetString(0), false)
+                                let storedUpdatedAt = ofIso (sessionReader.GetString(1))
+                                sessionReader.Close()
+
+                                // The lifecycle fence: closed rejects, a moved
+                                // version rejects, both with zero writes.
+                                if state = SessionState.Closed then
+                                    transaction.Rollback()
+                                    EventAppendRejected(sessionId, "sessionClosed") :> EventAppendOutcome
+                                elif storedUpdatedAt <> expectedUpdatedAt then
+                                    transaction.Rollback()
+                                    EventAppendRejected(sessionId, "staleLifecycle") :> EventAppendOutcome
+                                else
+                                    // A cleanup that archived the journal
+                                    // re-opens on the next append: the fresh
+                                    // batch starts a new journal.
+                                    clearArchived connection transaction tenant sessionId
+
+                                    use next = connection.CreateCommand()
+                                    next.Transaction <- transaction
+
+                                    next.CommandText <-
+                                        $"SELECT COALESCE(MAX(sequence), 0) FROM \"%s{eventsTable ()}\" WHERE session_id = $session"
+
+                                    next.Parameters.AddWithValue("$session", sessionId.Value) |> ignore
+
+                                    let baseSequence = Convert.ToInt64(next.ExecuteScalar())
+                                    let mutable sequence = baseSequence
+                                    let stamped = List<SessionEvent>()
+
+                                    for event in events do
+                                        sequence <- sequence + 1L
+                                        stamped.Add(restamp event sequence)
+
+                                    for event in stamped do
+                                        use insert = connection.CreateCommand()
+                                        insert.Transaction <- transaction
+
+                                        insert.CommandText <-
+                                            $"INSERT INTO \"%s{eventsTable ()}\" (session_id, sequence, tenant, turn_id, event_type, payload_json, timestamp) VALUES ($session, $sequence, $tenant, $turn, $type, $payload, $at)"
+
+                                        // The host-operation sentinel
+                                        // (default TurnId, null Value) stores
+                                        // an empty turn marker in the column;
+                                        // replay reads the payload, where the
+                                        // sentinel round-trips as JSON null.
+                                        let turnValue =
+                                            if box event.TurnId.Value |> isNull then
+                                                ""
+                                            else
+                                                event.TurnId.Value
+
+                                        insert.Parameters.AddWithValue("$session", sessionId.Value) |> ignore
+                                        insert.Parameters.AddWithValue("$sequence", event.Sequence.Value) |> ignore
+                                        insert.Parameters.AddWithValue("$tenant", tenant.Value) |> ignore
+                                        insert.Parameters.AddWithValue("$turn", turnValue) |> ignore
+                                        insert.Parameters.AddWithValue("$type", eventTypeName event) |> ignore
+
+                                        insert.Parameters.AddWithValue("$payload", SqliteJson.serialize event)
+                                        |> ignore
+
+                                        insert.Parameters.AddWithValue("$at", toIso event.Timestamp) |> ignore
+                                        insert.ExecuteNonQuery() |> ignore
+
+                                    // A successful host append bumps the
+                                    // session version stamp, so the next idle
+                                    // writer must re-read.
+                                    use bump = connection.CreateCommand()
+                                    bump.Transaction <- transaction
+
+                                    bump.CommandText <-
+                                        $"UPDATE \"%s{sessionsTable ()}\" SET updated_at = $now WHERE id = $id AND tenant = $tenant"
+
+                                    bump.Parameters.AddWithValue("$now", toIso database.UtcNow) |> ignore
+                                    bump.Parameters.AddWithValue("$id", sessionId.Value) |> ignore
+                                    bump.Parameters.AddWithValue("$tenant", tenant.Value) |> ignore
+                                    bump.ExecuteNonQuery() |> ignore
+
+                                    transaction.Commit()
+                                    EventAppended(stamped :> IReadOnlyList<SessionEvent>) :> EventAppendOutcome)
+                with
+                | :? LegateException as ex -> return raise ex
+                | :? SqliteException as sql -> return raise (mapSql sql)
+            }
+
         member _.Replay(tenant, sessionId, fromSequence, limit, _) =
             task {
                 if limit <= 0 then

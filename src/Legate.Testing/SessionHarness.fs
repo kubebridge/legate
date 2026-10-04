@@ -133,6 +133,24 @@ type internal ObservingEventStore(inner: ISessionEventStore, onAppended: Session
         member _.Replay(tenant, sessionId, fromSequence, limit, cancellationToken) =
             inner.Replay(tenant, sessionId, fromSequence, limit, cancellationToken)
 
+        member _.AppendHostEvents(tenant, sessionId, expectedUpdatedAt, events, cancellationToken) =
+            task {
+                let! outcome = inner.AppendHostEvents(tenant, sessionId, expectedUpdatedAt, events, cancellationToken)
+
+                match outcome with
+                | :? EventAppended as appended when not (isNull (box appended)) ->
+                    if not (isNull (box appended.Events)) then
+                        for event in appended.Events do
+                            if not (isNull (box event)) then
+                                try
+                                    onAppended event
+                                with _ ->
+                                    ()
+                | _ -> ()
+
+                return outcome
+            }
+
         member _.TryClaimCleanup(tenant, sessionId, owner, leaseDuration, cancellationToken) =
             inner.TryClaimCleanup(tenant, sessionId, owner, leaseDuration, cancellationToken)
 

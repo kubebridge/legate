@@ -943,8 +943,33 @@ module internal SessionActor =
 
             let history = Compaction.messagesFromCells cells
 
+            // The host fence stamp for the idle compact (issue 373): read
+            // before the summariser call. A concurrent idle writer moves
+            // the stamp and the host append below fences as CompactFenced.
+            // A missing row falls back to the primed token sink, so the
+            // compact stays fenced either way; the prime itself is untouched.
+            let expectedStamp =
+                try
+                    match awaitTask (props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None)) with
+                    | null -> None
+                    | session -> Some session.UpdatedAt
+                with _ ->
+                    None
+
             let journalAsync =
-                journalSink compact.EventStore props.Tenant props.SessionId compact.JournalToken
+                match expectedStamp with
+                | Some stamp ->
+                    fun (event: SessionEvent) ->
+                        let events = ResizeArray<SessionEvent>([| event |]) :> IReadOnlyList<SessionEvent>
+
+                        JournalWriter.appendHostAsync
+                            compact.EventStore
+                            props.Tenant
+                            props.SessionId
+                            stamp
+                            events
+                            CancellationToken.None
+                | None -> journalSink compact.EventStore props.Tenant props.SessionId compact.JournalToken
 
             let request: Compaction.CompactionRequest =
                 {
@@ -959,7 +984,10 @@ module internal SessionActor =
                     ModelPolicy = compact.Policy
                     Tenant = props.Tenant
                     SessionId = props.SessionId
-                    TurnId = TurnId.New()
+                    // The host-operation sentinel (issue 373): the idle
+                    // compact is host authority, not execution, so the
+                    // journaled CompactedEvent carries the default TurnId.
+                    TurnId = Unchecked.defaultof<TurnId>
                     Attempt = 1
                     InputTokens = 0L
                     OutputTokens = 0L
@@ -2958,7 +2986,10 @@ module internal SessionActor =
             // The crash-path terminal (issue 289): the CurrentTurnId
             // snapshot the crash path never ran a loop for. Fenced under
             // the live journal token; a settled-NULL turn (None) journals
-            // nothing.
+            // nothing. Stays on the prime (issue 373): the write terminates
+            // an execution turn, so only the claim fence proves the writer
+            // is no takeover loser; the host path cannot tell a stale
+            // generation from the live one. Re-anchoring belongs to #400.
             match liveId with
             | Some _ when fenced -> ()
             | Some turnId ->
@@ -4190,10 +4221,14 @@ module internal SessionActor =
 
                 let previous = previousAgentNow target
 
+                // The host-operation sentinel (issue 373): the rebind is
+                // idle/host authority, not execution, so it carries the
+                // default TurnId. The prime stays for execution; only this
+                // journal step rides the host path.
                 let switched =
                     AgentSwitchedEvent(
                         props.SessionId,
-                        fresh.TurnId,
+                        Unchecked.defaultof<TurnId>,
                         Unchecked.defaultof<Nullable<int64>>,
                         DateTimeOffset.UtcNow,
                         previous,
@@ -4203,18 +4238,40 @@ module internal SessionActor =
 
                 let batch = ResizeArray<SessionEvent>([| switched |]) :> IReadOnlyList<SessionEvent>
 
-                match
-                    awaitTask (
-                        JournalWriter.appendWithTokenAsync
-                            suspend.EventStore
-                            props.Tenant
-                            props.SessionId
-                            fresh.Token
-                            batch
-                            CancellationToken.None
-                    )
-                with
-                | JournalWriter.JournalAppended _ ->
+                // The host fence reads the version stamp after the re-prime
+                // (settle and claim both stamp the row), so the exact
+                // equality compares against the current row.
+                let expectedStamp =
+                    try
+                        match
+                            awaitTask (props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
+                        with
+                        | null -> None
+                        | session -> Some session.UpdatedAt
+                    with _ ->
+                        None
+
+                let hostOutcome =
+                    match expectedStamp with
+                    | None -> None
+                    | Some stamp ->
+                        try
+                            Some(
+                                awaitTask (
+                                    JournalWriter.appendHostAsync
+                                        suspend.EventStore
+                                        props.Tenant
+                                        props.SessionId
+                                        stamp
+                                        batch
+                                        CancellationToken.None
+                                )
+                            )
+                        with _ ->
+                            None
+
+                match hostOutcome with
+                | Some(JournalWriter.JournalAppended _) ->
                     if not (settleTurnQuiet fresh) then
                         false
                     else

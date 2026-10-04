@@ -198,11 +198,26 @@ let ``AgentId serialises and deserialises as a plain string`` () =
     deserialize<AgentId> ("\"" + validA + "\"") |> should equal agent
 
 [<Fact>]
+let ``TurnId JSON null reads as the host-operation sentinel`` () =
+    // Issue 373: JSON null is the default (unstamped) TurnId, mirroring
+    // how CellId reads null as its unstamped id. Fresh idle/host-control
+    // writes carry the sentinel; real turns carry parsed ids.
+    let sentinel = deserialize<TurnId> "null"
+    (box sentinel.Value |> isNull) |> should equal true
+    sentinel |> should equal Unchecked.defaultof<TurnId>
+    JsonSerializer.Serialize sentinel |> should equal "null"
+
+    // Real ids still round-trip as strings.
+    let turn = TurnId.Parse validA
+    JsonSerializer.Serialize turn |> should equal ("\"" + validA + "\"")
+    deserialize<TurnId> ("\"" + validA + "\"") |> should equal turn
+
+[<Fact>]
 let ``JSON deserialisation rejects invalid and non-string payloads`` () =
     (fun () -> deserialize<SessionId> "\"not-a-ulid\"" |> ignore)
     |> should throw typeof<JsonException>
 
-    (fun () -> deserialize<TurnId> "null" |> ignore)
+    (fun () -> deserialize<TurnId> "\"not-a-ulid\"" |> ignore)
     |> should throw typeof<JsonException>
 
     (fun () -> deserialize<AgentId> "12345" |> ignore)

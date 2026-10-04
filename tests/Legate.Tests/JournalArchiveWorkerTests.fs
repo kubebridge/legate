@@ -169,6 +169,9 @@ type CompleteCountingStore(inner: ISessionEventStore) =
         member _.Append(tenant, sessionId, token, events, cancellationToken) =
             inner.Append(tenant, sessionId, token, events, cancellationToken)
 
+        member _.AppendHostEvents(tenant, sessionId, expectedUpdatedAt, events, cancellationToken) =
+            inner.AppendHostEvents(tenant, sessionId, expectedUpdatedAt, events, cancellationToken)
+
         member _.Replay(tenant, sessionId, cursor, limit, cancellationToken) =
             inner.Replay(tenant, sessionId, cursor, limit, cancellationToken)
 

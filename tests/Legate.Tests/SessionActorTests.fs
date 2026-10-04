@@ -988,6 +988,16 @@ type RecordingEventStore() =
             let stamped = ResizeArray<SessionEvent>(events) :> IReadOnlyList<SessionEvent>
             Task.FromResult(EventAppended(stamped) :> EventAppendOutcome)
 
+        member _.AppendHostEvents(_, _, _, batch, _) =
+            if isNull (box batch) then
+                raise (ArgumentNullException(nameof batch))
+
+            for event in batch do
+                events.Add(event)
+
+            let stamped = ResizeArray<SessionEvent>(events) :> IReadOnlyList<SessionEvent>
+            Task.FromResult(EventAppended(stamped) :> EventAppendOutcome)
+
         member _.Replay(_, sessionId, fromSequence, _, _) =
             if fromSequence = 0L && events.Count > 0 then
                 let page = ResizeArray<SessionEvent>(events) :> IReadOnlyList<SessionEvent>
@@ -2650,7 +2660,7 @@ let ``Compact on Idle with a denied model journals CompactionFailedEvent and con
         stopSystem system
 
 [<Fact>]
-let ``Compact on Idle with a stale claim journals nothing`` () =
+let ``Compact on Idle with a stale claim journals under host authority`` () =
     use system = createSystem ()
     let store, journal = createJournalStores ()
     let created = createSession store
@@ -2661,8 +2671,11 @@ let ``Compact on Idle with a stale claim journals nothing`` () =
     let client =
         new ScriptedChatClient(ResizeArray<ScriptStep>([| ScriptStep.Text("loser gist") |]))
 
-    // The takeover winner re-claimed elsewhere: these dependencies carry a
-    // token the store no longer honors.
+    // The execution claim token is stale (a takeover winner re-claimed
+    // elsewhere), but the idle compact is host authority (issue 373), not
+    // execution: it rides the lifecycle fence, so the stale token neither
+    // blocks nor fences it. Stale execution writes still reject on the
+    // claim fence; only this host write lands.
     let deps =
         compactDeps
             (client :> IChatClient)
@@ -2676,13 +2689,21 @@ let ``Compact on Idle with a stale claim journals nothing`` () =
 
     try
         match compact store created.Id session with
-        | CompactFenced -> ()
-        | reply -> failwith $"Expected CompactFenced, observed %A{reply}."
+        | CompactCompleted _ -> ()
+        | reply -> failwith $"Expected CompactCompleted, observed %A{reply}."
 
-        // The summariser ran (the fence checks at the last moment before
-        // the journal write), but the loser journaled nothing.
         client.Calls |> should equal 1
-        (replayEvents journal created.Id).Count |> should equal 6
+
+        let events = replayEvents journal created.Id
+        events.Count |> should equal 7
+
+        match events[events.Count - 1] with
+        | :? CompactedEvent as compacted ->
+            // The host-operation sentinel: no execution turn is fabricated
+            // for the idle compact.
+            (box compacted.TurnId.Value |> isNull) |> should equal true
+        | _ -> failwith "Expected the trailing CompactedEvent."
+
         (snapshotOf session).State |> should equal SessionState.Idle
     finally
         stopSystem system
@@ -4612,7 +4633,7 @@ let ``SetAgent on Closed rejects with InvalidSessionStateException`` () : Task =
     }
 
 [<Fact>]
-let ``Compact after SetAgent journals under the refreshed token`` () =
+let ``Compact after SetAgent journals under host authority`` () =
     use system = createSystem ()
     let store, journal = createJournalStores ()
     let created = createSession store
@@ -4650,8 +4671,9 @@ let ``Compact after SetAgent journals under the refreshed token`` () =
         let rebound = setAgent store tenant created.Id session target
         rebound.AgentId |> should equal target
 
-        // A stale compact token would fence the write into CompactFenced:
-        // completing proves the swap refreshed the wiring.
+        // The idle compact rides the host lifecycle fence (issue 373), not
+        // any journal token: completing proves the rebind converged and the
+        // host path fenced live. The prime stays for execution either way.
         match compactSuspendable store created.Id session with
         | CompactCompleted(beforeEstimate, afterEstimate) -> (beforeEstimate > afterEstimate) |> should equal true
         | reply -> failwith $"Expected CompactCompleted, observed %O{reply}."
@@ -4665,6 +4687,8 @@ let ``Compact after SetAgent journals under the refreshed token`` () =
         let switches = switchEvents events
         switches.Length |> should equal 1
         switches[0].NewAgentId |> should equal target
+        // The rebind is idle/host authority: the sentinel, not a turn.
+        (box switches[0].TurnId.Value |> isNull) |> should equal true
     finally
         stopSystem system
 

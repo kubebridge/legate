@@ -166,6 +166,7 @@
     <Compile Include="CrossNodeSubscriptionTests.fs" />
     <Compile Include="TurnInCallMarkerTests.fs" />
     <Compile Include="LegacyRejectionRecoveryTests.fs" />
+    <Compile Include="IdleAuthorityTests.fs" />
   </ItemGroup>
 
   <ItemGroup>

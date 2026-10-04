@@ -208,6 +208,96 @@ type FakeSessionEventStore() =
                                     EventAppended(stamped :> IReadOnlyList<SessionEvent>) :> EventAppendOutcome
                                 )
 
+        // Test-only host path: same limits and stamping as Append, fenced
+        // on journal existence only. No test here exercises the
+        // lifecycle fence; the shared conformance suite proves it on the
+        // real stores.
+        member _.AppendHostEvents(t, sessionId, _, events, _) =
+            if isNull (box events) then
+                raise (ArgumentNullException(nameof events))
+
+            for event in events do
+                if box event |> isNull then
+                    raise (ArgumentNullException(nameof events))
+
+            if events.Count = 0 then
+                raise (ArgumentException("The batch must not be empty.", nameof events))
+
+            match journals.TryGetValue(key t sessionId) with
+            | false, _ -> raise (SessionNotFoundException(sessionId, "Session not found."))
+            | true, journal ->
+                if int64 events.Count > batchSizeLimit then
+                    raise (
+                        EventLimitExceededException(
+                            "batchSize",
+                            batchSizeLimit,
+                            int64 events.Count,
+                            "The event batch exceeds the configured batch-size limit."
+                        )
+                    )
+                else
+                    let stamped = ResizeArray<SessionEvent>()
+
+                    for event in events do
+                        let sequence = nextSequence journal
+
+                        let copy =
+                            match event with
+                            | :? TextDeltaEvent as delta ->
+                                TextDeltaEvent(
+                                    event.SessionId,
+                                    event.TurnId,
+                                    Nullable sequence,
+                                    event.Timestamp,
+                                    delta.Text
+                                )
+                                :> SessionEvent
+                            | :? UsageEvent as usage ->
+                                UsageEvent(
+                                    event.SessionId,
+                                    event.TurnId,
+                                    Nullable sequence,
+                                    event.Timestamp,
+                                    usage.InputTokens,
+                                    usage.OutputTokens
+                                )
+                                :> SessionEvent
+                            | :? TurnStartedEvent ->
+                                TurnStartedEvent(event.SessionId, event.TurnId, Nullable sequence, event.Timestamp)
+                                :> SessionEvent
+                            | :? TurnCompletedEvent ->
+                                TurnCompletedEvent(event.SessionId, event.TurnId, Nullable sequence, event.Timestamp)
+                                :> SessionEvent
+                            | :? CompactedEvent as compacted ->
+                                CompactedEvent(
+                                    event.SessionId,
+                                    event.TurnId,
+                                    Nullable sequence,
+                                    event.Timestamp,
+                                    compacted.BeforeEstimate,
+                                    compacted.AfterEstimate
+                                )
+                                :> SessionEvent
+                            | :? AgentSwitchedEvent as switched ->
+                                AgentSwitchedEvent(
+                                    event.SessionId,
+                                    event.TurnId,
+                                    Nullable sequence,
+                                    event.Timestamp,
+                                    switched.PreviousAgentId,
+                                    switched.NewAgentId
+                                )
+                                :> SessionEvent
+                            | other ->
+                                failwithf
+                                    "the fake journals only the event kinds the tests use, not %s"
+                                    (other.GetType().Name)
+
+                        journal[sequence] <- copy
+                        stamped.Add copy
+
+                    Task.FromResult(EventAppended(stamped :> IReadOnlyList<SessionEvent>) :> EventAppendOutcome)
+
         member _.Replay(t, sessionId, fromSequence, limit, _) =
             if limit <= 0 then
                 raise (ArgumentOutOfRangeException(nameof limit))
@@ -1174,7 +1264,7 @@ let ``Append rejects a null batch or token and Replay rejects a non-positive lim
 [<Fact>]
 let ``Every ISessionEventStore method takes a TenantId and returns Task`` () =
     let methods = typeof<ISessionEventStore>.GetMethods()
-    methods.Length |> should equal 5
+    methods.Length |> should equal 6
 
     for method in methods do
         let paramOk =

@@ -636,3 +636,247 @@ type SessionEventStoreConformance
                 | _ -> failwith "expected the replay page"
             | _ -> failwith "expected the appended outcome"
         }
+
+    // ────────────────── Host-append matrix (issue 373) ──────────────────
+
+    /// Reads the session's current UpdatedAt version stamp the host-append
+    /// fence compares with exact equality.
+    member this.SessionVersion(sessionId: SessionId) =
+        task {
+            let! session = sessionStore.GetSession(tenant, sessionId, CancellationToken.None)
+
+            match session with
+            | null -> return failwith "expected the session row"
+            | found -> return found.UpdatedAt
+        }
+
+    /// One sentinel host-operation event: the default (unstamped) TurnId
+    /// means host operation, mirroring the CellId unstamped precedent.
+    member this.HostSentinel(sessionId: SessionId) =
+        CompactedEvent(sessionId, Unchecked.defaultof<TurnId>, Nullable(), DateTimeOffset.MinValue, 100L, 60L)
+        :> SessionEvent
+
+    [<Fact>]
+    member this.``Host append lands with sentinel attribution and bumps UpdatedAt``() =
+        task {
+            let! sessionId, _claim = this.ClaimedSession()
+            let! expected = this.SessionVersion(sessionId)
+
+            this.Clock.Advance(TimeSpan.FromMinutes 1.)
+
+            let! outcome =
+                eventStore.AppendHostEvents(
+                    tenant,
+                    sessionId,
+                    expected,
+                    [ this.HostSentinel(sessionId) ],
+                    CancellationToken.None
+                )
+
+            match outcome with
+            | :? EventAppended as appended ->
+                Assert.Equal(1, appended.Events.Count)
+                Assert.Equal(1L, appended.Events[0].Sequence.Value)
+                Assert.True(box appended.Events[0].TurnId.Value |> isNull)
+            | _ -> failwith "expected the host-appended outcome"
+
+            let! replayed = eventStore.Replay(tenant, sessionId, 0L, 10, CancellationToken.None)
+
+            match replayed with
+            | :? EventReplayPage as page ->
+                Assert.Equal(1, page.Events.Count)
+                Assert.True(box page.Events[0].TurnId.Value |> isNull)
+            | _ -> failwith "expected the replay page"
+
+            let! bumped = this.SessionVersion(sessionId)
+            Assert.True(bumped > expected)
+        }
+
+    [<Fact>]
+    member this.``Host append accepts preserved history-copy TurnIds``() =
+        task {
+            let! sessionId, _claim = this.ClaimedSession()
+            let! expected = this.SessionVersion(sessionId)
+
+            this.Clock.Advance(TimeSpan.FromMinutes 1.)
+
+            let preserved = TurnId.New()
+
+            let copied =
+                AgentSwitchedEvent(
+                    sessionId,
+                    preserved,
+                    Nullable(),
+                    DateTimeOffset.MinValue,
+                    AgentId.New(),
+                    AgentId.New()
+                )
+                :> SessionEvent
+
+            let! outcome = eventStore.AppendHostEvents(tenant, sessionId, expected, [ copied ], CancellationToken.None)
+
+            match outcome with
+            | :? EventAppended as appended -> Assert.Equal(preserved, appended.Events[0].TurnId)
+            | _ -> failwith "expected the history-copy host append"
+
+            let! replayed = eventStore.Replay(tenant, sessionId, 0L, 10, CancellationToken.None)
+
+            match replayed with
+            | :? EventReplayPage as page -> Assert.Equal(preserved, page.Events[0].TurnId)
+            | _ -> failwith "expected the replay page"
+        }
+
+    [<Fact>]
+    member this.``Host append rejects a moved version with zero writes``() =
+        task {
+            let! sessionId, _claim = this.ClaimedSession()
+            let! expected = this.SessionVersion(sessionId)
+
+            this.Clock.Advance(TimeSpan.FromMinutes 1.)
+
+            let! first =
+                eventStore.AppendHostEvents(
+                    tenant,
+                    sessionId,
+                    expected,
+                    [ this.HostSentinel(sessionId) ],
+                    CancellationToken.None
+                )
+
+            Assert.True(first :? EventAppended)
+
+            // The winner bumped UpdatedAt: the loser's stale stamp rejects
+            // atomically, so its two-event batch leaves nothing behind.
+            let! rejected =
+                eventStore.AppendHostEvents(
+                    tenant,
+                    sessionId,
+                    expected,
+                    [
+                        this.HostSentinel(sessionId)
+                        this.HostSentinel(sessionId)
+                    ],
+                    CancellationToken.None
+                )
+
+            match rejected with
+            | :? EventAppendRejected as refused -> Assert.Equal("staleLifecycle", refused.Reason)
+            | _ -> failwith "expected the staleLifecycle rejection"
+
+            let! replayed = eventStore.Replay(tenant, sessionId, 0L, 10, CancellationToken.None)
+
+            match replayed with
+            | :? EventReplayPage as page -> Assert.Equal(1, page.Events.Count)
+            | _ -> failwith "expected exactly the winner's event"
+        }
+
+    [<Fact>]
+    member this.``Host append rejects a closed session with zero writes``() =
+        task {
+            let! sessionId, _claim = this.ClaimedSession()
+            let! expected = this.SessionVersion(sessionId)
+
+            let! _ = sessionStore.CloseSession(tenant, sessionId, CancellationToken.None)
+
+            let! rejected =
+                eventStore.AppendHostEvents(
+                    tenant,
+                    sessionId,
+                    expected,
+                    [ this.HostSentinel(sessionId) ],
+                    CancellationToken.None
+                )
+
+            match rejected with
+            | :? EventAppendRejected as refused -> Assert.Equal("sessionClosed", refused.Reason)
+            | _ -> failwith "expected the sessionClosed rejection"
+
+            let! replayed = eventStore.Replay(tenant, sessionId, 0L, 10, CancellationToken.None)
+
+            match replayed with
+            | :? EventReplayEndOfStream -> ()
+            | _ -> failwith "expected end of stream after the closed-session rejection"
+        }
+
+    [<Fact>]
+    member this.``Host append is tenant-isolated``() =
+        task {
+            let! sessionId, _claim = this.ClaimedSession()
+            let! expected = this.SessionVersion(sessionId)
+
+            try
+                let! _ =
+                    eventStore.AppendHostEvents(
+                        this.OtherTenant,
+                        sessionId,
+                        expected,
+                        [ this.HostSentinel(sessionId) ],
+                        CancellationToken.None
+                    )
+
+                return failwith "expected SessionNotFoundException across tenants"
+            with :? SessionNotFoundException ->
+                ()
+
+            let! replayed = eventStore.Replay(tenant, sessionId, 0L, 10, CancellationToken.None)
+
+            match replayed with
+            | :? EventReplayEndOfStream -> ()
+            | _ -> failwith "expected end of stream after the isolated refusal"
+        }
+
+    [<Fact>]
+    member this.``Host and claim appends share gap-free per-session sequences``() =
+        task {
+            let! sessionId, claim = this.ClaimedSession()
+            let! expected = this.SessionVersion(sessionId)
+
+            let! first =
+                eventStore.Append(
+                    tenant,
+                    sessionId,
+                    claim.Token,
+                    [ this.Delta(sessionId, claim.TurnId) ],
+                    CancellationToken.None
+                )
+
+            Assert.True(first :? EventAppended)
+
+            this.Clock.Advance(TimeSpan.FromMinutes 1.)
+
+            let! second =
+                eventStore.AppendHostEvents(
+                    tenant,
+                    sessionId,
+                    expected,
+                    [ this.HostSentinel(sessionId) ],
+                    CancellationToken.None
+                )
+
+            match second with
+            | :? EventAppended as appended -> Assert.Equal(2L, appended.Events[0].Sequence.Value)
+            | _ -> failwith "expected the host event at sequence 2"
+
+            let! third =
+                eventStore.Append(
+                    tenant,
+                    sessionId,
+                    claim.Token,
+                    [ this.Delta(sessionId, claim.TurnId) ],
+                    CancellationToken.None
+                )
+
+            match third with
+            | :? EventAppended as appended -> Assert.Equal(3L, appended.Events[0].Sequence.Value)
+            | _ -> failwith "expected the claim event at sequence 3"
+
+            let! replayed = eventStore.Replay(tenant, sessionId, 0L, 10, CancellationToken.None)
+
+            match replayed with
+            | :? EventReplayPage as page ->
+                let sequences =
+                    page.Events |> Seq.map (fun event -> event.Sequence.Value) |> Seq.toList
+
+                Assert.Equal<int64 list>([ 1L; 2L; 3L ], sequences)
+            | _ -> failwith "expected the ordered replay"
+        }
