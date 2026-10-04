@@ -168,6 +168,7 @@
     <Compile Include="LegacyRejectionRecoveryTests.fs" />
     <Compile Include="IdleAuthorityTests.fs" />
     <Compile Include="RealTurnOwnershipTests.fs" />
+    <Compile Include="ProductionTurnRenewalTests.fs" />
   </ItemGroup>
 
   <ItemGroup>

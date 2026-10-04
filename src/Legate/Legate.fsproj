@@ -38,6 +38,7 @@
     <Compile Include="SsrfGuard.fs" />
     <Compile Include="ProviderFailureReason.fs" />
     <Compile Include="ControlAdmission.fs" />
+    <Compile Include="LeaseAdmission.fs" />
     <Compile Include="TurnLoop.fs" />
     <Compile Include="AskUserTool.fs" />
     <Compile Include="SkillTool.fs" />
