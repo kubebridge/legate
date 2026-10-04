@@ -111,6 +111,27 @@ module internal SessionPermissions =
             | null -> Unchecked.defaultof<IPermissionPolicy>
             | present -> present
 
+        /// Builds the last-moment per-tool admission fence for the running
+        /// attempt (issue 376): ClaimFence.checkBeforeCallAsync over the
+        /// AsyncLocal running claim, failing closed on lost, missing, or
+        /// unverifiable authority. Some false denies dispatch (TurnLoop
+        /// raises TurnLeaseLostException); never None, which would read as
+        /// no fence. The renewed isLeaseValid hook (LeaseAdmission over the
+        /// #375 heartbeat view) stays the fast cached check; this verify is
+        /// the token check immediately before each dispatch.
+        /// <returns>The VerifyClaim hook the turn runs with.</returns>
+        let verifyForCurrentClaim () : (unit -> Task<bool>) option =
+            match FencedClaimScope.currentClaim () with
+            | Some claim when not (isNull (box claim)) ->
+                Some(fun () ->
+                    task {
+                        try
+                            return! ClaimFence.checkBeforeCallAsync store tenant claim CancellationToken.None
+                        with _ ->
+                            return false
+                    })
+            | _ -> Some(fun () -> Task.FromResult(false))
+
         /// Reads the entry session's pending inbox for the Inject fold: the
         /// loop filters Inject user messages itself, so the drain returns
         /// the raw pending read. Runs on the turn thread, blocking like the
@@ -130,14 +151,22 @@ module internal SessionPermissions =
                 ResizeArray<InboxEntry>() :> IReadOnlyList<InboxEntry>
 
         /// Marks one folded Inject entry consumed so it never refolds: the
-        /// consume lands before the next provider call, or the settle drain
-        /// would redeliver the folded entry as a new turn. Runs on the turn
-        /// thread, blocking like the base Inject wiring.
+        /// consume lands atomically under the running claim through the
+        /// #377 ConsumeInboxUnderClaim path (never verify-then-write around
+        /// the unfenced consume), before the next provider call, or the
+        /// settle drain would redeliver the folded entry as a new turn.
+        /// Fails closed: a lost claim raises TurnLeaseLostException with
+        /// zero effects, and a missing claim raises too (never an unfenced
+        /// consume). Runs on the turn thread, blocking like the base Inject
+        /// wiring.
         /// <param name="entry">The running turn's entry, carrying the session.</param>
         /// <param name="injected">The folded entry to consume.</param>
         let consumeInjected (entry: InboxEntry) (injected: InboxEntry) : unit =
             if not (isNull (box injected)) then
                 if not (ControlAdmission.check ()) then
+                    raise (TurnLoop.TurnLeaseLostException())
+
+                if not (LeaseAdmission.check ()) then
                     raise (TurnLoop.TurnLeaseLostException())
 
                 let positions = [| injected.Position |] :> IReadOnlyList<int64>
@@ -157,15 +186,10 @@ module internal SessionPermissions =
 
                         if not landed then
                             raise (TurnLoop.TurnLeaseLostException())
-                    | _ ->
-                        store
-                            .MarkInboxConsumed(tenant, entry.SessionId, positions, CancellationToken.None)
-                            .GetAwaiter()
-                            .GetResult()
-                        |> ignore
+                    | _ -> raise (TurnLoop.TurnLeaseLostException())
                 with
                 | :? TurnLoop.TurnLeaseLostException -> reraise ()
-                | _ -> ()
+                | _ -> raise (TurnLoop.TurnLeaseLostException())
 
         /// Binds the running turn's skill journal hook into the pre-built
         /// tool map (issue 321): hosts build the skill tool once per
@@ -262,9 +286,13 @@ module internal SessionPermissions =
                         // usage plus skill loads through the fenced journal
                         // hooks (issue 321). The skill map rebinds per turn
                         // so the pre-built host tool journals under the
-                        // running claim.
+                        // running claim. Every dispatch verifies the live
+                        // real-turn claim at the last moment (issue 376);
+                        // the renewed LeaseAdmission hook is the cached fast
+                        // check underneath.
                         let merged =
                             { loopOptions with
+                                VerifyClaim = verifyForCurrentClaim ()
                                 OnTurnStarted = onTurnStarted
                                 OnUsageCheckpoint = onUsageCheckpoint
                                 OnSkillLoaded = onSkillLoaded
@@ -302,14 +330,30 @@ module internal SessionPermissions =
                         // the nested loop's own boundaries through the same
                         // drain.
                         let resume = live.Nested.Value
+
+                        if not (ControlAdmission.check () && LeaseAdmission.check ()) then
+                            raise (TurnLoop.TurnLeaseLostException())
+
+                        match verifyForCurrentClaim () with
+                        | Some verify ->
+                            let! admitted = verify ()
+
+                            if not admitted then
+                                raise (TurnLoop.TurnLeaseLostException())
+                        | None -> raise (TurnLoop.TurnLeaseLostException())
+
                         return! resume.ResumeAsync reply runnerToken
                     | Some live, Some(:? PermissionDecision as decision) ->
                         // Resumes already marked before they suspended: never
                         // mark on resume, but carry the usage and skill hooks
                         // so post-resume work checkpoints and loads journal
                         // (issue 321), with the skill map rebound per turn.
+                        // The pending call re-verifies current authority at
+                        // dispatch (issue 376); allowed tools still need
+                        // ownership and the permission gate stays intact.
                         let merged =
                             { loopOptions with
+                                VerifyClaim = verifyForCurrentClaim ()
                                 OnTurnStarted = None
                                 OnUsageCheckpoint = onUsageCheckpoint
                                 OnSkillLoaded = onSkillLoaded
@@ -335,8 +379,11 @@ module internal SessionPermissions =
                         // mark on resume, but carry the usage and skill hooks
                         // so post-resume work checkpoints and loads journal
                         // (issue 321), with the skill map rebound per turn.
+                        // Post-resume dispatches re-verify current authority
+                        // (issue 376).
                         let merged =
                             { loopOptions with
+                                VerifyClaim = verifyForCurrentClaim ()
                                 OnTurnStarted = None
                                 OnUsageCheckpoint = onUsageCheckpoint
                                 OnSkillLoaded = onSkillLoaded
@@ -366,9 +413,12 @@ module internal SessionPermissions =
                         // Retries run under the supplied turn id: mark at the
                         // first provider-call entry and carry the usage and
                         // skill hooks (issue 321), with the skill map rebound
-                        // per turn.
+                        // per turn. Crash retries verify the live claim like
+                        // fresh runs (issue 376), failing closed when the
+                        // rebuild holds no authority.
                         let merged =
                             { loopOptions with
+                                VerifyClaim = verifyForCurrentClaim ()
                                 OnTurnStarted = onTurnStarted
                                 OnUsageCheckpoint = onUsageCheckpoint
                                 OnSkillLoaded = onSkillLoaded
