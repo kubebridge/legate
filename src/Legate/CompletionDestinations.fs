@@ -21,6 +21,9 @@ type internal CompletionDestinations(provider: IServiceProvider) =
         | _ -> raise (refuse CompletionRoutingReason.Unavailable)
 
     member this.Validate(session: Session) =
+        if isNull (box session) || isNull (box session.Options) then
+            raise (CompletionRoutingException(Nullable(), Nullable(), null, CompletionRoutingReason.UnsupportedFormat))
+
         session.Options.ValidatePersistence()
 
         match session.Options.CompletionDestinationId with

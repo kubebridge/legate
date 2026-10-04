@@ -2535,7 +2535,7 @@ module internal SessionActor =
 
         let crashKnobOf (session: Session) : OnCrashResume =
             if isNull (box session) || isNull (box session.Options) then
-                OnCrashResume.ResumeAttempt
+                OnCrashResume.FailAttempt
             else
                 session.Options.OnCrashResume
 
@@ -6304,6 +6304,15 @@ module internal SessionActor =
             try
                 match store.GetSession(tenant, sessionId, CancellationToken.None).GetAwaiter().GetResult() with
                 | null -> None
+                | session when isNull (box session.Options) ->
+                    raise (
+                        CompletionRoutingException(
+                            Nullable tenant,
+                            Nullable sessionId,
+                            null,
+                            CompletionRoutingReason.UnsupportedFormat
+                        )
+                    )
                 | session ->
                     session.Options.ValidatePersistence()
 
@@ -6396,6 +6405,15 @@ module internal SessionActor =
                 let validateRoute () =
                     match store.GetSession(tenant, captured, CancellationToken.None).GetAwaiter().GetResult() with
                     | null -> raise (SessionNotFoundException(captured, "The session does not exist."))
+                    | session when isNull (box session.Options) ->
+                        raise (
+                            CompletionRoutingException(
+                                Nullable tenant,
+                                Nullable captured,
+                                null,
+                                CompletionRoutingReason.UnsupportedFormat
+                            )
+                        )
                     | session ->
                         session.Options.ValidatePersistence()
 

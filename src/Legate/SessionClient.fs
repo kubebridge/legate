@@ -115,6 +115,21 @@ type SessionClient
         and set value = destinations <- value
 
     member internal _.ValidateCompletionRoute(session: Session) =
+        if isNull (box session) || isNull (box session.Options) then
+            raise (
+                CompletionRoutingException(
+                    Nullable tenant,
+                    Nullable(
+                        if isNull (box session) then
+                            Unchecked.defaultof<SessionId>
+                        else
+                            session.Id
+                    ),
+                    null,
+                    CompletionRoutingReason.UnsupportedFormat
+                )
+            )
+
         session.Options.ValidatePersistence()
 
         match destinations, session.Options.CompletionDestinationId with
