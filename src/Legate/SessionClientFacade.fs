@@ -63,6 +63,9 @@ type SessionClientOptions() =
 
     /// How long the primed journal claim lasts. Must be positive. Defaults
     /// to one hour, covering the AskTimeout window for interactive hosts.
+    /// Prime-only (issue 375): the spawn-time journal prime claims under
+    /// this duration, while production renewals grant the Sessions lease
+    /// duration (60 s by default) through ClaimHeartbeat.fromSessions.
     member val LeaseDuration: TimeSpan = TimeSpan.FromHours 1.0 with get, set
 
     /// The default model reference (provider/model) the on-demand
@@ -1739,6 +1742,25 @@ module internal SessionClientWiring =
             | null -> SystemLlmDelay(TimeProvider.System) :> ILlmDelay
             | seam -> seam
 
+        // Production ownership clock (issue 375): the DI TimeProvider with
+        // a System fallback, mirroring the ILlmDelay precedent above. The
+        // heartbeat reuses the delay seam (virtual-time friendly) and the
+        // Sessions snapshot for its renewal tuning.
+        let clock =
+            match provider.GetService<TimeProvider>() with
+            | null -> TimeProvider.System
+            | resolved -> resolved
+
+        let sessionsSnapshot =
+            match box legateOptions.Sessions with
+            | null -> SessionsOptions()
+            | _ -> legateOptions.Sessions
+
+        // Renewal tuning derives from Sessions (60 s lease renewed every
+        // 15 s by default, under-half bound re-checked at use), never from
+        // SessionClientOptions.LeaseDuration, which stays prime-only.
+        let heartbeatOptions = ClaimHeartbeat.fromSessions sessionsSnapshot
+
         // A complete execution binding always owns a chat client.  Startup
         // validation enforces this before actor creation; resolving it here
         // keeps the production factory free of an identity-only fallback.
@@ -1857,6 +1879,8 @@ module internal SessionClientWiring =
                     compactFor
                     agentStore
                     (eraReaderOf provider)
+                    clock
+                    (Some heartbeatOptions)
 
             spawnContext <-
                 fun address context name ->

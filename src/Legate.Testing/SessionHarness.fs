@@ -489,7 +489,7 @@ type SessionHarness
                                         loopOptions
                                         loopDelay
                                         runnerToken
-                                        (fun () -> true)
+                                        (fun () -> Legate.LeaseAdmission.check ())
                                         noDrain
                                         ignore
                                         ignore
@@ -509,7 +509,7 @@ type SessionHarness
                                         loopOptions
                                         loopDelay
                                         runnerToken
-                                        (fun () -> true)
+                                        (fun () -> Legate.LeaseAdmission.check ())
                                         policy
                                         allowed
                             | Some live, Some(:? QuestionAnswer as answer) ->
@@ -523,7 +523,7 @@ type SessionHarness
                                         loopOptions
                                         loopDelay
                                         runnerToken
-                                        (fun () -> true)
+                                        (fun () -> Legate.LeaseAdmission.check ())
                                         policy
                                         allowed
                             | None, Some _ ->
@@ -540,7 +540,7 @@ type SessionHarness
                                         loopOptions
                                         loopDelay
                                         runnerToken
-                                        (fun () -> true)
+                                        (fun () -> Legate.LeaseAdmission.check ())
                                         noDrain
                                         ignore
                                         ignore

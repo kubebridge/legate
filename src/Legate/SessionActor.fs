@@ -2512,8 +2512,11 @@ module internal SessionActor =
         (validateRoute: unit -> unit)
         (props: SessionActorProps)
         (suspend: SuspendDeps)
+        (clock: TimeProvider)
+        (heartbeatOptions: ClaimHeartbeat.ClaimHeartbeatOptions option)
         (mailbox: Actor<SuspendableActorMessage>)
         =
+        ArgumentNullException.ThrowIfNull(clock)
         validateRoute ()
 
         if isNull (box props.Store) then
@@ -2576,6 +2579,76 @@ module internal SessionActor =
         let mutable controlPrime = suspend.PrimeClaim
         let controlReports = Dictionary<int64, TurnId * TurnClaim * string>()
         let completedControlReports = HashSet<string>()
+
+        // Production turn-ownership heartbeat (issue 375): the actor-owned
+        // per-attempt renewal over the spawn-time prime. The view backs the
+        // ambient LeaseAdmission scope the runner reads; the CTS cancels on
+        // every terminal path. Suspended renewal survives WaitingForInput
+        // under the same claim without consuming replies or resuming work.
+        let mutable heartbeatCts: CancellationTokenSource option = None
+        let mutable heartbeatView: ClaimHeartbeat.ClaimLeaseView option = None
+
+        let cancelHeartbeat () : unit =
+            match heartbeatCts with
+            | Some cts ->
+                try
+                    cts.Cancel()
+                with _ ->
+                    ()
+
+                heartbeatCts <- None
+                heartbeatView <- None
+            | None -> ()
+
+        /// Starts the production heartbeat for one attempt over its bound
+        /// prime claim: fire-and-forget renewal that never touches inbox or
+        /// lifecycle state, so detached or terminal loops stay inert. Loss
+        /// pipes back through the existing SuspendableFaulted path with the
+        /// lease-loss cause. The actor thread never awaits the loop.
+        let startHeartbeat (entry: InboxEntry) (attempt: int) (runId: TurnId) (claim: TurnClaim) : unit =
+            match heartbeatOptions with
+            | None -> ()
+            | Some hbOptions ->
+                if isNull (box claim) then
+                    ()
+                else
+                    cancelHeartbeat ()
+
+                    let view = ClaimHeartbeat.ClaimLeaseView(clock, claim)
+                    let cts = new CancellationTokenSource()
+                    heartbeatView <- Some view
+                    heartbeatCts <- Some cts
+
+                    let loopTask =
+                        ClaimHeartbeat.runWithStoreAsync
+                            props.Store
+                            props.Tenant
+                            claim
+                            hbOptions
+                            clock
+                            suspend.Delay
+                            (fun () -> false)
+                            (Some view)
+                            cts.Token
+
+                    loopTask.ContinueWith(fun (completed: Task<ClaimHeartbeat.ClaimHeartbeatDecision>) ->
+                        if completed.IsCompletedSuccessfully then
+                            match completed.Result with
+                            | ClaimHeartbeat.StopLeaseLost ->
+                                try
+                                    suspendSelf.Tell(
+                                        SuspendableFaulted(
+                                            entry,
+                                            TurnLoop.TurnLeaseLostException() :> Exception,
+                                            attempt,
+                                            Some runId
+                                        )
+                                    )
+                                with _ ->
+                                    ()
+                            | ClaimHeartbeat.StopCancelled -> ()
+                            | _ -> ())
+                    |> ignore
 
         let controlStore =
             match props.Store with
@@ -3901,6 +3974,17 @@ module internal SessionActor =
 
             runningTurnId <- Some runTurnId
 
+            // Production heartbeat (issue 375): renew the bound prime
+            // in place for the whole attempt. The prime stays untouched
+            // (#400 owns removal); renewals grant the Sessions duration.
+            match controlReports.TryGetValue entry.Position with
+            | true, (_, boundClaim, _) when not (isNull (box boundClaim)) ->
+                startHeartbeat entry attempt runTurnId boundClaim
+            | _ ->
+                match controlPrime with
+                | Some prime when not (isNull (box prime)) -> startHeartbeat entry attempt runTurnId prime
+                | _ -> ()
+
             let onTurnStarted: TurnLoop.TurnStartedHook option =
                 Some(fun turnId cancellationToken ->
                     journalTurnStartedAsync
@@ -3950,7 +4034,15 @@ module internal SessionActor =
                         | true, (turn, claim, _) -> ControlAdmission.enter (controlAdmission turn entry.Position claim)
                         | _ -> ControlAdmission.enter (fun () -> true)
 
+                    use _leaseScope =
+                        match heartbeatView with
+                        | Some view -> LeaseAdmission.enter (view.IsValid)
+                        | None -> LeaseAdmission.enter (fun () -> true)
+
                     if not (ControlAdmission.check ()) then
+                        raise (TurnLoop.TurnLeaseLostException())
+
+                    if not (LeaseAdmission.check ()) then
                         raise (TurnLoop.TurnLeaseLostException())
 
                     let started =
@@ -4010,10 +4102,20 @@ module internal SessionActor =
                 )
             | _ -> ()
 
+            // Suspended renewal continues under the same claim/view (issue
+            // 375): no new heartbeat, no reply consumption by the renewal
+            // itself. The ambient lease scope below carries the live view
+            // into the resumed runner, so a lost view faults before any
+            // provider call and stale execution never authorizes.
             use _controlScope =
                 match controlReports.TryGetValue parked.Entry.Position with
                 | true, (turn, claim, _) -> ControlAdmission.enter (controlAdmission turn parked.Entry.Position claim)
                 | _ -> ControlAdmission.enter (fun () -> true)
+
+            use _leaseScope =
+                match heartbeatView with
+                | Some view -> LeaseAdmission.enter (view.IsValid)
+                | None -> LeaseAdmission.enter (fun () -> true)
 
             let cursor =
                 match parked.Cursor with
@@ -4059,6 +4161,9 @@ module internal SessionActor =
 
             let runTask =
                 try
+                    if not (LeaseAdmission.check ()) then
+                        raise (TurnLoop.TurnLeaseLostException())
+
                     let started =
                         suspend.RunSuspendable
                             parked.Entry
@@ -5156,9 +5261,11 @@ module internal SessionActor =
                                 // would strand the turn on a missing journal
                                 // entry, so the turn fails with the typed
                                 // reason instead.
+                                cancelHeartbeat ()
                                 settleJournalFailure entry (sprintf "The journal append was rejected: %s." rejection)
                                 return! loop SessionState.Idle None resolved
                             | JournalWriter.JournalFailed failure ->
+                                cancelHeartbeat ()
                                 settleJournalFailure entry failure
                                 return! loop SessionState.Idle None resolved
                         | _ ->
@@ -5169,6 +5276,10 @@ module internal SessionActor =
                             // turn-cell, then snapshot, else the terminal
                             // journals nothing.
                             let settling = resolveSettlingTurnId completion.TurnId
+                            // End the finishing attempt's heartbeat before
+                            // settling: a drained following turn starts its
+                            // own heartbeat after this cancel.
+                            cancelHeartbeat ()
                             let next = settleEntryNow entry carried settling
                             return! loop next None resolved
                     | SessionState.WaitingForInput, Some parked when parked.Cursor.IsNone && parked.Rebuilt.IsSome ->
@@ -5229,6 +5340,7 @@ module internal SessionActor =
                             // here.
                             pendingStop <- None
                             runningTurnId <- None
+                            cancelHeartbeat ()
                             notifySettled selected
 
                             match settling with
@@ -5264,6 +5376,7 @@ module internal SessionActor =
                             // disposition as the loop state only.
                             pendingStop <- None
                             runningTurnId <- None
+                            cancelHeartbeat ()
 
                             if outcome.State = SessionState.Closed then
                                 pendingAgent <- None
@@ -5276,6 +5389,7 @@ module internal SessionActor =
                             // Rejected: a takeover winner owns the turn now.
                             // Zero effects from this loser.
                             runningTurnId <- None
+                            cancelHeartbeat ()
                             return! loop state None resolved
                         | None ->
                             // No capability or claim (unclaimed test shells)
@@ -5295,6 +5409,7 @@ module internal SessionActor =
 
                             pendingStop <- None
                             runningTurnId <- None
+                            cancelHeartbeat ()
                             notifySettled selected
                             dispatchCompletion props selected |> ignore
 
@@ -5565,6 +5680,7 @@ module internal SessionActor =
                             notifySettled result
                             dispatchCompletion props result |> ignore
                             retireControl parked.Entry
+                            cancelHeartbeat ()
 
                             awaitTask (
                                 props.Store.UpdateSessionState(
@@ -5679,6 +5795,8 @@ module internal SessionActor =
                             ()
                     | None -> ()
 
+                    cancelHeartbeat ()
+
                     // A recorded stop dies with the session: Closed settles
                     // nothing further. A recorded rebind dies with it too:
                     // Closed rejects it.
@@ -5767,7 +5885,7 @@ module internal SessionActor =
         | _ -> loop initialState initialSuspended (HashSet<string>())
 
     let behaviorWithSuspend props suspend mailbox =
-        behaviorWithSuspendRouted (fun () -> ()) props suspend mailbox
+        behaviorWithSuspendRouted (fun () -> ()) props suspend TimeProvider.System None mailbox
 
     /// Asks a suspendable actor with the shared timeout, honouring the
     /// caller's cancellation. Mirrors askAsync for the suspendable protocol.
@@ -6320,10 +6438,13 @@ module internal SessionActor =
         (compactFor: SessionId -> string -> CompactDeps option)
         (agentStore: IAgentStore | null)
         (eraMarked: CompletionEra.CompletionEraReader)
+        (clock: TimeProvider)
+        (heartbeatOptions: ClaimHeartbeat.ClaimHeartbeatOptions option)
         : (string -> IActorContext -> string -> IActorRef) =
         ArgumentNullException.ThrowIfNull(store)
         ArgumentNullException.ThrowIfNull(eventStore)
         ArgumentNullException.ThrowIfNull(delay)
+        ArgumentNullException.ThrowIfNull(clock)
 
         if String.IsNullOrWhiteSpace claimOwner then
             raise (ArgumentException("The claim owner must be a non-empty string.", nameof claimOwner))
@@ -6587,7 +6708,8 @@ module internal SessionActor =
 
                 match refusal with
                 | Some error -> spawn context name (blocked error)
-                | None -> spawn context name (behaviorWithSuspendRouted validateRoute props suspend)
+                | None ->
+                    spawn context name (behaviorWithSuspendRouted validateRoute props suspend clock heartbeatOptions)
             else
                 spawn context name (actorOf (fun (_: obj) -> ()))
 
@@ -6617,3 +6739,5 @@ module internal SessionActor =
             compactFor
             agentStore
             eraMarked
+            TimeProvider.System
+            None

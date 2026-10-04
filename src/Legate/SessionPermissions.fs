@@ -264,7 +264,7 @@ module internal SessionPermissions =
                                 merged
                                 loopDelay
                                 runnerToken
-                                (fun () -> true)
+                                (fun () -> LeaseAdmission.check ())
                                 drain
                                 ignore
                                 consume
@@ -311,7 +311,7 @@ module internal SessionPermissions =
                                 merged
                                 loopDelay
                                 runnerToken
-                                (fun () -> true)
+                                (fun () -> LeaseAdmission.check ())
                                 gate
                                 allowed
                     | Some live, Some(:? QuestionAnswer as answer) ->
@@ -338,7 +338,7 @@ module internal SessionPermissions =
                                 merged
                                 loopDelay
                                 runnerToken
-                                (fun () -> true)
+                                (fun () -> LeaseAdmission.check ())
                                 gate
                                 allowed
                     | None, Some _ ->
@@ -368,7 +368,7 @@ module internal SessionPermissions =
                                 merged
                                 loopDelay
                                 runnerToken
-                                (fun () -> true)
+                                (fun () -> LeaseAdmission.check ())
                                 drain
                                 ignore
                                 consume

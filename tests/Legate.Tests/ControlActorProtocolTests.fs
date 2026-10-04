@@ -417,6 +417,8 @@ module ControlActorProtocolTests =
                     (fun _ _ -> None)
                     null
                     (fun _ _ _ -> Task.FromResult false)
+                    System.TimeProvider.System
+                    None
 
             use system = ActorSystem.Create("route-" + Guid.NewGuid().ToString("N"))
 
