@@ -705,3 +705,134 @@ let ``Actor runner keeps its always-live default`` () =
         runner entry CancellationToken.None |> fun task -> task.GetAwaiter().GetResult()
 
     result.AssistantText |> should equal "done"
+
+// ──────────────────────────────────────────────────────────────────────────
+// Fenced nonterminal writes (issue 377): atomic consume, lifecycle, grant
+
+[<Fact>]
+let ``Fenced nonterminal writes land under the live claim`` () =
+    let _, store, _ = createStores ()
+    let session = createSession store
+    appendUser store session.Id "first"
+    let loser = claimTurn store session.Id "owner-a"
+
+    let pending =
+        store.ReadPendingInbox(tenant, session.Id, CancellationToken.None)
+        |> fun task -> task.GetAwaiter().GetResult()
+
+    let positions =
+        pending |> Seq.map (fun entry -> entry.Position) |> Array.ofSeq :> IReadOnlyList<int64>
+
+    let consumed =
+        ClaimFence.consumeInboxAsync store tenant loser session.Id positions CancellationToken.None
+        |> fun task -> task.GetAwaiter().GetResult()
+
+    consumed |> should equal true
+
+    let running =
+        ClaimFence.updateSessionStateAsync store tenant loser session.Id SessionState.Running CancellationToken.None
+        |> fun task -> task.GetAwaiter().GetResult()
+
+    running |> should equal true
+
+    let waiting =
+        ClaimFence.updateSessionStateAsync
+            store
+            tenant
+            loser
+            session.Id
+            SessionState.WaitingForInput
+            CancellationToken.None
+        |> fun task -> task.GetAwaiter().GetResult()
+
+    waiting |> should equal true
+
+    let granted =
+        ClaimFence.grantSessionToolAsync store tenant loser session.Id "exec" CancellationToken.None
+        |> fun task -> task.GetAwaiter().GetResult()
+
+    granted |> should equal true
+
+    let stored =
+        store.GetSession(tenant, session.Id, CancellationToken.None)
+        |> fun task -> task.GetAwaiter().GetResult()
+
+    match stored with
+    | null -> failwith "Expected the session."
+    | session ->
+        session.State |> should equal SessionState.WaitingForInput
+        session.PermissionGrants |> should contain "exec"
+
+[<Fact>]
+let ``Takeover loser fenced nonterminal writes fail closed with zero effects`` () =
+    let clock, store, _ = createStores ()
+    let session = createSession store
+    appendUser store session.Id "first"
+    appendUser store session.Id "second"
+
+    let loser = claimTurn store session.Id "owner-a"
+    clock.Advance(TimeSpan.FromSeconds 121.0)
+    let winner = claimTurn store session.Id "owner-b"
+
+    winner.TurnId |> should not' (equal loser.TurnId)
+
+    let pending =
+        store.ReadPendingInbox(tenant, session.Id, CancellationToken.None)
+        |> fun task -> task.GetAwaiter().GetResult()
+
+    let pendingBefore = pending.Count
+
+    let positions =
+        pending |> Seq.map (fun entry -> entry.Position) |> Array.ofSeq :> IReadOnlyList<int64>
+
+    let loserConsume =
+        ClaimFence.consumeInboxAsync store tenant loser session.Id positions CancellationToken.None
+        |> fun task -> task.GetAwaiter().GetResult()
+
+    loserConsume |> should equal false
+
+    let loserRunning =
+        ClaimFence.updateSessionStateAsync store tenant loser session.Id SessionState.Running CancellationToken.None
+        |> fun task -> task.GetAwaiter().GetResult()
+
+    loserRunning |> should equal false
+
+    let loserGrant =
+        ClaimFence.grantSessionToolAsync store tenant loser session.Id "exec" CancellationToken.None
+        |> fun task -> task.GetAwaiter().GetResult()
+
+    loserGrant |> should equal false
+
+    let pendingAfter =
+        store.ReadPendingInbox(tenant, session.Id, CancellationToken.None)
+        |> fun task -> task.GetAwaiter().GetResult()
+
+    pendingAfter.Count |> should equal pendingBefore
+
+    let stored =
+        store.GetSession(tenant, session.Id, CancellationToken.None)
+        |> fun task -> task.GetAwaiter().GetResult()
+
+    match stored with
+    | null -> failwith "Expected the session."
+    | session ->
+        session.PermissionGrants |> should not' (contain "exec")
+        session.State |> should not' (equal SessionState.Running)
+
+    let winnerConsume =
+        ClaimFence.consumeInboxAsync store tenant winner session.Id positions CancellationToken.None
+        |> fun task -> task.GetAwaiter().GetResult()
+
+    winnerConsume |> should equal true
+
+    let winnerRunning =
+        ClaimFence.updateSessionStateAsync store tenant winner session.Id SessionState.Running CancellationToken.None
+        |> fun task -> task.GetAwaiter().GetResult()
+
+    winnerRunning |> should equal true
+
+    let winnerGrant =
+        ClaimFence.grantSessionToolAsync store tenant winner session.Id "exec" CancellationToken.None
+        |> fun task -> task.GetAwaiter().GetResult()
+
+    winnerGrant |> should equal true

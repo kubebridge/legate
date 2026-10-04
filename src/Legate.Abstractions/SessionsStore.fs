@@ -392,16 +392,28 @@ type CompletionOutboxEntry =
 /// change and its timestamp land together or not at all.</description></item>
 /// <item><description><b>GrantSessionTool</b> is atomic: the grant and its
 /// timestamp land together or not at all.</description></item>
+/// <item><description><b>ConsumeInboxUnderClaim</b>,
+/// <b>UpdateSessionStateUnderClaim</b>, and
+/// <b>GrantSessionToolUnderClaim</b> are atomic: the claim token plus the
+/// current turn and attempt are checked in the same statement or
+/// transaction as the write, so a takeover between a preliminary
+/// verification and the write rejects atomically with zero effects.
+/// A retry under the same live claim is idempotent: an already-consumed
+/// position, the already-applied state, or the already-stored grant
+/// observes the held outcome with no further effects.</description></item>
 /// </list>
 ///
 /// <para>Fencing rules implementations and callers must honour: every side
-/// effect performed on behalf of a turn (checkpoint, settle, abort, and
-/// any tool call or journal write the runtime makes after claiming) must
-/// verify the claim token at the last moment, immediately before the
-/// effect. A correlation id is evidence, not authority; only
-/// <see cref="T:Legate.TurnClaim" />.Token is. A stale token must never
-/// produce an effect: renew, checkpoint, settle, and abort return the
-/// lost/rejected outcomes instead of acting. Completion delivery is fenced
+/// effect performed on behalf of a turn (checkpoint, settle, abort,
+/// fenced inbox consumption, fenced execution lifecycle, fenced
+/// persistent grants, and any tool call or journal write the runtime
+/// makes after claiming) must verify the claim token at the last moment,
+/// immediately before the effect. A correlation id is evidence, not
+/// authority; only <see cref="T:Legate.TurnClaim" />.Token is. A stale
+/// token must never produce an effect: renew, checkpoint, settle, abort,
+/// and the fenced nonterminal writes return the lost/rejected outcomes
+/// instead of acting. Custom providers implement the fencing with no
+/// unsafe fallback. Completion delivery is fenced
 /// the same way on the outbox lease: the re-driver claims a row, verifies
 /// the lease owner at the last moment before
 /// <see cref="M:Legate.ISessionCompletionSink.Notify*" />, notifies, then
@@ -722,6 +734,89 @@ type ISessionStore =
     /// <exception cref="T:System.ArgumentNullException">The claim is null.</exception>
     abstract AbortTurn:
         tenant: TenantId * claim: TurnClaim * cancellationToken: CancellationToken -> Task<TurnLeaseState>
+
+    // ── Fenced nonterminal writes ──
+
+    /// Consumes inbox entries under the claim: the turn-owned Inject and
+    /// reply consumption the runtime folds or resumes. Fenced: the token
+    /// plus the current turn and attempt are checked in the same statement
+    /// or transaction as the write, so a takeover between a preliminary
+    /// verification and the write rejects atomically with zero effects.
+    /// Atomic and idempotent: consuming an already-consumed position under
+    /// the same live claim observes the held outcome with no further
+    /// effects. A stale or missing claim consumes nothing and returns the
+    /// lost or missing lease state. Host and idle paths keep the unfenced
+    /// <see cref="M:Legate.ISessionStore.MarkInboxConsumed*" />.
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="claim">The claim fencing the consumption. Must not be null.</param>
+    /// <param name="sessionId">The session whose entries to consume.</param>
+    /// <param name="positions">The positions to consume. Must not be null.</param>
+    /// <param name="cancellationToken">Token that abandons the consume.</param>
+    /// <returns>The lease state after the fenced consume: held when the consume landed, lost or missing otherwise.</returns>
+    /// <exception cref="T:System.ArgumentNullException">The claim or the position list is null.</exception>
+    /// <exception cref="T:Legate.SessionNotFoundException">The session id does not exist in this tenant.</exception>
+    abstract ConsumeInboxUnderClaim:
+        tenant: TenantId *
+        claim: TurnClaim *
+        sessionId: SessionId *
+        positions: IReadOnlyList<int64> *
+        cancellationToken: CancellationToken ->
+            Task<TurnLeaseState>
+
+    /// Updates the execution-owned lifecycle state under the claim:
+    /// <see cref="F:Legate.SessionState.Running" /> or
+    /// <see cref="F:Legate.SessionState.WaitingForInput" /> only. Fenced:
+    /// the token plus the current turn and attempt are checked in the same
+    /// statement or transaction as the write, so a takeover between a
+    /// preliminary verification and the write rejects atomically with zero
+    /// effects. Atomic: the state change and its timestamp land together.
+    /// A retry under the same live claim observes the held outcome. Host
+    /// and idle lifecycle paths keep the unfenced
+    /// <see cref="M:Legate.ISessionStore.UpdateSessionState*" />.
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="claim">The claim fencing the update. Must not be null.</param>
+    /// <param name="sessionId">The session to update.</param>
+    /// <param name="state">The new execution-owned lifecycle state: Running or WaitingForInput.</param>
+    /// <param name="cancellationToken">Token that abandons the update.</param>
+    /// <returns>The lease state after the fenced update: held when the update landed, lost or missing otherwise.</returns>
+    /// <exception cref="T:System.ArgumentNullException">The claim is null.</exception>
+    /// <exception cref="T:Legate.SessionNotFoundException">The session id does not exist in this tenant.</exception>
+    /// <exception cref="T:Legate.InvalidSessionStateException">The session is Closed, or the state is not execution-owned.</exception>
+    abstract UpdateSessionStateUnderClaim:
+        tenant: TenantId *
+        claim: TurnClaim *
+        sessionId: SessionId *
+        state: SessionState *
+        cancellationToken: CancellationToken ->
+            Task<TurnLeaseState>
+
+    /// Records an AllowForSession grant under the claim: the tool name joins
+    /// the session's <see cref="P:Legate.Session.PermissionGrants" /> and
+    /// stays there across restarts. Fenced: the token plus the current turn
+    /// and attempt are checked in the same statement or transaction as the
+    /// write, so a takeover between a preliminary verification and the
+    /// write rejects atomically with zero effects. Atomic and idempotent:
+    /// the grant and the <see cref="T:Legate.Session" />.UpdatedAt stamp
+    /// land together, and granting a tool name twice stores it once while
+    /// still observing the held outcome. Host permission paths keep the
+    /// unfenced <see cref="M:Legate.ISessionStore.GrantSessionTool*" />.
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="claim">The claim fencing the grant. Must not be null.</param>
+    /// <param name="sessionId">The session to grant the tool for.</param>
+    /// <param name="toolName">The tool name the host allowed for the session. Must be a non-empty string.</param>
+    /// <param name="cancellationToken">Token that abandons the grant.</param>
+    /// <returns>The lease state after the fenced grant: held when the grant landed, lost or missing otherwise.</returns>
+    /// <exception cref="T:System.ArgumentException">The tool name is null, empty, or whitespace.</exception>
+    /// <exception cref="T:System.ArgumentNullException">The claim is null.</exception>
+    /// <exception cref="T:Legate.SessionNotFoundException">The session id does not exist in this tenant.</exception>
+    /// <exception cref="T:Legate.InvalidSessionStateException">The session is Closed.</exception>
+    abstract GrantSessionToolUnderClaim:
+        tenant: TenantId *
+        claim: TurnClaim *
+        sessionId: SessionId *
+        toolName: string *
+        cancellationToken: CancellationToken ->
+            Task<TurnLeaseState>
 
     // ── Completion outbox ──
 

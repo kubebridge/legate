@@ -1157,6 +1157,130 @@ type InMemorySessionStore(database: InMemoryDatabase) =
                 | Choice3Of3() -> TurnLeaseMissing claim.TurnId :> TurnLeaseState)
             |> ok
 
+        member _.ConsumeInboxUnderClaim(tenant, claim, sessionId, positions, _) =
+            if isNull (box claim) then
+                raise (ArgumentNullException(nameof claim))
+
+            if isNull (box positions) then
+                raise (ArgumentNullException(nameof positions))
+
+            lock database.Gate (fun () ->
+                requireSession tenant sessionId |> ignore
+
+                match resolve tenant claim with
+                | Choice1Of3(sid, live) when sid = sessionId ->
+                    if live.ExpiresAt <= database.UtcNow then
+                        TurnLeaseLost(claim.TurnId, "expired") :> TurnLeaseState
+                    elif live.Attempt <> claim.Attempt then
+                        TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState
+                    else
+                        match database.Inboxes.TryGetValue((tenant, sessionId)) with
+                        | true, entries ->
+                            let wanted = HashSet positions
+
+                            for index in 0 .. entries.Count - 1 do
+                                let entry = entries[index]
+
+                                if not entry.Consumed && wanted.Contains entry.Position then
+                                    entries[index] <- { entry with Consumed = true }
+                        | false, _ -> ()
+
+                        TurnLeaseHeld live :> TurnLeaseState
+                | Choice1Of3(_, _) -> TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState
+                | Choice2Of3() -> TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState
+                | Choice3Of3() -> TurnLeaseMissing claim.TurnId :> TurnLeaseState)
+            |> ok
+
+        member _.UpdateSessionStateUnderClaim(tenant, claim, sessionId, state, _) =
+            if isNull (box claim) then
+                raise (ArgumentNullException(nameof claim))
+
+            if state <> SessionState.Running && state <> SessionState.WaitingForInput then
+                raise (
+                    InvalidSessionStateException(
+                        sessionId,
+                        nameof state,
+                        "Only execution-owned states (Running, WaitingForInput) update under a claim."
+                    )
+                )
+
+            lock database.Gate (fun () ->
+                let session = requireSession tenant sessionId
+
+                if session.State = SessionState.Closed then
+                    raise (
+                        InvalidSessionStateException(
+                            sessionId,
+                            nameof session.State,
+                            "A closed session cannot leave the Closed state."
+                        )
+                    )
+
+                match resolve tenant claim with
+                | Choice1Of3(sid, live) when sid = sessionId ->
+                    if live.ExpiresAt <= database.UtcNow then
+                        TurnLeaseLost(claim.TurnId, "expired") :> TurnLeaseState
+                    elif live.Attempt <> claim.Attempt then
+                        TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState
+                    else
+                        ControlTargetProtocol.requireTransition sessionId state (controlState tenant sessionId)
+
+                        let updated =
+                            { session with
+                                State = state
+                                UpdatedAt = database.UtcNow
+                            }
+
+                        database.Sessions[(tenant, sessionId)] <- updated
+                        TurnLeaseHeld live :> TurnLeaseState
+                | Choice1Of3(_, _) -> TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState
+                | Choice2Of3() -> TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState
+                | Choice3Of3() -> TurnLeaseMissing claim.TurnId :> TurnLeaseState)
+            |> ok
+
+        member _.GrantSessionToolUnderClaim(tenant, claim, sessionId, toolName, _) =
+            if isNull (box claim) then
+                raise (ArgumentNullException(nameof claim))
+
+            if String.IsNullOrWhiteSpace toolName then
+                raise (ArgumentException("The tool name must be a non-empty string.", nameof toolName))
+
+            lock database.Gate (fun () ->
+                let session = requireSession tenant sessionId
+
+                match resolve tenant claim with
+                | Choice1Of3(sid, live) when sid = sessionId ->
+                    if live.ExpiresAt <= database.UtcNow then
+                        TurnLeaseLost(claim.TurnId, "expired") :> TurnLeaseState
+                    elif live.Attempt <> claim.Attempt then
+                        TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState
+                    elif session.State = SessionState.Closed then
+                        raise (
+                            InvalidSessionStateException(
+                                sessionId,
+                                nameof session.State,
+                                "A closed session carries no grant memory."
+                            )
+                        )
+                    else
+                        let grants = ResizeArray<string>(storedGrants session)
+
+                        if not (grants.Contains toolName) then
+                            grants.Add toolName
+
+                        let updated =
+                            { session with
+                                PermissionGrants = grants :> IReadOnlyList<string>
+                                UpdatedAt = database.UtcNow
+                            }
+
+                        database.Sessions[(tenant, sessionId)] <- updated
+                        TurnLeaseHeld live :> TurnLeaseState
+                | Choice1Of3(_, _) -> TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState
+                | Choice2Of3() -> TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState
+                | Choice3Of3() -> TurnLeaseMissing claim.TurnId :> TurnLeaseState)
+            |> ok
+
         member _.EnqueueCompletionOutbox(tenant, destinationId, completion, _) =
             CompletionDestinationRules.Validate destinationId
 
