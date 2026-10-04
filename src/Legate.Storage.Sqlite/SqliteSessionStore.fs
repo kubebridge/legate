@@ -14,12 +14,14 @@ open Microsoft.Data.Sqlite
 // the completion outbox, and the capacity counts. One live claim per
 // session and one open turn per session, mirroring the in-memory
 // implementation: ClaimNextTurn consumes the head pending user message into
-// a new turn, or the head pending reply into a resume of the open turn with
-// the attempt incremented; a live unexpired claim makes every further claim
-// the missing branch. Every transition that touches more than one row runs
-// as a single transaction under the database gate, so claims and
-// settlements are atomic and a takeover race leaves the loser with zero
-// effects. Every SqliteException funnels through the SqliteErrors boundary.
+// a new turn under its durable real-turn identity (stamped at accept;
+// legacy rows bind once at first claim), or the head pending reply into a
+// resume of the open turn with the attempt incremented; a live unexpired
+// claim makes every further claim the missing branch. Every transition that
+// touches more than one row runs as a single transaction under the database
+// gate, so claims and settlements are atomic and a takeover race leaves the
+// loser with zero effects. Every SqliteException funnels through the
+// SqliteErrors boundary.
 
 /// What a fenced call against the claim's turn resolved to.
 type private ClaimResolution =
@@ -135,6 +137,20 @@ type SqliteSessionStore(database: SqliteDatabase) =
         let appendedAt = ofIso (reader.GetString(5))
         let payload = SqliteJson.deserialize<InboxPayload> payloadJson
 
+        // Real-turn identity (issue 374): column 6 is turn_id when the
+        // migration has landed; older readers see FieldCount 6 and legacy
+        // rows read as the default sentinel.
+        let turnId =
+            if reader.FieldCount > 6 && not (reader.IsDBNull(6)) then
+                let text = reader.GetString(6)
+
+                if String.IsNullOrWhiteSpace(text) then
+                    Unchecked.defaultof<TurnId>
+                else
+                    TurnId.Parse(text)
+            else
+                Unchecked.defaultof<TurnId>
+
         {
             SessionId = sessionId
             Position = position
@@ -142,6 +158,7 @@ type SqliteSessionStore(database: SqliteDatabase) =
             Delivery = delivery
             Consumed = consumed
             AppendedAt = appendedAt
+            TurnId = turnId
         }
 
     let readOutboxEntry (reader: SqliteDataReader) : CompletionOutboxEntry =
@@ -283,14 +300,14 @@ type SqliteSessionStore(database: SqliteDatabase) =
         (connection: SqliteConnection)
         (transaction: SqliteTransaction | null)
         (sessionId: SessionId)
-        : (int64 * InboxPayload) option =
+        : (int64 * InboxPayload * TurnId) option =
         use command = connection.CreateCommand()
 
         if not (isNull (box transaction)) then
             command.Transaction <- transaction
 
         command.CommandText <-
-            $"SELECT position, payload_json FROM \"%s{inboxTable ()}\" WHERE session_id = $session AND consumed = 0 ORDER BY position LIMIT 1"
+            $"SELECT position, payload_json, turn_id FROM \"%s{inboxTable ()}\" WHERE session_id = $session AND consumed = 0 ORDER BY position LIMIT 1"
 
         command.Parameters.AddWithValue("$session", sessionId.Value) |> ignore
 
@@ -299,7 +316,19 @@ type SqliteSessionStore(database: SqliteDatabase) =
         if reader.Read() then
             let position = reader.GetInt64(0)
             let payload = SqliteJson.deserialize<InboxPayload> (reader.GetString(1))
-            Some(position, payload)
+
+            let stamped =
+                if reader.FieldCount > 2 && not (reader.IsDBNull(2)) then
+                    let text = reader.GetString(2)
+
+                    if String.IsNullOrWhiteSpace(text) then
+                        Unchecked.defaultof<TurnId>
+                    else
+                        TurnId.Parse(text)
+                else
+                    Unchecked.defaultof<TurnId>
+
+            Some(position, payload, stamped)
         else
             None
 
@@ -1000,11 +1029,24 @@ type SqliteSessionStore(database: SqliteDatabase) =
                             let now = database.UtcNow
                             let payloadJson = SqliteJson.serialize payload
 
+                            // Real-turn identity (issue 374): user messages
+                            // stamp a fresh durable TurnId at accept; replies
+                            // carry null (the default sentinel).
+                            let turnIdText: string | null =
+                                match payload with
+                                | :? UserMessagePayload -> TurnId.New().ToString()
+                                | _ -> null
+
+                            let turnId =
+                                match turnIdText with
+                                | null -> Unchecked.defaultof<TurnId>
+                                | text -> TurnId.Parse(text)
+
                             use insert = connection.CreateCommand()
                             insert.Transaction <- transaction
 
                             insert.CommandText <-
-                                $"INSERT INTO \"%s{inboxTable ()}\" (session_id, position, tenant, payload_json, delivery_mode, consumed, appended_at) VALUES ($session, $position, $tenant, $payload, $delivery, 0, $at)"
+                                $"INSERT INTO \"%s{inboxTable ()}\" (session_id, position, tenant, payload_json, delivery_mode, consumed, appended_at, turn_id) VALUES ($session, $position, $tenant, $payload, $delivery, 0, $at, $turn)"
 
                             insert.Parameters.AddWithValue("$session", sessionId.Value) |> ignore
                             insert.Parameters.AddWithValue("$position", position) |> ignore
@@ -1012,6 +1054,12 @@ type SqliteSessionStore(database: SqliteDatabase) =
                             insert.Parameters.AddWithValue("$payload", payloadJson) |> ignore
                             insert.Parameters.AddWithValue("$delivery", deliveryName delivery) |> ignore
                             insert.Parameters.AddWithValue("$at", toIso now) |> ignore
+
+                            if isNull (box turnIdText) then
+                                insert.Parameters.AddWithValue("$turn", DBNull.Value) |> ignore
+                            else
+                                insert.Parameters.AddWithValue("$turn", turnIdText) |> ignore
+
                             insert.ExecuteNonQuery() |> ignore
                             transaction.Commit()
 
@@ -1022,6 +1070,7 @@ type SqliteSessionStore(database: SqliteDatabase) =
                                 Delivery = delivery
                                 Consumed = false
                                 AppendedAt = now
+                                TurnId = turnId
                             })
                 with
                 | :? LegateException as ex -> return raise ex
@@ -1039,7 +1088,7 @@ type SqliteSessionStore(database: SqliteDatabase) =
                             use command = connection.CreateCommand()
 
                             command.CommandText <-
-                                $"SELECT session_id, position, payload_json, delivery_mode, consumed, appended_at FROM \"%s{inboxTable ()}\" WHERE session_id = $session AND consumed = 0 ORDER BY position"
+                                $"SELECT session_id, position, payload_json, delivery_mode, consumed, appended_at, turn_id FROM \"%s{inboxTable ()}\" WHERE session_id = $session AND consumed = 0 ORDER BY position"
 
                             command.Parameters.AddWithValue("$session", sessionId.Value) |> ignore
 
@@ -1112,7 +1161,7 @@ type SqliteSessionStore(database: SqliteDatabase) =
                                 let openTurn = openTurnRow connection transaction tenant sessionId
 
                                 match pending, openTurn with
-                                | Some(position, (:? ReplyPayload as _reply)), Some(turnId, attempt) ->
+                                | Some(position, (:? ReplyPayload as _reply), _), Some(turnId, attempt) ->
                                     consumePosition connection transaction sessionId position
                                     let nextAttempt = attempt + 1
                                     let token = mintToken ()
@@ -1141,21 +1190,40 @@ type SqliteSessionStore(database: SqliteDatabase) =
                                     stampCurrentTurn connection transaction tenant sessionId (Some turnId) now
                                     transaction.Commit()
                                     TurnLeaseRenewed claim :> TurnLeaseState
-                                | Some(position, (:? UserMessagePayload as _message)), _ ->
+                                | Some(position, (:? UserMessagePayload as _message), stamped), _ ->
                                     consumePosition connection transaction sessionId position
+
+                                    // Real-turn identity (issue 374): claim
+                                    // under the entry's durable identity;
+                                    // legacy rows bind once here.
+                                    let isDefault = isNull (box stamped.Value)
+
+                                    let turnId = if isDefault then TurnId.New() else stamped
+
+                                    if isDefault then
+                                        use backfill = connection.CreateCommand()
+                                        backfill.Transaction <- transaction
+
+                                        backfill.CommandText <-
+                                            $"UPDATE \"%s{inboxTable ()}\" SET turn_id = $turn WHERE session_id = $session AND position = $position"
+
+                                        backfill.Parameters.AddWithValue("$turn", turnId.Value) |> ignore
+                                        backfill.Parameters.AddWithValue("$session", sessionId.Value) |> ignore
+                                        backfill.Parameters.AddWithValue("$position", position) |> ignore
+                                        backfill.ExecuteNonQuery() |> ignore
 
                                     // A stale open turn from a lapsed claim is abandoned.
                                     use clear = connection.CreateCommand()
                                     clear.Transaction <- transaction
 
                                     clear.CommandText <-
-                                        $"DELETE FROM \"%s{turnsTable ()}\" WHERE session_id = $session AND tenant = $tenant AND status IN (%s{nonTerminalFilter})"
+                                        $"DELETE FROM \"%s{turnsTable ()}\" WHERE session_id = $session AND tenant = $tenant AND status IN (%s{nonTerminalFilter}) AND turn_id <> $turn"
 
                                     clear.Parameters.AddWithValue("$session", sessionId.Value) |> ignore
                                     clear.Parameters.AddWithValue("$tenant", tenant.Value) |> ignore
+                                    clear.Parameters.AddWithValue("$turn", turnId.Value) |> ignore
                                     clear.ExecuteNonQuery() |> ignore
 
-                                    let turnId = TurnId.New()
                                     let token = mintToken ()
 
                                     let claim =

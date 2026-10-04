@@ -17,6 +17,7 @@
     <Compile Include="SessionControlTargets.fs" />
     <Compile Include="CompletionDestination.fs" />
     <Compile Include="ExecutionSettlements.fs" />
+    <Compile Include="InboxRealTurn.fs" />
     <Compile Include="MigrationServiceExtensions.fs" />
   </ItemGroup>
 

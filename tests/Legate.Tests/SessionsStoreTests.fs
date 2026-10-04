@@ -282,6 +282,10 @@ type FakeSessionStore() =
                         Delivery = delivery
                         Consumed = false
                         AppendedAt = sessionStamp
+                        TurnId =
+                            match payload with
+                            | :? UserMessagePayload -> TurnId.New()
+                            | _ -> Unchecked.defaultof<TurnId>
                     }
 
                 inbox[key t sessionId].Add entry

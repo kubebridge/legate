@@ -227,12 +227,22 @@ cannot claim a turn, consume inbox input, or settle one, so stale execution
 cannot borrow it to consume winner input, alter lifecycle or agent, or
 close the session.
 
-Execution writes stay on the ambient prime claim (`Append` under the turn
-claim token) until real-turn claims land in #400: the prime, its re-prime,
-and the claim-fenced settlement boundary in `SessionSettlement` are
-unchanged here. Crash-path terminal writes for interrupted turns stay
-claim-fenced for the same reason: only the token proves the writer is no
-takeover loser. Suspension is not idle authority: a suspended turn still
+Execution writes fence on the ambient prime claim (`Append` under the turn
+claim token) while attributing to the real durable turn: every accepted user
+message carries a stable `TurnId` stamped at accept on its `InboxEntry`, and
+`ClaimNextTurn` claims under that stamped identity (never a fresh synthetic
+bootstrap), so distinct queued entries yield distinct durable `TurnId`s.
+`Session.CurrentTurnId` plus the turn row own execution, suspension, resume,
+restart, takeover, and settlement through the existing claim-token fence with
+the #363 committed outcome; execution journal events carry the real `TurnId`.
+Reply entries carry the default sentinel and resume the suspended real turn
+with attempt+1, never starting one. The prime, its re-prime, and the
+claim-fenced settlement boundary in `SessionSettlement` are unchanged here
+as the handoff #400 removes the prime onto: #400 re-anchors execution
+fencing from the prime claim onto these real-turn claims without changing
+the attribution defined here. Crash-path terminal writes for interrupted
+turns stay claim-fenced for the same reason: only the token proves the writer
+is no takeover loser. Suspension is not idle authority: a suspended turn still
 owns the history, so on-demand compaction no-ops while waiting for input.
 
 ### Store contracts
@@ -242,17 +252,18 @@ in-memory implementations implement: session CRUD with tenant-scoped list
 paging (`SessionPage`), the session inbox in front of the turn queue
 (`AppendInboxMessage`, `ReadPendingInbox`, `MarkInboxConsumed`, with the
 `InboxEntry` envelope carrying a `UserMessage` or a `Reply` plus its
-`DeliveryMode`), turn claims under a lease, dispatch candidates, and the
-capacity count queries. Every method takes the `TenantId` the data belongs
-to; isolation across tenants is enforced in the stores, not only in the
-host.
+`DeliveryMode` and its stable real-turn `TurnId`), turn claims under a lease,
+dispatch candidates, and the capacity count queries. Every method takes the
+`TenantId` the data belongs to; isolation across tenants is enforced in the
+stores, not only in the host.
 
 - **Atomicity.** Inbox append, `ClaimNextTurn`, `RenewClaim` /
   `ObserveAndRenewClaim`, `CheckpointUsage`, `SettleTurn`, and
   `UpdateSessionState` must be atomic: each lands in one transaction, so a
   reader never observes a half-applied step. `ClaimNextTurn` in particular
-  hands a turn to exactly one caller; a loser observes no claimable turn,
-  never a double claim.
+  hands a turn to exactly one caller bound to the accepted entry's durable
+  real-turn identity; a loser observes no claimable turn, never a double
+  claim, and distinct queued entries never share an identity.
 - **Fencing.** The claim token lives on `TurnClaim` (with its owner, expiry,
   and attempt) and nowhere else; it is opaque: stores mint it, callers carry
   it verbatim, nothing parses it. Every side effect on behalf of a turn

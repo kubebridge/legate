@@ -40,6 +40,7 @@ let private goldenEntry (text: string) (position: int64) : InboxEntry =
         Delivery = DeliveryMode.Queue
         Consumed = false
         AppendedAt = fixedTimestamp
+        TurnId = TurnId.Parse("01ARZ3NDEKTSV4RRFFQ69G5FAX")
     }
 
 /// Builds a stored session with fixed ids and timestamps.

@@ -656,6 +656,7 @@ let ``Actor runner with a dead lease faults without calling the provider`` () =
             Delivery = DeliveryMode.Queue
             Consumed = false
             AppendedAt = startInstant
+            TurnId = TurnId.New()
         }
 
     let callsBefore = client.Calls
@@ -697,6 +698,7 @@ let ``Actor runner keeps its always-live default`` () =
             Delivery = DeliveryMode.Queue
             Consumed = false
             AppendedAt = startInstant
+            TurnId = TurnId.New()
         }
 
     let result =

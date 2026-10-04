@@ -2604,10 +2604,18 @@ module internal SessionActor =
         let bindControl (entry: InboxEntry) =
             match controlStore, controlPrime with
             | Some control, Some claim ->
+                // Real-turn identity (issue 374): the durable TurnId stamped
+                // at accept owns execution; the in-memory report reuses it so
+                // restart and recovery agree with the store. Legacy entries
+                // without a stamped identity mint once here.
                 let turn =
                     match controlReports.TryGetValue entry.Position with
                     | true, (turn, _, _) -> turn
-                    | _ -> TurnId.New()
+                    | _ ->
+                        if isNull (box entry.TurnId.Value) then
+                            TurnId.New()
+                        else
+                            entry.TurnId
 
                 let bound =
                     awaitTask (

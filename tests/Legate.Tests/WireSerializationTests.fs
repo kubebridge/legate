@@ -33,6 +33,7 @@ let private textEntry (text: string) (position: int64) : InboxEntry =
         Delivery = DeliveryMode.Queue
         Consumed = false
         AppendedAt = DateTimeOffset.UtcNow
+        TurnId = TurnId.New()
     }
 
 /// Builds a stored session with null host hooks, the cluster-safe shape.

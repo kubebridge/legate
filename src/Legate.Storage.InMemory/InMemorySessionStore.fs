@@ -14,15 +14,16 @@ open Legate.Storage
 /// pins, dispatch candidates, and the capacity counts. One live claim per
 /// session and one open turn per session:
 /// <see cref="M:Legate.ISessionStore.ClaimNextTurn" /> consumes the head
-/// pending user message into a new turn, or the head pending reply into a
-/// resume of the open turn with the attempt incremented; a live unexpired
-/// claim makes every further claim the missing branch. Lease expiry reads
-/// the database's clock, and every transition runs under the database's
-/// gate lock, so claims and settlements are atomic under concurrent
-/// callers and a takeover race leaves the loser with zero effects. The
-/// stored row's <see cref="P:Legate.Session.CurrentTurnId" /> is stamped on
-/// claim and cleared on settlement, the basis of the CurrentTurnId-based
-/// state rules.
+/// pending user message into a new turn under its durable real-turn identity
+/// (stamped at accept; legacy rows bind once at first claim), or the head
+/// pending reply into a resume of the open turn with the attempt incremented;
+/// a live unexpired claim makes every further claim the missing branch.
+/// Lease expiry reads the database's clock, and every transition runs under
+/// the database's gate lock, so claims and settlements are atomic under
+/// concurrent callers and a takeover race leaves the loser with zero
+/// effects. The stored row's <see cref="P:Legate.Session.CurrentTurnId" />
+/// is stamped on claim and cleared on settlement, the basis of the
+/// CurrentTurnId-based state rules.
 type InMemorySessionStore(database: InMemoryDatabase) =
 
     do
@@ -852,6 +853,16 @@ type InMemorySessionStore(database: InMemoryDatabase) =
 
                 database.InboxPositions[(tenant, sessionId)] <- position + 1L
 
+                // Real-turn identity (issue 374): every accepted user message
+                // gets a stable durable TurnId tied to its inbox entry at
+                // accept; reply entries carry the default sentinel and never
+                // start a turn. Distinct queued entries never share a synthetic
+                // bootstrap identity.
+                let turnId =
+                    match payload with
+                    | :? UserMessagePayload -> TurnId.New()
+                    | _ -> Unchecked.defaultof<TurnId>
+
                 let entry =
                     {
                         SessionId = sessionId
@@ -860,6 +871,7 @@ type InMemorySessionStore(database: InMemoryDatabase) =
                         Delivery = delivery
                         Consumed = false
                         AppendedAt = database.UtcNow
+                        TurnId = turnId
                     }
 
                 match database.Inboxes.TryGetValue((tenant, sessionId)) with
@@ -962,14 +974,31 @@ type InMemorySessionStore(database: InMemoryDatabase) =
                     | Some {
                                Payload = :? UserMessagePayload
                                Position = position
+                               TurnId = stamped
                            },
                       _ ->
-                        // New turn: consume the message and mint a fresh
-                        // turn; a stale open turn from a lapsed claim is
-                        // abandoned (replaced, never settled).
+                        // New turn: consume the message and claim under its
+                        // durable real-turn identity (issue 374). The TurnId
+                        // was stamped at accept; legacy rows without one are
+                        // bound once here without rewriting history. A stale
+                        // open turn from a lapsed claim is abandoned
+                        // (replaced, never settled).
                         consume tenant sessionId position
 
-                        let turnId = TurnId.New()
+                        let isDefault = isNull (box stamped.Value)
+
+                        let turnId = if isDefault then TurnId.New() else stamped
+
+                        // Backfill legacy pending entries that carried the
+                        // default sentinel, so the identity stays stable for
+                        // the rest of this entry's life.
+                        if isDefault then
+                            match database.Inboxes.TryGetValue((tenant, sessionId)) with
+                            | true, entries ->
+                                for index in 0 .. entries.Count - 1 do
+                                    if entries[index].Position = position then
+                                        entries[index] <- { entries[index] with TurnId = turnId }
+                            | false, _ -> ()
 
                         let claim =
                             {

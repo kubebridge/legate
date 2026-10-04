@@ -274,6 +274,7 @@ let ``Baseline columns carry the contract shapes`` () =
             "delivery_mode"
             "consumed"
             "appended_at"
+            "turn_id"
         ]
 
     columnNames keepAlive "turns"

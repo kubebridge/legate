@@ -1013,11 +1013,19 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
 
                 let now = this.UtcNow
 
+                // Real-turn identity (issue 374): user messages stamp a fresh
+                // durable TurnId at accept; replies carry null (the default
+                // sentinel) and never start a turn.
+                let turnIdText: string | null =
+                    match payload with
+                    | :? UserMessagePayload -> TurnId.New().ToString()
+                    | _ -> null
+
                 use insertCmd =
                     command
                         connection
                         transaction
-                        $"INSERT INTO {this.InboxTable} (session_id, position, tenant, payload_json, delivery_mode, consumed, appended_at) VALUES (@sid, @pos, @t, @payload, @delivery, FALSE, @appended)"
+                        $"INSERT INTO {this.InboxTable} (session_id, position, tenant, payload_json, delivery_mode, consumed, appended_at, turn_id) VALUES (@sid, @pos, @t, @payload, @delivery, FALSE, @appended, @turn)"
 
                 textParam insertCmd "sid" (sessionId.ToString())
                 longParam insertCmd "pos" position
@@ -1025,6 +1033,7 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
                 textParam insertCmd "payload" (serialize<InboxPayload> payload)
                 textParam insertCmd "delivery" (delivery.ToString())
                 textParam insertCmd "appended" (stamp now)
+                textParam insertCmd "turn" turnIdText
                 insertCmd.ExecuteNonQuery() |> ignore
 
                 {
@@ -1034,6 +1043,10 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
                     Delivery = delivery
                     Consumed = false
                     AppendedAt = now
+                    TurnId =
+                        match turnIdText with
+                        | null -> Unchecked.defaultof<TurnId>
+                        | text -> TurnId.Parse(text)
                 })
             |> Task.FromResult
 
@@ -1066,7 +1079,7 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
                     command
                         connection
                         transaction
-                        $"SELECT position, payload_json, delivery_mode, appended_at FROM {this.InboxTable} WHERE session_id = @sid AND tenant = @t AND consumed = FALSE ORDER BY position"
+                        $"SELECT position, payload_json, delivery_mode, appended_at, turn_id FROM {this.InboxTable} WHERE session_id = @sid AND tenant = @t AND consumed = FALSE ORDER BY position"
 
                 textParam cmd "sid" (sessionId.ToString())
                 textParam cmd "t" (tenant.ToString())
@@ -1081,6 +1094,8 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
                                 | null -> raise (InvalidOperationException("The stored inbox payload is null."))
                                 | decoded -> decoded
 
+                            let turnText: string | null = getTextOrNull reader 4
+
                             {
                                 SessionId = sessionId
                                 Position = reader.GetInt64(0)
@@ -1088,6 +1103,11 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
                                 Delivery = Enum.Parse<DeliveryMode>(reader.GetString(2))
                                 Consumed = false
                                 AppendedAt = parseStamp (reader.GetString(3))
+                                TurnId =
+                                    match turnText with
+                                    | null -> Unchecked.defaultof<TurnId>
+                                    | text when String.IsNullOrWhiteSpace(text) -> Unchecked.defaultof<TurnId>
+                                    | text -> TurnId.Parse(text)
                             }
                     ]
 
@@ -1184,21 +1204,29 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
                         command
                             connection
                             transaction
-                            $"SELECT position, payload_json FROM {this.InboxTable} WHERE session_id = @sid AND tenant = @t AND consumed = FALSE ORDER BY position LIMIT 1 FOR UPDATE"
+                            $"SELECT position, payload_json, turn_id FROM {this.InboxTable} WHERE session_id = @sid AND tenant = @t AND consumed = FALSE ORDER BY position LIMIT 1 FOR UPDATE"
 
                     textParam headCmd "sid" (sessionId.ToString())
                     textParam headCmd "t" (tenant.ToString())
 
                     use headReader = headCmd.ExecuteReader()
 
-                    let head: (int64 * InboxPayload) option =
+                    let head: (int64 * InboxPayload * TurnId) option =
                         if headReader.Read() then
                             let payload: InboxPayload =
                                 match JsonSerializer.Deserialize(headReader.GetString(1), jsonOptions) with
                                 | null -> raise (InvalidOperationException("The stored inbox payload is null."))
                                 | decoded -> decoded
 
-                            Some(headReader.GetInt64(0), payload)
+                            let turnText: string | null = getTextOrNull headReader 2
+
+                            let stamped =
+                                match turnText with
+                                | null -> Unchecked.defaultof<TurnId>
+                                | text when String.IsNullOrWhiteSpace(text) -> Unchecked.defaultof<TurnId>
+                                | text -> TurnId.Parse(text)
+
+                            Some(headReader.GetInt64(0), payload, stamped)
                         else
                             None
 
@@ -1230,9 +1258,10 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
                         stampCmd.ExecuteNonQuery() |> ignore
 
                     match head, openTurn with
-                    | Some(position, :? ReplyPayload), Some(openTurnId, openAttempt) ->
+                    | Some(position, :? ReplyPayload, _), Some(openTurnId, openAttempt) ->
                         // Resume: consume the reply and re-claim the same
-                        // open turn under a fresh token, attempt + 1.
+                        // open turn under a fresh token, attempt + 1. Reply
+                        // entries never start a turn (issue 374).
                         consume position
 
                         let attempt = openAttempt + 1
@@ -1262,15 +1291,31 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
 
                         stampCurrent (openTurnId.ToString())
                         TurnLeaseRenewed claim :> TurnLeaseState
-                    | Some(position, :? UserMessagePayload), _ ->
-                        // New turn: consume the message and mint a fresh
-                        // turn; a stale open turn from a lapsed claim is
-                        // retired to Aborted with its fence released and no
-                        // settlement recorded, so a later settle on it
-                        // rejects as a stale claim.
+                    | Some(position, :? UserMessagePayload, stamped), _ ->
+                        // New turn: consume the message and claim under its
+                        // durable real-turn identity (issue 374). Legacy rows
+                        // without a stamped identity bind once here. A stale
+                        // open turn from a lapsed claim is retired to Aborted
+                        // with its fence released and no settlement recorded,
+                        // so a later settle on it rejects as a stale claim.
                         consume position
 
-                        let turnId = TurnId.New()
+                        let isDefault = isNull (box stamped.Value)
+
+                        let turnId = if isDefault then TurnId.New() else stamped
+
+                        if isDefault then
+                            use backfillCmd =
+                                command
+                                    connection
+                                    transaction
+                                    $"UPDATE {this.InboxTable} SET turn_id = @turn WHERE session_id = @sid AND tenant = @t AND position = @pos"
+
+                            textParam backfillCmd "turn" (turnId.ToString())
+                            textParam backfillCmd "sid" (sessionId.ToString())
+                            textParam backfillCmd "t" (tenant.ToString())
+                            longParam backfillCmd "pos" position
+                            backfillCmd.ExecuteNonQuery() |> ignore
 
                         let claim =
                             {

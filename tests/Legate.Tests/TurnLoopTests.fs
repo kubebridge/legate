@@ -1042,6 +1042,10 @@ let injectEntry (position: int64) (payload: InboxPayload) (delivery: DeliveryMod
         Delivery = delivery
         Consumed = false
         AppendedAt = injectStamp ()
+        TurnId =
+            match payload with
+            | :? UserMessagePayload -> TurnId.New()
+            | _ -> Unchecked.defaultof<TurnId>
     }
 
 let textInject (position: int64) (text: string) : InboxEntry =

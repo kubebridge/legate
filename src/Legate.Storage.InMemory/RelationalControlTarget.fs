@@ -272,7 +272,7 @@ module internal RelationalControlTarget =
                                 command
                                     connection
                                     transaction
-                                    $"SELECT payload_json,delivery_mode,consumed,appended_at FROM {inboxTable} WHERE tenant=@t AND session_id=@sid AND position=@pos"
+                                    $"SELECT payload_json,delivery_mode,consumed,appended_at,turn_id FROM {inboxTable} WHERE tenant=@t AND session_id=@sid AND position=@pos"
                                     tenant
                                     sessionId
 
@@ -303,6 +303,20 @@ module internal RelationalControlTarget =
                                     )
                                 | payload -> payload
 
+                            let turnId =
+                                try
+                                    if reader.FieldCount > 4 && not (reader.IsDBNull(4)) then
+                                        let text = reader.GetString(4)
+
+                                        if String.IsNullOrWhiteSpace(text) then
+                                            Unchecked.defaultof<TurnId>
+                                        else
+                                            TurnId.Parse(text)
+                                    else
+                                        Unchecked.defaultof<TurnId>
+                                with _ ->
+                                    Unchecked.defaultof<TurnId>
+
                             {
                                 SessionId = sessionId
                                 Position = target.InboxPosition
@@ -310,6 +324,7 @@ module internal RelationalControlTarget =
                                 Delivery = Enum.Parse<DeliveryMode>(reader.GetString(1))
                                 Consumed = Convert.ToBoolean(reader.GetValue(2), CultureInfo.InvariantCulture)
                                 AppendedAt = DateTimeOffset.Parse(reader.GetString(3), CultureInfo.InvariantCulture)
+                                TurnId = turnId
                             }
 
                         use update =

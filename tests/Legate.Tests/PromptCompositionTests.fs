@@ -117,6 +117,7 @@ module PromptCompositionTests =
             Delivery = DeliveryMode.Queue
             Consumed = false
             AppendedAt = DateTimeOffset.UtcNow
+            TurnId = TurnId.New()
         }
 
     let private hookReturning (text: string | null) : PromptComposition.GetTurnSystemPrompt =
