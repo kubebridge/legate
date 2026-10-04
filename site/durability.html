@@ -96,6 +96,19 @@
   <div class="content-stack">
     <p class="body-copy">When rebuilding model history, Legate removes the interrupted turn's tool-call and tool-result entries and adds a note explaining the restart.</p>
     <p class="body-copy">Recovery starts a new attempt. It does not continue an interrupted HTTP request or undo an external action that already completed. Tools that change external systems need to account for retries.</p>
+    <p class="body-copy">Missing journal evidence is never treated as proof that an external action did not happen. When the runtime cannot tell whether an interrupted turn acted, recovery fails closed with an explicit diagnostic instead of replaying blindly or inventing what happened.</p>
+  </div>
+</div></section>
+
+<section class="block" aria-labelledby="formats"><div class="wrap">
+  <div class="sec-head">
+    <div><span class="sec-no pk">Formats</span>
+      <h2 class="sec-title" id="formats">Unsupported old data versus a supported crash</h2></div>
+    <p class="sec-sub">Sessions carry a format marker (<code>SessionOptions.FormatVersion</code>, currently <code>1</code>). Data from an older prerelease format is rejected before anything runs; a crash of a current-format session recovers as described above. The two cases look different and mean different things.</p>
+  </div>
+  <div class="grid c2">
+    <div class="card"><h3>Unsupported old data</h3><p>Opening, resuming, prompting, replying, rebinding, compacting, or forking the session fails with an unsupported-format refusal that points at a clean start. Nothing is consumed, rebound, replayed, or rewritten, and repeated attempts leave the old data untouched. Starting over is an explicit choice you make with fresh persistence: the runtime never deletes or resets local databases and never converts old records.</p></div>
+    <div class="card"><h3>Supported crash recovery</h3><p>Accepted inbox work survives in order, suspension and ownership identity are kept, and work that already settled is never run again. Competing owners are fenced so the loser has no effect. When the outcome is uncertain, the turn fails closed with a diagnostic rather than guessing.</p></div>
   </div>
 </div></section>
 

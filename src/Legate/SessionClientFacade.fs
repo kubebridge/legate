@@ -622,7 +622,8 @@ type SessionClientOperations =
         ArgumentNullException.ThrowIfNull(client)
 
         task {
-            let! _ = SessionClientOperations.RequireAsync(client, sessionId, cancellationToken)
+            let! current = SessionClientOperations.RequireAsync(client, sessionId, cancellationToken)
+            client.ValidateCompletionRoute current
             let! actor = client.Resolve(sessionId, cancellationToken)
 
             let! reply =
@@ -676,6 +677,7 @@ type SessionClientOperations =
 
         task {
             let! source = SessionClientOperations.RequireAsync(client, sessionId, cancellationToken)
+            client.ValidateCompletionRoute source
 
             if source.State = SessionState.Closed then
                 raise (
@@ -729,6 +731,7 @@ type SessionClientOperations =
         task {
             let tenant = client.Tenant
             let! source = SessionClientOperations.RequireAsync(client, sessionId, cancellationToken)
+            client.ValidateCompletionRoute source
 
             let! prefix =
                 SessionClientOperations.ReadPrefixAsync(client, tenant, sessionId, upToSequence, cancellationToken)

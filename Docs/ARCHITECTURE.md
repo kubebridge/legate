@@ -175,6 +175,39 @@ pending recovery barriers and breaking 0.1.0/current-format requirements.
    or `WaitingForInput`; `AutoClose` sessions close and notify the completion
    sink with at-least-once delivery.
 
+### Unsupported old data versus supported crash recovery
+
+`SessionOptions.FormatVersion` (current: `1`) is the single supported-format
+gate. `SessionOptionsPersistence.Deserialize`/`ValidatePersistence` reject
+anything else with `CompletionRoutingException` carrying
+`CompletionRoutingReason.UnsupportedFormat`, whose message is secret-free and
+points at a clean start. The gate runs before execution or further work on
+every open/resume/recovery path: the session client (`OpenSession`, `Prompt`,
+`Reply`, `SetAgent`, `Compact`, `Fork`, `PromptAndWait`), the dispatcher
+sweeps (unsupported sessions are skipped, never dispatched), the actor
+activation prime, and the store deserializers.
+
+Rejection is fail-closed and non-destructive: it consumes no inbox input,
+rebinds no sink or agent, manufactures no turn identities, conversation,
+usage, or results, and writes nothing to the journal. Repeated rejection and
+competing opens leave the old rows untouched, and the losing side of a claim
+race observes zero effects. Clean start is an explicit host/user choice made
+with fresh supported persistence; the runtime never deletes or resets local
+databases and never rewrites old records into the new format. New shared
+schema migrations stay additive and UTC-versioned; schema evolution does not
+imply support for old session payloads.
+
+Supported current-format crash recovery keeps the store-first inbox with
+atomic claim-fenced terminal settlement: reopening retains actual accepted
+inbox work in order, the recorded turn and ownership identity, suspension,
+and committed settlement. Already-settled work is never re-executed or
+re-settled, and later accepted work stays durable and ordered. Absent journal
+evidence is never treated as proof that an external effect did not happen:
+uncertain execution fails closed with an explicit diagnostic (the
+`OnCrashResume.FailAttempt` terminal or a fenced return to `Idle`) instead
+of automatic unsafe replay or invented historical outcomes. There is no
+exactly-once remote-effect guarantee and no new host privilege.
+
 ### Store contracts
 
 `ISessionStore` is the durable store contract the Postgres, SQLite, and

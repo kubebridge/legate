@@ -165,6 +165,7 @@
     <Compile Include="WireSerializationGoldenTests.fs" />
     <Compile Include="CrossNodeSubscriptionTests.fs" />
     <Compile Include="TurnInCallMarkerTests.fs" />
+    <Compile Include="LegacyRejectionRecoveryTests.fs" />
   </ItemGroup>
 
   <ItemGroup>

@@ -594,8 +594,11 @@ module internal Dispatcher =
         passOnceRoutedAsync
             (fun session ->
                 try
-                    session.Options.ValidatePersistence()
-                    isNull session.Options.CompletionDestinationId
+                    if isNull (box session) || isNull (box session.Options) then
+                        false
+                    else
+                        session.Options.ValidatePersistence()
+                        isNull session.Options.CompletionDestinationId
                 with :? CompletionRoutingException ->
                     false)
             store
