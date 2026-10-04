@@ -208,6 +208,33 @@ uncertain execution fails closed with an explicit diagnostic (the
 of automatic unsafe replay or invented historical outcomes. There is no
 exactly-once remote-effect guarantee and no new host privilege.
 
+### Idle authority versus execution authority
+
+Idle and host-control writes (on-demand compaction of an `Idle` session,
+agent rebinds, fork-prefix copies, and other host operations with no turn
+in flight) carry host authority, never a fabricated executing turn.
+`ISessionEventStore.AppendHostEvents` appends them under the caller's host
+permissions with a store-side lifecycle fence: the write lands only when
+the session still carries exactly the `UpdatedAt` version stamp the caller
+read and is not `Closed`. A moved version rejects as `staleLifecycle` and
+a `Closed` session as `sessionClosed`, both with zero writes; a successful
+append bumps `UpdatedAt`, so concurrent idle writers serialize and the
+loser observes the rejection. Fresh idle writes carry the default
+(unstamped) `TurnId` sentinel on the existing event subtypes (no new
+subtypes, no new id field, no `SessionClosedEvent` invention); history
+copies (fork prefixes) preserve their original `TurnId`s. The host path
+cannot claim a turn, consume inbox input, or settle one, so stale execution
+cannot borrow it to consume winner input, alter lifecycle or agent, or
+close the session.
+
+Execution writes stay on the ambient prime claim (`Append` under the turn
+claim token) until real-turn claims land in #400: the prime, its re-prime,
+and the claim-fenced settlement boundary in `SessionSettlement` are
+unchanged here. Crash-path terminal writes for interrupted turns stay
+claim-fenced for the same reason: only the token proves the writer is no
+takeover loser. Suspension is not idle authority: a suspended turn still
+owns the history, so on-demand compaction no-ops while waiting for input.
+
 ### Store contracts
 
 `ISessionStore` is the durable store contract the Postgres, SQLite, and

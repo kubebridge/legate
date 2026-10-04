@@ -769,87 +769,48 @@ type SessionClientOperations =
             | None -> ()
 
             if prefix.Count > 0 then
-                // Prime, copy, and settle under the facade-held claim before
-                // Resolve re-primes: the bootstrap is consumed by the claim,
-                // so the forked actor drains real prompts first. The owner
-                // and lease mirror the SessionClientOptions prime defaults;
-                // the client does not carry the options, and both are
-                // attribution only on a claim settled below.
-                let bootstrap =
-                    UserMessagePayload(UserMessage.Text "legate fork prime") :> InboxPayload
+                // Host-append copy (issue 373): the fork-prefix lands as a
+                // host-authorized batch preserving the source TurnIds
+                // through RekeyForFork, fenced on the fork's UpdatedAt
+                // version stamp. No inbox append, no ClaimNextTurn, no
+                // SettleTurn for the copy: the fork carries no turn claim
+                // and no lease state, so it opens Idle with an empty inbox
+                // and real prompts drain first. The actor prime on Resolve
+                // below stays exactly as before for future execution.
+                let rekeyed =
+                    prefix
+                    |> Seq.map (SessionClientOperations.RekeyForFork created.Id)
+                    |> List.ofSeq
 
-                let! _ =
-                    client.Store.AppendInboxMessage(
-                        tenant,
-                        created.Id,
-                        bootstrap,
-                        DeliveryMode.Queue,
-                        cancellationToken
-                    )
+                let mutable expectedStamp = created.UpdatedAt
 
-                let! lease =
-                    client.Store.ClaimNextTurn(
-                        tenant,
-                        created.Id,
-                        "legate-session-facade",
-                        TimeSpan.FromHours 1.0,
-                        cancellationToken
-                    )
+                for batch in rekeyed |> List.chunkBySize 100 do
+                    let events = ResizeArray<SessionEvent>(batch) :> IReadOnlyList<SessionEvent>
 
-                let claim =
-                    match lease with
-                    | :? TurnLeaseRenewed as renewed when not (isNull (box renewed)) -> renewed.Claim
-                    | :? TurnLeaseHeld as held when not (isNull (box held)) -> held.Claim
-                    | :? TurnLeaseExpiring as expiring when not (isNull (box expiring)) -> expiring.Claim
-                    | _ ->
+                    match!
+                        JournalWriter.appendHostAsync
+                            client.EventBus.EventStore
+                            tenant
+                            created.Id
+                            expectedStamp
+                            events
+                            cancellationToken
+                    with
+                    | JournalWriter.JournalAppended _ ->
+                        let! refreshed = SessionClientOperations.RequireAsync(client, created.Id, cancellationToken)
+                        expectedStamp <- refreshed.UpdatedAt
+                    | JournalWriter.JournalRejected reason ->
                         raise (
                             InvalidOperationException(
-                                sprintf "The fork of session %O claimed no turn on its fresh row." sessionId
+                                sprintf "The fork of session %O lost its host fence: %s." sessionId reason
                             )
                         )
-
-                try
-                    let rekeyed =
-                        prefix
-                        |> Seq.map (SessionClientOperations.RekeyForFork created.Id)
-                        |> List.ofSeq
-
-                    for batch in rekeyed |> List.chunkBySize 100 do
-                        let events = ResizeArray<SessionEvent>(batch) :> IReadOnlyList<SessionEvent>
-
-                        match!
-                            JournalWriter.appendWithTokenAsync
-                                client.EventBus.EventStore
-                                tenant
-                                created.Id
-                                claim.Token
-                                events
-                                cancellationToken
-                        with
-                        | JournalWriter.JournalAppended _ -> ()
-                        | JournalWriter.JournalRejected reason ->
-                            raise (
-                                InvalidOperationException(
-                                    sprintf "The fork of session %O lost its journal claim: %s." sessionId reason
-                                )
+                    | JournalWriter.JournalFailed reason ->
+                        raise (
+                            InvalidOperationException(
+                                sprintf "The fork of session %O failed to copy its prefix: %s." sessionId reason
                             )
-                        | JournalWriter.JournalFailed reason ->
-                            raise (
-                                InvalidOperationException(
-                                    sprintf "The fork of session %O failed to copy its prefix: %s." sessionId reason
-                                )
-                            )
-
-                    let! _ = client.Store.SettleTurn(tenant, claim, TurnStatus.Completed, null, cancellationToken)
-                    ()
-                with ex ->
-                    try
-                        client.Store.SettleTurn(tenant, claim, TurnStatus.Completed, null, CancellationToken.None)
-                        |> ignore
-                    with _ ->
-                        ()
-
-                    raise ex
+                        )
 
             try
                 let! _ = client.Resolve(created.Id, cancellationToken)

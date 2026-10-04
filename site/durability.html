@@ -110,6 +110,9 @@
     <div class="card"><h3>Unsupported old data</h3><p>Opening, resuming, prompting, replying, rebinding, compacting, or forking the session fails with an unsupported-format refusal that points at a clean start. Nothing is consumed, rebound, replayed, or rewritten, and repeated attempts leave the old data untouched. Starting over is an explicit choice you make with fresh persistence: the runtime never deletes or resets local databases and never converts old records.</p></div>
     <div class="card"><h3>Supported crash recovery</h3><p>Accepted inbox work survives in order, suspension and ownership identity are kept, and work that already settled is never run again. Competing owners are fenced so the loser has no effect. When the outcome is uncertain, the turn fails closed with a diagnostic rather than guessing.</p></div>
   </div>
+  <div class="content-stack">
+    <p class="body-copy">Idle work carries host authority, never a fabricated turn: compacting an idle session, rebinding its agent, or forking its history journals under host permissions with a lifecycle check, so a session that moved on (or closed) rejects the write instead of recording it. Execution writes still require the live claim token.</p>
+  </div>
 </div></section>
 
 <section class="block" aria-labelledby="journal"><div class="wrap">

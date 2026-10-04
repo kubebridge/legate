@@ -338,6 +338,194 @@ type PostgresSessionEventStore(options: PostgresOptions, timeProvider: TimeProvi
                     EventAppended(stamped :> IReadOnlyList<SessionEvent>) :> EventAppendOutcome)
             |> Task.FromResult
 
+        member this.AppendHostEvents(tenant, sessionId, expectedUpdatedAt, events, _) =
+            if isNull (box events) then
+                raise (ArgumentNullException(nameof events))
+
+            if Seq.isEmpty events then
+                raise (ArgumentException("The event batch must not be empty.", nameof events))
+
+            for event in events do
+                if isNull (box event) then
+                    raise (ArgumentNullException(nameof events))
+
+            this.EnsureMigrated()
+
+            transact options (fun connection transaction ->
+                use lockCmd =
+                    command
+                        connection
+                        transaction
+                        $"SELECT state, updated_at FROM {this.SessionsTable} WHERE id = @id AND tenant = @t FOR UPDATE"
+
+                textParam lockCmd "id" (sessionId.ToString())
+                textParam lockCmd "t" (tenant.ToString())
+
+                use lockReader = lockCmd.ExecuteReader()
+                let found = lockReader.Read()
+
+                let fenced: EventAppendOutcome option =
+                    if not found then
+                        lockReader.Close()
+
+                        raise (
+                            SessionNotFoundException(
+                                sessionId,
+                                sprintf "No session %O exists in tenant %O." sessionId tenant
+                            )
+                        )
+                    else
+                        let state = Enum.Parse<SessionState>(lockReader.GetString(0), false)
+                        let storedUpdatedAt = parseStamp (lockReader.GetString(1))
+                        lockReader.Close()
+
+                        // The lifecycle fence: closed rejects, a moved
+                        // version rejects, both with zero writes.
+                        if state = SessionState.Closed then
+                            Some(EventAppendRejected(sessionId, "sessionClosed") :> EventAppendOutcome)
+                        elif storedUpdatedAt <> expectedUpdatedAt then
+                            Some(EventAppendRejected(sessionId, "staleLifecycle") :> EventAppendOutcome)
+                        else
+                            None
+
+                match fenced with
+                | Some rejected -> rejected
+                | None ->
+                    // Limit checks run before any part of the batch lands.
+                    let batchSize = Seq.length events
+
+                    if options.MaxAppendBatchSize > 0 && batchSize > options.MaxAppendBatchSize then
+                        raise (
+                            EventLimitExceededException(
+                                "batchSize",
+                                int64 options.MaxAppendBatchSize,
+                                int64 batchSize,
+                                sprintf
+                                    "An append of %d events exceeds the batch-size limit %d."
+                                    batchSize
+                                    options.MaxAppendBatchSize
+                            )
+                        )
+
+                    let sizes = events |> Seq.map this.EventBytes |> Seq.toList
+
+                    for size in sizes do
+                        if options.MaxEventBytes > 0L && size > float options.MaxEventBytes then
+                            raise (
+                                EventLimitExceededException(
+                                    "perEventBytes",
+                                    options.MaxEventBytes,
+                                    int64 size,
+                                    sprintf "An event exceeds the per-event byte limit %d." options.MaxEventBytes
+                                )
+                            )
+
+                    use countCmd =
+                        command
+                            connection
+                            transaction
+                            $"SELECT COUNT(*), COALESCE(SUM(octet_length(payload_json)::bigint), 0), COALESCE(MAX(sequence), 0) FROM {this.EventsTable} WHERE session_id = @sid AND tenant = @t"
+
+                    textParam countCmd "sid" (sessionId.ToString())
+                    textParam countCmd "t" (tenant.ToString())
+
+                    use countReader = countCmd.ExecuteReader()
+                    countReader.Read() |> ignore
+                    let count = countReader.GetInt64(0)
+                    let totalBytes = countReader.GetInt64(1)
+                    let maxSequence = countReader.GetInt64(2)
+                    countReader.Close()
+
+                    let countAfter = count + int64 batchSize
+
+                    if options.MaxEventsPerSession > 0L && countAfter > options.MaxEventsPerSession then
+                        raise (
+                            EventLimitExceededException(
+                                "perSessionCount",
+                                options.MaxEventsPerSession,
+                                countAfter,
+                                sprintf
+                                    "The journal would hold %d events, over the per-session limit %d."
+                                    countAfter
+                                    options.MaxEventsPerSession
+                            )
+                        )
+
+                    let bytesAfter = totalBytes + (sizes |> List.sum |> int64)
+
+                    if
+                        options.MaxJournalBytesPerSession > 0L
+                        && bytesAfter > options.MaxJournalBytesPerSession
+                    then
+                        raise (
+                            EventLimitExceededException(
+                                "perSessionBytes",
+                                options.MaxJournalBytesPerSession,
+                                bytesAfter,
+                                sprintf
+                                    "The journal would hold %d bytes, over the per-session limit %d."
+                                    bytesAfter
+                                    options.MaxJournalBytesPerSession
+                            )
+                        )
+
+                    let stamped = this.Restamp(events, maxSequence + 1L)
+
+                    for event in stamped do
+                        use insertCmd =
+                            command
+                                connection
+                                transaction
+                                $"INSERT INTO {this.EventsTable} (session_id, sequence, tenant, turn_id, event_type, payload_json, timestamp) VALUES (@sid, @seq, @t, @tid, @kind, @payload, @ts)"
+
+                        // The host-operation sentinel (default TurnId, null
+                        // Value) stores an empty turn marker in the column;
+                        // replay reads the payload, where the sentinel
+                        // round-trips as JSON null.
+                        let turnValue =
+                            if box event.TurnId.Value |> isNull then
+                                ""
+                            else
+                                event.TurnId.Value
+
+                        textParam insertCmd "sid" (sessionId.ToString())
+                        longParam insertCmd "seq" event.Sequence.Value
+                        textParam insertCmd "t" (tenant.ToString())
+                        textParam insertCmd "tid" turnValue
+                        textParam insertCmd "kind" (event.GetType().Name)
+                        textParam insertCmd "payload" (serialize<SessionEvent> event)
+                        textParam insertCmd "ts" (stamp event.Timestamp)
+                        insertCmd.ExecuteNonQuery() |> ignore
+
+                    // Reopening: an append after a completed cleanup clears
+                    // the archive marker, so the journal reads live again.
+                    use reopenCmd =
+                        command
+                            connection
+                            transaction
+                            $"DELETE FROM {this.CleanupTable} WHERE session_id = @sid AND tenant = @t AND owner = @marker"
+
+                    textParam reopenCmd "sid" (sessionId.ToString())
+                    textParam reopenCmd "t" (tenant.ToString())
+                    textParam reopenCmd "marker" this.ArchiveMarker
+                    reopenCmd.ExecuteNonQuery() |> ignore
+
+                    // A successful host append bumps the session version
+                    // stamp, so the next idle writer must re-read.
+                    use bumpCmd =
+                        command
+                            connection
+                            transaction
+                            $"UPDATE {this.SessionsTable} SET updated_at = @now WHERE id = @id AND tenant = @t"
+
+                    textParam bumpCmd "now" (stamp this.UtcNow)
+                    textParam bumpCmd "id" (sessionId.ToString())
+                    textParam bumpCmd "t" (tenant.ToString())
+                    bumpCmd.ExecuteNonQuery() |> ignore
+
+                    EventAppended(stamped :> IReadOnlyList<SessionEvent>) :> EventAppendOutcome)
+            |> Task.FromResult
+
         member this.Replay(tenant, sessionId, fromSequence, limit, _) =
             if limit <= 0 then
                 raise (ArgumentOutOfRangeException(nameof limit, "The limit must be positive."))

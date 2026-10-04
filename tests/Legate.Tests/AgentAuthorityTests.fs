@@ -105,6 +105,16 @@ type private TestJournal() =
             let stamped = ResizeArray<SessionEvent>(events) :> IReadOnlyList<SessionEvent>
             Task.FromResult(EventAppended(stamped) :> EventAppendOutcome)
 
+        member _.AppendHostEvents(_, _, _, batch, _) =
+            if isNull (box batch) then
+                raise (ArgumentNullException(nameof batch))
+
+            for event in batch do
+                events.Add(event)
+
+            let stamped = ResizeArray<SessionEvent>(events) :> IReadOnlyList<SessionEvent>
+            Task.FromResult(EventAppended(stamped) :> EventAppendOutcome)
+
         member _.Replay(_, sessionId, fromSequence, _, _) =
             if fromSequence = 0L && events.Count > 0 then
                 let page = ResizeArray<SessionEvent>(events) :> IReadOnlyList<SessionEvent>

@@ -100,6 +100,10 @@ type private CountingEventStore(inner: ISessionEventStore) =
             calls <- calls + 1
             inner.Append(tenant, sessionId, token, events, cancellationToken)
 
+        member _.AppendHostEvents(tenant, sessionId, expectedUpdatedAt, events, cancellationToken) =
+            calls <- calls + 1
+            inner.AppendHostEvents(tenant, sessionId, expectedUpdatedAt, events, cancellationToken)
+
         member _.Replay(tenant, sessionId, cursor, limit, cancellationToken) =
             inner.Replay(tenant, sessionId, cursor, limit, cancellationToken)
 
@@ -128,6 +132,14 @@ type private FlakyEventStore(inner: ISessionEventStore, failures: int, failure: 
             else
                 inner.Append(tenant, sessionId, token, events, cancellationToken)
 
+        member _.AppendHostEvents(tenant, sessionId, expectedUpdatedAt, events, cancellationToken) =
+            calls <- calls + 1
+
+            if calls <= failures then
+                Task.FromException<EventAppendOutcome>(failure)
+            else
+                inner.AppendHostEvents(tenant, sessionId, expectedUpdatedAt, events, cancellationToken)
+
         member _.Replay(tenant, sessionId, cursor, limit, cancellationToken) =
             inner.Replay(tenant, sessionId, cursor, limit, cancellationToken)
 
@@ -145,6 +157,12 @@ type private FlakyEventStore(inner: ISessionEventStore, failures: int, failure: 
 type private CancelHonoringStore() =
     interface ISessionEventStore with
         member _.Append(_, _, _, _, cancellationToken) =
+            task {
+                cancellationToken.ThrowIfCancellationRequested()
+                return Unchecked.defaultof<EventAppendOutcome>
+            }
+
+        member _.AppendHostEvents(_, _, _, _, cancellationToken) =
             task {
                 cancellationToken.ThrowIfCancellationRequested()
                 return Unchecked.defaultof<EventAppendOutcome>

@@ -60,9 +60,11 @@ and [<Sealed>] EventAppended(events: IReadOnlyList<SessionEvent>) =
     member _.Events = events
 
 /// The append was rejected because the claim token no longer holds the
-/// turn: another owner took over (or the lease lapsed) between the claim
-/// and the write. Nothing changed: the journal has no partial batch, and a
-/// retry with the recovered token will land cleanly. The reason is a
+/// turn, or because the host-append lifecycle fence refused the write:
+/// another owner took over (or the lease lapsed) between the claim
+/// and the write, or the session's lifecycle/version moved between the
+/// caller's read and the write. Nothing changed: the journal has no partial batch, and a
+/// retry with the recovered token (or a re-read lifecycle) will land cleanly. The reason is a
 /// stable string, never parsed from messages.
 /// <param name="sessionId">The session whose append was rejected.</param>
 /// <param name="reason">Why the append was rejected. Never contains secrets or tool arguments.</param>
@@ -73,7 +75,10 @@ and [<Sealed>] EventAppendRejected(sessionId: SessionId, reason: string) =
     member _.SessionId = sessionId
 
     /// Why the append was rejected: "staleClaim" when the claim token does
-    /// not own the turn's journal writes anymore. Never contains secrets
+    /// not own the turn's journal writes anymore, "staleLifecycle" when a
+    /// host-append observed a moved session lifecycle/version between the
+    /// caller's read and the write, or "sessionClosed" when a host-append
+    /// landed on a Closed session. Never contains secrets
     /// or tool arguments.
     member _.Reason = reason
 
@@ -348,6 +353,56 @@ type ISessionEventStore =
         tenant: TenantId *
         sessionId: SessionId *
         claimToken: string *
+        events: IReadOnlyList<SessionEvent> *
+        cancellationToken: CancellationToken ->
+            Task<EventAppendOutcome>
+
+    /// Appends a batch of idle/host-control events to the session's journal
+    /// under the caller's host permissions with a store-side lifecycle fence.
+    /// The caller authorizes the write (host permissions, lifecycle
+    /// restrictions, accepted/deferred/rejected behavior) before calling;
+    /// the store fences atomically at the last moment on the tenant-scoped
+    /// session lifecycle/version, so a stale caller writes nothing. The
+    /// fence is exact-equality on the session's <c>UpdatedAt</c> version
+    /// stamp plus the closed-session rule: the write lands only when the
+    /// session still carries exactly <paramref name="expectedUpdatedAt" />
+    /// and is not Closed. A moved version rejects with
+    /// <see cref="T:Legate.EventAppendRejected" /> carrying
+    /// <c>"staleLifecycle"</c> and zero writes; a Closed session rejects
+    /// with <c>"sessionClosed"</c> and zero writes, so closed stays closed.
+    /// A successful append bumps <c>UpdatedAt</c> to the store's now, so the
+    /// next idle writer must re-read: concurrent idle writers serialize and
+    /// the loser observes <c>"staleLifecycle"</c> with zero effects.
+    ///
+    /// <para>Attribution: the default (unstamped) <see cref="T:Legate.TurnId" />
+    /// means host operation on existing subtypes (no new subtypes, no new id
+    /// field, no <c>SessionClosedEvent</c> invention). Fresh idle writes use
+    /// the sentinel by caller convention; the member accepts non-sentinel
+    /// ids for history copies (fork-prefix copies preserve original
+    /// <c>TurnId</c>s through <c>RekeyForFork</c>). The store preserves every
+    /// <c>TurnId</c> as given and never mints execution ownership: this path
+    /// cannot claim a turn, consume inbox input, or settle one.</para>
+    ///
+    /// <para>Like <see cref="M:Legate.ISessionEventStore.Append*" /> the
+    /// batch is atomic with per-session monotonic, gap-free sequences
+    /// stamped by the store, and the same limit breaches throw
+    /// <see cref="T:Legate.EventLimitExceededException" /> before anything
+    /// lands. This is not an <c>Append</c> overload and takes no claim
+    /// token: execution writes stay token-fenced, host writes stay
+    /// lifecycle-fenced, and neither borrows the other's authority.</para>
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="sessionId">The session to append to.</param>
+    /// <param name="expectedUpdatedAt">The session <c>UpdatedAt</c> the caller read before authorizing. Must exactly match the stored stamp or the append rejects.</param>
+    /// <param name="events">The events to append, in order, each with an empty (in-flight) Sequence. Must not be null or empty; at most the host's batch-size limit.</param>
+    /// <param name="cancellationToken">Token that abandons the append.</param>
+    /// <returns>The outcome: the stamped events, or the rejection with its reason.</returns>
+    /// <exception cref="T:System.ArgumentNullException">The event list is null or one of its events is null.</exception>
+    /// <exception cref="T:Legate.SessionNotFoundException">The session id does not exist in this tenant.</exception>
+    /// <exception cref="T:Legate.EventLimitExceededException">An event, the batch, or the session's journal would breach a configured limit; nothing lands.</exception>
+    abstract AppendHostEvents:
+        tenant: TenantId *
+        sessionId: SessionId *
+        expectedUpdatedAt: DateTimeOffset *
         events: IReadOnlyList<SessionEvent> *
         cancellationToken: CancellationToken ->
             Task<EventAppendOutcome>
