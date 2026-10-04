@@ -67,6 +67,7 @@ type FakeSessionStore() =
     let sessions = Dictionary<string, Session>()
     let inbox = Dictionary<string, ResizeArray<InboxEntry>>()
     let claims = Dictionary<TenantId * TurnId, TurnClaim>()
+    let claimSessions = Dictionary<TenantId * TurnId, SessionId>()
     let settlement = Dictionary<string, TurnStatus>()
     let outbox = Dictionary<string, CompletionOutboxEntry>()
     let mutable positionCounter = 0L
@@ -356,6 +357,7 @@ type FakeSessionStore() =
                         | false, _ -> sampleClaim turnId 1
 
                     claims[claimKey t turnId] <- claim
+                    claimSessions[claimKey t turnId] <- sessionId
                     Task.FromResult(TurnLeaseRenewed(claim) :> TurnLeaseState)
 
         member _.RenewClaim(t, claim, _, _) =
@@ -438,6 +440,109 @@ type FakeSessionStore() =
                 else
                     claims.Remove(claimKey t claim.TurnId) |> ignore
                     Task.FromResult(TurnLeaseHeld(current) :> TurnLeaseState)
+
+        member _.ConsumeInboxUnderClaim(t, claim, sessionId, positions, _) =
+            if box claim |> isNull then
+                raise (ArgumentNullException(nameof claim))
+
+            if box positions |> isNull then
+                raise (ArgumentNullException(nameof positions))
+
+            match sessions.TryGetValue(key t sessionId) with
+            | false, _ -> raise (SessionNotFoundException(sessionId, "Session not found."))
+            | true, _ ->
+                match claims.TryGetValue(claimKey t claim.TurnId) with
+                | false, _ -> Task.FromResult(TurnLeaseMissing(claim.TurnId) :> TurnLeaseState)
+                | true, current ->
+                    if current.Token <> claim.Token || current.Attempt <> claim.Attempt then
+                        Task.FromResult(TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState)
+                    else
+                        match claimSessions.TryGetValue(claimKey t claim.TurnId) with
+                        | true, bound when bound <> sessionId ->
+                            Task.FromResult(TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState)
+                        | _ ->
+                            match inbox.TryGetValue(key t sessionId) with
+                            | false, _ -> raise (SessionNotFoundException(sessionId, "Session not found."))
+                            | true, entries ->
+                                for position in positions do
+                                    for index in 0 .. entries.Count - 1 do
+                                        if entries[index].Position = position && not entries[index].Consumed then
+                                            entries[index] <- { entries[index] with Consumed = true }
+
+                                Task.FromResult(TurnLeaseHeld(current) :> TurnLeaseState)
+
+        member _.UpdateSessionStateUnderClaim(t, claim, sessionId, state, _) =
+            if box claim |> isNull then
+                raise (ArgumentNullException(nameof claim))
+
+            if state <> SessionState.Running && state <> SessionState.WaitingForInput then
+                raise (InvalidSessionStateException(sessionId, "nonExecutionState", "Only Running or WaitingForInput."))
+
+            match sessions.TryGetValue(key t sessionId) with
+            | false, _ -> raise (SessionNotFoundException(sessionId, "Session not found."))
+            | true, session ->
+                if session.State = SessionState.Closed then
+                    raise (InvalidSessionStateException(sessionId, "Closed", "A closed session stays closed."))
+                else
+                    match claims.TryGetValue(claimKey t claim.TurnId) with
+                    | false, _ -> Task.FromResult(TurnLeaseMissing(claim.TurnId) :> TurnLeaseState)
+                    | true, current ->
+                        if current.Token <> claim.Token || current.Attempt <> claim.Attempt then
+                            Task.FromResult(TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState)
+                        else
+                            match claimSessions.TryGetValue(claimKey t claim.TurnId) with
+                            | true, bound when bound <> sessionId ->
+                                Task.FromResult(TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState)
+                            | _ ->
+                                sessions[key t sessionId] <-
+                                    { session with
+                                        State = state
+                                        UpdatedAt = sessionStamp
+                                    }
+
+                                Task.FromResult(TurnLeaseHeld(current) :> TurnLeaseState)
+
+        member _.GrantSessionToolUnderClaim(t, claim, sessionId, toolName, _) =
+            if box claim |> isNull then
+                raise (ArgumentNullException(nameof claim))
+
+            if String.IsNullOrWhiteSpace toolName then
+                raise (ArgumentException("The tool name must be a non-empty string.", nameof toolName))
+
+            match sessions.TryGetValue(key t sessionId) with
+            | false, _ -> raise (SessionNotFoundException(sessionId, "Session not found."))
+            | true, session ->
+                match claims.TryGetValue(claimKey t claim.TurnId) with
+                | false, _ -> Task.FromResult(TurnLeaseMissing(claim.TurnId) :> TurnLeaseState)
+                | true, current ->
+                    if current.Token <> claim.Token || current.Attempt <> claim.Attempt then
+                        Task.FromResult(TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState)
+                    else
+                        match claimSessions.TryGetValue(claimKey t claim.TurnId) with
+                        | true, bound when bound <> sessionId ->
+                            Task.FromResult(TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState)
+                        | _ ->
+                            if session.State = SessionState.Closed then
+                                raise (
+                                    InvalidSessionStateException(
+                                        sessionId,
+                                        "Closed",
+                                        "A closed session carries no grants."
+                                    )
+                                )
+                            else
+                                let grants = ResizeArray<string>(session.PermissionGrants)
+
+                                if not (grants.Contains toolName) then
+                                    grants.Add toolName
+
+                                sessions[key t sessionId] <-
+                                    { session with
+                                        PermissionGrants = grants :> IReadOnlyList<string>
+                                        UpdatedAt = sessionStamp
+                                    }
+
+                                Task.FromResult(TurnLeaseHeld(current) :> TurnLeaseState)
 
         member this.EnqueueCompletionOutbox(t, destinationId, completion, _) =
             CompletionDestinationRules.Validate destinationId

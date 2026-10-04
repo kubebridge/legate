@@ -610,13 +610,38 @@ module internal SessionActor =
                             | _ -> ()
 
                     let consumeInjected (injected: InboxEntry) : unit =
-                        let positions = [| injected.Position |] :> IReadOnlyList<int64>
+                        if not (isNull (box injected)) then
+                            let positions = [| injected.Position |] :> IReadOnlyList<int64>
 
-                        wiring.Store
-                            .MarkInboxConsumed(wiring.Tenant, wiring.SessionId, positions, CancellationToken.None)
-                            .GetAwaiter()
-                            .GetResult()
-                        |> ignore
+                            try
+                                match FencedClaimScope.currentClaim () with
+                                | Some claim when not (isNull (box claim)) ->
+                                    let landed =
+                                        ClaimFence.consumeInboxAsync
+                                            wiring.Store
+                                            wiring.Tenant
+                                            claim
+                                            wiring.SessionId
+                                            positions
+                                            CancellationToken.None
+                                        |> fun task -> task.GetAwaiter().GetResult()
+
+                                    if not landed then
+                                        raise (TurnLoop.TurnLeaseLostException())
+                                | _ ->
+                                    wiring.Store
+                                        .MarkInboxConsumed(
+                                            wiring.Tenant,
+                                            wiring.SessionId,
+                                            positions,
+                                            CancellationToken.None
+                                        )
+                                        .GetAwaiter()
+                                        .GetResult()
+                                    |> ignore
+                            with
+                            | :? TurnLoop.TurnLeaseLostException -> reraise ()
+                            | _ -> ()
 
                     let! completion =
                         TurnLoop.runAsyncWithInjects
@@ -3962,15 +3987,43 @@ module internal SessionActor =
                 | Some live -> live
                 | None -> TurnId.New()
 
-            awaitTask (
-                props.Store.UpdateSessionState(
-                    props.Tenant,
-                    props.SessionId,
-                    SessionState.Running,
-                    CancellationToken.None
+            // Execution-owned Running (issue 377): fenced under the bound
+            // claim when one exists, so a takeover between verification
+            // and the write rejects with zero effects. Unclaimed shells
+            // keep the unfenced update.
+            let startClaim =
+                match controlReports.TryGetValue entry.Position with
+                | true, (_, claim, _) when not (isNull (box claim)) -> Some claim
+                | _ ->
+                    match controlPrime with
+                    | Some claim when not (isNull (box claim)) -> Some claim
+                    | _ -> None
+
+            match startClaim with
+            | Some claim ->
+                let landed =
+                    awaitTask (
+                        ClaimFence.updateSessionStateAsync
+                            props.Store
+                            props.Tenant
+                            claim
+                            props.SessionId
+                            SessionState.Running
+                            CancellationToken.None
+                    )
+
+                if not landed then
+                    raise (TurnLoop.TurnLeaseLostException())
+            | None ->
+                awaitTask (
+                    props.Store.UpdateSessionState(
+                        props.Tenant,
+                        props.SessionId,
+                        SessionState.Running,
+                        CancellationToken.None
+                    )
                 )
-            )
-            |> ignore
+                |> ignore
 
             runningTurnId <- Some runTurnId
 
@@ -4038,6 +4091,18 @@ module internal SessionActor =
                         match heartbeatView with
                         | Some view -> LeaseAdmission.enter (view.IsValid)
                         | None -> LeaseAdmission.enter (fun () -> true)
+
+                    // Fenced Inject consumption (issue 377): the captured
+                    // claim rides the AsyncLocal scope into the runner's
+                    // fold hooks, so the consume lands atomically under the
+                    // same claim or rejects the loser.
+                    use _fenceScope =
+                        match controlReports.TryGetValue entry.Position with
+                        | true, (_, claim, _) when not (isNull (box claim)) -> FencedClaimScope.enter (Some claim)
+                        | _ ->
+                            match controlPrime with
+                            | Some claim when not (isNull (box claim)) -> FencedClaimScope.enter (Some claim)
+                            | _ -> FencedClaimScope.enter None
 
                     if not (ControlAdmission.check ()) then
                         raise (TurnLoop.TurnLeaseLostException())
@@ -4116,6 +4181,17 @@ module internal SessionActor =
                 match heartbeatView with
                 | Some view -> LeaseAdmission.enter (view.IsValid)
                 | None -> LeaseAdmission.enter (fun () -> true)
+
+            // Fenced post-resume Inject consumption (issue 377): the
+            // parked claim rides the scope into the resumed runner's fold
+            // hooks.
+            use _fenceScope =
+                match controlReports.TryGetValue parked.Entry.Position with
+                | true, (_, claim, _) when not (isNull (box claim)) -> FencedClaimScope.enter (Some claim)
+                | _ ->
+                    match controlPrime with
+                    | Some claim when not (isNull (box claim)) -> FencedClaimScope.enter (Some claim)
+                    | _ -> FencedClaimScope.enter None
 
             let cursor =
                 match parked.Cursor with
@@ -4597,6 +4673,145 @@ module internal SessionActor =
                 with _ ->
                     None
             | _ -> None
+
+        /// Consumes inbox positions atomically under the entry's captured
+        /// claim (issue 377): the token plus turn and attempt are checked
+        /// in the same store transaction as the write. Unclaimed shells
+        /// fall back to the unfenced consume; a fenced rejection returns
+        /// false with zero effects.
+        /// <param name="entry">The entry carrying the captured claim.</param>
+        /// <param name="positions">The positions to consume.</param>
+        /// <returns>True when the consume landed or no claim fences it.</returns>
+        let consumeUnderClaim (entry: InboxEntry) (positions: IReadOnlyList<int64>) : bool =
+            match settlementClaimFor entry with
+            | Some claim ->
+                awaitTask (
+                    ClaimFence.consumeInboxAsync
+                        props.Store
+                        props.Tenant
+                        claim
+                        props.SessionId
+                        positions
+                        CancellationToken.None
+                )
+            | None ->
+                awaitTask (
+                    props.Store.MarkInboxConsumed(props.Tenant, props.SessionId, positions, CancellationToken.None)
+                )
+                |> ignore
+
+                true
+
+        /// Updates the execution-owned lifecycle atomically under the
+        /// entry's captured claim (issue 377): Running or WaitingForInput
+        /// only, checked with the token plus turn and attempt in the same
+        /// store transaction. Unclaimed shells fall back to the unfenced
+        /// update; a fenced rejection returns false with zero effects.
+        /// <param name="entry">The entry carrying the captured claim.</param>
+        /// <param name="state">The new execution-owned lifecycle state.</param>
+        /// <returns>True when the update landed or no claim fences it.</returns>
+        let updateStateUnderClaim (entry: InboxEntry) (state: SessionState) : bool =
+            match settlementClaimFor entry with
+            | Some claim ->
+                awaitTask (
+                    ClaimFence.updateSessionStateAsync
+                        props.Store
+                        props.Tenant
+                        claim
+                        props.SessionId
+                        state
+                        CancellationToken.None
+                )
+            | None ->
+                awaitTask (props.Store.UpdateSessionState(props.Tenant, props.SessionId, state, CancellationToken.None))
+                |> ignore
+
+                true
+
+        /// Records a persistent grant atomically under the entry's captured
+        /// claim (issue 377). Unclaimed shells fall back to the unfenced
+        /// grant; a fenced rejection returns false with zero effects.
+        /// <param name="entry">The entry carrying the captured claim.</param>
+        /// <param name="toolName">The tool name the host allowed.</param>
+        /// <returns>True when the grant landed or no claim fences it.</returns>
+        let grantUnderClaim (entry: InboxEntry) (toolName: string) : bool =
+            match settlementClaimFor entry with
+            | Some claim ->
+                awaitTask (
+                    ClaimFence.grantSessionToolAsync
+                        props.Store
+                        props.Tenant
+                        claim
+                        props.SessionId
+                        toolName
+                        CancellationToken.None
+                )
+            | None ->
+                awaitTask (
+                    props.Store.GrantSessionTool(props.Tenant, props.SessionId, toolName, CancellationToken.None)
+                )
+                |> ignore
+
+                true
+
+        /// Persists the reply's AllowForSession grant, if any, under the
+        /// parked entry's captured claim (issue 377): remembers the tool in
+        /// memory so the resumed run skips Evaluate, then fenced-persists
+        /// it so it survives a restart. Non-grant replies and empty tool
+        /// names succeed with no store write. A fenced rejection returns
+        /// false with the in-memory add kept but nothing persisted.
+        /// <param name="parkedEntry">The parked entry carrying the captured claim.</param>
+        /// <param name="allowed">The session AllowForSession memory.</param>
+        /// <param name="cursorTool">The suspending tool name, or empty.</param>
+        /// <param name="rebuiltTool">The rebuilt tool name, or empty.</param>
+        /// <param name="reply">The reply to inspect.</param>
+        /// <returns>True when no grant was needed or the grant landed.</returns>
+        let grantReplyTool
+            (parkedEntry: InboxEntry)
+            (allowed: HashSet<string>)
+            (cursorTool: string)
+            (rebuiltTool: string)
+            (reply: Reply)
+            : bool =
+            match reply with
+            | :? PermissionDecision as decision when
+                not (isNull (box decision))
+                && decision.Decision = PermissionDecisionKind.AllowForSession
+                ->
+                let toolName =
+                    if not (String.IsNullOrEmpty cursorTool) then cursorTool
+                    elif not (String.IsNullOrEmpty rebuiltTool) then rebuiltTool
+                    else ""
+
+                if String.IsNullOrEmpty toolName then
+                    true
+                else
+                    allowed.Add(toolName) |> ignore
+                    grantUnderClaim parkedEntry toolName
+            | _ -> true
+
+        /// Applies the resume's fenced writes in order under the parked
+        /// entry's captured claim (issue 377): execution Running first,
+        /// then the reply's AllowForSession grant. Short-circuits on the
+        /// first rejection with zero further effects; pre-takeover commits
+        /// before the rejection stand.
+        /// <param name="parkedEntry">The parked entry carrying the captured claim.</param>
+        /// <param name="allowed">The session AllowForSession memory.</param>
+        /// <param name="cursorTool">The suspending tool name, or empty.</param>
+        /// <param name="rebuiltTool">The rebuilt tool name, or empty.</param>
+        /// <param name="reply">The reply to inspect.</param>
+        /// <returns>True when both writes landed or were unneeded.</returns>
+        let resumeFencedWrites
+            (parkedEntry: InboxEntry)
+            (allowed: HashSet<string>)
+            (cursorTool: string)
+            (rebuiltTool: string)
+            (reply: Reply)
+            : bool =
+            if not (updateStateUnderClaim parkedEntry SessionState.Running) then
+                false
+            else
+                grantReplyTool parkedEntry allowed cursorTool rebuiltTool reply
 
         /// Drains the committed settlement's authoritative following entry
         /// (issue 363): the provider-selected runnable candidate, never an
@@ -5219,55 +5434,59 @@ module internal SessionActor =
 
                         match completion.Suspension, stop with
                         | Some cursor, None ->
-                            awaitTask (
-                                props.Store.UpdateSessionState(
-                                    props.Tenant,
-                                    props.SessionId,
-                                    SessionState.WaitingForInput,
-                                    CancellationToken.None
-                                )
-                            )
-                            |> ignore
-
-                            match journalSuspend cursor with
-                            | JournalWriter.JournalAppended _ ->
-                                let timeoutCts = new CancellationTokenSource()
-
-                                let carriedAllowed = if isNull (box allowed) then HashSet<string>() else allowed
-
-                                // No running attempt remains once parked:
-                                // the parked turn id carries the settle
-                                // identity from here on.
+                            // Execution-owned WaitingForInput (issue 377):
+                            // fenced under the captured claim. A rejection
+                            // means a takeover winner owns the turn: zero
+                            // effects, no park, no journal.
+                            match updateStateUnderClaim entry SessionState.WaitingForInput with
+                            | false ->
+                                cancelHeartbeat ()
                                 runningTurnId <- None
+                                return! loop state None resolved
+                            | true ->
+                                match journalSuspend cursor with
+                                | JournalWriter.JournalAppended _ ->
+                                    let timeoutCts = new CancellationTokenSource()
 
-                                let parked =
-                                    {
-                                        Entry = entry
-                                        TurnId =
-                                            match resolveSettlingTurnId completion.TurnId with
-                                            | Some live -> live
-                                            | None -> Unchecked.defaultof<TurnId>
-                                        Cursor = Some cursor
-                                        Rebuilt = None
-                                        Allowed = carriedAllowed
-                                        Attempt = attempt
-                                        TimeoutCts = timeoutCts
-                                    }
+                                    let carriedAllowed = if isNull (box allowed) then HashSet<string>() else allowed
 
-                                armTimeout cursor.RequestId timeoutCts
-                                return! loop SessionState.WaitingForInput (Some parked) resolved
-                            | JournalWriter.JournalRejected rejection ->
-                                // The suspend event never landed: parking
-                                // would strand the turn on a missing journal
-                                // entry, so the turn fails with the typed
-                                // reason instead.
-                                cancelHeartbeat ()
-                                settleJournalFailure entry (sprintf "The journal append was rejected: %s." rejection)
-                                return! loop SessionState.Idle None resolved
-                            | JournalWriter.JournalFailed failure ->
-                                cancelHeartbeat ()
-                                settleJournalFailure entry failure
-                                return! loop SessionState.Idle None resolved
+                                    // No running attempt remains once parked:
+                                    // the parked turn id carries the settle
+                                    // identity from here on.
+                                    runningTurnId <- None
+
+                                    let parked =
+                                        {
+                                            Entry = entry
+                                            TurnId =
+                                                match resolveSettlingTurnId completion.TurnId with
+                                                | Some live -> live
+                                                | None -> Unchecked.defaultof<TurnId>
+                                            Cursor = Some cursor
+                                            Rebuilt = None
+                                            Allowed = carriedAllowed
+                                            Attempt = attempt
+                                            TimeoutCts = timeoutCts
+                                        }
+
+                                    armTimeout cursor.RequestId timeoutCts
+                                    return! loop SessionState.WaitingForInput (Some parked) resolved
+                                | JournalWriter.JournalRejected rejection ->
+                                    // The suspend event never landed: parking
+                                    // would strand the turn on a missing journal
+                                    // entry, so the turn fails with the typed
+                                    // reason instead.
+                                    cancelHeartbeat ()
+
+                                    settleJournalFailure
+                                        entry
+                                        (sprintf "The journal append was rejected: %s." rejection)
+
+                                    return! loop SessionState.Idle None resolved
+                                | JournalWriter.JournalFailed failure ->
+                                    cancelHeartbeat ()
+                                    settleJournalFailure entry failure
+                                    return! loop SessionState.Idle None resolved
                         | _ ->
                             // Settled, or suspended after a stop won: the
                             // stop settles Aborted with no suspend event
@@ -5506,102 +5725,88 @@ module internal SessionActor =
 
                                     let positions = [| replyEntry.Position |] :> IReadOnlyList<int64>
 
-                                    awaitTask (
-                                        props.Store.MarkInboxConsumed(
-                                            props.Tenant,
-                                            props.SessionId,
-                                            positions,
-                                            CancellationToken.None
-                                        )
-                                    )
-                                    |> ignore
-
-                                    let writeResult = journalResolve reply
-
-                                    match writeResult with
-                                    | JournalWriter.JournalAppended _ ->
-                                        resolved.Add(requestId) |> ignore
-
-                                        awaitTask (
-                                            props.Store.UpdateSessionState(
-                                                props.Tenant,
+                                    // Reply consumption (issue 377): fenced
+                                    // under the parked claim. A rejection
+                                    // means a takeover winner owns the turn:
+                                    // zero effects, host retries.
+                                    match consumeUnderClaim parked.Entry positions with
+                                    | false ->
+                                        let error =
+                                            ReplyMismatchException(
                                                 props.SessionId,
-                                                SessionState.Running,
-                                                CancellationToken.None
+                                                requestId,
+                                                "The reply arrived after a takeover and was not consumed."
                                             )
-                                        )
-                                        |> ignore
 
-                                        // AllowForSession memory: remember the tool
-                                        // in memory before resuming so the continued
-                                        // run skips Evaluate for it, and persist the
-                                        // grant on the session row so it survives a
-                                        // restart; the close evicts it.
-                                        match reply with
-                                        | :? PermissionDecision as decision when
-                                            not (isNull (box decision))
-                                            && decision.Decision = PermissionDecisionKind.AllowForSession
-                                            ->
-                                            let toolName =
+                                        mailbox.Sender() <! ReplyRejected error
+                                        return! loop state suspended resolved
+                                    | true ->
+                                        match journalResolve reply with
+                                        | JournalWriter.JournalAppended _ ->
+                                            resolved.Add(requestId) |> ignore
+
+                                            let cursorTool =
                                                 match parked.Cursor with
                                                 | Some cursor -> cursor.ToolName
+                                                | None -> ""
+
+                                            let rebuiltTool =
+                                                match parked.Rebuilt with
+                                                | Some rebuilt -> rebuilt.ToolName
+                                                | None -> ""
+
+                                            // Resume Running plus grant
+                                            // (issue 377): fenced under the
+                                            // parked claim with a single
+                                            // branch. A rejection after a
+                                            // landed consume and journal keeps
+                                            // those pre-takeover commits and
+                                            // stops without resuming.
+                                            match
+                                                resumeFencedWrites
+                                                    parked.Entry
+                                                    parked.Allowed
+                                                    cursorTool
+                                                    rebuiltTool
+                                                    reply
+                                            with
+                                            | false ->
+                                                cancelHeartbeat ()
+                                                return! loop SessionState.WaitingForInput suspended resolved
+                                            | true ->
+                                                mailbox.Sender() <! ReplyAccepted replyEntry
+
+                                                let nextAttempt = parked.Attempt + 1
+
+                                                match parked.Cursor with
+                                                | Some _ ->
+                                                    resumeSuspendable parked reply nextAttempt
+                                                    return! loop SessionState.Running None resolved
                                                 | None ->
-                                                    match parked.Rebuilt with
-                                                    | Some rebuilt -> rebuilt.ToolName
-                                                    | None -> ""
+                                                    startSuspendable parked.Entry nextAttempt parked.Allowed None
+                                                    return! loop SessionState.Running None resolved
+                                        | JournalWriter.JournalRejected rejection ->
+                                            // The resolve event never landed: resuming
+                                            // would strand the turn on a missing
+                                            // journal entry, so the turn fails with
+                                            // the typed reason instead. The reply
+                                            // matched and is consumed, so it still
+                                            // acks Accepted, and the request id is
+                                            // recorded so a redelivery replays
+                                            // Accepted instead of ReplyMismatch.
+                                            resolved.Add(requestId) |> ignore
 
-                                            if not (String.IsNullOrEmpty toolName) then
-                                                parked.Allowed.Add(toolName) |> ignore
+                                            settleJournalFailure
+                                                parked.Entry
+                                                (sprintf "The journal append was rejected: %s." rejection)
 
-                                                awaitTask (
-                                                    props.Store.GrantSessionTool(
-                                                        props.Tenant,
-                                                        props.SessionId,
-                                                        toolName,
-                                                        CancellationToken.None
-                                                    )
-                                                )
-                                                |> ignore
-                                        | _ -> ()
-
-                                        mailbox.Sender() <! ReplyAccepted replyEntry
-
-                                        let nextAttempt = parked.Attempt + 1
-
-                                        match parked.Cursor with
-                                        | Some _ ->
-                                            resumeSuspendable parked reply nextAttempt
-                                            return! loop SessionState.Running None resolved
-                                        | None ->
-                                            // Crash-retry: no cursor, so retry the
-                                            // parked entry from scratch under the new
-                                            // attempt. The retried run suspends again
-                                            // or settles; either path re-enters this
-                                            // loop.
-                                            startSuspendable parked.Entry nextAttempt parked.Allowed None
-                                            return! loop SessionState.Running None resolved
-                                    | JournalWriter.JournalRejected rejection ->
-                                        // The resolve event never landed: resuming
-                                        // would strand the turn on a missing
-                                        // journal entry, so the turn fails with
-                                        // the typed reason instead. The reply
-                                        // matched and is consumed, so it still
-                                        // acks Accepted, and the request id is
-                                        // recorded so a redelivery replays
-                                        // Accepted instead of ReplyMismatch.
-                                        resolved.Add(requestId) |> ignore
-
-                                        settleJournalFailure
-                                            parked.Entry
-                                            (sprintf "The journal append was rejected: %s." rejection)
-
-                                        mailbox.Sender() <! ReplyAccepted replyEntry
-                                        return! loop SessionState.Idle None resolved
-                                    | JournalWriter.JournalFailed failure ->
-                                        resolved.Add(requestId) |> ignore
-                                        settleJournalFailure parked.Entry failure
-                                        mailbox.Sender() <! ReplyAccepted replyEntry
-                                        return! loop SessionState.Idle None resolved
+                                            mailbox.Sender() <! ReplyAccepted replyEntry
+                                            return! loop SessionState.Idle None resolved
+                                        | JournalWriter.JournalFailed failure ->
+                                            resolved.Add(requestId) |> ignore
+                                            settleJournalFailure parked.Entry failure
+                                            mailbox.Sender() <! ReplyAccepted replyEntry
+                                            return! loop SessionState.Idle None resolved
                             | Some requestId, _ ->
                                 let error =
                                     ReplyMismatchException(

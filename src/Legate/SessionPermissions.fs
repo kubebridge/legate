@@ -143,13 +143,29 @@ module internal SessionPermissions =
                 let positions = [| injected.Position |] :> IReadOnlyList<int64>
 
                 try
-                    store
-                        .MarkInboxConsumed(tenant, entry.SessionId, positions, CancellationToken.None)
-                        .GetAwaiter()
-                        .GetResult()
-                    |> ignore
-                with _ ->
-                    ()
+                    match FencedClaimScope.currentClaim () with
+                    | Some claim when not (isNull (box claim)) ->
+                        let landed =
+                            ClaimFence.consumeInboxAsync
+                                store
+                                tenant
+                                claim
+                                entry.SessionId
+                                positions
+                                CancellationToken.None
+                            |> fun task -> task.GetAwaiter().GetResult()
+
+                        if not landed then
+                            raise (TurnLoop.TurnLeaseLostException())
+                    | _ ->
+                        store
+                            .MarkInboxConsumed(tenant, entry.SessionId, positions, CancellationToken.None)
+                            .GetAwaiter()
+                            .GetResult()
+                        |> ignore
+                with
+                | :? TurnLoop.TurnLeaseLostException -> reraise ()
+                | _ -> ()
 
         /// Binds the running turn's skill journal hook into the pre-built
         /// tool map (issue 321): hosts build the skill tool once per

@@ -1564,6 +1564,191 @@ type SqliteSessionStore(database: SqliteDatabase) =
                 | :? SqliteException as sql -> return raise (mapSql sql)
             }
 
+        member _.ConsumeInboxUnderClaim(tenant, claim, sessionId, positions, _) =
+            task {
+                if isNull (box claim) then
+                    raise (ArgumentNullException(nameof claim))
+
+                if isNull (box positions) then
+                    raise (ArgumentNullException(nameof positions))
+
+                try
+                    return
+                        lock database.Gate (fun () ->
+                            use connection = database.OpenConnection()
+                            use transaction = connection.BeginTransaction()
+                            requireSessionRow connection transaction tenant sessionId |> ignore
+
+                            match resolveClaim connection transaction tenant claim with
+                            | Live(sid, _, _, expiresAt, attempt) when sid = sessionId && attempt = claim.Attempt ->
+                                for position in positions do
+                                    use update = connection.CreateCommand()
+                                    update.Transaction <- transaction
+
+                                    update.CommandText <-
+                                        $"UPDATE \"%s{inboxTable ()}\" SET consumed = 1 WHERE session_id = $session AND position = $position AND consumed = 0"
+
+                                    update.Parameters.AddWithValue("$session", sessionId.Value) |> ignore
+                                    update.Parameters.AddWithValue("$position", position) |> ignore
+                                    update.ExecuteNonQuery() |> ignore
+
+                                transaction.Commit()
+
+                                let live = { claim with ExpiresAt = expiresAt }
+
+                                TurnLeaseHeld live :> TurnLeaseState
+                            | Live(_, _, _, _, _) ->
+                                transaction.Rollback()
+                                TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState
+                            | TakenOver ->
+                                transaction.Rollback()
+                                TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState
+                            | Absent ->
+                                transaction.Rollback()
+                                TurnLeaseMissing claim.TurnId :> TurnLeaseState)
+                with
+                | :? LegateException as ex -> return raise ex
+                | :? SqliteException as sql -> return raise (mapSql sql)
+            }
+
+        member _.UpdateSessionStateUnderClaim(tenant, claim, sessionId, state, _) =
+            task {
+                if isNull (box claim) then
+                    raise (ArgumentNullException(nameof claim))
+
+                if state <> SessionState.Running && state <> SessionState.WaitingForInput then
+                    raise (
+                        InvalidSessionStateException(
+                            sessionId,
+                            nameof state,
+                            "Only execution-owned states (Running, WaitingForInput) update under a claim."
+                        )
+                    )
+
+                try
+                    return
+                        lock database.Gate (fun () ->
+                            use connection = database.OpenConnection()
+                            use transaction = connection.BeginTransaction()
+                            let session = requireSessionRow connection transaction tenant sessionId
+
+                            if session.State = SessionState.Closed then
+                                raise (
+                                    InvalidSessionStateException(
+                                        sessionId,
+                                        nameof session.State,
+                                        "A closed session cannot leave the Closed state."
+                                    )
+                                )
+
+                            match resolveClaim connection transaction tenant claim with
+                            | Live(sid, _, _, expiresAt, attempt) when sid = sessionId && attempt = claim.Attempt ->
+                                ControlTargetProtocol.requireTransition
+                                    sessionId
+                                    state
+                                    (RelationalControlTarget.load
+                                        connection
+                                        transaction
+                                        (controlTable ())
+                                        tenant
+                                        sessionId)
+
+                                let now = database.UtcNow
+
+                                use update = connection.CreateCommand()
+                                update.Transaction <- transaction
+
+                                update.CommandText <-
+                                    $"UPDATE \"%s{sessionsTable ()}\" SET state = $state, updated_at = $now WHERE id = $id AND tenant = $tenant"
+
+                                update.Parameters.AddWithValue("$state", stateName state) |> ignore
+                                update.Parameters.AddWithValue("$now", toIso now) |> ignore
+                                update.Parameters.AddWithValue("$id", sessionId.Value) |> ignore
+                                update.Parameters.AddWithValue("$tenant", tenant.Value) |> ignore
+                                update.ExecuteNonQuery() |> ignore
+                                transaction.Commit()
+
+                                let live = { claim with ExpiresAt = expiresAt }
+
+                                TurnLeaseHeld live :> TurnLeaseState
+                            | Live(_, _, _, _, _) ->
+                                transaction.Rollback()
+                                TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState
+                            | TakenOver ->
+                                transaction.Rollback()
+                                TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState
+                            | Absent ->
+                                transaction.Rollback()
+                                TurnLeaseMissing claim.TurnId :> TurnLeaseState)
+                with
+                | :? LegateException as ex -> return raise ex
+                | :? SqliteException as sql -> return raise (mapSql sql)
+            }
+
+        member _.GrantSessionToolUnderClaim(tenant, claim, sessionId, toolName, _) =
+            task {
+                if isNull (box claim) then
+                    raise (ArgumentNullException(nameof claim))
+
+                if String.IsNullOrWhiteSpace toolName then
+                    raise (ArgumentException("The tool name must be a non-empty string.", nameof toolName))
+
+                try
+                    return
+                        lock database.Gate (fun () ->
+                            use connection = database.OpenConnection()
+                            use transaction = connection.BeginTransaction()
+                            let session = requireSessionRow connection transaction tenant sessionId
+
+                            match resolveClaim connection transaction tenant claim with
+                            | Live(sid, _, _, expiresAt, attempt) when sid = sessionId && attempt = claim.Attempt ->
+                                if session.State = SessionState.Closed then
+                                    raise (
+                                        InvalidSessionStateException(
+                                            sessionId,
+                                            nameof session.State,
+                                            "A closed session carries no grant memory."
+                                        )
+                                    )
+
+                                let grants = grantsOf session
+
+                                if not (grants.Contains toolName) then
+                                    grants.Add toolName
+
+                                let now = database.UtcNow
+                                let grantsJson = SqliteJson.serialize grants
+
+                                use update = connection.CreateCommand()
+                                update.Transaction <- transaction
+
+                                update.CommandText <-
+                                    $"UPDATE \"%s{sessionsTable ()}\" SET permission_grants_json = $grants, updated_at = $now WHERE id = $id AND tenant = $tenant"
+
+                                update.Parameters.AddWithValue("$grants", grantsJson) |> ignore
+                                update.Parameters.AddWithValue("$now", toIso now) |> ignore
+                                update.Parameters.AddWithValue("$id", sessionId.Value) |> ignore
+                                update.Parameters.AddWithValue("$tenant", tenant.Value) |> ignore
+                                update.ExecuteNonQuery() |> ignore
+                                transaction.Commit()
+
+                                let live = { claim with ExpiresAt = expiresAt }
+
+                                TurnLeaseHeld live :> TurnLeaseState
+                            | Live(_, _, _, _, _) ->
+                                transaction.Rollback()
+                                TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState
+                            | TakenOver ->
+                                transaction.Rollback()
+                                TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState
+                            | Absent ->
+                                transaction.Rollback()
+                                TurnLeaseMissing claim.TurnId :> TurnLeaseState)
+                with
+                | :? LegateException as ex -> return raise ex
+                | :? SqliteException as sql -> return raise (mapSql sql)
+            }
+
         member _.EnqueueCompletionOutbox(tenant, destinationId, completion, _) =
             task {
                 CompletionDestinationRules.Validate destinationId

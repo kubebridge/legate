@@ -1612,6 +1612,198 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
                 | Choice3Of3() -> TurnLeaseMissing claim.TurnId :> TurnLeaseState)
             |> Task.FromResult
 
+        member this.ConsumeInboxUnderClaim(tenant, claim, sessionId, positions, _) =
+            if isNull (box claim) then
+                raise (ArgumentNullException(nameof claim))
+
+            if isNull (box positions) then
+                raise (ArgumentNullException(nameof positions))
+
+            this.EnsureMigrated()
+
+            transact options (fun connection transaction ->
+                this.RequireSession(connection, transaction, tenant, sessionId)
+                let now = this.UtcNow
+                let nowText = stamp now
+
+                match this.ResolveClaim(connection, transaction, tenant, claim, nowText) with
+                | Choice1Of3(sid, live) when sid = sessionId && live.Attempt = claim.Attempt ->
+                    if live.ExpiresAt <= now then
+                        TurnLeaseLost(claim.TurnId, "expired") :> TurnLeaseState
+                    else
+                        use cmd =
+                            command
+                                connection
+                                transaction
+                                $"UPDATE {this.InboxTable} SET consumed = TRUE WHERE session_id = @sid AND tenant = @t AND consumed = FALSE AND position = ANY (@positions)"
+
+                        textParam cmd "sid" (sessionId.ToString())
+                        textParam cmd "t" (tenant.ToString())
+
+                        let arrayParam =
+                            NpgsqlParameter(
+                                "positions",
+                                NpgsqlTypes.NpgsqlDbType.Array ||| NpgsqlTypes.NpgsqlDbType.Bigint
+                            )
+
+                        arrayParam.Value <- box (Seq.toArray positions)
+                        cmd.Parameters.Add(arrayParam) |> ignore
+                        cmd.ExecuteNonQuery() |> ignore
+                        TurnLeaseHeld live :> TurnLeaseState
+                | Choice1Of3(_, _) -> TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState
+                | Choice2Of3() -> TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState
+                | Choice3Of3() -> TurnLeaseMissing claim.TurnId :> TurnLeaseState)
+            |> Task.FromResult
+
+        member this.UpdateSessionStateUnderClaim(tenant, claim, sessionId, state, _) =
+            if isNull (box claim) then
+                raise (ArgumentNullException(nameof claim))
+
+            if state <> SessionState.Running && state <> SessionState.WaitingForInput then
+                raise (
+                    InvalidSessionStateException(
+                        sessionId,
+                        nameof state,
+                        "Only execution-owned states (Running, WaitingForInput) update under a claim."
+                    )
+                )
+
+            this.EnsureMigrated()
+
+            transact options (fun connection transaction ->
+                use lockCmd =
+                    command
+                        connection
+                        transaction
+                        $"SELECT state FROM {this.SessionsTable} WHERE id = @id AND tenant = @t FOR UPDATE"
+
+                textParam lockCmd "id" (sessionId.ToString())
+                textParam lockCmd "t" (tenant.ToString())
+
+                use lockReader = lockCmd.ExecuteReader()
+
+                let current: string | null =
+                    if lockReader.Read() then lockReader.GetString(0) else null
+
+                lockReader.Close()
+
+                if isNull (box current) then
+                    raise (
+                        SessionNotFoundException(
+                            sessionId,
+                            sprintf "No session %O exists in tenant %O." sessionId tenant
+                        )
+                    )
+
+                if current = SessionState.Closed.ToString() then
+                    raise (
+                        InvalidSessionStateException(
+                            sessionId,
+                            nameof state,
+                            "A closed session cannot leave the Closed state."
+                        )
+                    )
+
+                let now = this.UtcNow
+                let nowText = stamp now
+
+                match this.ResolveClaim(connection, transaction, tenant, claim, nowText) with
+                | Choice1Of3(sid, live) when sid = sessionId && live.Attempt = claim.Attempt ->
+                    if live.ExpiresAt <= now then
+                        TurnLeaseLost(claim.TurnId, "expired") :> TurnLeaseState
+                    else
+                        use updateCmd =
+                            command
+                                connection
+                                transaction
+                                $"UPDATE {this.SessionsTable} SET state = @state, updated_at = @now WHERE id = @id AND tenant = @t"
+
+                        textParam updateCmd "state" (state.ToString())
+                        textParam updateCmd "now" nowText
+                        textParam updateCmd "id" (sessionId.ToString())
+                        textParam updateCmd "t" (tenant.ToString())
+                        updateCmd.ExecuteNonQuery() |> ignore
+                        TurnLeaseHeld live :> TurnLeaseState
+                | Choice1Of3(_, _) -> TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState
+                | Choice2Of3() -> TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState
+                | Choice3Of3() -> TurnLeaseMissing claim.TurnId :> TurnLeaseState)
+            |> Task.FromResult
+
+        member this.GrantSessionToolUnderClaim(tenant, claim, sessionId, toolName, _) =
+            if String.IsNullOrWhiteSpace toolName then
+                raise (ArgumentException("The tool name must be a non-empty string.", nameof toolName))
+
+            if isNull (box claim) then
+                raise (ArgumentNullException(nameof claim))
+
+            this.EnsureMigrated()
+
+            transact options (fun connection transaction ->
+                use lockCmd =
+                    command
+                        connection
+                        transaction
+                        $"SELECT {this.SessionColumns} FROM {this.SessionsTable} WHERE id = @id AND tenant = @t FOR UPDATE"
+
+                textParam lockCmd "id" (sessionId.ToString())
+                textParam lockCmd "t" (tenant.ToString())
+
+                use lockReader = lockCmd.ExecuteReader()
+
+                if not (lockReader.Read()) then
+                    lockReader.Close()
+
+                    raise (
+                        SessionNotFoundException(
+                            sessionId,
+                            sprintf "No session %O exists in tenant %O." sessionId tenant
+                        )
+                    )
+
+                let session = this.ReadSession(lockReader)
+                lockReader.Close()
+                let now = this.UtcNow
+                let nowText = stamp now
+
+                match this.ResolveClaim(connection, transaction, tenant, claim, nowText) with
+                | Choice1Of3(sid, live) when sid = sessionId && live.Attempt = claim.Attempt ->
+                    if live.ExpiresAt <= now then
+                        TurnLeaseLost(claim.TurnId, "expired") :> TurnLeaseState
+                    elif session.State = SessionState.Closed then
+                        raise (
+                            InvalidSessionStateException(
+                                sessionId,
+                                nameof session.State,
+                                "A closed session carries no grant memory."
+                            )
+                        )
+                    else
+                        let grants = ResizeArray<string>(this.StoredGrants(session.PermissionGrants))
+
+                        if not (grants.Contains toolName) then
+                            grants.Add toolName
+
+                        use updateCmd =
+                            command
+                                connection
+                                transaction
+                                $"UPDATE {this.SessionsTable} SET permission_grants_json = @grants, updated_at = @now WHERE id = @id AND tenant = @t"
+
+                        textParam
+                            updateCmd
+                            "grants"
+                            (serialize<List<string>> (List<string>(grants :> IReadOnlyList<string>)))
+
+                        textParam updateCmd "now" nowText
+                        textParam updateCmd "id" (sessionId.ToString())
+                        textParam updateCmd "t" (tenant.ToString())
+                        updateCmd.ExecuteNonQuery() |> ignore
+                        TurnLeaseHeld live :> TurnLeaseState
+                | Choice1Of3(_, _) -> TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState
+                | Choice2Of3() -> TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState
+                | Choice3Of3() -> TurnLeaseMissing claim.TurnId :> TurnLeaseState)
+            |> Task.FromResult
+
         member this.EnqueueCompletionOutbox(tenant, destinationId, completion, _) =
             CompletionDestinationRules.Validate destinationId
 

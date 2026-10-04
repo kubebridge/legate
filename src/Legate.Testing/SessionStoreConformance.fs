@@ -1362,6 +1362,323 @@ type SessionStoreConformance(store: ISessionStore, clock: TestClock, tenant: Ten
             | session -> Assert.Empty(session.PermissionGrants)
         }
 
+    // ── Fenced nonterminal writes (issue 377) ──
+
+    member this.ClaimLiveTurn(sessionId: SessionId, owner: string) =
+        task {
+            let! lease = store.ClaimNextTurn(tenant, sessionId, owner, TimeSpan.FromMinutes 5., CancellationToken.None)
+
+            match lease with
+            | :? TurnLeaseRenewed as renewed -> return renewed.Claim
+            | _ -> return failwith "expected the live claim"
+        }
+
+    [<Fact>]
+    member this.``Fenced consume lands under the live claim and retries idempotently``() =
+        task {
+            let! created = store.CreateSession(tenant, this.SampleSession(), CancellationToken.None)
+
+            let first = UserMessagePayload(UserMessage.Text("first")) :> InboxPayload
+            let second = UserMessagePayload(UserMessage.Text("second")) :> InboxPayload
+
+            let! firstEntry =
+                store.AppendInboxMessage(tenant, created.Id, first, DeliveryMode.Inject, CancellationToken.None)
+
+            let! _ = store.AppendInboxMessage(tenant, created.Id, second, DeliveryMode.Inject, CancellationToken.None)
+            let! claim = this.ClaimLiveTurn(created.Id, "owner-a")
+
+            let positions = [| firstEntry.Position |] :> IReadOnlyList<int64>
+
+            let! held = store.ConsumeInboxUnderClaim(tenant, claim, created.Id, positions, CancellationToken.None)
+            Assert.True(held :? TurnLeaseHeld)
+
+            let! pending = store.ReadPendingInbox(tenant, created.Id, CancellationToken.None)
+            Assert.All(pending, fun entry -> Assert.NotEqual(firstEntry.Position, entry.Position))
+
+            let! again = store.ConsumeInboxUnderClaim(tenant, claim, created.Id, positions, CancellationToken.None)
+            Assert.True(again :? TurnLeaseHeld)
+        }
+
+    [<Fact>]
+    member this.``Fenced lifecycle lands Running and WaitingForInput and retries idempotently``() =
+        task {
+            let! created = store.CreateSession(tenant, this.SampleSession(), CancellationToken.None)
+
+            let message = UserMessagePayload(UserMessage.Text("run")) :> InboxPayload
+            let! _ = store.AppendInboxMessage(tenant, created.Id, message, DeliveryMode.Queue, CancellationToken.None)
+            let! claim = this.ClaimLiveTurn(created.Id, "owner-a")
+
+            let! running =
+                store.UpdateSessionStateUnderClaim(
+                    tenant,
+                    claim,
+                    created.Id,
+                    SessionState.Running,
+                    CancellationToken.None
+                )
+
+            Assert.True(running :? TurnLeaseHeld)
+
+            let! waiting =
+                store.UpdateSessionStateUnderClaim(
+                    tenant,
+                    claim,
+                    created.Id,
+                    SessionState.WaitingForInput,
+                    CancellationToken.None
+                )
+
+            Assert.True(waiting :? TurnLeaseHeld)
+
+            let! again =
+                store.UpdateSessionStateUnderClaim(
+                    tenant,
+                    claim,
+                    created.Id,
+                    SessionState.WaitingForInput,
+                    CancellationToken.None
+                )
+
+            Assert.True(again :? TurnLeaseHeld)
+
+            let! stored = store.GetSession(tenant, created.Id, CancellationToken.None)
+
+            match stored with
+            | null -> failwith "expected the session"
+            | session -> Assert.Equal(SessionState.WaitingForInput, session.State)
+        }
+
+    [<Fact>]
+    member this.``Fenced grant lands and retries idempotently``() =
+        task {
+            let! created = store.CreateSession(tenant, this.SampleSession(), CancellationToken.None)
+
+            let message = UserMessagePayload(UserMessage.Text("grant")) :> InboxPayload
+            let! _ = store.AppendInboxMessage(tenant, created.Id, message, DeliveryMode.Queue, CancellationToken.None)
+            let! claim = this.ClaimLiveTurn(created.Id, "owner-a")
+
+            let! held = store.GrantSessionToolUnderClaim(tenant, claim, created.Id, "exec", CancellationToken.None)
+            Assert.True(held :? TurnLeaseHeld)
+
+            let! again = store.GrantSessionToolUnderClaim(tenant, claim, created.Id, "exec", CancellationToken.None)
+            Assert.True(again :? TurnLeaseHeld)
+
+            let! stored = store.GetSession(tenant, created.Id, CancellationToken.None)
+
+            match stored with
+            | null -> failwith "expected the session"
+            | session ->
+                Assert.Contains("exec", session.PermissionGrants)
+
+                let count =
+                    session.PermissionGrants
+                    |> Seq.filter (fun grant -> grant = "exec")
+                    |> Seq.length
+
+                Assert.Equal(1, count)
+        }
+
+    [<Fact>]
+    member this.``Fenced lifecycle rejects non-execution states and closed sessions``() =
+        task {
+            let! created = store.CreateSession(tenant, this.SampleSession(), CancellationToken.None)
+
+            let message = UserMessagePayload(UserMessage.Text("rules")) :> InboxPayload
+            let! _ = store.AppendInboxMessage(tenant, created.Id, message, DeliveryMode.Queue, CancellationToken.None)
+            let! claim = this.ClaimLiveTurn(created.Id, "owner-a")
+
+            Assert.Throws<InvalidSessionStateException>(fun () ->
+                store
+                    .UpdateSessionStateUnderClaim(tenant, claim, created.Id, SessionState.Idle, CancellationToken.None)
+                    .GetAwaiter()
+                    .GetResult()
+                |> ignore)
+            |> ignore
+
+            Assert.Throws<InvalidSessionStateException>(fun () ->
+                store
+                    .UpdateSessionStateUnderClaim(
+                        tenant,
+                        claim,
+                        created.Id,
+                        SessionState.Closed,
+                        CancellationToken.None
+                    )
+                    .GetAwaiter()
+                    .GetResult()
+                |> ignore)
+            |> ignore
+
+            let! _ = store.CloseSession(tenant, created.Id, CancellationToken.None)
+
+            Assert.Throws<InvalidSessionStateException>(fun () ->
+                store
+                    .UpdateSessionStateUnderClaim(
+                        tenant,
+                        claim,
+                        created.Id,
+                        SessionState.Running,
+                        CancellationToken.None
+                    )
+                    .GetAwaiter()
+                    .GetResult()
+                |> ignore)
+            |> ignore
+
+            Assert.Throws<InvalidSessionStateException>(fun () ->
+                store
+                    .GrantSessionToolUnderClaim(tenant, claim, created.Id, "exec", CancellationToken.None)
+                    .GetAwaiter()
+                    .GetResult()
+                |> ignore)
+            |> ignore
+        }
+
+    [<Fact>]
+    member this.``Fenced writes throw for unknown sessions and reject cross-tenant rows``() =
+        task {
+            let! created = store.CreateSession(tenant, this.SampleSession(), CancellationToken.None)
+
+            let message = UserMessagePayload(UserMessage.Text("tenant")) :> InboxPayload
+            let! _ = store.AppendInboxMessage(tenant, created.Id, message, DeliveryMode.Queue, CancellationToken.None)
+            let! claim = this.ClaimLiveTurn(created.Id, "owner-a")
+            let missing = SessionId.New()
+            let positions = [| 1L |] :> IReadOnlyList<int64>
+
+            Assert.Throws<SessionNotFoundException>(fun () ->
+                store
+                    .ConsumeInboxUnderClaim(tenant, claim, missing, positions, CancellationToken.None)
+                    .GetAwaiter()
+                    .GetResult()
+                |> ignore)
+            |> ignore
+
+            Assert.Throws<SessionNotFoundException>(fun () ->
+                store
+                    .ConsumeInboxUnderClaim(this.OtherTenant, claim, created.Id, positions, CancellationToken.None)
+                    .GetAwaiter()
+                    .GetResult()
+                |> ignore)
+            |> ignore
+
+            Assert.Throws<SessionNotFoundException>(fun () ->
+                store
+                    .UpdateSessionStateUnderClaim(
+                        this.OtherTenant,
+                        claim,
+                        created.Id,
+                        SessionState.Running,
+                        CancellationToken.None
+                    )
+                    .GetAwaiter()
+                    .GetResult()
+                |> ignore)
+            |> ignore
+
+            Assert.Throws<SessionNotFoundException>(fun () ->
+                store
+                    .GrantSessionToolUnderClaim(this.OtherTenant, claim, created.Id, "exec", CancellationToken.None)
+                    .GetAwaiter()
+                    .GetResult()
+                |> ignore)
+            |> ignore
+        }
+
+    [<Fact>]
+    member this.``A takeover race rejects fenced nonterminal writes with zero effects``() =
+        task {
+            let! created = store.CreateSession(tenant, this.SampleSession(), CancellationToken.None)
+
+            let first = UserMessagePayload(UserMessage.Text("first")) :> InboxPayload
+
+            let! firstEntry =
+                store.AppendInboxMessage(tenant, created.Id, first, DeliveryMode.Inject, CancellationToken.None)
+
+            let! loser = this.ClaimLiveTurn(created.Id, "owner-a")
+            Assert.Equal(firstEntry.TurnId, loser.TurnId)
+            this.Clock.Advance(TimeSpan.FromMinutes 10.)
+
+            let reply =
+                ReplyPayload(PermissionDecision("req-1", PermissionDecisionKind.AllowOnce)) :> InboxPayload
+
+            let! _ = store.AppendInboxMessage(tenant, created.Id, reply, DeliveryMode.Queue, CancellationToken.None)
+
+            let! resumed =
+                store.ClaimNextTurn(tenant, created.Id, "owner-b", TimeSpan.FromMinutes 5., CancellationToken.None)
+
+            let winner =
+                match resumed with
+                | :? TurnLeaseRenewed as renewed -> renewed.Claim
+                | _ -> failwith "expected the resume claim"
+
+            Assert.Equal(loser.TurnId, winner.TurnId)
+            Assert.Equal(loser.Attempt + 1, winner.Attempt)
+
+            let second = UserMessagePayload(UserMessage.Text("second")) :> InboxPayload
+
+            let! secondEntry =
+                store.AppendInboxMessage(tenant, created.Id, second, DeliveryMode.Inject, CancellationToken.None)
+
+            let loserPositions = [| secondEntry.Position |] :> IReadOnlyList<int64>
+
+            let! consumeLost =
+                store.ConsumeInboxUnderClaim(tenant, loser, created.Id, loserPositions, CancellationToken.None)
+
+            Assert.True(consumeLost :? TurnLeaseLost || consumeLost :? TurnLeaseMissing)
+
+            let! lifecycleLost =
+                store.UpdateSessionStateUnderClaim(
+                    tenant,
+                    loser,
+                    created.Id,
+                    SessionState.WaitingForInput,
+                    CancellationToken.None
+                )
+
+            Assert.True(lifecycleLost :? TurnLeaseLost || lifecycleLost :? TurnLeaseMissing)
+
+            let! grantLost = store.GrantSessionToolUnderClaim(tenant, loser, created.Id, "exec", CancellationToken.None)
+
+            Assert.True(grantLost :? TurnLeaseLost || grantLost :? TurnLeaseMissing)
+
+            let! pending = store.ReadPendingInbox(tenant, created.Id, CancellationToken.None)
+            Assert.Contains(pending, fun entry -> entry.Position = secondEntry.Position)
+
+            let! stored = store.GetSession(tenant, created.Id, CancellationToken.None)
+
+            match stored with
+            | null -> failwith "expected the session"
+            | session ->
+                Assert.DoesNotContain("exec", session.PermissionGrants)
+                Assert.NotEqual(SessionState.WaitingForInput, session.State)
+
+            let winnerPositions = [| secondEntry.Position |] :> IReadOnlyList<int64>
+
+            let! winnerConsume =
+                store.ConsumeInboxUnderClaim(tenant, winner, created.Id, winnerPositions, CancellationToken.None)
+
+            Assert.True(winnerConsume :? TurnLeaseHeld)
+
+            let! winnerLifecycle =
+                store.UpdateSessionStateUnderClaim(
+                    tenant,
+                    winner,
+                    created.Id,
+                    SessionState.WaitingForInput,
+                    CancellationToken.None
+                )
+
+            Assert.True(winnerLifecycle :? TurnLeaseHeld)
+
+            let! winnerGrant =
+                store.GrantSessionToolUnderClaim(tenant, winner, created.Id, "exec", CancellationToken.None)
+
+            Assert.True(winnerGrant :? TurnLeaseHeld)
+
+            let! pendingAfter = store.ReadPendingInbox(tenant, created.Id, CancellationToken.None)
+            Assert.DoesNotContain(pendingAfter, fun entry -> entry.Position = secondEntry.Position)
+        }
+
     // ── Completion outbox (issue 84) ──
 
     /// Builds a completion carrying the key, the shape settlement enqueues.
