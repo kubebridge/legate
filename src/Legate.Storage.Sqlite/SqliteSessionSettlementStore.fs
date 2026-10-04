@@ -626,7 +626,7 @@ type SqliteSessionSettlementStore(database: SqliteDatabase) =
                                                 entryQuery.Transaction <- transaction
 
                                                 entryQuery.CommandText <-
-                                                    $"SELECT payload_json, delivery_mode, consumed, appended_at FROM \"%s{inboxTable ()}\" WHERE session_id = $session AND position = $pos"
+                                                    $"SELECT payload_json, delivery_mode, consumed, appended_at, turn_id FROM \"%s{inboxTable ()}\" WHERE session_id = $session AND position = $pos"
 
                                                 entryQuery.Parameters.AddWithValue("$session", sessionId.Value)
                                                 |> ignore
@@ -643,6 +643,17 @@ type SqliteSessionSettlementStore(database: SqliteDatabase) =
                                                 let consumed = entryReader.GetInt64(2) <> 0L
                                                 let appendedAt = ofIso (entryReader.GetString(3))
 
+                                                let turnId =
+                                                    if entryReader.FieldCount > 4 && not (entryReader.IsDBNull(4)) then
+                                                        let text = entryReader.GetString(4)
+
+                                                        if String.IsNullOrWhiteSpace(text) then
+                                                            Unchecked.defaultof<TurnId>
+                                                        else
+                                                            TurnId.Parse(text)
+                                                    else
+                                                        Unchecked.defaultof<TurnId>
+
                                                 {
                                                     SessionId = sessionId
                                                     Position = position
@@ -650,6 +661,7 @@ type SqliteSessionSettlementStore(database: SqliteDatabase) =
                                                     Delivery = delivery
                                                     Consumed = consumed
                                                     AppendedAt = appendedAt
+                                                    TurnId = turnId
                                                 }
 
                                             let following: InboxEntry | null =

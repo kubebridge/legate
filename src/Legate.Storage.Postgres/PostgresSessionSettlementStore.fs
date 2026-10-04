@@ -615,7 +615,7 @@ type PostgresSessionSettlementStore(options: PostgresOptions, timeProvider: Time
                                                 command
                                                     connection
                                                     transaction
-                                                    $"SELECT payload_json, delivery_mode, consumed, appended_at FROM {this.InboxTable} WHERE session_id = @sid AND tenant = @t AND position = @pos"
+                                                    $"SELECT payload_json, delivery_mode, consumed, appended_at, turn_id FROM {this.InboxTable} WHERE session_id = @sid AND tenant = @t AND position = @pos"
 
                                             textParam entryQuery "sid" (sessionId.ToString())
                                             textParam entryQuery "t" (tenant.ToString())
@@ -627,6 +627,7 @@ type PostgresSessionSettlementStore(options: PostgresOptions, timeProvider: Time
                                             let delivery = Enum.Parse<DeliveryMode>(entryReader.GetString(1), false)
                                             let consumed = entryReader.GetBoolean(2)
                                             let appendedAt = parseStamp (entryReader.GetString(3))
+                                            let turnText: string | null = getTextOrNull entryReader 4
 
                                             {
                                                 SessionId = sessionId
@@ -635,6 +636,12 @@ type PostgresSessionSettlementStore(options: PostgresOptions, timeProvider: Time
                                                 Delivery = delivery
                                                 Consumed = consumed
                                                 AppendedAt = appendedAt
+                                                TurnId =
+                                                    match turnText with
+                                                    | null -> Unchecked.defaultof<TurnId>
+                                                    | text when String.IsNullOrWhiteSpace(text) ->
+                                                        Unchecked.defaultof<TurnId>
+                                                    | text -> TurnId.Parse(text)
                                             }
 
                                         let following: InboxEntry | null =

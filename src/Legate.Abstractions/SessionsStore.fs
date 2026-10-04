@@ -228,12 +228,19 @@ and [<Sealed>] ReplyPayload(reply: Reply) =
 /// the stable <c>$type</c> discriminators
 /// <see cref="T:Legate.UserMessagePayload" /> and
 /// <see cref="T:Legate.ReplyPayload" /> declare; the envelope's own fields
-/// (delivery mode, consumed flag, position) serialise flat. Position is
-/// the store-assigned per-session ordering key: entries consume in
-/// position order, and a store assigns the next position on append, so
+/// (delivery mode, consumed flag, position, turn identity) serialise flat.
+/// Position is the store-assigned per-session ordering key: entries consume
+/// in position order, and a store assigns the next position on append, so
 /// readers never observe two entries with the same position in one
-/// session. Consumed entries stay readable until the implementation's
-/// retention policy removes them; ReadPendingInbox never returns one.
+/// session. TurnId is the stable durable identity of the real turn this
+/// entry runs as, assigned once at accept for user messages: distinct queued
+/// user messages never share an identity, including the synthetic journal
+/// prime bootstrap. Reply entries carry the default (unstamped) TurnId
+/// sentinel and never start a turn; they resume the suspended real turn.
+/// Legacy rows without a stamped identity read as the default sentinel and
+/// are bound on first claim without rewriting history. Consumed entries stay
+/// readable until the implementation's retention policy removes them;
+/// ReadPendingInbox never returns one.
 /// Constructible from C# through property setters and serialises with
 /// System.Text.Json.
 [<CLIMutable; NoComparison>]
@@ -254,6 +261,11 @@ type InboxEntry =
         Consumed: bool
         /// When the entry was appended.
         AppendedAt: DateTimeOffset
+        /// The stable durable identity of the real turn this entry runs as,
+        /// assigned at accept for user messages. Distinct user messages carry
+        /// distinct identities; reply entries and legacy rows carry the default
+        /// (unstamped) sentinel.
+        TurnId: TurnId
     }
 
 /// One bounded page of the session list: what
@@ -556,14 +568,16 @@ type ISessionStore =
     // ── Inbox ──
 
     /// Appends one message to the session's inbox with its delivery mode.
-    /// Atomic: the entry and its assigned position become visible
-    /// together.
+    /// Atomic: the entry, its assigned position, and its durable real-turn
+    /// identity become visible together. User messages are assigned a fresh
+    /// stable TurnId at accept; reply entries carry the default (unstamped)
+    /// sentinel and never start a turn.
     /// <param name="tenant">The tenant the session belongs to.</param>
     /// <param name="sessionId">The session to append to.</param>
     /// <param name="payload">What the entry carries: a user message or a reply. Must not be null.</param>
     /// <param name="delivery">How the message was delivered.</param>
     /// <param name="cancellationToken">Token that abandons the append.</param>
-    /// <returns>The stored entry, position and timestamp stamped by the store.</returns>
+    /// <returns>The stored entry, position, real-turn identity, and timestamp stamped by the store.</returns>
     /// <exception cref="T:System.ArgumentNullException">The payload is null.</exception>
     /// <exception cref="T:Legate.SessionNotFoundException">The session id does not exist in this tenant.</exception>
     abstract AppendInboxMessage:
@@ -601,9 +615,13 @@ type ISessionStore =
     // ── Claims and leases ──
 
     /// Claims the session's next pending turn under a lease. Atomic:
-    /// exactly one caller wins a turn. Returns the missing lease state
-    /// when the session has no claimable turn, so the caller branches on
-    /// the result rather than catching an exception.
+    /// exactly one caller wins a turn, bound to the accepted entry's durable
+    /// real-turn identity: a user message claims under its stamped TurnId,
+    /// never a fresh synthetic bootstrap identity, so distinct queued entries
+    /// yield distinct durable TurnIds. A reply resumes the open turn with the
+    /// attempt incremented and never starts one. Returns the missing lease
+    /// state when the session has no claimable turn, so the caller branches
+    /// on the result rather than catching an exception.
     /// <param name="tenant">The tenant the session belongs to.</param>
     /// <param name="sessionId">The session whose next turn to claim.</param>
     /// <param name="owner">The claim owner identity. Must not be null.</param>

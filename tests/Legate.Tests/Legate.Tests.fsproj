@@ -167,6 +167,7 @@
     <Compile Include="TurnInCallMarkerTests.fs" />
     <Compile Include="LegacyRejectionRecoveryTests.fs" />
     <Compile Include="IdleAuthorityTests.fs" />
+    <Compile Include="RealTurnOwnershipTests.fs" />
   </ItemGroup>
 
   <ItemGroup>

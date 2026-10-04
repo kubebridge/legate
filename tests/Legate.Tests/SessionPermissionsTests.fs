@@ -704,6 +704,7 @@ let ``Crash seed carries the resumption note into the runner history input`` () 
             Delivery = DeliveryMode.Queue
             Consumed = false
             AppendedAt = DateTimeOffset.UtcNow
+            TurnId = TurnId.New()
         }
 
     let seed =
