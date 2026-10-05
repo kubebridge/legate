@@ -374,6 +374,352 @@ module internal SessionJournal =
             | JournalWriter.JournalFailed _ -> ()
         }
 
+/// Bounded per-attempt streaming journaler (issue 379): coalesces the
+/// production suspendable path's progressive assistant-text and
+/// provider-surfaced reasoning deltas into bounded journal appends. Only
+/// surfaced chunks are journaled: nothing is inferred or fabricated, and
+/// reasoning never reaches AssistantText (that stays TurnLoop's shape).
+/// Every flush routes through the fenced
+/// JournalWriter.appendWithTokenAsync under the attempt's claim token with
+/// the real turn id: landed batches publish to live subscribers before
+/// returning (replayable through the same journal), rejections raise
+/// TurnLeaseLostException (zero writes, zero publication), and failures
+/// raise with the writer's typed reason (explicit, never silent loss or a
+/// false durability claim). Storage backpressure stays on the turn thread
+/// as bounded append work; subscriber lag stays on the SessionEventBus,
+/// which never blocks the publisher. Single-threaded turn ownership: all
+/// members run on the running attempt's thread, never the actor thread.
+module internal SessionStreaming =
+
+    /// Bounded per-attempt streaming journaler tuning, resolved from
+    /// TurnsOptions so production honors the configured bounds.
+    type StreamingBounds =
+        {
+            /// The coalesced delta events buffered before forcing a flush.
+            MaxPendingEvents: int
+            /// The coalesced delta bytes (UTF-8) buffered before forcing a
+            /// flush. Whichever pending cap trips first flushes.
+            MaxPendingBytes: int
+            /// The most delta events one journal append carries. Larger
+            /// buffers split across bounded appends.
+            MaxBatchEvents: int
+            /// The most chars one delta event carries. Larger buffers split
+            /// into several events within MaxBatchEvents.
+            MaxBatchChars: int
+        }
+
+    /// Default tuning mirroring the TurnsOptions defaults.
+    let defaultBounds: StreamingBounds =
+        {
+            MaxPendingEvents = 64
+            MaxPendingBytes = 65536
+            MaxBatchEvents = 8
+            MaxBatchChars = 8192
+        }
+
+    /// Resolves the streaming bounds from the Turns snapshot,
+    /// re-checking the positive bound at use like
+    /// ClaimHeartbeat.fromSessions. A null snapshot reads as defaults.
+    /// <param name="turns">The configured turn defaults, or null for defaults.</param>
+    /// <returns>The bounds the per-attempt journaler enforces.</returns>
+    let boundsFromTurns (turns: TurnsOptions) : StreamingBounds =
+        if isNull (box turns) then
+            defaultBounds
+        else
+            if turns.MaxStreamingPendingEvents < 1 then
+                raise (
+                    ArgumentOutOfRangeException(
+                        nameof turns,
+                        "TurnsOptions.MaxStreamingPendingEvents must be at least 1."
+                    )
+                )
+
+            if turns.MaxStreamingPendingBytes < 1 then
+                raise (
+                    ArgumentOutOfRangeException(
+                        nameof turns,
+                        "TurnsOptions.MaxStreamingPendingBytes must be at least 1."
+                    )
+                )
+
+            if turns.MaxStreamingAppendBatchEvents < 1 then
+                raise (
+                    ArgumentOutOfRangeException(
+                        nameof turns,
+                        "TurnsOptions.MaxStreamingAppendBatchEvents must be at least 1."
+                    )
+                )
+
+            if turns.MaxStreamingAppendBatchChars < 1 then
+                raise (
+                    ArgumentOutOfRangeException(
+                        nameof turns,
+                        "TurnsOptions.MaxStreamingAppendBatchChars must be at least 1."
+                    )
+                )
+
+            {
+                MaxPendingEvents = turns.MaxStreamingPendingEvents
+                MaxPendingBytes = turns.MaxStreamingPendingBytes
+                MaxBatchEvents = turns.MaxStreamingAppendBatchEvents
+                MaxBatchChars = turns.MaxStreamingAppendBatchChars
+            }
+
+    /// One per-attempt coalescing journaler: buffers text and reasoning
+    /// chunks separately (each kind keeps chunk order; text precedes
+    /// reasoning within one flush), starts a chained append when a pending
+    /// cap trips, and lands the remainder on FlushAsync. The chain
+    /// serializes appends in creation order, so committed output stays
+    /// ordered before whatever terminal event the actor journals next, and
+    /// every flush observes its predecessors: a rejected or failed
+    /// predecessor faults its successors with zero further writes. Empty
+    /// buffers never touch storage. Callbacks never block: they buffer and
+    /// chain only, so a slow store stalls neither the turn thread (which
+    /// awaits the chain at the attempt boundary) nor the actor thread
+    /// (which the turn never runs inline past its first incomplete await).
+    /// A flush that lands publishes its stamped events before returning; a
+    /// rejected flush raises TurnLeaseLostException with zero writes and
+    /// zero publication; a failed flush raises InvalidOperationException
+    /// with the writer's typed reason. Prior landed batches survive every
+    /// later outcome, so partial committed output stays ordered before
+    /// whatever terminal event the actor journals next.
+    type StreamingJournaler
+        (
+            eventStore: ISessionEventStore,
+            tenant: TenantId,
+            sessionId: SessionId,
+            turnId: TurnId,
+            token: string,
+            bounds: StreamingBounds
+        ) =
+
+        do ArgumentNullException.ThrowIfNull(eventStore)
+
+        do
+            if isNull (box token) then
+                raise (ArgumentNullException(nameof token))
+
+        do
+            if bounds.MaxPendingEvents < 1 then
+                raise (ArgumentOutOfRangeException(nameof bounds, "MaxPendingEvents must be at least 1."))
+
+        do
+            if bounds.MaxPendingBytes < 1 then
+                raise (ArgumentOutOfRangeException(nameof bounds, "MaxPendingBytes must be at least 1."))
+
+        do
+            if bounds.MaxBatchEvents < 1 then
+                raise (ArgumentOutOfRangeException(nameof bounds, "MaxBatchEvents must be at least 1."))
+
+        do
+            if bounds.MaxBatchChars < 1 then
+                raise (ArgumentOutOfRangeException(nameof bounds, "MaxBatchChars must be at least 1."))
+
+        let textChunks = ResizeArray<string>()
+        let reasoningChunks = ResizeArray<string>()
+        let mutable textChars = 0
+        let mutable reasoningChars = 0
+        let mutable pendingBytes = 0
+        let mutable totalAppends = 0
+        let mutable totalEvents = 0
+        let mutable maxPendingChars = 0
+        let mutable maxPendingBytes = 0
+
+        // The serialized flush chain: every flush awaits its predecessor,
+        // so appends land in creation order and a rejected or failed flush
+        // faults its successors with zero further writes. Mutated only on
+        // the turn thread (buffering and FlushAsync); awaited from the
+        // chain tasks and the attempt boundary.
+        let mutable flushChain: Task = Task.CompletedTask
+
+        /// The pending delta events the buffer would produce, split at the
+        /// batch-char bound: text pieces plus reasoning pieces.
+        let pendingEventCount () =
+            let pieces chars =
+                if chars <= 0 then
+                    0
+                else
+                    (chars + bounds.MaxBatchChars - 1) / bounds.MaxBatchChars
+
+            pieces textChars + pieces reasoningChars
+
+        /// Splits buffered text into MaxBatchChars pieces in order.
+        let splitPieces (value: string) : string list =
+            if String.IsNullOrEmpty value then
+                []
+            else
+                let mutable pieces = []
+                let mutable index = 0
+
+                while index < value.Length do
+                    let take = min bounds.MaxBatchChars (value.Length - index)
+                    pieces <- value.Substring(index, take) :: pieces
+                    index <- index + take
+
+                List.rev pieces
+
+        /// Builds the flush events in journal order: text pieces first,
+        /// then reasoning pieces, each carrying the real session and turn
+        /// ids with an empty in-flight sequence the store stamps.
+        let buildEvents (text: string) (reasoning: string) : SessionEvent list =
+            [
+                for piece in splitPieces text do
+                    yield
+                        TextDeltaEvent(
+                            sessionId,
+                            turnId,
+                            Unchecked.defaultof<Nullable<int64>>,
+                            DateTimeOffset.UtcNow,
+                            piece
+                        )
+                        :> SessionEvent
+
+                for piece in splitPieces reasoning do
+                    yield
+                        ReasoningDeltaEvent(
+                            sessionId,
+                            turnId,
+                            Unchecked.defaultof<Nullable<int64>>,
+                            DateTimeOffset.UtcNow,
+                            piece
+                        )
+                        :> SessionEvent
+            ]
+
+        /// Appends the given events in bounded batches, awaiting the
+        /// predecessor first: the chain primitive behind every flush. A
+        /// landed batch stays observable and replayable; rejected and
+        /// failed batches publish nothing and fault the chain.
+        /// <param name="events">The events to append, in journal order. May be empty (a pure ordering barrier).</param>
+        /// <returns>The chained flush, awaitable to observe predecessors and this flush.</returns>
+        let chainFlush (events: SessionEvent list) : Task<unit> =
+            let previous = flushChain
+
+            let chained =
+                task {
+                    do! previous
+
+                    for batch in events |> List.chunkBySize bounds.MaxBatchEvents do
+                        let prepared = ResizeArray<SessionEvent>(batch) :> IReadOnlyList<SessionEvent>
+
+                        match!
+                            JournalWriter.appendWithTokenAsync
+                                eventStore
+                                tenant
+                                sessionId
+                                token
+                                prepared
+                                CancellationToken.None
+                        with
+                        | JournalWriter.JournalAppended stamped ->
+                            totalAppends <- totalAppends + 1
+                            totalEvents <- totalEvents + (if isNull (box stamped) then 0 else stamped.Count)
+                        | JournalWriter.JournalRejected _ -> return raise (TurnLoop.TurnLeaseLostException())
+                        | JournalWriter.JournalFailed reason -> return raise (InvalidOperationException(reason))
+                }
+
+            flushChain <- chained
+            chained
+
+        /// Snapshots the buffered remainder into events and clears the
+        /// buffers. Runs on the turn thread only.
+        /// <returns>The buffered events, in journal order.</returns>
+        let takeBuffered () : SessionEvent list =
+            let text = String.Concat(textChunks)
+            let reasoning = String.Concat(reasoningChunks)
+            textChunks.Clear()
+            reasoningChunks.Clear()
+            textChars <- 0
+            reasoningChars <- 0
+            pendingBytes <- 0
+            buildEvents text reasoning
+
+        /// The journal appends the turn spent on streaming deltas so far.
+        member this.TotalAppends = totalAppends
+
+        /// The delta events journaled so far.
+        member this.TotalEvents = totalEvents
+
+        /// The largest pending char count observed before a flush.
+        member this.MaxPendingChars = maxPendingChars
+
+        /// The largest pending byte count observed before a flush.
+        member this.MaxPendingBytes = maxPendingBytes
+
+        /// Buffers one assistant-text chunk, chaining a flush first when a
+        /// pending cap already trips. Never blocks: the flush runs chained
+        /// in the background while buffering continues. Null and empty
+        /// chunks are provider keepalives, never deltas.
+        /// <param name="text">The text chunk that arrived.</param>
+        member this.AppendText(text: string) : unit =
+            if not (String.IsNullOrEmpty text) then
+                if
+                    pendingEventCount () >= bounds.MaxPendingEvents
+                    || pendingBytes >= bounds.MaxPendingBytes
+                then
+                    takeBuffered () |> chainFlush |> ignore
+
+                textChunks.Add(text)
+                textChars <- textChars + text.Length
+                pendingBytes <- pendingBytes + System.Text.Encoding.UTF8.GetByteCount(text)
+                maxPendingChars <- max maxPendingChars (textChars + reasoningChars)
+                maxPendingBytes <- max maxPendingBytes pendingBytes
+
+        /// Buffers one provider-surfaced reasoning chunk, like AppendText.
+        /// <param name="text">The reasoning chunk that arrived.</param>
+        member this.AppendReasoning(text: string) : unit =
+            if not (String.IsNullOrEmpty text) then
+                if
+                    pendingEventCount () >= bounds.MaxPendingEvents
+                    || pendingBytes >= bounds.MaxPendingBytes
+                then
+                    takeBuffered () |> chainFlush |> ignore
+
+                reasoningChunks.Add(text)
+                reasoningChars <- reasoningChars + text.Length
+                pendingBytes <- pendingBytes + System.Text.Encoding.UTF8.GetByteCount(text)
+                maxPendingChars <- max maxPendingChars (textChars + reasoningChars)
+                maxPendingBytes <- max maxPendingBytes pendingBytes
+
+        /// Lands the buffered remainder in bounded appends and awaits the
+        /// whole chain: at most MaxBatchEvents events per storage
+        /// operation, so a sustained stream never needs a synchronous
+        /// storage operation per token and never grows one unbounded event.
+        /// Awaits outstanding mid-stream flushes even with nothing new, so
+        /// the attempt boundary observes every predecessor before the actor
+        /// journals suspension or settlement.
+        /// <returns>The attempt's streaming flush, awaitable to completion.</returns>
+        member this.FlushAsync() : Task<unit> =
+            let buffered = takeBuffered ()
+
+            task { do! chainFlush buffered }
+
+    /// Execution-context-scoped per-attempt streaming journaler (issue
+    /// 379): the actor enters it before invoking the runner (alongside
+    /// FencedClaimScope, ControlAdmission, and LeaseAdmission); the
+    /// runner's delta hooks read it to buffer under the running attempt,
+    /// so nested continuations inherit it and resumed attempts observe the
+    /// fresh journaler. AsyncLocal, None outside a streaming turn.
+    module StreamingScope =
+
+        let private current = AsyncLocal<StreamingJournaler option>()
+
+        /// Reads the running attempt's streaming journaler, or None outside
+        /// a streaming turn.
+        /// <returns>The journaler, or None when no streaming turn is running.</returns>
+        let currentJournaler () : StreamingJournaler option = current.Value
+
+        /// Enters the scope for one running attempt.
+        /// <param name="journaler">The attempt's journaler, or None for unclaimed shells.</param>
+        /// <returns>The scope to dispose when the attempt reports.</returns>
+        let enter (journaler: StreamingJournaler option) =
+            let previous = current.Value
+            current.Value <- journaler
+
+            { new IDisposable with
+                member _.Dispose() = current.Value <- previous
+            }
+
 /// The session actor behaviour and its client boundary. Internal so no Akka
 /// type ever crosses the public API.
 module internal SessionActor =

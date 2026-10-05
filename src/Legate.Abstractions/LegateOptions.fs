@@ -292,6 +292,37 @@ type TurnsOptions() =
     /// <see cref="F:Legate.TurnCrashResume.Fail" />.
     member val CrashResume: TurnCrashResume = TurnCrashResume.Fail with get, set
 
+    /// The assistant-text and reasoning deltas one streaming turn buffers
+    /// before forcing a journal flush, in events. Deltas coalesce in memory
+    /// as they stream; reaching this count flushes a bounded batch through
+    /// the fenced append instead of growing the backlog without bound. The
+    /// turn awaits storage (never subscribers) on a forced flush. Default
+    /// 64. Bound from <c>Legate:Turns:MaxStreamingPendingEvents</c>.
+    member val MaxStreamingPendingEvents: int = 64 with get, set
+
+    /// The assistant-text and reasoning deltas one streaming turn buffers
+    /// before forcing a journal flush, in bytes (UTF-8). Caps sustained
+    /// chunk production under delayed storage alongside
+    /// <see cref="P:Legate.TurnsOptions.MaxStreamingPendingEvents" />:
+    /// whichever cap trips first flushes. Default 65536. Bound from
+    /// <c>Legate:Turns:MaxStreamingPendingBytes</c>.
+    member val MaxStreamingPendingBytes: int = 65536 with get, set
+
+    /// The most delta events one streaming journal append carries. Larger
+    /// coalesced buffers split across bounded appends, so no single storage
+    /// operation grows with the stream. Default 8. Bound from
+    /// <c>Legate:Turns:MaxStreamingAppendBatchEvents</c>.
+    member val MaxStreamingAppendBatchEvents: int = 8 with get, set
+
+    /// The most chars one streaming delta event carries. Larger buffers
+    /// split into several events within
+    /// <see cref="P:Legate.TurnsOptions.MaxStreamingAppendBatchEvents" />,
+    /// so a sustained stream produces bounded appends instead of one
+    /// synchronous storage operation per token or one unbounded event.
+    /// Default 8192. Bound from
+    /// <c>Legate:Turns:MaxStreamingAppendBatchChars</c>.
+    member val MaxStreamingAppendBatchChars: int = 8192 with get, set
+
     /// Returns null when every knob is in range, otherwise a message for the
     /// first violation.
     /// <returns>The first violation's message, or null when the settings are valid.</returns>
@@ -306,6 +337,14 @@ type TurnsOptions() =
                     "DefaultDelivery has an unknown delivery mode."
                 if not (Enum.IsDefined(typeof<TurnCrashResume>, this.CrashResume)) then
                     "CrashResume has an unknown crash resume."
+                if this.MaxStreamingPendingEvents < 1 then
+                    "MaxStreamingPendingEvents must be at least 1."
+                if this.MaxStreamingPendingBytes < 1 then
+                    "MaxStreamingPendingBytes must be at least 1."
+                if this.MaxStreamingAppendBatchEvents < 1 then
+                    "MaxStreamingAppendBatchEvents must be at least 1."
+                if this.MaxStreamingAppendBatchChars < 1 then
+                    "MaxStreamingAppendBatchChars must be at least 1."
             |]
 
         if violations.Length = 0 then

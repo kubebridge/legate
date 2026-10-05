@@ -87,6 +87,8 @@ module internal SessionPermissions =
     /// <param name="loopDelay">The delay seam the turn's hard deadline fires off. Must not be null.</param>
     /// <param name="policy">The permission policy, or null for no gate (every call executes).</param>
     /// <param name="getSystemPrompt">The composed system prompt hook (issue 66), or None to run with no system message.</param>
+    /// <param name="eventStore">The journal streaming deltas append to. Must not be null.</param>
+    /// <param name="streaming">The per-attempt streaming journaler bounds.</param>
     /// <returns>The suspendable runner executing one attempt per call.</returns>
     let createRunner
         (client: IChatClient)
@@ -96,10 +98,13 @@ module internal SessionPermissions =
         (loopDelay: ILlmDelay)
         (policy: IPermissionPolicy | null)
         (getSystemPrompt: PromptComposition.GetTurnSystemPrompt option)
+        (eventStore: ISessionEventStore)
+        (streaming: SessionStreaming.StreamingBounds)
         : SessionActor.SuspendableRunner =
         ArgumentNullException.ThrowIfNull(client)
         ArgumentNullException.ThrowIfNull(store)
         ArgumentNullException.ThrowIfNull(loopDelay)
+        ArgumentNullException.ThrowIfNull(eventStore)
 
         if isNull (box resolveInputs) then
             raise (ArgumentNullException(nameof resolveInputs))
@@ -191,6 +196,67 @@ module internal SessionPermissions =
                 | :? TurnLoop.TurnLeaseLostException -> reraise ()
                 | _ -> raise (TurnLoop.TurnLeaseLostException())
 
+        /// Builds the progressive delta hooks (issue 379) from the ambient
+        /// streaming scope the actor entered per attempt: each non-empty
+        /// text/reasoning chunk buffers under the running attempt's
+        /// coalescing journaler with the real turn id, flushing bounded
+        /// batches through the fenced append as caps trip. The hooks read
+        /// the scope per chunk (not the build-time journaler), so nested
+        /// and resumed continuations observe the fresh attempt's journaler.
+        /// Outside a streaming turn the hooks no-op, preserving harness
+        /// and unclaimed-shell shapes.
+        /// <returns>The text and reasoning hooks the turn runs with.</returns>
+        let streamingHooks () : TurnLoop.TextDeltaHook option * TurnLoop.ReasoningDeltaHook option =
+            let onText (text: string) : unit =
+                match SessionStreaming.StreamingScope.currentJournaler () with
+                | Some journaler when not (isNull (box journaler)) -> journaler.AppendText text
+                | _ -> ()
+
+            let onReasoning (text: string) : unit =
+                match SessionStreaming.StreamingScope.currentJournaler () with
+                | Some journaler when not (isNull (box journaler)) -> journaler.AppendReasoning text
+                | _ -> ()
+
+            Some onText, Some onReasoning
+
+        /// Flushes the running attempt's streaming remainder (issue 379):
+        /// lands coalesced deltas in bounded appends and awaits the whole
+        /// chain after the loop, before the actor journals suspension or
+        /// settlement, so committed output stays ordered before the terminal
+        /// event. Awaits outstanding mid-stream flushes even with nothing
+        /// new. A rejected flush raises TurnLeaseLostException (the takeover
+        /// loser stops with zero further effects); a failed flush raises
+        /// with the typed reason (explicit, never silent loss); prior landed
+        /// batches survive either way.
+        let flushStreamingAsync () : Task<unit> =
+            match SessionStreaming.StreamingScope.currentJournaler () with
+            | Some journaler when not (isNull (box journaler)) -> journaler.FlushAsync()
+            | _ -> Task.FromResult(())
+
+        /// Runs one loop attempt under the streaming flush (issue 379): the
+        /// remainder lands and the chain settles before the completion
+        /// returns, so the actor journals suspension or settlement after
+        /// every committed delta. On a loop fault the chain still settles
+        /// first (best-effort: flush faults swallow so the original fault
+        /// propagates), so partial commits stay ordered before the terminal
+        /// event the fault handler journals.
+        /// <param name="run">The loop attempt to settle streaming for.</param>
+        /// <returns>The loop completion with streaming flushed.</returns>
+        let settleStreaming (run: unit -> Task<TurnLoop.TurnLoopCompletion>) : Task<TurnLoop.TurnLoopCompletion> =
+            task {
+                try
+                    let! completion = run ()
+                    do! flushStreamingAsync ()
+                    return completion
+                with ex ->
+                    try
+                        do! flushStreamingAsync ()
+                    with _ ->
+                        ()
+
+                    return! Task.FromException<TurnLoop.TurnLoopCompletion>(ex)
+            }
+
         /// Binds the running turn's skill journal hook into the pre-built
         /// tool map (issue 321): hosts build the skill tool once per
         /// session with a log-only onLoaded, so the runner rebinds it per
@@ -260,6 +326,31 @@ module internal SessionPermissions =
             | None ->
                 task {
 
+                    // Per-attempt streaming journaler (issue 379): built
+                    // under the running fenced claim with the real turn id
+                    // the actor supplied, so deltas journal with actual
+                    // session/turn attribution through the token fence. A
+                    // missing claim (unclaimed shells) journals nothing.
+                    // Entered for the whole attempt so nested and resumed
+                    // continuations observe this journaler through the
+                    // scope-reading delta hooks.
+                    let streamer =
+                        match FencedClaimScope.currentClaim () with
+                        | Some claim when not (isNull (box claim)) && not (String.IsNullOrEmpty claim.Token) ->
+                            Some(
+                                SessionStreaming.StreamingJournaler(
+                                    eventStore,
+                                    tenant,
+                                    entry.SessionId,
+                                    turnId,
+                                    claim.Token,
+                                    streaming
+                                )
+                            )
+                        | _ -> None
+
+                    use _streamingScope = SessionStreaming.StreamingScope.enter streamer
+
                     // Package-load step (issue 66): fresh runs resolve the
                     // composed system prompt and lead with it. Resumes replay
                     // the suspended history verbatim, never recomposing.
@@ -284,39 +375,48 @@ module internal SessionPermissions =
                         // Fresh runs mark at the first provider-call entry
                         // through the behavior-supplied hook and checkpoint
                         // usage plus skill loads through the fenced journal
-                        // hooks (issue 321). The skill map rebinds per turn
+                        // hooks (issue 321). Progressive text and reasoning
+                        // deltas buffer through the per-attempt streaming
+                        // journaler (issue 379) and flush after the loop,
+                        // before the actor journals suspension or
+                        // settlement. The skill map rebinds per turn
                         // so the pre-built host tool journals under the
                         // running claim. Every dispatch verifies the live
                         // real-turn claim at the last moment (issue 376);
                         // the renewed LeaseAdmission hook is the cached fast
                         // check underneath.
+                        let onTextDelta, onReasoningDelta = streamingHooks ()
+
                         let merged =
                             { loopOptions with
                                 VerifyClaim = verifyForCurrentClaim ()
                                 OnTurnStarted = onTurnStarted
                                 OnUsageCheckpoint = onUsageCheckpoint
                                 OnSkillLoaded = onSkillLoaded
+                                OnTextDelta = onTextDelta
+                                OnReasoningDelta = onReasoningDelta
                             }
 
                         let boundTools = bindSkillHook tools turnId merged.OnSkillLoaded
 
                         return!
-                            TurnLoop.runSuspendableAsync
-                                client
-                                history
-                                boundTools
-                                merged
-                                loopDelay
-                                runnerToken
-                                (fun () -> LeaseAdmission.check ())
-                                drain
-                                ignore
-                                consume
-                                gate
-                                entry.SessionId
-                                turnId
-                                None
-                                allowed
+                            settleStreaming (fun () ->
+                                TurnLoop.runSuspendableAsync
+                                    client
+                                    history
+                                    boundTools
+                                    merged
+                                    loopDelay
+                                    runnerToken
+                                    (fun () -> LeaseAdmission.check ())
+                                    drain
+                                    ignore
+                                    consume
+                                    gate
+                                    entry.SessionId
+                                    turnId
+                                    None
+                                    allowed)
                     | Some live, Some reply when live.Nested.IsSome ->
                         // Nested sub-agent suspension (issue 72): the reply
                         // re-enters the nested loop through the suspension's
@@ -342,68 +442,82 @@ module internal SessionPermissions =
                                 raise (TurnLoop.TurnLeaseLostException())
                         | None -> raise (TurnLoop.TurnLeaseLostException())
 
-                        return! resume.ResumeAsync reply runnerToken
+                        // Post-nested streams journal through the fresh
+                        // attempt's scope (the delta hooks read it per
+                        // chunk), settling with the resumed journaler below.
+                        return! settleStreaming (fun () -> resume.ResumeAsync reply runnerToken)
                     | Some live, Some(:? PermissionDecision as decision) ->
                         // Resumes already marked before they suspended: never
-                        // mark on resume, but carry the usage and skill hooks
-                        // so post-resume work checkpoints and loads journal
-                        // (issue 321), with the skill map rebound per turn.
+                        // mark on resume, but carry the usage, skill, and
+                        // streaming hooks so post-resume work checkpoints,
+                        // loads, and streams journal (issues 321, 379), with
+                        // the skill map rebound per turn.
                         // The pending call re-verifies current authority at
                         // dispatch (issue 376); allowed tools still need
                         // ownership and the permission gate stays intact.
+                        let onTextDelta, onReasoningDelta = streamingHooks ()
+
                         let merged =
                             { loopOptions with
                                 VerifyClaim = verifyForCurrentClaim ()
                                 OnTurnStarted = None
                                 OnUsageCheckpoint = onUsageCheckpoint
                                 OnSkillLoaded = onSkillLoaded
+                                OnTextDelta = onTextDelta
+                                OnReasoningDelta = onReasoningDelta
                             }
 
                         let boundTools = bindSkillHook tools turnId merged.OnSkillLoaded
 
                         return!
-                            TurnLoop.resumePermissionAsync
-                                live
-                                decision.Decision
-                                client
-                                live.HistorySnapshot
-                                boundTools
-                                merged
-                                loopDelay
-                                runnerToken
-                                (fun () -> LeaseAdmission.check ())
-                                gate
-                                allowed
+                            settleStreaming (fun () ->
+                                TurnLoop.resumePermissionAsync
+                                    live
+                                    decision.Decision
+                                    client
+                                    live.HistorySnapshot
+                                    boundTools
+                                    merged
+                                    loopDelay
+                                    runnerToken
+                                    (fun () -> LeaseAdmission.check ())
+                                    gate
+                                    allowed)
                     | Some live, Some(:? QuestionAnswer as answer) ->
                         // Resumes already marked before they suspended: never
-                        // mark on resume, but carry the usage and skill hooks
-                        // so post-resume work checkpoints and loads journal
-                        // (issue 321), with the skill map rebound per turn.
+                        // mark on resume, but carry the usage, skill, and
+                        // streaming hooks so post-resume work checkpoints,
+                        // loads, and streams journal (issues 321, 379).
                         // Post-resume dispatches re-verify current authority
                         // (issue 376).
+                        let onTextDelta, onReasoningDelta = streamingHooks ()
+
                         let merged =
                             { loopOptions with
                                 VerifyClaim = verifyForCurrentClaim ()
                                 OnTurnStarted = None
                                 OnUsageCheckpoint = onUsageCheckpoint
                                 OnSkillLoaded = onSkillLoaded
+                                OnTextDelta = onTextDelta
+                                OnReasoningDelta = onReasoningDelta
                             }
 
                         let boundTools = bindSkillHook tools turnId merged.OnSkillLoaded
 
                         return!
-                            TurnLoop.resumeQuestionAsync
-                                live
-                                answer.Answer
-                                client
-                                live.HistorySnapshot
-                                boundTools
-                                merged
-                                loopDelay
-                                runnerToken
-                                (fun () -> LeaseAdmission.check ())
-                                gate
-                                allowed
+                            settleStreaming (fun () ->
+                                TurnLoop.resumeQuestionAsync
+                                    live
+                                    answer.Answer
+                                    client
+                                    live.HistorySnapshot
+                                    boundTools
+                                    merged
+                                    loopDelay
+                                    runnerToken
+                                    (fun () -> LeaseAdmission.check ())
+                                    gate
+                                    allowed)
                     | None, Some _ ->
                         // Crash-rebuild shape: no live cursor, so retry the
                         // turn from its inbox entry with the persisted grants.
@@ -411,38 +525,43 @@ module internal SessionPermissions =
                         let history = historyOf entry rebuildPrompt seed
 
                         // Retries run under the supplied turn id: mark at the
-                        // first provider-call entry and carry the usage and
-                        // skill hooks (issue 321), with the skill map rebound
-                        // per turn. Crash retries verify the live claim like
-                        // fresh runs (issue 376), failing closed when the
-                        // rebuild holds no authority.
+                        // first provider-call entry and carry the usage,
+                        // skill, and streaming hooks (issues 321, 379), with
+                        // the skill map rebound per turn. Crash retries
+                        // verify the live claim like fresh runs (issue 376),
+                        // failing closed when the rebuild holds no authority.
+                        let onTextDelta, onReasoningDelta = streamingHooks ()
+
                         let merged =
                             { loopOptions with
                                 VerifyClaim = verifyForCurrentClaim ()
                                 OnTurnStarted = onTurnStarted
                                 OnUsageCheckpoint = onUsageCheckpoint
                                 OnSkillLoaded = onSkillLoaded
+                                OnTextDelta = onTextDelta
+                                OnReasoningDelta = onReasoningDelta
                             }
 
                         let boundTools = bindSkillHook tools turnId merged.OnSkillLoaded
 
                         return!
-                            TurnLoop.runSuspendableAsync
-                                client
-                                history
-                                boundTools
-                                merged
-                                loopDelay
-                                runnerToken
-                                (fun () -> LeaseAdmission.check ())
-                                drain
-                                ignore
-                                consume
-                                gate
-                                entry.SessionId
-                                turnId
-                                None
-                                allowed
+                            settleStreaming (fun () ->
+                                TurnLoop.runSuspendableAsync
+                                    client
+                                    history
+                                    boundTools
+                                    merged
+                                    loopDelay
+                                    runnerToken
+                                    (fun () -> LeaseAdmission.check ())
+                                    drain
+                                    ignore
+                                    consume
+                                    gate
+                                    entry.SessionId
+                                    turnId
+                                    None
+                                    allowed)
                     | _ ->
                         return
                             raise (

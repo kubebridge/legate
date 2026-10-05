@@ -171,6 +171,7 @@
     <Compile Include="ProductionTurnRenewalTests.fs" />
     <Compile Include="NonterminalFenceTests.fs" />
     <Compile Include="ToolAdmissionFenceTests.fs" />
+    <Compile Include="ProductionStreamingTests.fs" />
   </ItemGroup>
 
   <ItemGroup>

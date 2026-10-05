@@ -169,6 +169,7 @@ let private collectJournal (journal: ISessionEventStore) (sessionId: SessionId) 
 /// Builds the production runner over a scripted client and stub tools.
 let private productionRunner
     (store: ISessionStore)
+    (journal: ISessionEventStore)
     (client: ScriptedChatClient)
     (tools: IReadOnlyDictionary<string, AITool>)
     (policy: IPermissionPolicy | null)
@@ -181,6 +182,8 @@ let private productionRunner
         (NeverDelay() :> ILlmDelay)
         policy
         None
+        journal
+        SessionStreaming.defaultBounds
 
 // ──────────────────────────────────────────────────────────────────────────
 // Production spawn wiring: Ask suspends the live actor (Tasks 1+3)
@@ -208,7 +211,7 @@ let ``Ask suspends the live factory-spawned actor with the request journaled sto
         ScriptPolicy(Map.ofList [ "exec", PermissionVerdict.Ask ]) :> IPermissionPolicy
 
     let service =
-        startService store journal (productionRunner store client tools policy) (TimeSpan.FromHours 1.0)
+        startService store journal (productionRunner store journal client tools policy) (TimeSpan.FromHours 1.0)
 
     try
         let child = resolveChild service created.Id
@@ -276,7 +279,7 @@ let ``Deny on the live path skips the tool effect and continues the turn`` () =
         :> IPermissionPolicy
 
     let service =
-        startService store journal (productionRunner store client tools policy) (TimeSpan.FromHours 1.0)
+        startService store journal (productionRunner store journal client tools policy) (TimeSpan.FromHours 1.0)
 
     try
         let child = resolveChild service created.Id
@@ -318,7 +321,7 @@ let ``AllowOnce reply resumes the live turn and journals the resolve`` () =
         ScriptPolicy(Map.ofList [ "exec", PermissionVerdict.Ask ]) :> IPermissionPolicy
 
     let service =
-        startService store journal (productionRunner store client tools policy) (TimeSpan.FromHours 1.0)
+        startService store journal (productionRunner store journal client tools policy) (TimeSpan.FromHours 1.0)
 
     try
         let child = resolveChild service created.Id
@@ -385,6 +388,7 @@ let ``AllowForSession grants survive restart through the session store`` () =
             journal
             (productionRunner
                 store
+                journal
                 client1
                 (makeTools
                     [
@@ -442,6 +446,7 @@ let ``AllowForSession grants survive restart through the session store`` () =
             journal
             (productionRunner
                 store
+                journal
                 client2
                 (makeTools
                     [
@@ -489,7 +494,7 @@ let ``Closing the live session evicts the grant memory`` () =
         ScriptPolicy(Map.ofList [ "exec", PermissionVerdict.Ask ]) :> IPermissionPolicy
 
     let service =
-        startService store journal (productionRunner store client tools policy) (TimeSpan.FromHours 1.0)
+        startService store journal (productionRunner store journal client tools policy) (TimeSpan.FromHours 1.0)
 
     try
         let child = resolveChild service created.Id
@@ -555,7 +560,7 @@ let ``Permission events from the live path derive system cells`` () =
         ScriptPolicy(Map.ofList [ "exec", PermissionVerdict.Ask ]) :> IPermissionPolicy
 
     let service =
-        startService store journal (productionRunner store client tools policy) (TimeSpan.FromHours 1.0)
+        startService store journal (productionRunner store journal client tools policy) (TimeSpan.FromHours 1.0)
 
     try
         let child = resolveChild service created.Id
@@ -668,7 +673,7 @@ let ``Null policy runs the live turn with no gate`` () =
         startService
             store
             journal
-            (productionRunner store client tools Unchecked.defaultof<IPermissionPolicy>)
+            (productionRunner store journal client tools Unchecked.defaultof<IPermissionPolicy>)
             (TimeSpan.FromHours 1.0)
 
     try
@@ -689,12 +694,12 @@ let ``Null policy runs the live turn with no gate`` () =
 
 [<Fact>]
 let ``Crash seed carries the resumption note into the runner history input`` () =
-    let store, _ = createStores TimeProvider.System
+    let store, journal = createStores TimeProvider.System
     let created = createSession store
     let client = scripted [ textStep "done" ]
 
     let runner =
-        productionRunner store client (makeTools []) Unchecked.defaultof<IPermissionPolicy>
+        productionRunner store journal client (makeTools []) Unchecked.defaultof<IPermissionPolicy>
 
     let entry: InboxEntry =
         {
@@ -725,7 +730,7 @@ let ``Crash seed carries the resumption note into the runner history input`` () 
     let rebuildClient = scripted [ textStep "done" ]
 
     let rebuildRunner =
-        productionRunner store rebuildClient (makeTools []) Unchecked.defaultof<IPermissionPolicy>
+        productionRunner store journal rebuildClient (makeTools []) Unchecked.defaultof<IPermissionPolicy>
 
     let rebuild =
         rebuildRunner
@@ -886,7 +891,7 @@ let ``Facade turns journal cumulative UsageEvents replayable after resume`` () =
             ]
 
     let service =
-        startService store journal (productionRunner store client tools null) (TimeSpan.FromHours 1.0)
+        startService store journal (productionRunner store journal client tools null) (TimeSpan.FromHours 1.0)
 
     try
         let child = resolveChild service created.Id
@@ -1019,7 +1024,7 @@ let ``Facade turns journal SkillLoadedEvents through the rebound skill tool`` ()
             ]
 
     let service =
-        startService store journal (productionRunner store client tools null) (TimeSpan.FromHours 1.0)
+        startService store journal (productionRunner store journal client tools null) (TimeSpan.FromHours 1.0)
 
     try
         let child = resolveChild service created.Id
