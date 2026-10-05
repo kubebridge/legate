@@ -785,10 +785,14 @@ type Engine
                 | :? TextDeltaEvent as delta when not (isNull (box delta)) ->
                     let raw: string | null = delta.Text
 
-                    let fragment =
-                        match raw with
-                        | null -> ""
-                        | text -> text
+                    // Visible scope (issue 412): the plain EVENT line never
+                    // carries delta text, so only the hooked fullscreen fold
+                    // (which renders delta text progressively) contributes to
+                    // the streamed prefix. Fallback deltas on an unhooked
+                    // stream leave the prefix empty, so the settlement carrying
+                    // the sole visible copy renders fully instead of being
+                    // mistaken for already-rendered output.
+                    let fragment = DotDedup.visibleFragment onEvent.IsSome raw
 
                     if fragment <> "" then
                         let turnKey = DotDedup.turnKeyOf evt
