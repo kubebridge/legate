@@ -148,10 +148,21 @@ module internal SessionPermissions =
             sprintf
                 "The conversation journal is unusable (%s): start a clean session."
                 (if isNull (box reason) then "invalid batch" else reason)
+        | ConversationRecovery.IncompleteCompactedContext reason ->
+            sprintf
+                "The compacted context is incomplete (%s): start a clean session."
+                (if isNull (box reason) then
+                     "missing replacement context"
+                 else
+                     reason)
+        | ConversationRecovery.UnsupportedCompactedFormat version ->
+            sprintf "The compacted context version %d is unsupported: start a clean session." version
 
-    /// Assembles the ordinary-turn history for a seedless fresh run (issue
-    /// 366): replays the journal from cursor 0, folds the prefix through
-    /// the read-only #380 recovery builder (never the lossy display cells),
+    /// Assembles the ordinary-turn history for a seedless fresh run (issues
+    /// 366 and 387): replays the journal from cursor 0, folds the prefix
+    /// through the shared compacted-base builder (the last successful
+    /// enriched CompactedEvent supplies the summary plus the retained
+    /// current-format tail, superseded pre-compaction context drops),
     /// appends the executing entry's initial user message in conversational
     /// order, then leads with the composed system prompt exactly once. The
     /// composed prompt is never journaled, so prepend-once never duplicates.
@@ -173,7 +184,7 @@ module internal SessionPermissions =
             try
                 let! events = replayJournalAsync eventStore tenant entry.SessionId
 
-                match ConversationRecovery.tryRecover events with
+                match ConversationRecovery.tryRecoverCompacted events with
                 | Error rejection -> return Error(historyRejectionReason rejection)
                 | Ok history ->
                     history.Add(userMessageOfEntry entry)

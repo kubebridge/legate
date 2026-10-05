@@ -795,6 +795,47 @@ module internal Compaction =
                                     request.SessionId
                                     request.TurnId
 
+                            // The durable replacement tail: the planned
+                            // history without the system prefix and without
+                            // the summary message, copied so later
+                            // in-place rewrites never mutate the journaled
+                            // event.
+                            let prefixLength =
+                                if
+                                    request.History.Count > 0
+                                    && not (isNull (box request.History[0]))
+                                    && request.History[0].Role = ChatRole.System
+                                then
+                                    1
+                                else
+                                    0
+
+                            let tailStart = prefixLength + 1
+
+                            let retained =
+                                let copied = ResizeArray<ChatMessage>()
+
+                                for index in tailStart .. planned.Length - 1 do
+                                    let message = planned[index]
+
+                                    let contents =
+                                        if isNull (box message) || isNull (box message.Contents) then
+                                            ResizeArray<AIContent>() :> IList<AIContent>
+                                        else
+                                            let fresh = ResizeArray<AIContent>(message.Contents.Count)
+
+                                            for content in message.Contents do
+                                                fresh.Add(content)
+
+                                            fresh :> IList<AIContent>
+
+                                    if isNull (box message) then
+                                        copied.Add(null)
+                                    else
+                                        copied.Add(ChatMessage(message.Role, contents))
+
+                                copied :> IReadOnlyList<ChatMessage>
+
                             let compacted =
                                 CompactedEvent(
                                     request.SessionId,
@@ -802,28 +843,54 @@ module internal Compaction =
                                     Nullable<int64>(),
                                     DateTimeOffset.UtcNow,
                                     beforeEstimate,
-                                    afterEstimate
+                                    afterEstimate,
+                                    summary,
+                                    retained,
+                                    SessionEventContract.CompactedContextVersion
                                 )
                                 :> SessionEvent
 
-                            do! journalOrFence request.JournalAsync request.IsLeaseValid compacted
+                            // Durable success or explicit failure, never a
+                            // success marker with missing replacement
+                            // context: a fenced-out write raises like any
+                            // loser (zero effects), a failed persistence
+                            // journals a failure-continue instead of
+                            // rewriting, so the turn continues uncompacted.
+                            if not (request.IsLeaseValid()) then
+                                let lost = TurnLoop.TurnLeaseLostException()
+                                return raise lost
+                            else
+                                let! write = request.JournalAsync compacted
 
-                            applyRewrite request.History planned
+                                match write with
+                                | JournalWriter.JournalAppended _ ->
+                                    applyRewrite request.History planned
 
-                            let totalInput = request.InputTokens + summaryInput
-                            let totalOutput = request.OutputTokens + summaryOutput
+                                    let totalInput = request.InputTokens + summaryInput
+                                    let totalOutput = request.OutputTokens + summaryOutput
 
-                            reportCheckpoint
-                                request.Observer
-                                request.Tenant
-                                request.SessionId
-                                request.TurnId
-                                request.Attempt
-                                compactionRef
-                                totalInput
-                                totalOutput
+                                    reportCheckpoint
+                                        request.Observer
+                                        request.Tenant
+                                        request.SessionId
+                                        request.TurnId
+                                        request.Attempt
+                                        compactionRef
+                                        totalInput
+                                        totalOutput
 
-                            return Compacted(beforeEstimate, afterEstimate, totalInput, totalOutput)
+                                    return Compacted(beforeEstimate, afterEstimate, totalInput, totalOutput)
+                                | JournalWriter.JournalRejected _ ->
+                                    let lost = TurnLoop.TurnLeaseLostException()
+                                    return raise lost
+                                | JournalWriter.JournalFailed reason ->
+                                    let safe =
+                                        if String.IsNullOrWhiteSpace reason then
+                                            "The compacted context could not be persisted."
+                                        else
+                                            reason
+
+                                    return! journalFailureAsync request safe
         }
 
     /// Attempts one threshold-gated compaction pass: the TurnLoop boundary

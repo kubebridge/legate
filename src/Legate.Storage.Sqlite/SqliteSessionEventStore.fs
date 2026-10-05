@@ -230,7 +230,17 @@ type SqliteSessionEventStore(database: SqliteDatabase) =
         | :? UsageEvent as source ->
             UsageEvent(sessionId, turnId, stamped, timestamp, source.InputTokens, source.OutputTokens) :> SessionEvent
         | :? CompactedEvent as source ->
-            CompactedEvent(sessionId, turnId, stamped, timestamp, source.BeforeEstimate, source.AfterEstimate)
+            CompactedEvent(
+                sessionId,
+                turnId,
+                stamped,
+                timestamp,
+                source.BeforeEstimate,
+                source.AfterEstimate,
+                source.Summary,
+                source.RetainedMessages,
+                source.FormatVersion
+            )
             :> SessionEvent
         | :? CompactionFailedEvent as source ->
             CompactionFailedEvent(sessionId, turnId, stamped, timestamp, source.Reason) :> SessionEvent

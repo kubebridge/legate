@@ -1315,15 +1315,20 @@ module internal SessionActor =
         ArgumentNullException.ThrowIfNull(compact.Force)
 
     /// Compacts an Idle session now without starting a turn: replays the
-    /// journal into a history through the shared estimate mapping, then
-    /// runs the merged runner. Under threshold (or with nothing
-    /// replaceable) no summariser call runs and a summariser failure
-    /// journals CompactionFailedEvent while the session continues
-    /// uncompacted. The mailbox serializes Idle work, so the lease hook is
-    /// actor-owned constant-true; the store-side token still fences a
-    /// takeover loser into TurnLeaseLostException before anything journals.
-    /// Runs synchronously on the actor thread like the other fast
-    /// store-first paths; the summariser call bounds the block.
+    /// journal through the shared compacted-base builder (issue 387),
+    /// then runs the forced core (threshold bypass, replaceable guard
+    /// kept) without a synthetic user turn or execution claim. Under
+    /// threshold (or with nothing replaceable) no summariser call runs;
+    /// a summariser failure, failed persistence, or recovery rejection
+    /// journals no success (a failure event at most) while the session
+    /// continues uncompacted. The mailbox serializes Idle work, so the
+    /// lease hook is actor-owned constant-true; the store-side host fence
+    /// still fences a takeover loser into TurnLeaseLostException before
+    /// anything journals. Truthful idle-operation attribution: the
+    /// journaled CompactedEvent carries the default TurnId sentinel and
+    /// zero turn totals, never an executing turn. Runs synchronously on
+    /// the actor thread like the other fast store-first paths; the
+    /// summariser call bounds the block.
     /// <param name="props">The session actor dependencies.</param>
     /// <param name="compact">The on-demand compaction wiring. Must be validated.</param>
     /// <param name="cancellationToken">Abandons the replay and the summariser call.</param>
@@ -1334,79 +1339,127 @@ module internal SessionActor =
         (cancellationToken: CancellationToken)
         : SessionCompactReply =
         try
-            let options = ReadTranscriptOptions()
+            // Resolve the idle history through the shared compacted base:
+            // the last successful enriched CompactedEvent supplies the
+            // summary plus the retained current-format tail, superseded
+            // pre-compaction context drops, and the suffix folds in order.
+            // Lossy display cells never feed the summariser: required
+            // content is never reconstructed from them. A rejection
+            // (unsupported/incomplete compacted state or unreadable
+            // journal) truthfully no-ops with no success published; the
+            // next production turn rejects explicitly with a clean start.
+            let collected = ResizeArray<SessionEvent>()
+            let mutable cursor = 0L
+            let mutable paging = true
 
-            let cells =
-                awaitTask (
-                    Transcripts.readTranscript
-                        compact.EventStore
-                        props.Tenant
-                        props.SessionId
-                        options
-                        100
-                        cancellationToken
-                )
+            while paging do
+                cancellationToken.ThrowIfCancellationRequested()
 
-            let history = Compaction.messagesFromCells cells
+                let outcome =
+                    awaitTask (compact.EventStore.Replay(props.Tenant, props.SessionId, cursor, 100, cancellationToken))
 
-            // The host fence stamp for the idle compact (issue 373): read
-            // before the summariser call. A concurrent idle writer moves
-            // the stamp and the host append below fences as CompactFenced.
-            // A missing row falls back to the primed token sink, so the
-            // compact stays fenced either way; the prime itself is untouched.
-            let expectedStamp =
-                try
-                    match awaitTask (props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None)) with
-                    | null -> None
-                    | session -> Some session.UpdatedAt
-                with _ ->
-                    None
+                if isNull (box outcome) then
+                    paging <- false
+                else
+                    match outcome with
+                    | :? EventReplayPage as page when not (isNull (box page)) ->
+                        if isNull (box page.Events) then
+                            paging <- false
+                        elif page.NextCursor.HasValue then
+                            for ev in page.Events do
+                                if not (isNull (box ev)) then
+                                    collected.Add(ev)
 
-            let journalAsync =
-                match expectedStamp with
-                | Some stamp ->
-                    fun (event: SessionEvent) ->
-                        let events = ResizeArray<SessionEvent>([| event |]) :> IReadOnlyList<SessionEvent>
+                            cursor <- page.NextCursor.Value
+                        else
+                            for ev in page.Events do
+                                if not (isNull (box ev)) then
+                                    collected.Add(ev)
 
-                        JournalWriter.appendHostAsync
-                            compact.EventStore
-                            props.Tenant
-                            props.SessionId
-                            stamp
-                            events
-                            CancellationToken.None
-                | None -> journalSink compact.EventStore props.Tenant props.SessionId compact.JournalToken
+                            paging <- false
+                    | _ -> paging <- false
 
-            let request: Compaction.CompactionRequest =
-                {
-                    Client = compact.Client
-                    History = history
-                    SessionModel = compact.SessionModel
-                    CompactionModel = compact.Llm.Compaction
-                    KeepMessages = compact.Llm.CompactionKeepMessages
-                    CatalogEntry = catalogEntryOf compact.Catalog compact.SessionModel
-                    ReservedBufferTokens = compact.ReservedBufferTokens
-                    Observer = compact.Observer
-                    ModelPolicy = compact.Policy
-                    Tenant = props.Tenant
-                    SessionId = props.SessionId
-                    // The host-operation sentinel (issue 373): the idle
-                    // compact is host authority, not execution, so the
-                    // journaled CompactedEvent carries the default TurnId.
-                    TurnId = Unchecked.defaultof<TurnId>
-                    Attempt = 1
-                    InputTokens = 0L
-                    OutputTokens = 0L
-                    JournalAsync = journalAsync
-                    IsLeaseValid = (fun () -> true)
-                    CancellationToken = cancellationToken
-                }
+            let baseResolution =
+                ConversationRecovery.tryRecoverCompacted (collected :> IReadOnlyList<SessionEvent>)
 
-            match awaitTask (Compaction.tryCompactAsync request) with
-            | Compaction.NotNeeded -> CompactNotNeeded
-            | Compaction.Compacted(beforeEstimate, afterEstimate, _, _) ->
-                CompactCompleted(beforeEstimate, afterEstimate)
-            | Compaction.FailedContinue _ -> CompactNotNeeded
+            match baseResolution with
+            | Error _ when collected.Count > 0 ->
+                // Unsupported or incomplete compacted state: truthful
+                // no-op with no success published and no journal write.
+                // The next production turn rejects explicitly with a
+                // clean start before any provider execution.
+                CompactNotNeeded
+            | _ ->
+                let history =
+                    match baseResolution with
+                    | Error _ -> ResizeArray<ChatMessage>() :> IList<ChatMessage>
+                    | Ok resolved -> ResizeArray<ChatMessage>(resolved) :> IList<ChatMessage>
+
+                // The host fence stamp for the idle compact (issue 373): read
+                // before the summariser call. A concurrent idle writer moves
+                // the stamp and the host append below fences as CompactFenced.
+                // A missing row falls back to the primed token sink, so the
+                // compact stays fenced either way; the prime itself is untouched.
+                let expectedStamp =
+                    try
+                        match
+                            awaitTask (props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
+                        with
+                        | null -> None
+                        | session -> Some session.UpdatedAt
+                    with _ ->
+                        None
+
+                let journalAsync =
+                    match expectedStamp with
+                    | Some stamp ->
+                        fun (event: SessionEvent) ->
+                            let events = ResizeArray<SessionEvent>([| event |]) :> IReadOnlyList<SessionEvent>
+
+                            JournalWriter.appendHostAsync
+                                compact.EventStore
+                                props.Tenant
+                                props.SessionId
+                                stamp
+                                events
+                                CancellationToken.None
+                    | None -> journalSink compact.EventStore props.Tenant props.SessionId compact.JournalToken
+
+                let request: Compaction.CompactionRequest =
+                    {
+                        Client = compact.Client
+                        History = history
+                        SessionModel = compact.SessionModel
+                        CompactionModel = compact.Llm.Compaction
+                        KeepMessages = compact.Llm.CompactionKeepMessages
+                        CatalogEntry = catalogEntryOf compact.Catalog compact.SessionModel
+                        ReservedBufferTokens = compact.ReservedBufferTokens
+                        Observer = compact.Observer
+                        ModelPolicy = compact.Policy
+                        Tenant = props.Tenant
+                        SessionId = props.SessionId
+                        // The host-operation sentinel (issue 373): the idle
+                        // compact is host authority, not execution, so the
+                        // journaled CompactedEvent carries the default TurnId.
+                        TurnId = Unchecked.defaultof<TurnId>
+                        Attempt = 1
+                        InputTokens = 0L
+                        OutputTokens = 0L
+                        JournalAsync = journalAsync
+                        IsLeaseValid = (fun () -> true)
+                        CancellationToken = cancellationToken
+                    }
+
+                // Forced core (issue 387): explicit idle requests compact
+                // eligible context below the automatic threshold, while the
+                // replaceable guard still truthfully no-ops when nothing
+                // can be replaced. No synthetic user turn, no execution
+                // claim, idle-operation attribution via the sentinel above.
+                match awaitTask (Compaction.tryCompactCoreAsync true request) with
+                | Compaction.NotNeeded -> CompactNotNeeded
+                | Compaction.Compacted(beforeEstimate, afterEstimate, _, _) ->
+                    CompactCompleted(beforeEstimate, afterEstimate)
+                | Compaction.FailedContinue _ -> CompactNotNeeded
         with
         | :? TurnLoop.TurnLeaseLostException -> CompactFenced
         | :? OperationCanceledException -> CompactNotNeeded

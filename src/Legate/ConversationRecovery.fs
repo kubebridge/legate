@@ -52,6 +52,12 @@ module internal ConversationRecovery =
         | MissingToolResult of callId: string
         /// The journal batch itself was unusable (null list).
         | InvalidJournal of reason: string
+        /// A compacted event carried no durable replacement context
+        /// (a pre-387 journal with a null/empty summary or null tail).
+        | IncompleteCompactedContext of reason: string
+        /// A compacted event carried an unsupported compacted-context
+        /// version.
+        | UnsupportedCompactedFormat of version: int
 
     /// Parses one tool arguments JSON object string into the argument table
     /// a FunctionCallContent carries. Null/whitespace never parses here:
@@ -275,3 +281,105 @@ module internal ConversationRecovery =
                                 kept.Add(message)
 
                         Ok(kept :> IList<ChatMessage>)
+
+    /// Copies one provider message with a fresh contents list, sharing the
+    /// content objects: the history owns its list, the journal keeps its
+    /// own. Null messages copy as null; null contents copy as an empty
+    /// user text (the recovery never emits null lists).
+    /// <param name="message">The message to copy. May be null.</param>
+    /// <returns>The copied message.</returns>
+    let private copyMessage (message: ChatMessage) : ChatMessage =
+        if isNull (box message) then
+            null
+        else
+            let contents =
+                if isNull (box message.Contents) then
+                    ResizeArray<AIContent>() :> IList<AIContent>
+                else
+                    let copied = ResizeArray<AIContent>(message.Contents.Count)
+
+                    for content in message.Contents do
+                        copied.Add(content)
+
+                    copied :> IList<AIContent>
+
+            ChatMessage(message.Role, contents)
+
+    /// Builds the marked summary message the rewritten history carries:
+    /// one user message with the shared marker plus the raw summary,
+    /// mirroring <see cref="M:Legate.Compaction.planRewrite" />.
+    /// <param name="summary">The raw summary text. Must not be null.</param>
+    /// <returns>The summary message.</returns>
+    let summaryMessageOf (summary: string) : ChatMessage =
+        // Mirrors Compaction.SummaryMarker without referencing the later
+        // module (compile order): the marker is part of the durable
+        // compacted-context contract.
+        ChatMessage(ChatRole.User, "[legate-compacted-summary]" + "\n" + summary)
+
+    /// Validates one compacted event's durable replacement context.
+    /// <param name="compacted">The compacted event. Must not be null.</param>
+    /// <returns>The validated event, or the explicit rejection.</returns>
+    let private validateCompacted (compacted: CompactedEvent) : Result<CompactedEvent, RecoveryRejection> =
+        if compacted.FormatVersion <> SessionEventContract.CompactedContextVersion then
+            Error(UnsupportedCompactedFormat compacted.FormatVersion)
+        elif String.IsNullOrWhiteSpace compacted.Summary then
+            Error(IncompleteCompactedContext "The compacted event carries no summary text.")
+        elif isNull (box compacted.RetainedMessages) then
+            Error(IncompleteCompactedContext "The compacted event carries no retained context.")
+        else
+            Ok compacted
+
+    /// Resolves one session's provider history through the last successful
+    /// compacted base (issue 387): folds the journal to the last
+    /// CompactedEvent, drops superseded pre-compaction model context, then
+    /// appends the post-compaction suffix through the current-format
+    /// builder in conversational order. Live turns, idle Compact,
+    /// subsequent turns, and fresh-process reopen all resolve through
+    /// this one function, so repeated compaction uses the current
+    /// compacted state, never an obsolete replay. With no compacted base
+    /// this is the ordinary builder; audit transcript derivation is
+    /// untouched (CompactedEvent still produces no transcript cell).
+    /// Unsupported or incomplete compacted state rejects explicitly with
+    /// a clean start before any provider execution, without migrating,
+    /// rebinding, or manufacturing retained context.
+    /// <param name="events">The journaled events in sequence order. Must not be null and must not contain null.</param>
+    /// <returns>The provider history, or the explicit rejection.</returns>
+    let tryRecoverCompacted (events: IReadOnlyList<SessionEvent>) : Result<IList<ChatMessage>, RecoveryRejection> =
+        if isNull (box events) then
+            Error(InvalidJournal "The event batch must not be null.")
+        else
+            let mutable lastIndex = -1
+            let mutable lastCompacted: CompactedEvent | null = null
+
+            for index in 0 .. events.Count - 1 do
+                match events[index] with
+                | :? CompactedEvent as compacted when not (isNull (box compacted)) ->
+                    lastIndex <- index
+                    lastCompacted <- compacted
+                | _ -> ()
+
+            match lastCompacted with
+            | null -> tryRecover events
+            | compacted ->
+                match validateCompacted compacted with
+                | Error rejection -> Error rejection
+                | Ok valid ->
+                    let suffix = ResizeArray<SessionEvent>()
+
+                    for index in lastIndex + 1 .. events.Count - 1 do
+                        suffix.Add(events[index])
+
+                    match tryRecover (suffix :> IReadOnlyList<SessionEvent>) with
+                    | Error rejection -> Error rejection
+                    | Ok suffixHistory ->
+                        let history = ResizeArray<ChatMessage>()
+                        history.Add(summaryMessageOf valid.Summary)
+
+                        if not (isNull (box valid.RetainedMessages)) then
+                            for message in valid.RetainedMessages do
+                                history.Add(copyMessage message)
+
+                        for message in suffixHistory do
+                            history.Add(copyMessage message)
+
+                        Ok(history :> IList<ChatMessage>)

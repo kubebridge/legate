@@ -653,7 +653,17 @@ type SessionEventStoreConformance
     /// One sentinel host-operation event: the default (unstamped) TurnId
     /// means host operation, mirroring the CellId unstamped precedent.
     member this.HostSentinel(sessionId: SessionId) =
-        CompactedEvent(sessionId, Unchecked.defaultof<TurnId>, Nullable(), DateTimeOffset.MinValue, 100L, 60L)
+        CompactedEvent(
+            sessionId,
+            Unchecked.defaultof<TurnId>,
+            Nullable(),
+            DateTimeOffset.MinValue,
+            100L,
+            60L,
+            "host sentinel",
+            ResizeArray<Microsoft.Extensions.AI.ChatMessage>() :> IReadOnlyList<Microsoft.Extensions.AI.ChatMessage>,
+            SessionEventContract.CompactedContextVersion
+        )
         :> SessionEvent
 
     [<Fact>]

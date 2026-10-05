@@ -279,6 +279,24 @@ module internal JournalWriter =
         | :? CompactionFailedEvent as source when not (isNull (box source)) ->
             CompactionFailedEvent(source.SessionId, source.TurnId, source.Sequence, source.Timestamp, map source.Reason)
             :> SessionEvent
+        | :? CompactedEvent as source when not (isNull (box source)) ->
+            // The summary is text-bearing and redacts/bounds like any
+            // reason; the retained current-format tail passes through
+            // verbatim so provider-required pairing, required content,
+            // and artifact references survive exactly as the summariser
+            // boundary built them.
+            CompactedEvent(
+                source.SessionId,
+                source.TurnId,
+                source.Sequence,
+                source.Timestamp,
+                source.BeforeEstimate,
+                source.AfterEstimate,
+                map source.Summary,
+                source.RetainedMessages,
+                source.FormatVersion
+            )
+            :> SessionEvent
         | :? SkillInvalidEvent as source when not (isNull (box source)) ->
             SkillInvalidEvent(
                 source.SessionId,
@@ -354,6 +372,7 @@ module internal JournalWriter =
         | :? TurnAbortedEvent as source when not (isNull (box source)) -> length source.Reason
         | :? TurnFailedEvent as source when not (isNull (box source)) -> length source.Reason
         | :? CompactionFailedEvent as source when not (isNull (box source)) -> length source.Reason
+        | :? CompactedEvent as source when not (isNull (box source)) -> length source.Summary
         | :? SkillInvalidEvent as source when not (isNull (box source)) ->
             max (length source.SkillName) (length source.Reason)
         | :? UserMessageEvent as source when not (isNull (box source)) ->

@@ -100,13 +100,16 @@ type private StaticSource(tools: IReadOnlyList<AITool>) =
 // Host building
 
 /// Creates the scripted chat client with the smoke script: a permission
-/// gated echo call, then the fixture echo call, then plain answers.
+/// gated echo call, then the fixture echo call, then the idle-compaction
+/// summary (explicit idle requests compact eligible context below the
+/// automatic threshold), then plain answers.
 let private scriptedClient () : ScriptedClient =
     let steps = Queue<ScriptStep>()
     steps.Enqueue(ToolCall("call-1", "scripted-echo"))
     steps.Enqueue(Text "scripted answer one")
     steps.Enqueue(ToolCall("call-2", "fixture_echo"))
     steps.Enqueue(Text "fixture says hi")
+    steps.Enqueue(Text "compacted summary")
     steps.Enqueue(Text "scripted answer two")
     new ScriptedClient(steps)
 
