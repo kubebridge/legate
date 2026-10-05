@@ -1834,6 +1834,12 @@ module internal SessionClientWiring =
                             TaskNested = Some(TaskRunner.createHook deps)
                         }
 
+            // Bounded progressive streaming (issue 379): the per-attempt
+            // journaler bounds resolve once from the configured turn
+            // defaults; the production runner builds each attempt's
+            // journaler under the running fenced claim with them.
+            let streaming = SessionStreaming.boundsFromTurns legateOptions.Turns
+
             let runner: SessionActor.SuspendableRunner =
                 fun entry attempt allowed cursor reply seed token started usage skill turnId ->
                     workTracker.Track(fun () ->
@@ -1855,6 +1861,8 @@ module internal SessionClientWiring =
                                     delay
                                     policy
                                     (Some(systemPromptFor store clientOptions.Tenant))
+                                    bus.EventStore
+                                    streaming
 
                             return! run entry attempt allowed cursor reply seed token started usage skill turnId
                         })

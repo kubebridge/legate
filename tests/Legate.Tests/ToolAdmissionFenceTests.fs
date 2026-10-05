@@ -72,6 +72,7 @@ let private claimLive (store: ISessionStore) (sessionId: SessionId) (owner: stri
 /// Builds the production runner over a scripted client and tool map.
 let private productionRunner
     (store: ISessionStore)
+    (journal: ISessionEventStore)
     (client: ScriptedChatClient)
     (tools: IReadOnlyDictionary<string, AITool>)
     (policy: IPermissionPolicy | null)
@@ -84,6 +85,8 @@ let private productionRunner
         (NeverDelay() :> ILlmDelay)
         policy
         None
+        journal
+        SessionStreaming.defaultBounds
 
 let private runFresh (runner: SessionActor.SuspendableRunner) (entry: InboxEntry) : TurnLoop.TurnLoopCompletion =
     runner entry 1 (HashSet<string>()) None None None CancellationToken.None None None None (TurnId.New())
@@ -107,7 +110,7 @@ let private questionArgs (question: string) : IDictionary<string, obj> =
 [<Fact>]
 let ``fresh admitted ordinary tool call passes under the live claim`` () =
     let clock = FakeClock()
-    let store, _ = createStores clock
+    let store, journal = createStores clock
     let created = createSession store
     let entry = appendQueue store created.Id "run"
     let claim = claimLive store created.Id "owner-a"
@@ -126,7 +129,7 @@ let ``fresh admitted ordinary tool call passes under the live claim`` () =
                 textStep "done"
             ]
 
-    let runner = productionRunner store client tools null
+    let runner = productionRunner store journal client tools null
 
     use _c = ControlAdmission.enter (fun () -> true)
     use _l = LeaseAdmission.enter (fun () -> true)
@@ -139,7 +142,7 @@ let ``fresh admitted ordinary tool call passes under the live claim`` () =
 [<Fact>]
 let ``fresh admitted built-in named custom and ordinary tools all pass`` () =
     let clock = FakeClock()
-    let store, _ = createStores clock
+    let store, journal = createStores clock
     let created = createSession store
     let entry = appendQueue store created.Id "run"
     let claim = claimLive store created.Id "owner-a"
@@ -162,7 +165,7 @@ let ``fresh admitted built-in named custom and ordinary tools all pass`` () =
             ]
 
     let client = scripted [ calls; textStep "done" ]
-    let runner = productionRunner store client tools null
+    let runner = productionRunner store journal client tools null
 
     use _c = ControlAdmission.enter (fun () -> true)
     use _l = LeaseAdmission.enter (fun () -> true)
@@ -175,7 +178,7 @@ let ``fresh admitted built-in named custom and ordinary tools all pass`` () =
 [<Fact>]
 let ``stale takeover fresh dispatch raises with zero invocations`` () =
     let clock = FakeClock()
-    let store, _ = createStores clock
+    let store, journal = createStores clock
     let created = createSession store
     let entry = appendQueue store created.Id "first"
     let loser = claimLive store created.Id "owner-a"
@@ -199,7 +202,7 @@ let ``stale takeover fresh dispatch raises with zero invocations`` () =
                 textStep "never"
             ]
 
-    let runner = productionRunner store client tools null
+    let runner = productionRunner store journal client tools null
 
     use _c = ControlAdmission.enter (fun () -> true)
     use _l = LeaseAdmission.enter (fun () -> true)
@@ -213,7 +216,7 @@ let ``stale takeover fresh dispatch raises with zero invocations`` () =
 [<Fact>]
 let ``missing claim fails closed with zero invocations`` () =
     let clock = FakeClock()
-    let store, _ = createStores clock
+    let store, journal = createStores clock
     let created = createSession store
     let entry = appendQueue store created.Id "run"
     claimLive store created.Id "owner-a" |> ignore
@@ -233,7 +236,7 @@ let ``missing claim fails closed with zero invocations`` () =
                 textStep "never"
             ]
 
-    let runner = productionRunner store client tools null
+    let runner = productionRunner store journal client tools null
 
     use _c = ControlAdmission.enter (fun () -> true)
     use _l = LeaseAdmission.enter (fun () -> true)
@@ -245,7 +248,7 @@ let ``missing claim fails closed with zero invocations`` () =
 [<Fact>]
 let ``unverifiable authority fails closed with zero invocations`` () =
     let clock = FakeClock()
-    let store, _ = createStores clock
+    let store, journal = createStores clock
     let created = createSession store
     let entry = appendQueue store created.Id "run"
     let live = claimLive store created.Id "owner-a"
@@ -276,7 +279,7 @@ let ``unverifiable authority fails closed with zero invocations`` () =
                 textStep "never"
             ]
 
-    let runner = productionRunner store client tools null
+    let runner = productionRunner store journal client tools null
 
     use _c = ControlAdmission.enter (fun () -> true)
     use _l = LeaseAdmission.enter (fun () -> true)
@@ -288,7 +291,7 @@ let ``unverifiable authority fails closed with zero invocations`` () =
 [<Fact>]
 let ``crash retry under a live claim passes while a stale retry raises`` () =
     let clock = FakeClock()
-    let store, _ = createStores clock
+    let store, journal = createStores clock
     let created = createSession store
     let entry = appendQueue store created.Id "run"
     let live = claimLive store created.Id "owner-a"
@@ -308,7 +311,7 @@ let ``crash retry under a live claim passes while a stale retry raises`` () =
                 textStep "done"
             ]
 
-    let runner = productionRunner store client tools null
+    let runner = productionRunner store journal client tools null
 
     use _c = ControlAdmission.enter (fun () -> true)
     use _l = LeaseAdmission.enter (fun () -> true)
@@ -346,7 +349,7 @@ let ``crash retry under a live claim passes while a stale retry raises`` () =
                 textStep "never"
             ]
 
-    let staleRunner = productionRunner store staleClient tools null
+    let staleRunner = productionRunner store journal staleClient tools null
 
     expectLeaseLost (fun () ->
         staleRunner
@@ -371,7 +374,7 @@ let ``crash retry under a live claim passes while a stale retry raises`` () =
 [<Fact>]
 let ``loser consumes nothing and winner input redelivers`` () =
     let clock = FakeClock()
-    let store, _ = createStores clock
+    let store, _journal = createStores clock
     let created = createSession store
     appendQueue store created.Id "queue" |> ignore
     let loser = claimLive store created.Id "owner-a"
@@ -412,7 +415,7 @@ let ``loser consumes nothing and winner input redelivers`` () =
 [<Fact>]
 let ``runner consume without a claim fails closed and redelivers`` () =
     let clock = FakeClock()
-    let store, _ = createStores clock
+    let store, journal = createStores clock
     let created = createSession store
     let entry = appendQueue store created.Id "run"
     claimLive store created.Id "owner-a" |> ignore
@@ -440,7 +443,7 @@ let ``runner consume without a claim fails closed and redelivers`` () =
                 textStep "done"
             ]
 
-    let runner = productionRunner store client tools null
+    let runner = productionRunner store journal client tools null
 
     use _c = ControlAdmission.enter (fun () -> true)
     use _l = LeaseAdmission.enter (fun () -> true)
@@ -716,7 +719,7 @@ let ``question resume authorizes no further effects after loss`` () =
 [<Fact>]
 let ``admitted then lost finishes the admitted effect but dispatches nothing further`` () =
     let clock = FakeClock()
-    let store, _ = createStores clock
+    let store, journal = createStores clock
     let created = createSession store
     let entry = appendQueue store created.Id "run"
     let loser = claimLive store created.Id "owner-a"
@@ -742,7 +745,7 @@ let ``admitted then lost finishes the admitted effect but dispatches nothing fur
 
     let calls = callSteps [ ("c1", "first"); ("c2", "second") ]
     let client = scripted [ calls; textStep "never" ]
-    let runner = productionRunner store client tools null
+    let runner = productionRunner store journal client tools null
 
     use _c = ControlAdmission.enter (fun () -> true)
     use _l = LeaseAdmission.enter (fun () -> true)
@@ -760,7 +763,7 @@ let ``admitted then lost finishes the admitted effect but dispatches nothing fur
 [<Fact>]
 let ``rejected admission produces no losing completion`` () =
     let clock = FakeClock()
-    let store, _ = createStores clock
+    let store, journal = createStores clock
     let created = createSession store
     let entry = appendQueue store created.Id "first"
     let loser = claimLive store created.Id "owner-a"
@@ -784,7 +787,7 @@ let ``rejected admission produces no losing completion`` () =
                 textStep "never"
             ]
 
-    let runner = productionRunner store client tools null
+    let runner = productionRunner store journal client tools null
 
     use _c = ControlAdmission.enter (fun () -> true)
     use _l = LeaseAdmission.enter (fun () -> true)

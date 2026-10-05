@@ -502,11 +502,13 @@ let ``Multi-iteration turn marks exactly once`` () : Task =
                     // Two provider calls, one marker: later iterations never
                     // refire the hook. The settled turn also journals its
                     // terminal completion row (issue 289), coexisting with
-                    // the single marker.
+                    // the single marker, plus the progressive text delta
+                    // (issue 379).
                     let! journal = collectJournal client created.Id
-                    journal.Length |> should equal 2
+                    journal.Length |> should equal 3
                     journal.Head |> should be ofExactType<TurnStartedEvent>
-                    journal.Tail.Head |> should be ofExactType<TurnCompletedEvent>
+                    journal.Tail.Head |> should be ofExactType<TextDeltaEvent>
+                    journal.Tail.Tail.Head |> should be ofExactType<TurnCompletedEvent>
 
                     journal
                     |> List.filter (fun event -> event :? TurnStartedEvent)
@@ -587,16 +589,18 @@ let ``Ask resume marks exactly once`` () : Task =
                     result.Status |> should equal TurnStatus.Completed
 
                     // The resume continuation runs stripped: still exactly
-                    // one marker, plus the resolve event and the terminal
-                    // completion row (issue 289).
+                    // one marker, plus the resolve event, the post-resume
+                    // text delta (issue 379), and the terminal completion
+                    // row (issue 289).
                     let! settled = collectJournal client created.Id
-                    settled.Length |> should equal 4
+                    settled.Length |> should equal 5
 
                     settled
                     |> List.filter (fun event -> event :? TurnStartedEvent)
                     |> should haveLength 1
 
                     settled[2] |> should be ofExactType<PermissionResolvedEvent>
-                    settled[3] |> should be ofExactType<TurnCompletedEvent>
+                    settled[3] |> should be ofExactType<TextDeltaEvent>
+                    settled[4] |> should be ofExactType<TurnCompletedEvent>
                 })
     }

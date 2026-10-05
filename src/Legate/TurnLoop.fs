@@ -104,6 +104,25 @@ module internal TurnLoop =
     /// token rides the closure, mirroring OnTurnStarted.
     type SkillLoadedHook = SkillLoadedEvent -> CancellationToken -> Task<unit>
 
+    /// Progressive assistant-text hook (issue 379): invoked synchronously
+    /// with each non-empty text chunk as the provider streams it, in chunk
+    /// order. The production runner binds the per-attempt streaming
+    /// journaler's coalescing callback here, so deltas journal progressively
+    /// instead of discarding with ignore; None emits nothing. The fallback
+    /// single-delta shape for non-streaming providers is preserved: the
+    /// accumulated text still arrives as one call. Carries no token: the
+    /// callback buffers synchronously and chains bounded appends under the
+    /// running claim without blocking, so cancellation propagates at the
+    /// next loop check.
+    type TextDeltaHook = string -> unit
+
+    /// Progressive provider-surfaced reasoning hook (issue 379): invoked
+    /// synchronously with each non-empty reasoning chunk the provider
+    /// surfaces, mirroring TextDeltaHook. Only surfaced reasoning is
+    /// emitted: nothing is inferred or fabricated, and reasoning never
+    /// reaches AssistantText.
+    type ReasoningDeltaHook = string -> unit
+
     /// What one settled tool invocation looked like: the name the model
     /// called it by, the call id the result answers, the appended result
     /// text, and the failure when the invocation raised instead of
@@ -184,6 +203,15 @@ module internal TurnLoop =
             /// skill bypass path triggers it indirectly via the tool
             /// invocation. Resumes carry it so post-resume loads journal.
             OnSkillLoaded: SkillLoadedHook option
+            /// The progressive assistant-text hook (issue 379), or None to
+            /// emit nothing. Bound by the production runner to the
+            /// per-attempt streaming journaler; resumes and nested
+            /// continuations carry it so post-resume streams journal.
+            OnTextDelta: TextDeltaHook option
+            /// The progressive reasoning hook (issue 379), or None to emit
+            /// nothing. Carried like OnTextDelta; only provider-surfaced
+            /// reasoning is emitted.
+            OnReasoningDelta: ReasoningDeltaHook option
             /// The task-tool nested runner, or None when the turn offers no
             /// task tool.
             TaskNested: TaskNestedRun option
@@ -218,6 +246,8 @@ module internal TurnLoop =
                 OnTurnStarted = None
                 OnUsageCheckpoint = None
                 OnSkillLoaded = None
+                OnTextDelta = None
+                OnReasoningDelta = None
                 TaskNested = None
                 StructuredOutcome = false
                 Logger = null
@@ -2382,8 +2412,26 @@ module internal TurnLoop =
                             | Some hook -> do! hook turnId linkedToken
                             | None -> ()
 
+                        // Progressive deltas (issue 379): fan each
+                        // non-empty text/reasoning chunk out to the
+                        // per-attempt streaming journaler as it arrives;
+                        // None journals nothing (the harness-only
+                        // ignore-ignore shape). The fallback single-delta
+                        // for non-streaming providers is preserved by
+                        // LlmStreaming, and cancellation propagates from
+                        // the linked token through the enumeration.
+                        let onText =
+                            match options.OnTextDelta with
+                            | Some hook -> hook
+                            | None -> ignore
+
+                        let onReasoning =
+                            match options.OnReasoningDelta with
+                            | Some hook -> hook
+                            | None -> ignore
+
                         let! response =
-                            LlmStreaming.streamResponseAsync client history chatOptions linkedToken ignore ignore
+                            LlmStreaming.streamResponseAsync client history chatOptions linkedToken onText onReasoning
 
                         let nextIterations = iterations + 1
                         let mutable nextInput = compactedInput

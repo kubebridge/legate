@@ -284,6 +284,8 @@ let ``suspended renewal consumes no reply and resumes no work by itself`` () =
             delay
             policy
             None
+            journal
+            SessionStreaming.defaultBounds
 
     let heartbeat = Some(ClaimHeartbeat.fromSessions (SessionsOptions()))
 
