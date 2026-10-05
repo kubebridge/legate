@@ -245,16 +245,15 @@ module internal SessionPermissions =
                             CancellationToken.None
                     with
                     | JournalWriter.JournalAppended _ -> ()
-                    | JournalWriter.JournalRejected _ -> raise (TurnLoop.TurnLeaseLostException())
+                    | JournalWriter.JournalRejected _ -> return raise (TurnLoop.TurnLeaseLostException())
                     | JournalWriter.JournalFailed reason ->
-                        raise (
-                            InvalidOperationException(
-                                if String.IsNullOrWhiteSpace reason then
-                                    "The journal append failed."
-                                else
-                                    reason
-                            )
-                        )
+                        let message =
+                            if String.IsNullOrWhiteSpace reason then
+                                "The journal append failed."
+                            else
+                                reason
+
+                        return raise (InvalidOperationException(message))
                 | _ -> ()
         }
 
