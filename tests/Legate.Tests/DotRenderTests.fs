@@ -4,6 +4,7 @@ module Legate.Tests.DotRenderTests
 open System
 open Legate
 open Dot.DotRender
+open Dot.DotDedup
 open FsUnit.Xunit
 open Xunit
 
@@ -40,6 +41,44 @@ let private callOutput (s: SessionId) (t: TurnId) (id: string) (text: string) : 
 
 let private callCompleted (s: SessionId) (t: TurnId) (id: string) (error: string | null) : SessionEvent =
     ToolCallCompletedEvent(s, t, at 6, stamp, id, error) :> SessionEvent
+
+let private deltaAt (s: SessionId) (t: TurnId) (sequence: int) (text: string) : SessionEvent =
+    TextDeltaEvent(s, t, at sequence, stamp, text) :> SessionEvent
+
+let private startedAt (s: SessionId) (t: TurnId) (sequence: int) : SessionEvent =
+    TurnStartedEvent(s, t, at sequence, stamp) :> SessionEvent
+
+let private completedAt (s: SessionId) (t: TurnId) (sequence: int) : SessionEvent =
+    TurnCompletedEvent(s, t, at sequence, stamp) :> SessionEvent
+
+let private reasoningAt (s: SessionId) (t: TurnId) (sequence: int) (text: string) : SessionEvent =
+    ReasoningDeltaEvent(s, t, at sequence, stamp, text) :> SessionEvent
+
+let private callOutputAt (s: SessionId) (t: TurnId) (sequence: int) (id: string) (text: string) : SessionEvent =
+    ToolCallOutputEvent(s, t, at sequence, stamp, id, text) :> SessionEvent
+
+let private failedAt (s: SessionId) (t: TurnId) (sequence: int) (reason: string) : SessionEvent =
+    TurnFailedEvent(s, t, at sequence, stamp, reason) :> SessionEvent
+
+let private abortedAt (s: SessionId) (t: TurnId) (sequence: int) (reason: string) : SessionEvent =
+    TurnAbortedEvent(s, t, at sequence, stamp, StopCause.ExplicitAbort, reason) :> SessionEvent
+
+/// One settlement envelope as the engine prints it: the RESULT status
+/// line, the settlement text lines, and the END-RESULT marker.
+let private settleLines (status: string) (textLines: string list) : string list =
+    [ $"RESULT {status}" ] @ textLines @ [ "END-RESULT" ]
+
+/// The human-facing assistant blocks in conversation order.
+let private assistantBlocks (state: RendererState) : string list =
+    state.Display
+    |> List.choose (function
+        | AssistantText text -> Some text
+        | _ -> None)
+
+/// A test-only unknown event subtype: proves unsupported shapes fail
+/// clearly (a system notice) without fabricating assistant content.
+type private BogusEvent(sessionId: SessionId, turnId: TurnId, sequence: Nullable<int64>) =
+    inherit SessionEvent(sessionId, turnId, sequence, DateTimeOffset.UtcNow)
 
 let private allEvents (s: SessionId) (t: TurnId) : SessionEvent list =
     [
@@ -89,10 +128,10 @@ let ``Display keeps streaming text and tool cards in conversation order`` () =
             applyAll
                 state
                 [
-                    started s t
-                    delta s t "Before"
+                    startedAt s t 1
+                    deltaAt s t 2 "Before"
                     callStarted s t "read-1" "read_file"
-                    delta s t "After"
+                    deltaAt s t 7 "After"
                     callCompleted s t "read-1" null
                 ]
 
@@ -152,9 +191,9 @@ let ``User reasoning and assistant retain distinct session cell styles`` () =
                 state
                 [
                     started s t
-                    reasoning s t "Considering "
-                    reasoning s t "the request.\n\nReady."
-                    delta s t "Hello!"
+                    reasoningAt s t 3 "Considering "
+                    reasoningAt s t 4 "the request.\n\nReady."
+                    deltaAt s t 5 "Hello!"
                 ]
 
     let cells = toSessionCells state
@@ -216,7 +255,8 @@ let ``Text deltas accumulate into one assistant block`` () =
 
     let state =
         empty
-        |> fun current -> apply current (delta s t "hel") |> fun next -> apply next (delta s t "lo")
+        |> fun current -> apply current (deltaAt s t 2 "hel")
+        |> fun next -> apply next (deltaAt s t 3 "lo")
 
     state.Assistant |> should equal "hello"
 
@@ -246,8 +286,8 @@ let ``Tool started output completed correlate by id`` () =
     let state =
         empty
         |> fun current -> apply current (callStarted s t "call-9" "exec")
-        |> fun current -> apply current (callOutput s t "call-9" "out-")
-        |> fun current -> apply current (callOutput s t "call-9" "bytes")
+        |> fun current -> apply current (callOutputAt s t 5 "call-9" "out-")
+        |> fun current -> apply current (callOutputAt s t 7 "call-9" "bytes")
         |> fun current -> apply current (callCompleted s t "call-9" null)
 
     state.Order |> should equal [ "call-9" ]
@@ -754,3 +794,343 @@ let ``Progress markers keep the diagnostics tail window`` () =
         state <- markCompactRunning state
 
     state.Diagnostics.Length |> should equal maxMetaLines
+
+// ──────────────────────────────────────────────────────────────────────────
+// Consumer deduplication (issue 385): every logical assistant content
+// segment renders once across duplicate delivery, replay-to-live overlap,
+// reconnect, and settlement, in both Dot modes. The apply fold is the
+// fullscreen OnEvent path; the addLine RESULT envelope is the shared
+// settlement path the plain REPL prints and the fullscreen ring folds.
+
+[<Fact>]
+let ``Settlement suffix strips only the streamed prefix`` () =
+    settlementSuffix "" "hello" |> should equal "hello"
+    settlementSuffix null "hello" |> should equal "hello"
+    settlementSuffix "hel" "hello" |> should equal "lo"
+    settlementSuffix "hello" "hello" |> should equal ""
+    settlementSuffix "hello" "hel" |> should equal ""
+    settlementSuffix "" "" |> should equal ""
+    settlementSuffix "hel" "" |> should equal ""
+    settlementSuffix null null |> should equal ""
+    // Event/settlement races never suppress valid output.
+    settlementSuffix "abc" "xyz" |> should equal "xyz"
+    settlementSuffix "abc" "xabc" |> should equal "xabc"
+
+[<Fact>]
+let ``Duplicate delivery of a committed event folds once`` () =
+    let s, t = sid (), tid ()
+    let once = deltaAt s t 2 "hello"
+
+    let state = applyAll empty [ startedAt s t 1; once; once ]
+
+    state.Assistant |> should equal "hello"
+    assistantBlocks state |> should equal [ "hello" ]
+
+[<Fact>]
+let ``Replay-to-live overlap renders only the genuinely new suffix`` () =
+    let s, t = sid (), tid ()
+
+    let replay = [ startedAt s t 1; deltaAt s t 2 "hel" ]
+
+    let live =
+        [
+            startedAt s t 1
+            deltaAt s t 2 "hel"
+            deltaAt s t 3 "lo"
+        ]
+
+    let state = applyAll (applyAll empty replay) live
+
+    state.Assistant |> should equal "hello"
+    assistantBlocks state |> should equal [ "hello" ]
+
+[<Fact>]
+let ``Distinct events with identical text stay distinct`` () =
+    let s, t = sid (), tid ()
+
+    let state =
+        applyAll
+            empty
+            [
+                startedAt s t 1
+                deltaAt s t 2 "hi"
+                deltaAt s t 3 "hi"
+            ]
+
+    state.Assistant |> should equal "hihi"
+    assistantBlocks state |> should equal [ "hihi" ]
+
+[<Fact>]
+let ``Streamed-then-success renders the unrendered suffix once`` () =
+    let s, t = sid (), tid ()
+
+    let state =
+        applyAll
+            empty
+            [
+                startedAt s t 1
+                deltaAt s t 2 "hel"
+                deltaAt s t 3 "lo "
+            ]
+        |> fun current -> addLines current (settleLines "Completed" [ "hello world" ])
+
+    assistantBlocks state |> should equal [ "hello world" ]
+
+    toDisplayLines state
+    |> List.filter (fun line -> line.Contains("hello world", StringComparison.Ordinal))
+    |> List.length
+    |> should equal 1
+
+[<Fact>]
+let ``Exact settlement repeats render nothing new`` () =
+    let s, t = sid (), tid ()
+
+    let state =
+        applyAll
+            empty
+            [
+                startedAt s t 1
+                deltaAt s t 2 "hello"
+            ]
+        |> fun current -> addLines current (settleLines "Completed" [ "hello" ])
+
+    assistantBlocks state |> should equal [ "hello" ]
+
+[<Fact>]
+let ``Settlement-only content renders fully`` () =
+    let state = addLines empty (settleLines "Completed" [ "hello" ])
+
+    assistantBlocks state |> should equal [ "hello" ]
+
+[<Fact>]
+let ``Partial-then-failure keeps the partial once with no invented text`` () =
+    let s, t = sid (), tid ()
+
+    let state =
+        applyAll
+            empty
+            [
+                startedAt s t 1
+                deltaAt s t 2 "hel"
+                failedAt s t 4 "boom"
+            ]
+        |> fun current -> addLines current (settleLines "Failed" [ "hello" ])
+
+    assistantBlocks state |> should equal [ "hel" ]
+
+    toDisplayLines state
+    |> List.exists (fun line -> line.Contains("hello", StringComparison.Ordinal))
+    |> should equal false
+
+    toDisplayLines state
+    |> List.exists (fun line -> line.Contains("boom", StringComparison.Ordinal))
+    |> should equal true
+
+[<Fact>]
+let ``Partial-then-abort keeps the partial once with the truthful terminal`` () =
+    let s, t = sid (), tid ()
+
+    let state =
+        applyAll
+            empty
+            [
+                startedAt s t 1
+                deltaAt s t 2 "hel"
+                abortedAt s t 4 "stopped"
+            ]
+        |> fun current -> addLines current (settleLines "Aborted" [ "hello" ])
+
+    assistantBlocks state |> should equal [ "hel" ]
+
+    toDisplayLines state
+    |> List.exists (fun line -> line.Contains("stopped", StringComparison.Ordinal))
+    |> should equal true
+
+[<Fact>]
+let ``Settlement-only failure invents no success text`` () =
+    let s, t = sid (), tid ()
+
+    let state =
+        applyAll
+            empty
+            [
+                startedAt s t 1
+                failedAt s t 4 "boom"
+            ]
+        |> fun current -> addLines current (settleLines "Failed" [ "oops" ])
+
+    (assistantBlocks state |> List.isEmpty) |> should equal true
+
+    toDisplayLines state
+    |> List.exists (fun line -> line.Contains("boom", StringComparison.Ordinal))
+    |> should equal true
+
+[<Fact>]
+let ``Mismatched settlement races render fully`` () =
+    let s, t = sid (), tid ()
+
+    let state =
+        applyAll empty [ startedAt s t 1; deltaAt s t 2 "abc" ]
+        |> fun current -> addLines current (settleLines "Completed" [ "xyz" ])
+
+    let blocks = assistantBlocks state
+    // Both segments stay visible in order; nothing valid is suppressed.
+    blocks |> should equal [ "abc\nxyz" ]
+
+    toDisplayLines state
+    |> List.exists (fun line -> line.Contains("xyz", StringComparison.Ordinal))
+    |> should equal true
+
+[<Fact>]
+let ``Repeated identical text across turns stays distinct`` () =
+    let s = sid ()
+    let first, second = tid (), tid ()
+
+    let state =
+        applyAll
+            empty
+            [
+                startedAt s first 1
+                deltaAt s first 2 "hi"
+                startedAt s second 3
+                deltaAt s second 4 "hi"
+            ]
+
+    state.Assistant |> should equal "hihi"
+    assistantBlocks state |> should equal [ "hi"; "hi" ]
+
+[<Fact>]
+let ``Queued turns never cross-render or cross-dedupe`` () =
+    let s = sid ()
+    let first, second = tid (), tid ()
+
+    let state =
+        applyAll
+            empty
+            [
+                startedAt s first 1
+                deltaAt s first 2 "aaa"
+            ]
+        |> fun current -> addLines current (settleLines "Completed" [ "aaa" ])
+        |> fun current -> apply current (startedAt s second 3)
+        |> fun current -> apply current (deltaAt s second 4 "bbb")
+        |> fun current -> addLines current (settleLines "Completed" [ "bbbccc" ])
+
+    assistantBlocks state |> should equal [ "aaa"; "bbbccc" ]
+
+[<Fact>]
+let ``Session switching never cross-renders or cross-dedupes`` () =
+    let a, b = sid (), sid ()
+    let ta, tb = tid (), tid ()
+
+    let state =
+        applyAll
+            empty
+            [
+                startedAt a ta 1
+                deltaAt a ta 2 "aaa"
+                startedAt b tb 1
+                deltaAt b tb 2 "aaa"
+            ]
+        |> fun current -> addLines current (settleLines "Completed" [ "aaa" ])
+
+    // The settlement matches the active (switched) session prefix, so it
+    // renders nothing new; both sessions' streamed prefixes stay visible.
+    assistantBlocks state |> should equal [ "aaa"; "aaa" ]
+
+[<Fact>]
+let ``A new TurnStarted isolates the streamed prefix`` () =
+    let s = sid ()
+    let first, second = tid (), tid ()
+
+    let state =
+        applyAll
+            empty
+            [
+                startedAt s first 1
+                deltaAt s first 2 "aaa"
+                startedAt s second 3
+            ]
+        |> fun current -> addLines current (settleLines "Completed" [ "aaa" ])
+
+    // The settlement belongs to the earlier turn, not the active one: it
+    // renders fully rather than being mistaken for a duplicate.
+    assistantBlocks state |> should equal [ "aaa\naaa" ]
+
+[<Fact>]
+let ``Duplicate reasoning deltas fold once with tool rules unchanged`` () =
+    let s, t = sid (), tid ()
+    let once = reasoning s t "thinking"
+
+    let state =
+        applyAll
+            empty
+            [
+                startedAt s t 1
+                once
+                once
+                callStarted s t "call-1" "read_file"
+                callOutput s t "call-1" "bytes"
+                callOutput s t "call-1" "bytes"
+                ToolCallOutputEvent(s, t, at 8, stamp, "call-1", "-more") :> SessionEvent
+                callCompleted s t "call-1" null
+            ]
+
+    state.Reasoning |> should equal "thinking"
+
+    // The repeated output delivery carries the identical identity, so it
+    // folds once; the card still accumulates the genuinely new fragment.
+    match state.Tools.TryFind "call-1" with
+    | None -> failwith "expected card call-1"
+    | Some card -> card.Output |> should equal "bytes-more"
+
+[<Fact>]
+let ``Unsupported event shapes fail clearly without fabricated content`` () =
+    let s, t = sid (), tid ()
+    let state = apply empty (BogusEvent(s, t, at 30) :> SessionEvent)
+
+    (assistantBlocks state |> List.isEmpty) |> should equal true
+    state.Assistant |> should equal ""
+
+    toViewportLines state
+    |> List.exists (fun line -> line.Contains("BogusEvent", StringComparison.Ordinal))
+    |> should equal true
+
+[<Fact>]
+let ``Fullscreen ring keeps parity through the shared fold`` () =
+    let s, t = sid (), tid ()
+
+    let state =
+        applyAll
+            empty
+            [
+                startedAt s t 1
+                deltaAt s t 2 "hel"
+                deltaAt s t 3 "lo"
+            ]
+
+    // The ring drops live EVENT lines (they duplicate the OnEvent fold)
+    // and folds everything else, including the RESULT envelope, through
+    // the same prefix-aware path as the plain REPL prints.
+    let mutable view = state
+
+    for line in
+        [
+            "EVENT seq=2 TextDeltaEvent"
+            "TREE 2 events"
+            "RESULT Completed"
+            "hello"
+            "END-RESULT"
+        ] do
+        if not (isJournalDuplicate line) then
+            view <- addLine view line
+
+    assistantBlocks view |> should equal [ "hello" ]
+
+    toViewportLines view
+    |> List.exists (fun line -> line.Contains("TREE 2 events", StringComparison.Ordinal))
+    |> should equal true
+
+    toViewportLines view
+    |> List.exists (fun line -> line.Contains("EVENT seq=2", StringComparison.Ordinal))
+    |> should equal false

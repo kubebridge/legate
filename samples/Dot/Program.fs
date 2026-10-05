@@ -1005,6 +1005,10 @@ let private runPrintJsonAsync
     task {
         use streamCts = new CancellationTokenSource()
         let collected = ResizeArray<SessionEvent>()
+        // Consumer dedup (issue 385): durable identities already streamed
+        // as JSONL print once; duplicate delivery repeats the identical
+        // pair and never a second logical event.
+        let seen = HashSet<string>()
 
         let streamTask =
             task {
@@ -1027,9 +1031,20 @@ let private runPrintJsonAsync
                                     let evt = enumerator.Current
 
                                     if not (isNull (box evt)) then
-                                        collected.Add(evt)
-                                        Console.Out.WriteLine(DotExport.toJsonLine evt)
-                                        Console.Out.Flush()
+                                        let duplicate =
+                                            match DotDedup.durableKeyOf evt with
+                                            | None -> false
+                                            | Some identity ->
+                                                if seen.Contains identity then
+                                                    true
+                                                else
+                                                    seen.Add identity |> ignore
+                                                    false
+
+                                        if not duplicate then
+                                            collected.Add(evt)
+                                            Console.Out.WriteLine(DotExport.toJsonLine evt)
+                                            Console.Out.Flush()
                             with :? OperationCanceledException ->
                                 go <- false
                     finally
@@ -1088,8 +1103,30 @@ let private runPrintJsonAsync
         | Some result, _ ->
             Console.Error.WriteLine($"RESULT {result.Status}")
 
-            if not (isNull (box result.AssistantText)) && result.AssistantText <> "" then
-                Console.Error.WriteLine($"TEXT {result.AssistantText}")
+            // Prefix-aware settlement text (issue 385): streamed-then-success
+            // reports only the genuinely unrendered suffix, and
+            // failure/abort reports no text (the truthful terminal outcome
+            // travels on the RESULT line and the journaled terminal event).
+            if
+                result.Status = TurnStatus.Completed
+                && not (String.IsNullOrEmpty result.AssistantText)
+            then
+                let prefix =
+                    lock collected (fun () ->
+                        collected
+                        |> Seq.filter (fun evt -> evt :? TextDeltaEvent)
+                        |> Seq.choose (fun evt ->
+                            let raw: string | null = (evt :?> TextDeltaEvent).Text
+
+                            match raw with
+                            | null -> None
+                            | text -> Some text)
+                        |> String.concat "")
+
+                let suffix = DotDedup.settlementSuffix prefix result.AssistantText
+
+                if suffix <> "" then
+                    Console.Error.WriteLine($"TEXT {suffix}")
 
             return exitFor result.Status
         | None, Some(:? DeadlineExceededException as exceeded) ->
