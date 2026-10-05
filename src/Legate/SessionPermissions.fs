@@ -30,12 +30,37 @@ open Microsoft.Extensions.DependencyInjection
 /// policy type ever crosses the public API beyond the contracts.
 module internal SessionPermissions =
 
+    /// Extracts the executing entry's user message in conversational shape:
+    /// the entry's parts in order, or an empty user message when the entry
+    /// carries no user payload. Non-text parts pass by reference, so
+    /// supported images and files survive exactly as the host sent them.
+    /// <param name="entry">The inbox entry the run executes.</param>
+    /// <returns>The user message the turn executes.</returns>
+    let private userMessageOfEntry (entry: InboxEntry) : ChatMessage =
+        match entry.Payload with
+        | :? UserMessagePayload as userMessage when
+            not (isNull (box userMessage))
+            && not (isNull (box userMessage.Message))
+            && not (isNull (box userMessage.Message.Parts))
+            ->
+            let parts = ResizeArray<AIContent>()
+
+            for part in userMessage.Message.Parts do
+                if not (isNull (box part)) then
+                    parts.Add(part)
+
+            ChatMessage(ChatRole.User, parts :> IList<AIContent>)
+        | _ -> ChatMessage(ChatRole.User, "")
+
     /// Builds the user history for a fresh run from the entry's parts,
     /// mirroring the actor's Queue runner shape, with the composed system
     /// prompt (issue 66) leading when present. A crash seed (Some) wins:
     /// the rehydrated transcript plus the in-memory resumption note
     /// replaces the entry-derived message, while the composed system
     /// prompt still leads. The seed is copied: the turn owns its history.
+    /// Seedless production fresh runs do not use this shape: the runner
+    /// assembles the ordinary-turn history from the journal instead (issue
+    /// 366, assembleOrdinaryHistoryAsync below).
     /// <param name="entry">The inbox entry the run executes.</param>
     /// <param name="systemPrompt">The composed system prompt, or null for the user-only shape.</param>
     /// <param name="seed">The crash-resume seed history, or None for a seedless run.</param>
@@ -52,24 +77,344 @@ module internal SessionPermissions =
             history
         | _ ->
             let history = ResizeArray<ChatMessage>() :> IList<ChatMessage>
-
-            match entry.Payload with
-            | :? UserMessagePayload as userMessage when
-                not (isNull (box userMessage))
-                && not (isNull (box userMessage.Message))
-                && not (isNull (box userMessage.Message.Parts))
-                ->
-                let parts = ResizeArray<AIContent>()
-
-                for part in userMessage.Message.Parts do
-                    if not (isNull (box part)) then
-                        parts.Add(part)
-
-                history.Add(ChatMessage(ChatRole.User, parts :> IList<AIContent>))
-            | _ -> history.Add(ChatMessage(ChatRole.User, ""))
-
+            history.Add(userMessageOfEntry entry)
             PromptComposition.prependSystemPrompt history systemPrompt
             history
+
+    /// Replays one session's journal in sequence order from cursor 0,
+    /// concatenating bounded pages. Pages only transport: every page split
+    /// replays identically, mirroring the Transcripts.readTranscript
+    /// invariant. Unknown session, expired journal, and end of stream all
+    /// stop the replay, so a fresh session assembles from an empty prefix.
+    /// <param name="eventStore">The journal to replay. Must not be null.</param>
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="sessionId">The session to replay.</param>
+    /// <returns>The journaled events in sequence order.</returns>
+    let private replayJournalAsync
+        (eventStore: ISessionEventStore)
+        (tenant: TenantId)
+        (sessionId: SessionId)
+        : Task<IReadOnlyList<SessionEvent>> =
+        ArgumentNullException.ThrowIfNull(eventStore)
+
+        task {
+            let collected = ResizeArray<SessionEvent>()
+            let mutable cursor = 0L
+            let mutable paging = true
+
+            while paging do
+                let! outcome = eventStore.Replay(tenant, sessionId, cursor, 100, CancellationToken.None)
+
+                match outcome with
+                | :? EventReplayPage as page when not (isNull (box page)) ->
+                    if not (isNull (box page.Events)) then
+                        for event in page.Events do
+                            if not (isNull (box event)) then
+                                collected.Add(event)
+
+                    if page.NextCursor.HasValue then
+                        cursor <- page.NextCursor.Value
+                    else
+                        paging <- false
+                | _ -> paging <- false
+
+            return collected :> IReadOnlyList<SessionEvent>
+        }
+
+    /// Maps one history rejection to the client-safe turn-fault reason. The
+    /// reason names the offending call id (never secrets or tool arguments)
+    /// so the host can act on it.
+    /// <param name="rejection">The rejection recovery refused the journal with.</param>
+    /// <returns>The typed fault reason.</returns>
+    let private historyRejectionReason (rejection: ConversationRecovery.RecoveryRejection) : string =
+        match rejection with
+        | ConversationRecovery.MissingToolArguments callId ->
+            sprintf
+                "The conversation history is missing tool arguments for call '%s': start a clean session."
+                (if isNull (box callId) then "" else callId)
+        | ConversationRecovery.InvalidToolArguments callId ->
+            sprintf
+                "The conversation history carries invalid tool arguments for call '%s': start a clean session."
+                (if isNull (box callId) then "" else callId)
+        | ConversationRecovery.UnpairedToolCompletion callId ->
+            sprintf
+                "The conversation history has a tool completion without its call for call '%s': start a clean session."
+                (if isNull (box callId) then "" else callId)
+        | ConversationRecovery.MissingToolResult callId ->
+            sprintf
+                "The conversation history is missing the tool result for call '%s': start a clean session."
+                (if isNull (box callId) then "" else callId)
+        | ConversationRecovery.InvalidJournal reason ->
+            sprintf
+                "The conversation journal is unusable (%s): start a clean session."
+                (if isNull (box reason) then "invalid batch" else reason)
+
+    /// Assembles the ordinary-turn history for a seedless fresh run (issue
+    /// 366): replays the journal from cursor 0, folds the prefix through
+    /// the read-only #380 recovery builder (never the lossy display cells),
+    /// appends the executing entry's initial user message in conversational
+    /// order, then leads with the composed system prompt exactly once. The
+    /// composed prompt is never journaled, so prepend-once never duplicates.
+    /// A rejection (or an unreadable journal) reads as an Error carrying the
+    /// turn-fault reason: the runner fails the turn before any provider call
+    /// instead of fabricating history.
+    /// <param name="eventStore">The journal to replay. Must not be null.</param>
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="entry">The inbox entry the run executes.</param>
+    /// <param name="systemPrompt">The composed system prompt, or null for the user-only shape.</param>
+    /// <returns>The assembled history, or the explicit fault reason.</returns>
+    let private assembleOrdinaryHistoryAsync
+        (eventStore: ISessionEventStore)
+        (tenant: TenantId)
+        (entry: InboxEntry)
+        (systemPrompt: string | null)
+        : Task<Result<IList<ChatMessage>, string>> =
+        task {
+            try
+                let! events = replayJournalAsync eventStore tenant entry.SessionId
+
+                match ConversationRecovery.tryRecover events with
+                | Error rejection -> return Error(historyRejectionReason rejection)
+                | Ok history ->
+                    history.Add(userMessageOfEntry entry)
+                    PromptComposition.prependSystemPrompt history systemPrompt
+                    return Ok history
+            with _ ->
+                return Error "The conversation history could not be read from the journal: start a clean session."
+        }
+
+    /// Builds the turn fault for an unassemblable ordinary history: a
+    /// Failed completion carrying the explicit reason with zero provider
+    /// calls and zero new journal writes. Never a
+    /// CompletionRoutingException: recovery-policy rejection stays at the
+    /// replay/wire layer (issue 372).
+    /// <param name="turnId">The running turn the fault settles under.</param>
+    /// <param name="reason">The explicit fault reason. Never null.</param>
+    /// <returns>The faulted completion.</returns>
+    let private failedHistoryCompletion (turnId: TurnId) (reason: string) : TurnLoop.TurnLoopCompletion =
+        {
+            Result =
+                {
+                    AssistantText = ""
+                    Status = TurnStatus.Failed
+                    Iterations = 0
+                    Usage = { InputTokens = 0L; OutputTokens = 0L }
+                    Outcome = TurnFailed(reason) :> TurnOutcome
+                }
+            TurnId = turnId
+            HasPendingInjects = false
+            Suspension = None
+        }
+
+    /// Appends one evidence batch under the running claim's last-moment
+    /// fence: verifies the live ControlAdmission and LeaseAdmission hooks,
+    /// then appends through the fenced writer under the ambient claim token
+    /// (JournalWriter redaction and bounds apply; tenant isolation rides the
+    /// tenant-scoped store). A fenced-out write raises
+    /// TurnLeaseLostException with zero effects, so a takeover loser
+    /// performs nothing; a failed write raises with the writer's typed
+    /// reason (explicit, never silent loss). Outside a fenced turn
+    /// (unclaimed shells) journals nothing, preserving harness shapes.
+    /// Callers stamp the running turn id on every event (#374 attribution)
+    /// before calling.
+    /// <param name="eventStore">The journal the events append to. Must not be null.</param>
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="sessionId">The session whose journal appends.</param>
+    /// <param name="events">The events to append, in order. Must not be null or empty and must carry no nulls.</param>
+    let private journalBatchUnderClaimAsync
+        (eventStore: ISessionEventStore)
+        (tenant: TenantId)
+        (sessionId: SessionId)
+        (events: IReadOnlyList<SessionEvent>)
+        : Task<unit> =
+        task {
+            if isNull (box events) || events.Count = 0 then
+                ()
+            elif not (ControlAdmission.check ()) || not (LeaseAdmission.check ()) then
+                raise (TurnLoop.TurnLeaseLostException())
+            else
+                match FencedClaimScope.currentClaim () with
+                | Some claim when not (isNull (box claim)) && not (String.IsNullOrEmpty claim.Token) ->
+                    match!
+                        JournalWriter.appendWithTokenAsync
+                            eventStore
+                            tenant
+                            sessionId
+                            claim.Token
+                            events
+                            CancellationToken.None
+                    with
+                    | JournalWriter.JournalAppended _ -> ()
+                    | JournalWriter.JournalRejected _ -> raise (TurnLoop.TurnLeaseLostException())
+                    | JournalWriter.JournalFailed reason ->
+                        raise (
+                            InvalidOperationException(
+                                if String.IsNullOrWhiteSpace reason then
+                                    "The journal append failed."
+                                else
+                                    reason
+                            )
+                        )
+                | _ -> ()
+        }
+
+    /// Journals one accepted user message as turn evidence (issue 366, Task
+    /// 9): the UserMessageEvent carrying the running turn id, through
+    /// redaction, bounds, and the claim fence.
+    /// <param name="eventStore">The journal the event appends to. Must not be null.</param>
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="sessionId">The session whose journal appends.</param>
+    /// <param name="turnId">The running turn the input executes in.</param>
+    /// <param name="message">The accepted user message. Null journals nothing.</param>
+    let private journalUserEvidenceAsync
+        (eventStore: ISessionEventStore)
+        (tenant: TenantId)
+        (sessionId: SessionId)
+        (turnId: TurnId)
+        (message: UserMessage)
+        : Task<unit> =
+        task {
+            if not (isNull (box message)) then
+                let event =
+                    UserMessageEvent(
+                        sessionId,
+                        turnId,
+                        Unchecked.defaultof<Nullable<int64>>,
+                        DateTimeOffset.UtcNow,
+                        message
+                    )
+                    :> SessionEvent
+
+                do!
+                    journalBatchUnderClaimAsync
+                        eventStore
+                        tenant
+                        sessionId
+                        (ResizeArray<SessionEvent>([| event |]) :> IReadOnlyList<SessionEvent>)
+        }
+
+    /// Builds the folded-Inject evidence hook (issue 366, Task 9): each
+    /// Inject entry the running turn actually folds journals once at the
+    /// iteration boundary before its consume lands, so later history carries
+    /// it exactly once. Pending, rejected, or never-folded input journals
+    /// nothing and is never fabricated. Blocking like the base Inject wiring:
+    /// a fenced-out loser raises TurnLeaseLostException with zero effects.
+    /// <param name="eventStore">The journal folded input appends to. Must not be null.</param>
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="sessionId">The session whose journal appends.</param>
+    /// <param name="turnId">The running turn the input folds into.</param>
+    /// <returns>The Inject journal hook the turn runs with.</returns>
+    let private journalInjectedHook
+        (eventStore: ISessionEventStore)
+        (tenant: TenantId)
+        (sessionId: SessionId)
+        (turnId: TurnId)
+        : TurnLoop.JournalInjected =
+        fun injected ->
+            if not (isNull (box injected)) then
+                match injected.Payload with
+                | :? UserMessagePayload as payload when not (isNull (box payload)) && not (isNull (box payload.Message)) ->
+                    journalUserEvidenceAsync eventStore tenant sessionId turnId payload.Message
+                    |> fun write -> write.GetAwaiter().GetResult()
+                | _ -> ()
+
+    /// Journals one settled top-level tool observation as its atomic
+    /// Started/Output/Completed batch under the running turn. Pure
+    /// assembly plus the fenced append: no branch on the observation
+    /// itself, so callers screen null before calling.
+    /// <param name="eventStore">The journal the markers append to. Must not be null.</param>
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="sessionId">The session whose journal appends.</param>
+    /// <param name="turnId">The running turn the call settled in.</param>
+    /// <param name="observation">The settled observation. Must not be null.</param>
+    let private journalToolMarkersAsync
+        (eventStore: ISessionEventStore)
+        (tenant: TenantId)
+        (sessionId: SessionId)
+        (turnId: TurnId)
+        (observation: TurnLoop.ToolCallObservation)
+        : Task<unit> =
+        task {
+            let stamp = DateTimeOffset.UtcNow
+            let noSequence = Unchecked.defaultof<Nullable<int64>>
+
+            let callId =
+                if isNull (box observation.ToolCallId) then
+                    ""
+                else
+                    observation.ToolCallId
+
+            let name =
+                if isNull (box observation.ToolName) then
+                    ""
+                else
+                    observation.ToolName
+
+            let text =
+                if isNull (box observation.Text) then
+                    ""
+                else
+                    observation.Text
+
+            let error: string | null =
+                match observation.Error with
+                | Some value when not (isNull (box value)) -> value
+                | _ -> null
+
+            let resultText: string | null =
+                if isNull (box observation.Text) then
+                    null
+                else
+                    observation.Text
+
+            let batch =
+                ResizeArray<SessionEvent>(
+                    [|
+                        ToolCallStartedEvent(
+                            sessionId,
+                            turnId,
+                            noSequence,
+                            stamp,
+                            callId,
+                            name,
+                            observation.ArgumentsJson
+                        )
+                        :> SessionEvent
+                        ToolCallOutputEvent(sessionId, turnId, noSequence, stamp, callId, text) :> SessionEvent
+                        ToolCallCompletedEvent(sessionId, turnId, noSequence, stamp, callId, error, resultText)
+                        :> SessionEvent
+                    |]
+                )
+                :> IReadOnlyList<SessionEvent>
+
+            do! journalBatchUnderClaimAsync eventStore tenant sessionId batch
+        }
+
+    /// Builds the top-level settled-tool evidence sink (issue 366, Task 3,
+    /// authorized 2026-10-05): every settled top-level invocation journals
+    /// its Started (call id, name, real ArgumentsJson) / Output / Completed
+    /// (error, paired result text) markers as one atomic batch under the
+    /// running turn, through redaction, bounds, and the claim fence.
+    /// Denials settle (their denial text pairs like a result); suspensions
+    /// never observe (a suspended call has not settled). Nested sub-agent
+    /// runs never inherit this sink: the task tool overrides OnToolCall with
+    /// its own nested observer.
+    /// <param name="eventStore">The journal the markers append to. Must not be null.</param>
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="sessionId">The session whose journal appends.</param>
+    /// <param name="turnId">The running turn the call settled in.</param>
+    /// <returns>The settled-invocation observer the turn runs with.</returns>
+    let private toolSinkHook
+        (eventStore: ISessionEventStore)
+        (tenant: TenantId)
+        (sessionId: SessionId)
+        (turnId: TurnId)
+        : (TurnLoop.ToolCallObservation -> Task<unit>) option =
+        Some(fun observation ->
+            if isNull (box observation) then
+                Task.FromResult(())
+            else
+                journalToolMarkersAsync eventStore tenant sessionId turnId observation)
 
     /// Builds the production suspendable runner over
     /// TurnLoop.runSuspendableAsync plus the resume continuations: the
@@ -139,7 +484,9 @@ module internal SessionPermissions =
 
         /// Reads the entry session's pending inbox for the Inject fold: the
         /// loop filters Inject user messages itself, so the drain returns
-        /// the raw pending read. Runs on the turn thread, blocking like the
+        /// the raw pending read minus the running entry (an Inject start
+        /// never refolds itself, or its input would duplicate in history
+        /// and evidence). Runs on the turn thread, blocking like the
         /// base Inject wiring.
         /// <param name="entry">The entry the running turn executes.</param>
         /// <returns>The pending inbox entries.</returns>
@@ -151,7 +498,14 @@ module internal SessionPermissions =
                 if isNull (box pending) then
                     ResizeArray<InboxEntry>() :> IReadOnlyList<InboxEntry>
                 else
+                    // The running entry stays pending until settle:
+                    // exclude it so an Inject start never refolds
+                    // itself and journals twice.
                     pending
+                    |> Seq.filter (fun candidate ->
+                        isNull (box candidate) |> not && candidate.Position <> entry.Position)
+                    |> ResizeArray
+                    :> IReadOnlyList<InboxEntry>
             with _ ->
                 ResizeArray<InboxEntry>() :> IReadOnlyList<InboxEntry>
 
@@ -362,61 +716,111 @@ module internal SessionPermissions =
                         }
 
                     // Folded Inject entries shape the running history and are
-                    // consumed, but journal nothing: the base spawn sites wire
-                    // no Inject observer either, so both paths stay consistent.
+                    // consumed, and now journaled once each at the fold
+                    // boundary (issue 366, Task 9): the hook below journals
+                    // only what the loop actually folds, so pending or
+                    // never-folded input stays unjournaled and unfabricated.
                     let drain = drainInjected entry
                     let consume = consumeInjected entry
+
+                    // Fenced evidence sinks for this attempt (issue 366,
+                    // Tasks 3 and 9): the settled-tool markers and the
+                    // folded-Inject user evidence journal under the running
+                    // claim with the running turn id. Unclaimed shells sink
+                    // nothing; a fenced-out loser raises with zero effects.
+                    let toolSink = toolSinkHook eventStore tenant entry.SessionId turnId
+                    let journalInjected = journalInjectedHook eventStore tenant entry.SessionId turnId
 
                     match cursor, reply with
                     | None, None ->
                         let! systemPrompt = resolveSystem ()
-                        let history = historyOf entry systemPrompt seed
 
-                        // Fresh runs mark at the first provider-call entry
-                        // through the behavior-supplied hook and checkpoint
-                        // usage plus skill loads through the fenced journal
-                        // hooks (issue 321). Progressive text and reasoning
-                        // deltas buffer through the per-attempt streaming
-                        // journaler (issue 379) and flush after the loop,
-                        // before the actor journals suspension or
-                        // settlement. The skill map rebinds per turn
-                        // so the pre-built host tool journals under the
-                        // running claim. Every dispatch verifies the live
-                        // real-turn claim at the last moment (issue 376);
-                        // the renewed LeaseAdmission hook is the cached fast
-                        // check underneath.
-                        let onTextDelta, onReasoningDelta = streamingHooks ()
+                        let! freshHistory =
+                            match seed with
+                            | Some _ -> task { return Ok(historyOf entry systemPrompt seed) }
+                            | None -> assembleOrdinaryHistoryAsync eventStore tenant entry systemPrompt
 
-                        let merged =
-                            { loopOptions with
-                                VerifyClaim = verifyForCurrentClaim ()
-                                OnTurnStarted = onTurnStarted
-                                OnUsageCheckpoint = onUsageCheckpoint
-                                OnSkillLoaded = onSkillLoaded
-                                OnTextDelta = onTextDelta
-                                OnReasoningDelta = onReasoningDelta
-                            }
+                        match freshHistory with
+                        | Error reason ->
+                            // Fail before any provider call and before any
+                            // journal write: the history cannot be rebuilt
+                            // truthfully, so the turn settles Failed with
+                            // the explicit reason and performs nothing.
+                            return failedHistoryCompletion turnId reason
+                        | Ok history ->
+                            // The journaled prefix (when any) holds the prior
+                            // turns; the executing entry's input journals once
+                            // here, after assembly (so the prefix never already
+                            // carries it) and before the first provider call (so
+                            // later turns replay it). Seeded rebuilds skip the
+                            // write: the pre-crash attempt already evidenced the
+                            // input, and re-journaling would duplicate it.
+                            match seed with
+                            | Some _ -> ()
+                            | None ->
+                                match entry.Payload with
+                                | :? UserMessagePayload as initial when
+                                    not (isNull (box initial)) && not (isNull (box initial.Message))
+                                    ->
+                                    do!
+                                        journalUserEvidenceAsync
+                                            eventStore
+                                            tenant
+                                            entry.SessionId
+                                            turnId
+                                            initial.Message
+                                | _ -> ()
 
-                        let boundTools = bindSkillHook tools turnId merged.OnSkillLoaded
+                            // Fresh runs mark at the first provider-call entry
+                            // through the behavior-supplied hook and checkpoint
+                            // usage plus skill loads through the fenced journal
+                            // hooks (issue 321). Progressive text and reasoning
+                            // deltas buffer through the per-attempt streaming
+                            // journaler (issue 379) and flush after the loop,
+                            // before the actor journals suspension or
+                            // settlement. Settled top-level tool calls journal
+                            // their Started/Output/Completed markers through
+                            // the fenced sink (issue 366), and folded Inject
+                            // entries journal once each at the fold boundary.
+                            // The skill map rebinds per turn
+                            // so the pre-built host tool journals under the
+                            // running claim. Every dispatch verifies the live
+                            // real-turn claim at the last moment (issue 376);
+                            // the renewed LeaseAdmission hook is the cached fast
+                            // check underneath.
+                            let onTextDelta, onReasoningDelta = streamingHooks ()
 
-                        return!
-                            settleStreaming (fun () ->
-                                TurnLoop.runSuspendableAsync
-                                    client
-                                    history
-                                    boundTools
-                                    merged
-                                    loopDelay
-                                    runnerToken
-                                    (fun () -> LeaseAdmission.check ())
-                                    drain
-                                    ignore
-                                    consume
-                                    gate
-                                    entry.SessionId
-                                    turnId
-                                    None
-                                    allowed)
+                            let merged =
+                                { loopOptions with
+                                    VerifyClaim = verifyForCurrentClaim ()
+                                    OnTurnStarted = onTurnStarted
+                                    OnUsageCheckpoint = onUsageCheckpoint
+                                    OnSkillLoaded = onSkillLoaded
+                                    OnTextDelta = onTextDelta
+                                    OnReasoningDelta = onReasoningDelta
+                                    OnToolCall = toolSink
+                                }
+
+                            let boundTools = bindSkillHook tools turnId merged.OnSkillLoaded
+
+                            return!
+                                settleStreaming (fun () ->
+                                    TurnLoop.runSuspendableAsync
+                                        client
+                                        history
+                                        boundTools
+                                        merged
+                                        loopDelay
+                                        runnerToken
+                                        (fun () -> LeaseAdmission.check ())
+                                        drain
+                                        journalInjected
+                                        consume
+                                        gate
+                                        entry.SessionId
+                                        turnId
+                                        None
+                                        allowed)
                     | Some live, Some reply when live.Nested.IsSome ->
                         // Nested sub-agent suspension (issue 72): the reply
                         // re-enters the nested loop through the suspension's
@@ -448,9 +852,10 @@ module internal SessionPermissions =
                         return! settleStreaming (fun () -> resume.ResumeAsync reply runnerToken)
                     | Some live, Some(:? PermissionDecision as decision) ->
                         // Resumes already marked before they suspended: never
-                        // mark on resume, but carry the usage, skill, and
-                        // streaming hooks so post-resume work checkpoints,
-                        // loads, and streams journal (issues 321, 379), with
+                        // mark on resume, but carry the usage, skill,
+                        // streaming, and settled-tool hooks so post-resume
+                        // work checkpoints, loads, streams, and evidences
+                        // tool calls journal (issues 321, 379, 366), with
                         // the skill map rebound per turn.
                         // The pending call re-verifies current authority at
                         // dispatch (issue 376); allowed tools still need
@@ -465,6 +870,7 @@ module internal SessionPermissions =
                                 OnSkillLoaded = onSkillLoaded
                                 OnTextDelta = onTextDelta
                                 OnReasoningDelta = onReasoningDelta
+                                OnToolCall = toolSink
                             }
 
                         let boundTools = bindSkillHook tools turnId merged.OnSkillLoaded
@@ -485,9 +891,10 @@ module internal SessionPermissions =
                                     allowed)
                     | Some live, Some(:? QuestionAnswer as answer) ->
                         // Resumes already marked before they suspended: never
-                        // mark on resume, but carry the usage, skill, and
-                        // streaming hooks so post-resume work checkpoints,
-                        // loads, and streams journal (issues 321, 379).
+                        // mark on resume, but carry the usage, skill,
+                        // streaming, and settled-tool hooks so post-resume
+                        // work checkpoints, loads, streams, and evidences
+                        // tool calls journal (issues 321, 379, 366).
                         // Post-resume dispatches re-verify current authority
                         // (issue 376).
                         let onTextDelta, onReasoningDelta = streamingHooks ()
@@ -500,6 +907,7 @@ module internal SessionPermissions =
                                 OnSkillLoaded = onSkillLoaded
                                 OnTextDelta = onTextDelta
                                 OnReasoningDelta = onReasoningDelta
+                                OnToolCall = toolSink
                             }
 
                         let boundTools = bindSkillHook tools turnId merged.OnSkillLoaded
@@ -521,12 +929,19 @@ module internal SessionPermissions =
                     | None, Some _ ->
                         // Crash-rebuild shape: no live cursor, so retry the
                         // turn from its inbox entry with the persisted grants.
+                        // History stays verbatim (a seed wins, else the entry
+                        // shape): no replay, no executing-entry append, no
+                        // user-evidence re-journal, so a retried turn never
+                        // duplicates evidence. Settled tools still evidence
+                        // through the fenced sink, and folded Injects still
+                        // journal once each at the fold boundary.
                         let! rebuildPrompt = resolveSystem ()
                         let history = historyOf entry rebuildPrompt seed
 
                         // Retries run under the supplied turn id: mark at the
                         // first provider-call entry and carry the usage,
-                        // skill, and streaming hooks (issues 321, 379), with
+                        // skill, streaming, and settled-tool hooks (issues
+                        // 321, 379, 366), with
                         // the skill map rebound per turn. Crash retries
                         // verify the live claim like fresh runs (issue 376),
                         // failing closed when the rebuild holds no authority.
@@ -540,6 +955,7 @@ module internal SessionPermissions =
                                 OnSkillLoaded = onSkillLoaded
                                 OnTextDelta = onTextDelta
                                 OnReasoningDelta = onReasoningDelta
+                                OnToolCall = toolSink
                             }
 
                         let boundTools = bindSkillHook tools turnId merged.OnSkillLoaded
@@ -555,7 +971,7 @@ module internal SessionPermissions =
                                     runnerToken
                                     (fun () -> LeaseAdmission.check ())
                                     drain
-                                    ignore
+                                    journalInjected
                                     consume
                                     gate
                                     entry.SessionId

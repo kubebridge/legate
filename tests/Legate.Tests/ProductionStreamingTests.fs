@@ -1046,16 +1046,17 @@ let ``non-streaming fallback journals a single text delta`` () : Task =
                     |> should
                         equal
                         [
+                            nameof UserMessageEvent
                             nameof TurnStartedEvent
                             nameof TextDeltaEvent
                             nameof TurnCompletedEvent
                         ]
 
-                    textOf events[1] |> should equal "hello"
+                    textOf events[2] |> should equal "hello"
 
-                    // Marker plus one coalesced flush plus the terminal:
-                    // no synchronous storage operation per token.
-                    counting.Appends |> should equal 3
+                    // Evidence plus marker plus one coalesced flush plus the
+                    // terminal: no synchronous storage operation per token.
+                    counting.Appends |> should equal 4
                 })
     }
 
@@ -1111,21 +1112,23 @@ let ``streaming chunks coalesce into ordered deltas before the terminal event`` 
                     |> should
                         equal
                         [
+                            nameof UserMessageEvent
                             nameof TurnStartedEvent
                             nameof TextDeltaEvent
                             nameof ReasoningDeltaEvent
                             nameof TurnCompletedEvent
                         ]
 
-                    textOf events[1] |> should equal "hello world"
-                    reasoningOf events[2] |> should equal "hmm"
+                    textOf events[2] |> should equal "hello world"
+                    reasoningOf events[3] |> should equal "hmm"
 
-                    let turn = events[0].TurnId
+                    let turn = events[1].TurnId
                     events |> List.iter (fun event -> event.TurnId |> should equal turn)
 
-                    // One marker, one streaming flush, and the terminal for
-                    // four chunks: no synchronous storage operation per token.
-                    counting.Appends |> should equal 3
+                    // One evidence write, one marker, one streaming flush,
+                    // and the terminal for four chunks: no synchronous
+                    // storage operation per token.
+                    counting.Appends |> should equal 4
                 })
     }
 
@@ -1207,7 +1210,7 @@ let ``held-open provider observes deltas before settlement`` () : Task =
                     (settledOf created.Id).Count |> should equal 0
 
                     // Subscribe streams the committed deltas live.
-                    let! observed = collectStream client created.Id 0L 3
+                    let! observed = collectStream client created.Id 0L 4
 
                     (observed |> List.exists isTextDelta) |> should equal true
                     (observed |> List.exists isReasoningDelta) |> should equal true
@@ -1308,8 +1311,12 @@ let ``partial committed output survives provider failure`` () : Task =
                     |> should
                         equal
                         [
+                            nameof UserMessageEvent
                             nameof TurnStartedEvent
                             nameof TextDeltaEvent
+                            nameof ToolCallStartedEvent
+                            nameof ToolCallOutputEvent
+                            nameof ToolCallCompletedEvent
                             nameof TextDeltaEvent
                             nameof TurnFailedEvent
                         ]
@@ -1358,7 +1365,7 @@ let ``suspended then resumed streams share the origin turn`` () : Task =
                 task {
                     let! created = openSession client
                     let waiter = settleWaiter created.Id
-                    let stream = collectStream client created.Id 0L 3
+                    let stream = collectStream client created.Id 0L 4
 
                     let! _ =
                         awaitWhat
@@ -1403,7 +1410,7 @@ let ``suspended then resumed streams share the origin turn`` () : Task =
 
                     // Both phases journal under the origin turn the marker
                     // carried: fresh plus resumed continuations covered.
-                    let origin = (journaled[0] :?> TurnStartedEvent).TurnId
+                    let origin = (journaled[1] :?> TurnStartedEvent).TurnId
                     deltas |> List.iter (fun event -> event.TurnId |> should equal origin)
 
                     let beforeSeq = deltas[0].Sequence.Value
@@ -1424,7 +1431,7 @@ let ``delayed storage backpressures without per-token ops`` () : Task =
 
         let gate =
             new TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
-        // The TurnStarted marker lands at once; the streaming flush stalls.
+        // The user evidence lands at once; the marker flush stalls next.
         let gated = GatedEventStore(inner, 1, gate)
 
         let chunks = List.init 20 (fun index -> textChunk (sprintf "%02d" index))
@@ -1452,8 +1459,9 @@ let ``delayed storage backpressures without per-token ops`` () : Task =
                     let! _ = awaitWhat prompt "the prompt to land"
 
                     // The streaming flush arrived and stalled on storage:
-                    // entered twice (marker plus flush), only the marker
-                    // completed, and the turn has not settled.
+                    // entered three times (evidence plus marker plus flush),
+                    // only the evidence completed, and the turn has not
+                    // settled.
                     let deadline = DateTime.UtcNow + waitBound
                     let mutable stalled = false
 
@@ -1483,9 +1491,9 @@ let ``delayed storage backpressures without per-token ops`` () : Task =
                     texts
                     |> should equal (String.concat "" (List.init 20 (fun index -> sprintf "%02d" index)))
 
-                    // Marker, one coalesced streaming flush, and the
-                    // terminal for twenty chunks: never one op per token.
-                    gated.Entered |> should equal 3
+                    // Evidence, marker, one coalesced streaming flush, and
+                    // the terminal for twenty chunks: never one op per token.
+                    gated.Entered |> should equal 4
                 })
     }
 
@@ -1706,7 +1714,6 @@ let ``tiny configured bounds stay bounded end to end`` () : Task =
                     |> should
                         equal
                         [
-                            2L
                             3L
                             4L
                             5L
@@ -1716,11 +1723,13 @@ let ``tiny configured bounds stay bounded end to end`` () : Task =
                             9L
                             10L
                             11L
+                            12L
                         ]
 
-                    // Five bounded streaming appends plus the marker plus
-                    // the terminal: ten chunks never cost ten storage ops.
-                    counting.Appends |> should equal 7
+                    // Five bounded streaming appends plus the evidence plus
+                    // the marker plus the terminal: ten chunks never cost
+                    // ten storage ops.
+                    counting.Appends |> should equal 8
                 })
     }
 

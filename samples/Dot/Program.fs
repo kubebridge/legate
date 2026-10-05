@@ -417,17 +417,6 @@ type private ScriptedClient(steps: Queue<ScriptStep>) =
             "mcp-echo"
         ]
 
-    /// True when any incoming message mentions the marker.
-    /// <param name="messages">The chat messages.</param>
-    /// <param name="marker">The probe marker.</param>
-    /// <returns>True when the marker is mentioned.</returns>
-    let mentions (messages: ChatMessage seq) (marker: string) : bool =
-        messages
-        |> Seq.exists (fun message ->
-            not (isNull (box message))
-            && not (isNull (box message.Text))
-            && message.Text.Contains(marker, StringComparison.Ordinal))
-
     /// True when any incoming system message mentions the marker: the
     /// context-file proof scans the composed system prompt only, never the
     /// transcript, so an edit between turns steers the next answer only
@@ -443,13 +432,40 @@ type private ScriptedClient(steps: Queue<ScriptStep>) =
             && message.Role = ChatRole.System
             && message.Text.Contains(marker, StringComparison.Ordinal))
 
-    /// Refills the queue with the first unserved probe the messages
-    /// mention, if any. ctx-check refills on every mention (never marked
+    /// The turn's current input: the latest user message in the received
+    /// history. Probes trigger on current intent, never on stale history:
+    /// restored conversation context repeats earlier turns' text, so
+    /// scanning every message would re-fire served probes and shadow the
+    /// live prompt (a prior ctx-check would swallow a current ctx-edit).
+    /// <param name="messages">The chat messages.</param>
+    /// <returns>The latest user message, or None when the history holds none.</returns>
+    let latestUser (messages: ChatMessage seq) : ChatMessage option =
+        if isNull (box messages) then
+            None
+        else
+            messages
+            |> Seq.filter (fun message ->
+                not (isNull (box message))
+                && not (isNull (box message.Text))
+                && message.Role = ChatRole.User)
+            |> Seq.tryLast
+
+    /// True when the turn's current input mentions the marker.
+    /// <param name="messages">The chat messages.</param>
+    /// <param name="marker">The probe marker.</param>
+    /// <returns>True when the latest user message mentions the marker.</returns>
+    let mentionsCurrent (messages: ChatMessage seq) (marker: string) : bool =
+        match latestUser messages with
+        | None -> false
+        | Some current -> current.Text.Contains(marker, StringComparison.Ordinal)
+
+    /// Refills the queue with the first unserved probe the current input
+    /// mentions, if any. ctx-check refills on every mention (never marked
     /// served): the answer names the context markers the current system
     /// prompt carries, proving the runtime re-read the files this turn.
     /// <param name="messages">The chat messages.</param>
     let serveProbe (messages: ChatMessage seq) : unit =
-        if mentions messages "ctx-check" then
+        if mentionsCurrent messages "ctx-check" then
             let agentsPart =
                 if mentionsSystem messages "CTX-AGENTS-BETA-309" then
                     "beta"
@@ -469,7 +485,7 @@ type private ScriptedClient(steps: Queue<ScriptStep>) =
         else
             match
                 probeMarkers
-                |> List.tryFind (fun marker -> not (served.Contains marker) && mentions messages marker)
+                |> List.tryFind (fun marker -> not (served.Contains marker) && mentionsCurrent messages marker)
             with
             | None -> ()
             | Some marker ->
@@ -479,15 +495,12 @@ type private ScriptedClient(steps: Queue<ScriptStep>) =
                 for step in probeScript marker do
                     steps.Enqueue step
 
-    /// True when the incoming messages ask for the slow-turn probe.
+    /// True when the turn's current input asks for the slow-turn probe.
+    /// Scoped to the latest user message like the probe triggers: a stale
+    /// history mention must not slow every later turn.
     /// <param name="messages">The chat messages.</param>
     /// <returns>True when the turn should wait before answering.</returns>
-    let isSlowTurn (messages: ChatMessage seq) : bool =
-        messages
-        |> Seq.exists (fun message ->
-            not (isNull (box message))
-            && not (isNull (box message.Text))
-            && message.Text.Contains("slow-turn", StringComparison.Ordinal))
+    let isSlowTurn (messages: ChatMessage seq) : bool = mentionsCurrent messages "slow-turn"
 
     interface IChatClient with
         member _.GetResponseAsync(messages, _, cancellationToken) =

@@ -1139,12 +1139,13 @@ type Engine
         }
 
     /// Reports one session's counts and token usage: messages (accepted
-    /// prompts plus folded follow-ups) and completed turns over a single
-    /// journal pass, plus the token sums (the journal's UsageEvents, if any,
-    /// with this process's settled-turn accumulation on top: the runtime
-    /// journals no usage on this path). Never prices: the runtime carries
-    /// no cost by construction. Per-call tool counts are not reported: the
-    /// runtime journals no per-call tool events for facade-driven turns.
+    /// prompts plus folded follow-ups, counted from user evidence) and
+    /// completed turns over a single journal pass, plus the token sums (the
+    /// journal's UsageEvents, if any, with this process's settled-turn
+    /// accumulation on top: the runtime journals no usage on this path).
+    /// Never prices: the runtime carries no cost by construction. Per-call
+    /// tool markers are execution evidence, not prompts, so they never
+    /// count as messages.
     /// <param name="session">The session to report on.</param>
     /// <param name="cancellationToken">Abandons the read.</param>
     member private _.SessionAsync(session: ReplSession, cancellationToken: CancellationToken) : Task =
