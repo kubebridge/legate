@@ -124,6 +124,16 @@ type RendererState =
         StreamedTurn: bool
         /// Whether diagnostic lines are inside a RESULT envelope.
         InResult: bool
+        /// The RESULT envelope status token while inside one, else empty.
+        ResultStatus: string
+        /// The session the streamed prefix belongs to, empty when none.
+        ActiveSession: string
+        /// The turn the streamed prefix belongs to, empty when none.
+        ActiveTurn: string
+        /// The assistant delta prefix streamed for the active turn.
+        TurnStreamed: string
+        /// The durable (session, sequence) identities already folded.
+        Rendered: Set<string>
     }
 
 /// The empty renderer: no text, no cards, no prompts, no markers.
@@ -142,6 +152,11 @@ let empty: RendererState =
         Display = []
         StreamedTurn = false
         InResult = false
+        ResultStatus = ""
+        ActiveSession = ""
+        ActiveTurn = ""
+        TurnStreamed = ""
+        Rendered = Set.empty
     }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -176,6 +191,39 @@ let private addMeta (lines: string list) (line: string) : string list =
     takeTail maxMetaLines (lines @ [ line ])
 
 // ──────────────────────────────────────────────────────────────────────────
+// Consumer deduplication (issue 385)
+
+// True when a RESULT envelope status token names a successful settle:
+// the TurnStatus.Completed text the engine prints. Unknown tokens read as
+// non-success only when explicitly terminal elsewhere; the envelope fold
+// treats only this token as success and only explicit non-completed,
+// non-empty tokens as failure, so malformed envelopes fail open.
+let private isCompletedStatus (status: string) : bool =
+    String.Equals(status, "Completed", StringComparison.Ordinal)
+
+// Scopes the streamed prefix to the event's session and turn: a session
+// change (switch, resume attach) or a turn change (TurnStarted, queued
+// turns) isolates the prefix and the streamed flag without clearing the
+// durable rendered set (sequences are per-session, so unrelated content
+// never cross-deduplicates) or the transcript.
+let private scopeFor (state: RendererState) (sessionKey: string) (turnKey: string) : RendererState =
+    if sessionKey <> state.ActiveSession then
+        { state with
+            ActiveSession = sessionKey
+            ActiveTurn = turnKey
+            TurnStreamed = ""
+            StreamedTurn = false
+        }
+    elif turnKey <> "" && turnKey <> state.ActiveTurn then
+        { state with
+            ActiveTurn = turnKey
+            TurnStreamed = ""
+            StreamedTurn = false
+        }
+    else
+        state
+
+// ──────────────────────────────────────────────────────────────────────────
 // Fold: Subscribe events into viewport blocks.
 
 // Applies one journaled event to the renderer state: TextDelta
@@ -193,6 +241,21 @@ let private applyState (state: RendererState) (evt: SessionEvent) : RendererStat
     else if isNull (box state) then
         empty
     else
+        // Consumer dedup (issue 385): scope the streamed prefix to the
+        // event's session and turn, then record its durable identity.
+        // Duplicate delivery repeats the identical identity, so the
+        // apply-level check already returned; distinct same-text events
+        // carry distinct sequences and fold normally here.
+        let scoped = scopeFor state (DotDedup.sessionKeyOf evt) (DotDedup.turnKeyOf evt)
+
+        let state =
+            match DotDedup.durableKeyOf evt with
+            | None -> scoped
+            | Some identity ->
+                { scoped with
+                    Rendered = scoped.Rendered.Add identity
+                }
+
         match evt with
         | :? TurnStartedEvent ->
             { state with
@@ -206,12 +269,24 @@ let private applyState (state: RendererState) (evt: SessionEvent) : RendererStat
             else
                 let combined = state.Assistant + fragment
 
+                let nextPrefix = state.TurnStreamed + fragment
+
+                let nextTurnStreamed =
+                    if nextPrefix.Length <= maxAssistantChars then
+                        nextPrefix
+                    else
+                        nextPrefix.Substring(0, maxAssistantChars)
+
                 if combined.Length <= maxAssistantChars then
-                    { state with Assistant = combined }
+                    { state with
+                        Assistant = combined
+                        TurnStreamed = nextTurnStreamed
+                    }
                 else
                     { state with
                         Assistant = combined.Substring(0, maxAssistantChars)
                         AssistantTruncated = true
+                        TurnStreamed = nextTurnStreamed
                     }
         | :? ReasoningDeltaEvent as delta when not (isNull (box delta)) ->
             let fragment = safe delta.Text
@@ -462,43 +537,56 @@ let private applyState (state: RendererState) (evt: SessionEvent) : RendererStat
 
 /// Folds an event and maintains chronological display blocks alongside the
 /// information-parity model. Tool updates keep their original position.
+/// Duplicate transport delivery repeats the identical durable identity and
+/// folds nothing: the first delivery already rendered it, while distinct
+/// same-text events carry distinct sequences and stay distinct.
 let apply (state: RendererState) (evt: SessionEvent) : RendererState =
-    let next = applyState state evt
+    let duplicate =
+        not (isNull (box evt))
+        && not (isNull (box state))
+        && (match DotDedup.durableKeyOf evt with
+            | Some identity -> state.Rendered.Contains identity
+            | None -> false)
 
-    let append block =
-        { next with
-            Display = (next.Display @ [ block ]) |> List.rev |> List.truncate maxMetaLines |> List.rev
-        }
+    if duplicate then
+        state
+    else
+        let next = applyState state evt
 
-    match evt with
-    | :? TurnStartedEvent -> { next with StreamedTurn = false }
-    | :? TextDeltaEvent as delta when not (String.IsNullOrEmpty delta.Text) ->
-        let blocks =
-            match List.rev next.Display with
-            | AssistantText text :: rest when state.StreamedTurn ->
-                let value, _, _ = appendCapped text delta.Text maxAssistantChars
-                List.rev rest @ [ AssistantText value ]
-            | _ ->
-                let value, _, _ = appendCapped "" delta.Text maxAssistantChars
-                next.Display @ [ AssistantText value ]
+        let append block =
+            { next with
+                Display = (next.Display @ [ block ]) |> List.rev |> List.truncate maxMetaLines |> List.rev
+            }
 
-        { next with
-            Display = blocks
-            StreamedTurn = true
-        }
-    | :? ReasoningDeltaEvent as delta when not (String.IsNullOrEmpty delta.Text) ->
-        let blocks =
-            match List.rev next.Display with
-            | ReasoningText text :: rest ->
-                let value, _, _ = appendCapped text delta.Text maxAssistantChars
-                List.rev rest @ [ ReasoningText value ]
-            | _ -> next.Display @ [ ReasoningText delta.Text ]
+        match evt with
+        | :? TurnStartedEvent -> { next with StreamedTurn = false }
+        | :? TextDeltaEvent as delta when not (String.IsNullOrEmpty delta.Text) ->
+            let blocks =
+                match List.rev next.Display with
+                | AssistantText text :: rest when next.StreamedTurn ->
+                    let value, _, _ = appendCapped text delta.Text maxAssistantChars
+                    List.rev rest @ [ AssistantText value ]
+                | _ ->
+                    let value, _, _ = appendCapped "" delta.Text maxAssistantChars
+                    next.Display @ [ AssistantText value ]
 
-        { next with Display = blocks }
-    | :? ToolCallStartedEvent as tool -> append (ToolReference tool.ToolCallId)
-    | :? TurnFailedEvent as failed -> append (ErrorText($"Error: {failed.Reason}"))
-    | :? TurnAbortedEvent as aborted -> append (ErrorText($"Aborted: {aborted.Reason}"))
-    | _ -> next
+            { next with
+                Display = blocks
+                StreamedTurn = true
+            }
+        | :? ReasoningDeltaEvent as delta when not (String.IsNullOrEmpty delta.Text) ->
+            let blocks =
+                match List.rev next.Display with
+                | ReasoningText text :: rest ->
+                    let value, _, _ = appendCapped text delta.Text maxAssistantChars
+                    List.rev rest @ [ ReasoningText value ]
+                | _ -> next.Display @ [ ReasoningText delta.Text ]
+
+            { next with Display = blocks }
+        | :? ToolCallStartedEvent as tool -> append (ToolReference tool.ToolCallId)
+        | :? TurnFailedEvent as failed -> append (ErrorText($"Error: {failed.Reason}"))
+        | :? TurnAbortedEvent as aborted -> append (ErrorText($"Aborted: {aborted.Reason}"))
+        | _ -> next
 
 /// Folds a sequence of Subscribe events into the renderer state, oldest
 /// first.
@@ -535,25 +623,72 @@ let addLine (state: RendererState) (line: string | null) : RendererState =
                 }
 
             if trimmed.StartsWith("RESULT ", StringComparison.Ordinal) then
-                { next with InResult = true }
+                let status = trimmed.Substring("RESULT ".Length).Trim()
+
+                { next with
+                    InResult = true
+                    ResultStatus = status
+                }
             elif trimmed = "END-RESULT" then
-                { next with InResult = false }
-            elif
-                trimmed.StartsWith("SESSION ", StringComparison.Ordinal)
-                || (state.InResult && state.StreamedTurn)
-            then
+                { next with
+                    InResult = false
+                    ResultStatus = ""
+                }
+            elif trimmed.StartsWith("SESSION ", StringComparison.Ordinal) then
                 next
             elif state.InResult then
-                let blocks =
-                    match List.rev state.Display with
-                    | AssistantText previous :: rest ->
-                        List.rev rest
-                        @ [
-                            AssistantText(previous + "\n" + text)
-                        ]
-                    | _ -> state.Display @ [ AssistantText text ]
+                if state.ResultStatus <> "" && not (isCompletedStatus state.ResultStatus) then
+                    // Terminal failure or abort: the streamed partial stays
+                    // visible once and the truthful terminal outcome travels
+                    // on the TurnFailed/TurnAborted event plus the RESULT
+                    // diagnostic. Settlement carries no success text.
+                    next
+                elif text = "" then
+                    // Blank separator inside a successful envelope: keeps
+                    // paragraph structure for settlement-only content.
+                    let blocks =
+                        match List.rev state.Display with
+                        | AssistantText previous :: rest ->
+                            List.rev rest
+                            @ [
+                                AssistantText(previous + "\n" + text)
+                            ]
+                        | _ -> state.Display @ [ AssistantText text ]
 
-                { next with Display = blocks }
+                    { next with Display = blocks }
+                else
+                    let suffix = DotDedup.settlementSuffix state.TurnStreamed text
+
+                    if suffix = "" then
+                        // Already rendered: the settlement repeats the
+                        // streamed prefix exactly.
+                        next
+                    elif
+                        state.TurnStreamed <> ""
+                        && text.StartsWith(state.TurnStreamed, StringComparison.Ordinal)
+                    then
+                        // Suffix continuation: extend the streamed block
+                        // without repeating the observed prefix.
+                        let blocks =
+                            match List.rev state.Display with
+                            | AssistantText previous :: rest -> List.rev rest @ [ AssistantText(previous + suffix) ]
+                            | _ -> state.Display @ [ AssistantText suffix ]
+
+                        { next with Display = blocks }
+                    else
+                        // Settlement-only, nonstreaming fallback, or an
+                        // event/settlement race: render fully so valid
+                        // output is never suppressed.
+                        let blocks =
+                            match List.rev state.Display with
+                            | AssistantText previous :: rest ->
+                                List.rev rest
+                                @ [
+                                    AssistantText(previous + "\n" + text)
+                                ]
+                            | _ -> state.Display @ [ AssistantText text ]
+
+                        { next with Display = blocks }
             else
                 { next with
                     Display =

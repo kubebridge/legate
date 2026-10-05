@@ -15,6 +15,7 @@
     <Compile Include="DotSkills.fs" />
     <Compile Include="DotTemplates.fs" />
     <Compile Include="DotExport.fs" />
+    <Compile Include="DotDedup.fs" />
     <Compile Include="ReplEngine.fs" />
     <Compile Include="CodingTools.fs" />
     <Compile Include="DotMcp.fs" />

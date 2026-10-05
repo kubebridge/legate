@@ -245,12 +245,20 @@ type private ReplSession =
     }
 
 /// One queued turn: the session it runs in, the settle waiter queued
-/// before its prompt landed, and the waiter CTS the drain disposes.
+/// before its prompt landed, and the waiter CTS the drain disposes. The
+/// streamed prefix accumulates this turn's TextDelta fragments while its
+/// stream drains (claimed by the first TurnStarted the stream observes, so
+/// queued turns never share a prefix); the settled prefix snapshots that
+/// text when the turn's terminal event lands, so settlement rendering stays
+/// scoped to this turn even when the next turn already streams.
 type private PendingTurn =
     {
         Session: ReplSession
         WaitTask: Task<TurnResult>
         WaitCts: CancellationTokenSource
+        mutable TurnKey: string
+        mutable StreamedPrefix: string
+        mutable SettledPrefix: string
     }
 
 /// Ensures the model-carrying agent exists in the agent store: the
@@ -464,6 +472,31 @@ type Engine
     let pendingGate = obj ()
     let pendingQueue = Queue<PendingTurn>()
     let mutable drainTask: Task option = None
+    // Consumer dedup (issue 385): durable (session, sequence) identities
+    // already printed on the stream. Duplicate transport delivery repeats
+    // the identical pair, so the second sighting prints nothing; distinct
+    // same-text events carry distinct sequences and stay distinct.
+    // Session-scoped keys keep session switches and resumes from
+    // cross-deduplicating unrelated content.
+    let renderGate = obj ()
+    let rendered = HashSet<string>()
+
+    /// True when the event was already printed: the second sighting of a
+    /// duplicate delivery. Marks first sightings. Null and in-flight
+    /// (sequence-free) events never deduplicate.
+    /// <param name="evt">The event just observed.</param>
+    /// <returns>True when the event must be skipped.</returns>
+    let isDuplicate (evt: SessionEvent) : bool =
+        lock renderGate (fun () ->
+            match DotDedup.durableKeyOf evt with
+            | None -> false
+            | Some identity ->
+                if rendered.Contains identity then
+                    true
+                else
+                    rendered.Add identity |> ignore
+                    false)
+
     let approvalGate = obj ()
     let mutable approvalCount = 0
     let usageGate = obj ()
@@ -719,15 +752,66 @@ type Engine
         this.OpenAsync(title, cancellationToken)
 
     /// Streams one turn's events until the subscriber is cancelled,
-    /// answering permission requests and questions inline.
-    /// <param name="session">The session streaming.</param>
+    /// answering permission requests and questions inline. Already-printed
+    /// durable identities print nothing (duplicate delivery, replay-to-live
+    /// overlap, reconnect), while the turn's streamed assistant prefix
+    /// accumulates for prefix-aware settlement rendering.
+    /// <param name="pending">The queued turn streaming.</param>
     /// <param name="cancellationToken">Stops the stream.</param>
-    member private _.StreamAsync(session: ReplSession, cancellationToken: CancellationToken) : Task =
+    member private _.StreamAsync(pending: PendingTurn, cancellationToken: CancellationToken) : Task =
         task {
+            let session = pending.Session
+
             let stream =
                 SessionClientOperations.Subscribe(client, session.Id, session.Cursor, cancellationToken)
 
             let enumerator = stream.GetAsyncEnumerator(cancellationToken)
+
+            // Folds one fresh event into the turn's streamed prefix: the
+            // first TurnStarted claims the turn, deltas accumulate only for
+            // the claimed turn, and the terminal event snapshots the prefix
+            // so settlement stays scoped when the next turn already streams.
+            let trackPrefix (evt: SessionEvent) : unit =
+                match evt with
+                | :? TurnStartedEvent ->
+                    let turnKey = DotDedup.turnKeyOf evt
+
+                    if pending.TurnKey = "" then
+                        pending.TurnKey <- turnKey
+
+                    if turnKey = pending.TurnKey then
+                        pending.StreamedPrefix <- ""
+                        pending.SettledPrefix <- ""
+                | :? TextDeltaEvent as delta when not (isNull (box delta)) ->
+                    let raw: string | null = delta.Text
+
+                    let fragment =
+                        match raw with
+                        | null -> ""
+                        | text -> text
+
+                    if fragment <> "" then
+                        let turnKey = DotDedup.turnKeyOf evt
+
+                        if pending.TurnKey = "" then
+                            pending.TurnKey <- turnKey
+
+                        if turnKey = pending.TurnKey then
+                            // Uncapped: the prefix must stay an exact prefix
+                            // of the settlement for suffix matching; one
+                            // turn's deltas are bounded by the model.
+                            pending.StreamedPrefix <- pending.StreamedPrefix + fragment
+                | :? TurnCompletedEvent
+                | :? TurnAbortedEvent
+                | :? TurnFailedEvent ->
+                    let turnKey = DotDedup.turnKeyOf evt
+
+                    if pending.TurnKey = "" then
+                        pending.TurnKey <- turnKey
+
+                    if turnKey = pending.TurnKey then
+                        pending.SettledPrefix <- pending.StreamedPrefix
+                | _ -> ()
 
             try
                 let mutable go = true
@@ -741,10 +825,11 @@ type Engine
                         else
                             let evt = enumerator.Current
 
-                            if not (isNull (box evt)) then
+                            if not (isNull (box evt)) && not (isDuplicate evt) then
                                 if evt.Sequence.HasValue && evt.Sequence.Value > session.Cursor then
                                     session.Cursor <- evt.Sequence.Value
 
+                                trackPrefix evt
                                 line (renderEvent evt)
 
                                 match onEvent with
@@ -773,16 +858,20 @@ type Engine
         }
 
     /// Runs one queued turn: streams its events from the cursor, awaits
-    /// its waiter, and prints the settle. A settle wait that outruns its
-    /// bound reports DEADLINE while the turn keeps running. The stream is
-    /// cancelled on settle and joined best-effort, so a stuck stream never
-    /// blocks the drain.
+    /// its waiter, and prints the settle. Settlement rendering is
+    /// prefix-aware per turn (issue 385): streamed-then-success prints only
+    /// the genuinely unrendered suffix, partial-then-failure/abort keeps the
+    /// streamed partial once with the truthful terminal outcome and no
+    /// invented success text, and settlement-only/nonstreaming output prints
+    /// fully. A settle wait that outruns its bound reports DEADLINE while
+    /// the turn keeps running. The stream is cancelled on settle and joined
+    /// best-effort, so a stuck stream never blocks the drain.
     /// <param name="pending">The queued turn.</param>
     /// <param name="cancellationToken">Abandons the drain.</param>
     member private this.RunPendingAsync(pending: PendingTurn, cancellationToken: CancellationToken) : Task =
         task {
             use streamCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
-            let stream = this.StreamAsync(pending.Session, streamCts.Token)
+            let stream = this.StreamAsync(pending, streamCts.Token)
 
             try
                 try
@@ -790,8 +879,20 @@ type Engine
                     recordUsage pending.Session.Id result.Usage
                     line $"RESULT {result.Status}"
 
-                    if not (String.IsNullOrEmpty result.AssistantText) then
-                        line result.AssistantText
+                    if
+                        result.Status = TurnStatus.Completed
+                        && not (String.IsNullOrEmpty result.AssistantText)
+                    then
+                        let prefix =
+                            if not (String.IsNullOrEmpty pending.SettledPrefix) then
+                                pending.SettledPrefix
+                            else
+                                pending.StreamedPrefix
+
+                        let suffix = DotDedup.settlementSuffix prefix result.AssistantText
+
+                        if suffix <> "" then
+                            line suffix
 
                     line "END-RESULT"
                 with
@@ -898,6 +999,9 @@ type Engine
                         Session = session
                         WaitTask = waitTask
                         WaitCts = waitCts
+                        TurnKey = ""
+                        StreamedPrefix = ""
+                        SettledPrefix = ""
                     }
                 ))
 

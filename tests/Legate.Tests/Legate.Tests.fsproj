@@ -137,6 +137,7 @@
     <Compile Include="DotShellTests.fs" />
     <Compile Include="../../samples/Dot/DotInput.fs" Link="DotInputUnderTest.fs" />
     <Compile Include="DotInputTests.fs" />
+    <Compile Include="../../samples/Dot/DotDedup.fs" Link="DotDedupUnderTest.fs" />
     <Compile Include="../../samples/Dot/DotRender.fs" Link="DotRenderUnderTest.fs" />
     <Compile Include="DotRenderTests.fs" />
     <Compile Include="../../samples/Dot/DotTuiMode.fs" Link="DotTuiModeUnderTest.fs" />
