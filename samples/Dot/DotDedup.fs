@@ -81,3 +81,19 @@ let settlementSuffix (streamed: string | null) (settlement: string | null) : str
         ""
     else
         finalText
+
+/// Scopes one streamed delta fragment to visibly rendered text (issue 412):
+/// the plain REPL EVENT line never carries delta text, so a fragment the
+/// fullscreen hook never folded was never shown and must not suppress the
+/// settlement carrying the sole visible copy. Adds nothing: the result is
+/// always empty or the fragment itself.
+/// <param name="renderedVisibly">True when the delta text reached a visible channel.</param>
+/// <param name="fragment">The delta fragment. Null reads as empty.</param>
+/// <returns>The fragment when visible, else empty.</returns>
+let visibleFragment (renderedVisibly: bool) (fragment: string | null) : string =
+    if not renderedVisibly then
+        ""
+    else
+        match fragment with
+        | null -> ""
+        | text -> text

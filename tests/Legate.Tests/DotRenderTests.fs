@@ -982,6 +982,64 @@ let ``Mismatched settlement races render fully`` () =
     |> should equal true
 
 [<Fact>]
+let ``Unseen fallback deltas never suppress the plain settlement`` () =
+    // Issue 412: the fallback journals the full answer as deltas the plain
+    // EVENT line never shows, so the scoped prefix stays empty and the
+    // settlement below renders the sole visible copy fully (not zero).
+    visibleFragment false "dot scripted answer" |> should equal ""
+    visibleFragment false null |> should equal ""
+    // The hooked fullscreen fold still renders delta text progressively, so
+    // visibly rendered fragments keep their prefix and the suffix rule still
+    // suppresses the already-rendered repeat there (not twice).
+    visibleFragment true "dot scripted answer" |> should equal "dot scripted answer"
+
+    settlementSuffix (visibleFragment false "dot scripted answer") "dot scripted answer"
+    |> should equal "dot scripted answer"
+
+    settlementSuffix (visibleFragment true "dot scripted answer") "dot scripted answer"
+    |> should equal ""
+
+[<Fact>]
+let ``Tool-then-text fallback settles the answer exactly once`` () =
+    // Issue 412 combined path: tool calls (no text) then one fallback delta
+    // carrying the answer, over the real-turn settlement.
+    let s, t = sid (), tid ()
+
+    let folded =
+        applyAll
+            empty
+            [
+                startedAt s t 1
+                callStarted s t "call-1" "scripted-echo"
+                callOutput s t "call-1" "scripted tool ok"
+                callCompleted s t "call-1" null
+                deltaAt s t 7 "dot scripted answer"
+            ]
+
+    folded.Assistant |> should equal "dot scripted answer"
+
+    // Duplicate transport delivery of the fallback delta folds nothing new.
+    let redelivered = applyAll folded [ deltaAt s t 7 "dot scripted answer" ]
+
+    redelivered.Assistant |> should equal "dot scripted answer"
+
+    // The plain settlement channel (never visibly streamed) renders the
+    // answer fully and exactly once.
+    let settlement =
+        settlementSuffix (visibleFragment false redelivered.Assistant) "dot scripted answer"
+
+    settlement |> should equal "dot scripted answer"
+
+    [
+        "RESULT Completed"
+        settlement
+        "END-RESULT"
+    ]
+    |> List.filter (fun line -> line.Contains("dot scripted answer", StringComparison.Ordinal))
+    |> List.length
+    |> should equal 1
+
+[<Fact>]
 let ``Repeated identical text across turns stays distinct`` () =
     let s = sid ()
     let first, second = tid (), tid ()
