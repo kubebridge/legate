@@ -1957,7 +1957,10 @@ let ``Inject while Running folds into history before the next provider call`` ()
         events[0].Sequence.HasValue |> should equal false
         events[1].Sequence.HasValue |> should equal false
         events[2].Sequence.HasValue |> should equal false
-        events |> List.map journaledText |> should equal [ "first"; "steer-one"; "steer-two" ]
+
+        events
+        |> List.map journaledText
+        |> should equal [ "first"; "steer-one"; "steer-two" ]
 
         // The initial evidence lands at turn start (before the fold
         // window); each fold lands inside it, in position order.
