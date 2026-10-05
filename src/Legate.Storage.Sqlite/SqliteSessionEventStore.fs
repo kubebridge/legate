@@ -192,12 +192,28 @@ type SqliteSessionEventStore(database: SqliteDatabase) =
         | :? ReasoningDeltaEvent as source ->
             ReasoningDeltaEvent(sessionId, turnId, stamped, timestamp, source.Text) :> SessionEvent
         | :? ToolCallStartedEvent as source ->
-            ToolCallStartedEvent(sessionId, turnId, stamped, timestamp, source.ToolCallId, source.ToolName)
+            ToolCallStartedEvent(
+                sessionId,
+                turnId,
+                stamped,
+                timestamp,
+                source.ToolCallId,
+                source.ToolName,
+                source.ArgumentsJson
+            )
             :> SessionEvent
         | :? ToolCallOutputEvent as source ->
             ToolCallOutputEvent(sessionId, turnId, stamped, timestamp, source.ToolCallId, source.Output) :> SessionEvent
         | :? ToolCallCompletedEvent as source ->
-            ToolCallCompletedEvent(sessionId, turnId, stamped, timestamp, source.ToolCallId, source.Error)
+            ToolCallCompletedEvent(
+                sessionId,
+                turnId,
+                stamped,
+                timestamp,
+                source.ToolCallId,
+                source.Error,
+                source.ResultText
+            )
             :> SessionEvent
         | :? PermissionRequestedEvent as source ->
             PermissionRequestedEvent(sessionId, turnId, stamped, timestamp, source.RequestId, source.ToolName)

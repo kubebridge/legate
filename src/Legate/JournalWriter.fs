@@ -221,6 +221,17 @@ module internal JournalWriter =
                 map source.Output
             )
             :> SessionEvent
+        | :? ToolCallStartedEvent as source when not (isNull (box source)) ->
+            ToolCallStartedEvent(
+                source.SessionId,
+                source.TurnId,
+                source.Sequence,
+                source.Timestamp,
+                source.ToolCallId,
+                source.ToolName,
+                map source.ArgumentsJson
+            )
+            :> SessionEvent
         | :? ToolCallCompletedEvent as source when not (isNull (box source)) ->
             ToolCallCompletedEvent(
                 source.SessionId,
@@ -228,7 +239,8 @@ module internal JournalWriter =
                 source.Sequence,
                 source.Timestamp,
                 source.ToolCallId,
-                map source.Error
+                map source.Error,
+                map source.ResultText
             )
             :> SessionEvent
         | :? QuestionAskedEvent as source when not (isNull (box source)) ->
@@ -334,7 +346,9 @@ module internal JournalWriter =
         | :? TextDeltaEvent as source when not (isNull (box source)) -> length source.Text
         | :? ReasoningDeltaEvent as source when not (isNull (box source)) -> length source.Text
         | :? ToolCallOutputEvent as source when not (isNull (box source)) -> length source.Output
-        | :? ToolCallCompletedEvent as source when not (isNull (box source)) -> length source.Error
+        | :? ToolCallStartedEvent as source when not (isNull (box source)) -> length source.ArgumentsJson
+        | :? ToolCallCompletedEvent as source when not (isNull (box source)) ->
+            max (length source.Error) (length source.ResultText)
         | :? QuestionAskedEvent as source when not (isNull (box source)) -> length source.Question
         | :? QuestionAnsweredEvent as source when not (isNull (box source)) -> length source.Answer
         | :? TurnAbortedEvent as source when not (isNull (box source)) -> length source.Reason

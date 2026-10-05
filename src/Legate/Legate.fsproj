@@ -25,6 +25,7 @@
     <Compile Include="LlmCoordinator.fs" />
     <Compile Include="SessionArtifactEnrichment.fs" />
     <Compile Include="Transcripts.fs" />
+    <Compile Include="ConversationRecovery.fs" />
     <Compile Include="SessionEventBus.fs" />
     <Compile Include="SubscriptionRegistry.fs" />
     <Compile Include="LlmStreaming.fs" />

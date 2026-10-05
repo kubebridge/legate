@@ -332,6 +332,12 @@ type SessionCellDeriver() =
         // calls each keep their own result text.
         let openOutputs = Dictionary<string, Text.StringBuilder>()
 
+        // Dedupe: repeated continuations or reports must not create distinct
+        // duplicate logical entries, so a repeated start or completion for
+        // one call id derives once (the first wins).
+        let seenStarts = HashSet<string>(StringComparer.Ordinal)
+        let seenCompletions = HashSet<string>(StringComparer.Ordinal)
+
         // Advances the iteration at an iteration boundary: a completed
         // tool call followed by new model activity.
         let mutable iteration = 1
@@ -420,22 +426,30 @@ type SessionCellDeriver() =
                 | :? ToolCallStartedEvent as started ->
                     // Rule 3: one ToolCall cell, emitted immediately so
                     // hosts render the call while it runs. Content stays
-                    // empty: arguments are journaled, never streamed.
+                    // empty: arguments are journaled, never streamed. A
+                    // repeated start for one call id derives nothing more:
+                    // the first logical entry wins.
                     flushRun ()
                     advanceIteration ()
 
-                    addCell
-                        SessionCellKind.ToolCall
-                        ""
-                        started.ToolName
-                        started.ToolCallId
-                        false
-                        iteration
-                        None
-                        started.Timestamp
+                    if not (isNull (box started.ToolCallId)) && seenStarts.Contains(started.ToolCallId) then
+                        ()
+                    else
+                        if not (isNull (box started.ToolCallId)) then
+                            seenStarts.Add(started.ToolCallId) |> ignore
 
-                    openCalls[started.ToolCallId] <- started.ToolName
-                    openOutputs[started.ToolCallId] <- Text.StringBuilder()
+                        addCell
+                            SessionCellKind.ToolCall
+                            ""
+                            started.ToolName
+                            started.ToolCallId
+                            false
+                            iteration
+                            None
+                            started.Timestamp
+
+                        openCalls[started.ToolCallId] <- started.ToolName
+                        openOutputs[started.ToolCallId] <- Text.StringBuilder()
 
                 | :? ToolCallOutputEvent as output ->
                     // Rule 4a: output fragments accumulate per call id
@@ -450,10 +464,16 @@ type SessionCellDeriver() =
                     // Rule 4b: the completion emits the ToolResult cell:
                     // accumulated output, or the error reason when the
                     // call failed with no output. The result's timestamp
-                    // is the completion event's.
+                    // is the completion event's. A repeated completion for
+                    // one call id derives nothing more.
                     flushRun ()
 
-                    if openOutputs.ContainsKey(completed.ToolCallId) then
+                    if
+                        not (isNull (box completed.ToolCallId))
+                        && seenCompletions.Contains(completed.ToolCallId)
+                    then
+                        ()
+                    elif openOutputs.ContainsKey(completed.ToolCallId) then
                         let builder = openOutputs[completed.ToolCallId]
                         openOutputs.Remove(completed.ToolCallId) |> ignore
 
@@ -491,6 +511,9 @@ type SessionCellDeriver() =
 
                         openCalls.Remove(completed.ToolCallId) |> ignore
                         completedCalls <- completedCalls + 1
+
+                        if not (isNull (box completed.ToolCallId)) then
+                            seenCompletions.Add(completed.ToolCallId) |> ignore
 
                 | :? PermissionRequestedEvent as requested ->
                     // Rule 5: one system cell per permission or question

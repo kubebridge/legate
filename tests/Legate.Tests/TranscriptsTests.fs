@@ -44,20 +44,23 @@ let subCallId = "call-read-9"
 
 let issueJournal: SessionEvent list =
     [
-        ToolCallStartedEvent(sessionId, parentTurn, noSequence, stamp, parentCallId, "task") :> SessionEvent
+        ToolCallStartedEvent(sessionId, parentTurn, noSequence, stamp, parentCallId, "task", "{}") :> SessionEvent
         TextDeltaEvent(sessionId, parentTurn, noSequence, stamp, "working") :> SessionEvent
         // Sub-agent turn, interleaved in sequence order.
-        ToolCallStartedEvent(sessionId, subTurn, noSequence, stamp, parentCallId, "task") :> SessionEvent
+        ToolCallStartedEvent(sessionId, subTurn, noSequence, stamp, parentCallId, "task", "{}") :> SessionEvent
         TextDeltaEvent(sessionId, subTurn, noSequence, stamp, "sub result") :> SessionEvent
         ToolCallOutputEvent(sessionId, subTurn, noSequence, stamp, parentCallId, "out") :> SessionEvent
-        ToolCallCompletedEvent(sessionId, subTurn, noSequence, stamp, parentCallId, nullString) :> SessionEvent
+        ToolCallCompletedEvent(sessionId, subTurn, noSequence, stamp, parentCallId, nullString, "result")
+        :> SessionEvent
         ToolCallOutputEvent(sessionId, parentTurn, noSequence, stamp, parentCallId, "done") :> SessionEvent
-        ToolCallCompletedEvent(sessionId, parentTurn, noSequence, stamp, parentCallId, nullString) :> SessionEvent
+        ToolCallCompletedEvent(sessionId, parentTurn, noSequence, stamp, parentCallId, nullString, "result")
+        :> SessionEvent
         // Second top-level turn with its own call.
         TextDeltaEvent(sessionId, secondTurn, noSequence, stamp, "again") :> SessionEvent
-        ToolCallStartedEvent(sessionId, secondTurn, noSequence, stamp, ownCallId, "search") :> SessionEvent
+        ToolCallStartedEvent(sessionId, secondTurn, noSequence, stamp, ownCallId, "search", "{}") :> SessionEvent
         ToolCallOutputEvent(sessionId, secondTurn, noSequence, stamp, ownCallId, "hit") :> SessionEvent
-        ToolCallCompletedEvent(sessionId, secondTurn, noSequence, stamp, ownCallId, nullString) :> SessionEvent
+        ToolCallCompletedEvent(sessionId, secondTurn, noSequence, stamp, ownCallId, nullString, "result")
+        :> SessionEvent
     ]
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -137,10 +140,12 @@ let ``Excluding sub-agent cells drops the linked turn but keeps the parent call`
 let ``Tool calls started in their own turn are never gated`` () =
     let events =
         [
-            ToolCallStartedEvent(sessionId, parentTurn, noSequence, stamp, ownCallId, "search") :> SessionEvent
-            ToolCallCompletedEvent(sessionId, parentTurn, noSequence, stamp, ownCallId, nullString) :> SessionEvent
-            ToolCallStartedEvent(sessionId, secondTurn, noSequence, stamp, subCallId, "read_file") :> SessionEvent
-            ToolCallCompletedEvent(sessionId, secondTurn, noSequence, stamp, subCallId, nullString) :> SessionEvent
+            ToolCallStartedEvent(sessionId, parentTurn, noSequence, stamp, ownCallId, "search", "{}") :> SessionEvent
+            ToolCallCompletedEvent(sessionId, parentTurn, noSequence, stamp, ownCallId, nullString, "result")
+            :> SessionEvent
+            ToolCallStartedEvent(sessionId, secondTurn, noSequence, stamp, subCallId, "read_file", "{}") :> SessionEvent
+            ToolCallCompletedEvent(sessionId, secondTurn, noSequence, stamp, subCallId, nullString, "result")
+            :> SessionEvent
         ]
 
     let cells = read events excludeSubAgents
@@ -315,7 +320,8 @@ let ``Every page size yields identical transcripts`` () =
                         noSequence,
                         started.Timestamp,
                         started.ToolCallId,
-                        started.ToolName
+                        started.ToolName,
+                        "{}"
                     )
                     :> SessionEvent
                 | :? ToolCallOutputEvent as output ->
@@ -335,7 +341,8 @@ let ``Every page size yields identical transcripts`` () =
                         noSequence,
                         completed.Timestamp,
                         completed.ToolCallId,
-                        completed.Error
+                        completed.Error,
+                        "result"
                     )
                     :> SessionEvent
                 | :? TextDeltaEvent as delta ->
@@ -381,7 +388,8 @@ let ``Folding each page independently breaks the transcript`` () =
                         noSequence,
                         started.Timestamp,
                         started.ToolCallId,
-                        started.ToolName
+                        started.ToolName,
+                        "{}"
                     )
                     :> SessionEvent
                 | :? ToolCallOutputEvent as output ->
@@ -401,7 +409,8 @@ let ``Folding each page independently breaks the transcript`` () =
                         noSequence,
                         completed.Timestamp,
                         completed.ToolCallId,
-                        completed.Error
+                        completed.Error,
+                        "result"
                     )
                     :> SessionEvent
                 | :? TextDeltaEvent as delta ->

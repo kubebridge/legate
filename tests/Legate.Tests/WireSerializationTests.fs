@@ -413,6 +413,7 @@ let ``Manifest table versions session-bearing and targeted routing payloads at v
                 || wireCase.Name = "SessionClosed"
                 || wireCase.Name = "SetAgentApplied"
                 || wireCase.Name = "SetAgentPending"
+                || wireCase.Name = "SessionEvent"
             then
                 2
             else
@@ -462,6 +463,7 @@ let ``Superseded session-bearing v1 manifests fail closed without a minus-one re
             "legate.actor.SessionClosed.v1"
             "legate.entity.SetAgentApplied.v1"
             "legate.entity.SetAgentPending.v1"
+            "legate.event.SessionEvent.v1"
         ] do
         let refused =
             Assert.Throws<WireManifests.WireRejectedException>(fun () ->

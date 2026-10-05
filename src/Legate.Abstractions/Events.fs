@@ -142,12 +142,16 @@ and [<Sealed>] ReasoningDeltaEvent
 /// id on its ToolCallId: the call's own output and completion events, the
 /// permission request it raised, and every event raised inside a sub-agent
 /// turn the call spawned, so hosts can nest them under this call.
+/// Provider replay pairs this start with its completion: the arguments here
+/// plus the completion's result text rebuild the call, so a null or missing
+/// arguments payload never replays as a valid call (recovery rejects it).
 /// <param name="sessionId">The session the event belongs to.</param>
 /// <param name="turnId">The turn calling the tool.</param>
 /// <param name="sequence">The event's per-session sequence number, or empty while in flight.</param>
 /// <param name="timestamp">When the event was raised.</param>
 /// <param name="toolCallId">The id of the tool call that began.</param>
 /// <param name="toolName">The name of the tool being called.</param>
+/// <param name="argumentsJson">The JSON object string of the call's arguments, verbatim. Null only on journals written before issue 380; recovery rejects those explicitly.</param>
 and [<Sealed>] ToolCallStartedEvent
     (
         sessionId: SessionId,
@@ -155,7 +159,8 @@ and [<Sealed>] ToolCallStartedEvent
         sequence: Nullable<int64>,
         timestamp: DateTimeOffset,
         toolCallId: string,
-        toolName: string
+        toolName: string,
+        argumentsJson: string | null
     ) =
     inherit SessionEvent(sessionId, turnId, sequence, timestamp)
 
@@ -164,6 +169,11 @@ and [<Sealed>] ToolCallStartedEvent
 
     /// The name of the tool being called.
     member _.ToolName = toolName
+
+    /// The JSON object string of the call's arguments, verbatim. Null only
+    /// on journals written before issue 380; recovery rejects those
+    /// explicitly instead of replaying a fabricated call.
+    member _.ArgumentsJson: string | null = argumentsJson
 
 /// Tool output arrived. Output streams through deltas exactly like
 /// assistant text; the arguments never appear here (they are journaled with
@@ -194,12 +204,18 @@ and [<Sealed>] ToolCallOutputEvent
 
 /// A tool call settled. Tool errors surface here as a non-null reason;
 /// they do not fail the turn (the model sees the error and continues).
+/// Provider replay pairs this completion with its start: the start's call
+/// id, name, and arguments plus the result text here rebuild the call, so
+/// a success (null error) with a null result never replays as valid state
+/// (recovery rejects it); a failure (non-null error) may carry partial
+/// result text or none.
 /// <param name="sessionId">The session the event belongs to.</param>
 /// <param name="turnId">The turn whose tool call settled.</param>
 /// <param name="sequence">The event's per-session sequence number, or empty while in flight.</param>
 /// <param name="timestamp">When the event was raised.</param>
 /// <param name="toolCallId">The id of the tool call that settled.</param>
 /// <param name="error">Why the call failed, or null when it succeeded. Never contains secrets or tool arguments.</param>
+/// <param name="resultText">The paired provider result content text, or null when the call produced none (an error-only failure). Null on a success never replays as valid state; recovery rejects it.</param>
 and [<Sealed>] ToolCallCompletedEvent
     (
         sessionId: SessionId,
@@ -207,7 +223,8 @@ and [<Sealed>] ToolCallCompletedEvent
         sequence: Nullable<int64>,
         timestamp: DateTimeOffset,
         toolCallId: string,
-        error: string | null
+        error: string | null,
+        resultText: string | null
     ) =
     inherit SessionEvent(sessionId, turnId, sequence, timestamp)
 
@@ -217,6 +234,12 @@ and [<Sealed>] ToolCallCompletedEvent
     /// Why the call failed, or null when it succeeded. Never contains
     /// secrets or tool arguments.
     member _.Error: string | null = error
+
+    /// The paired provider result content text, or null when the call
+    /// produced none (an error-only failure). Null on a success never
+    /// replays as valid state; recovery rejects it instead of fabricating
+    /// result content.
+    member _.ResultText: string | null = resultText
 
 /// A tool call needs a decision the configured policy could not make alone:
 /// the turn suspends until the host answers. Mirrors
@@ -629,3 +652,17 @@ and [<Sealed>] AgentSwitchedEvent
 
     /// The agent the session converses with from now on.
     member _.NewAgentId = newAgentId
+
+/// The current conversation/event wire version carrying complete
+/// provider-required tool evidence (issue 380): tool starts carry their
+/// JSON arguments and completions carry their paired result text. Journals
+/// persisting this version round-trip those fields; older versions without
+/// them are unsupported and recovery rejects them explicitly instead of
+/// fabricating arguments, results, or valid state.
+module SessionEventContract =
+
+    /// The current event wire version. Readers accept current only;
+    /// older versions without tool arguments/result content are rejected
+    /// explicitly with a clean start, never migrated.
+    [<Literal>]
+    let CurrentVersion = 2

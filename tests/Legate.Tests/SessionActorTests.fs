@@ -1943,20 +1943,27 @@ let ``Inject while Running folds into history before the next provider call`` ()
         client.Seen[1] |> should equal [ "first"; "steer-one"; "steer-two" ]
         invocations.Value |> should equal [ "lookup" ]
 
-        // Each folded entry journaled exactly once, under the running
-        // turn's id, with an empty sequence, a fold-time stamp, and the
-        // verbatim message.
+        // The initial entry journals once as the turn's own evidence plus
+        // each folded entry journals exactly once, all under the running
+        // turn's id, with an empty sequence and the verbatim message.
         let events = lock journaled (fun () -> journaled |> List.ofSeq)
-        events.Length |> should equal 2
+        events.Length |> should equal 3
         events[0].SessionId |> should equal created.Id
         events[1].SessionId |> should equal created.Id
+        events[2].SessionId |> should equal created.Id
         events[0].TurnId.Value |> should equal events[1].TurnId.Value
+        events[1].TurnId.Value |> should equal events[2].TurnId.Value
         String.IsNullOrEmpty(events[0].TurnId.Value) |> should equal false
         events[0].Sequence.HasValue |> should equal false
         events[1].Sequence.HasValue |> should equal false
-        events |> List.map journaledText |> should equal [ "steer-one"; "steer-two" ]
+        events[2].Sequence.HasValue |> should equal false
+        events |> List.map journaledText |> should equal [ "first"; "steer-one"; "steer-two" ]
 
-        for event in events do
+        // The initial evidence lands at turn start (before the fold
+        // window); each fold lands inside it, in position order.
+        (events[0].Timestamp <= events[1].Timestamp) |> should equal true
+
+        for event in events[1..] do
             (event.Timestamp >= beforeFold && event.Timestamp <= afterFold)
             |> should equal true
 

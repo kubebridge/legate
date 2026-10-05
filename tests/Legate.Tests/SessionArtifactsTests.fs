@@ -831,9 +831,10 @@ let ``Tool image stages to an event reference and a downloadable URL`` () =
     let batch =
         ResizeArray<SessionEvent>(
             [|
-                ToolCallStartedEvent(sessionId, claim.TurnId, noSequence, stamp, callId, "camera") :> SessionEvent
+                ToolCallStartedEvent(sessionId, claim.TurnId, noSequence, stamp, callId, "camera", "{}") :> SessionEvent
                 ToolCallOutputEvent(sessionId, claim.TurnId, noSequence, stamp, callId, outputText) :> SessionEvent
-                ToolCallCompletedEvent(sessionId, claim.TurnId, noSequence, stamp, callId, null) :> SessionEvent
+                ToolCallCompletedEvent(sessionId, claim.TurnId, noSequence, stamp, callId, null, "result")
+                :> SessionEvent
             |]
         )
         :> IReadOnlyList<SessionEvent>

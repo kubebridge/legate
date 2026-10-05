@@ -43,11 +43,13 @@ let sampleEvents: (string * (unit -> SessionEvent)) list =
         "reasoningDelta",
         fun () -> ReasoningDeltaEvent(sessionId, turnId, noSequence, stamp, "checking the name") :> SessionEvent
         "toolCallStarted",
-        fun () -> ToolCallStartedEvent(sessionId, turnId, noSequence, stamp, "call-1", "read_file") :> SessionEvent
+        fun () ->
+            ToolCallStartedEvent(sessionId, turnId, noSequence, stamp, "call-1", "read_file", "{}") :> SessionEvent
         "toolCallOutput",
         fun () -> ToolCallOutputEvent(sessionId, turnId, noSequence, stamp, "call-1", "line one") :> SessionEvent
         "toolCallCompleted",
-        fun () -> ToolCallCompletedEvent(sessionId, turnId, noSequence, stamp, "call-1", nullString) :> SessionEvent
+        fun () ->
+            ToolCallCompletedEvent(sessionId, turnId, noSequence, stamp, "call-1", nullString, "result") :> SessionEvent
         "permissionRequested",
         fun () -> PermissionRequestedEvent(sessionId, turnId, noSequence, stamp, "req-1", "write_file") :> SessionEvent
         "permissionResolved",
@@ -228,7 +230,7 @@ let ``ReasoningDelta round-trips its text payload`` () =
 let ``ToolCallStarted round-trips its call id and tool name`` () =
     let restored =
         roundTrip "toolCallStarted" (fun () ->
-            ToolCallStartedEvent(sessionId, turnId, noSequence, stamp, "call-7", "grep") :> SessionEvent)
+            ToolCallStartedEvent(sessionId, turnId, noSequence, stamp, "call-7", "grep", "{}") :> SessionEvent)
 
     let started = restored :?> ToolCallStartedEvent
     started.ToolCallId |> should equal "call-7"
@@ -248,7 +250,8 @@ let ``ToolCallOutput round-trips its call id and output`` () =
 let ``ToolCallCompleted round-trips a success without an error`` () =
     let restored =
         roundTrip "toolCallCompleted" (fun () ->
-            ToolCallCompletedEvent(sessionId, turnId, noSequence, stamp, "call-7", nullString) :> SessionEvent)
+            ToolCallCompletedEvent(sessionId, turnId, noSequence, stamp, "call-7", nullString, "result")
+            :> SessionEvent)
 
     let completed = restored :?> ToolCallCompletedEvent
     completed.ToolCallId |> should equal "call-7"
@@ -258,7 +261,8 @@ let ``ToolCallCompleted round-trips a success without an error`` () =
 let ``ToolCallCompleted round-trips a failure with an error reason`` () =
     let restored =
         roundTrip "toolCallCompleted" (fun () ->
-            ToolCallCompletedEvent(sessionId, turnId, noSequence, stamp, "call-7", "exit code 1") :> SessionEvent)
+            ToolCallCompletedEvent(sessionId, turnId, noSequence, stamp, "call-7", "exit code 1", "result")
+            :> SessionEvent)
 
     let completed = restored :?> ToolCallCompletedEvent
     completed.Error |> should equal "exit code 1"

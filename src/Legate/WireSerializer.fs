@@ -370,6 +370,7 @@ type internal WireSerializer(system: ExtendedActorSystem) =
                         && name <> "SessionClosed"
                         && name <> "SetAgentApplied"
                         && name <> "SetAgentPending"
+                        && name <> "SessionEvent"
                     )
                 then
                     this.refuse

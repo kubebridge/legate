@@ -33,13 +33,13 @@ let private reasoning (s: SessionId) (t: TurnId) (text: string) : SessionEvent =
     ReasoningDeltaEvent(s, t, at 3, stamp, text) :> SessionEvent
 
 let private callStarted (s: SessionId) (t: TurnId) (id: string) (name: string) : SessionEvent =
-    ToolCallStartedEvent(s, t, at 4, stamp, id, name) :> SessionEvent
+    ToolCallStartedEvent(s, t, at 4, stamp, id, name, "{}") :> SessionEvent
 
 let private callOutput (s: SessionId) (t: TurnId) (id: string) (text: string) : SessionEvent =
     ToolCallOutputEvent(s, t, at 5, stamp, id, text) :> SessionEvent
 
 let private callCompleted (s: SessionId) (t: TurnId) (id: string) (error: string | null) : SessionEvent =
-    ToolCallCompletedEvent(s, t, at 6, stamp, id, error) :> SessionEvent
+    ToolCallCompletedEvent(s, t, at 6, stamp, id, error, "result") :> SessionEvent
 
 let private allEvents (s: SessionId) (t: TurnId) : SessionEvent list =
     [
