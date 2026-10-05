@@ -338,7 +338,8 @@ module internal TaskRunner =
                                 noSequence,
                                 stamp,
                                 parentCallId,
-                                observation.ToolName
+                                observation.ToolName,
+                                "{}"
                             )
                             :> SessionEvent)
 
@@ -366,7 +367,8 @@ module internal TaskRunner =
                                 noSequence,
                                 stamp,
                                 parentCallId,
-                                Option.toObj observation.Error
+                                Option.toObj observation.Error,
+                                observation.Text
                             )
                             :> SessionEvent)
                 })

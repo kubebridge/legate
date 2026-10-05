@@ -915,14 +915,58 @@ module internal SessionActor =
                     // Per-turn mint: this closure runs synchronously inside
                     // the actor's startTurn, once per turn, so the id is
                     // the running (injecting) turn's for every entry this
-                    // turn folds.
+                    // turn folds. The initial entry journals once here as
+                    // the turn's own evidence; folded Inject entries journal
+                    // once each at their fold boundary below. Pending inbox
+                    // entries with no event are queued-but-not-executed;
+                    // rejected prompts never reach the runner and journal
+                    // nothing, so applied vs queued vs rejected stay
+                    // distinguishable.
                     let turnId = TurnId.New()
 
                     let drainInjected () : IReadOnlyList<InboxEntry> =
-                        wiring.Store
-                            .ReadPendingInbox(wiring.Tenant, wiring.SessionId, CancellationToken.None)
-                            .GetAwaiter()
-                            .GetResult()
+                        let pending =
+                            wiring.Store
+                                .ReadPendingInbox(wiring.Tenant, wiring.SessionId, CancellationToken.None)
+                                .GetAwaiter()
+                                .GetResult()
+
+                        if isNull (box pending) then
+                            ResizeArray<InboxEntry>() :> IReadOnlyList<InboxEntry>
+                        else
+                            // The running entry stays pending until settle:
+                            // exclude it so an Inject start never refolds
+                            // itself and journals twice.
+                            pending
+                            |> Seq.filter (fun candidate ->
+                                isNull (box candidate) |> not && candidate.Position <> entry.Position)
+                            |> ResizeArray
+                            :> IReadOnlyList<InboxEntry>
+
+                    let observeUserEvidence (sessionId: SessionId) (message: UserMessage) : unit =
+                        if not (isNull (box message)) then
+                            if not (isLeaseValid ()) then
+                                raise (TurnLoop.TurnLeaseLostException())
+
+                            let event =
+                                UserMessageEvent(sessionId, turnId, Nullable<int64>(), DateTimeOffset.UtcNow, message)
+
+                            // Route the fold through the journal writer:
+                            // the observer sees the redacted shape, so a
+                            // downstream journal carries no secrets. The
+                            // writer never drops: kind and ids survive,
+                            // only secret shapes are replaced. A fenced-out
+                            // loser raises above instead of observing, so
+                            // it journals nothing.
+                            let redacted = JournalWriter.sanitizeEvent event :?> UserMessageEvent
+
+                            match wiring.JournalEvent with
+                            | Some observe ->
+                                try
+                                    observe redacted
+                                with _ ->
+                                    ()
+                            | None -> ()
 
                     let journalInjected (injected: InboxEntry) : unit =
                         if not (isNull (box injected)) then
@@ -930,29 +974,7 @@ module internal SessionActor =
                             | :? UserMessagePayload as payload when
                                 not (isNull (box payload)) && not (isNull (box payload.Message))
                                 ->
-                                let event =
-                                    UserMessageEvent(
-                                        injected.SessionId,
-                                        turnId,
-                                        Nullable<int64>(),
-                                        DateTimeOffset.UtcNow,
-                                        payload.Message
-                                    )
-
-                                // Route the fold through the journal writer:
-                                // the observer sees the redacted shape, so a
-                                // downstream journal carries no secrets. The
-                                // writer never drops: kind and ids survive,
-                                // only secret shapes are replaced.
-                                let redacted = JournalWriter.sanitizeEvent event :?> UserMessageEvent
-
-                                match wiring.JournalEvent with
-                                | Some observe ->
-                                    try
-                                        observe redacted
-                                    with _ ->
-                                        ()
-                                | None -> ()
+                                observeUserEvidence injected.SessionId payload.Message
                             | _ -> ()
 
                     let consumeInjected (injected: InboxEntry) : unit =
@@ -988,6 +1010,19 @@ module internal SessionActor =
                             with
                             | :? TurnLoop.TurnLeaseLostException -> reraise ()
                             | _ -> ()
+
+                    // Initial evidence, once per delivery semantics: the
+                    // turn's own entry journals exactly once under the
+                    // running turn's id before the first provider call, so
+                    // the transcript holds the actual user content even when
+                    // no Inject ever folds. A fenced-out loser raises here
+                    // with zero provider effects.
+                    match entry.Payload with
+                    | :? UserMessagePayload as initial when
+                        not (isNull (box initial)) && not (isNull (box initial.Message))
+                        ->
+                        observeUserEvidence entry.SessionId initial.Message
+                    | _ -> ()
 
                     let! completion =
                         TurnLoop.runAsyncWithInjects

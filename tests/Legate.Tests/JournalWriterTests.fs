@@ -304,7 +304,8 @@ let ``Every text-bearing kind redacts`` () =
              ToolCallOutputEvent(sessionId, turnId, noSequence, startInstant, "c1", "pwd=hunter2") :> SessionEvent,
              fun event -> (event :?> ToolCallOutputEvent).Output)
             ("Error",
-             ToolCallCompletedEvent(sessionId, turnId, noSequence, startInstant, "c1", "pwd=hunter2") :> SessionEvent,
+             ToolCallCompletedEvent(sessionId, turnId, noSequence, startInstant, "c1", "pwd=hunter2", "result")
+             :> SessionEvent,
              fun event -> (event :?> ToolCallCompletedEvent).Error)
             ("Question",
              QuestionAskedEvent(sessionId, turnId, noSequence, startInstant, "q1", "pwd=hunter2") :> SessionEvent,
@@ -359,7 +360,7 @@ let ``Every text-bearing kind redacts`` () =
     kept.OutputTokens |> should equal 5L
 
     let started =
-        ToolCallStartedEvent(sessionId, turnId, noSequence, startInstant, "c1", "exec") :> SessionEvent
+        ToolCallStartedEvent(sessionId, turnId, noSequence, startInstant, "c1", "exec", "{}") :> SessionEvent
 
     let keptStarted = JournalWriter.sanitizeEvent started :?> ToolCallStartedEvent
     keptStarted.ToolName |> should equal "exec"
@@ -386,7 +387,7 @@ let ``Null text fields stay null`` () =
     (isNull (box kept.Text)) |> should equal true
 
     let completed =
-        ToolCallCompletedEvent(sessionId, turnId, noSequence, startInstant, "c1", nullText) :> SessionEvent
+        ToolCallCompletedEvent(sessionId, turnId, noSequence, startInstant, "c1", nullText, "result") :> SessionEvent
 
     let keptCompleted = JournalWriter.sanitizeEvent completed :?> ToolCallCompletedEvent
     (isNull (box keptCompleted.Error)) |> should equal true

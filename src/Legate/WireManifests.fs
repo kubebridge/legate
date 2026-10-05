@@ -159,7 +159,9 @@ module internal WireManifests =
             { row SubscriptionFamily "EventBatch" typeof<WireDtos.EventBatchDto> LargeWireBytes with
                 Version = 2
             }
-            row EventFamily "SessionEvent" typeof<WireDtos.SessionEventDto> LargeWireBytes
+            { row EventFamily "SessionEvent" typeof<WireDtos.SessionEventDto> LargeWireBytes with
+                Version = 2
+            }
         ]
 
     /// Manifests reserved for future wire cases. The subscription and event

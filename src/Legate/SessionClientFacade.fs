@@ -324,13 +324,29 @@ type SessionClientOperations =
         | :? ReasoningDeltaEvent as source ->
             ReasoningDeltaEvent(sessionId, turnId, noSequence, timestamp, source.Text) :> SessionEvent
         | :? ToolCallStartedEvent as source ->
-            ToolCallStartedEvent(sessionId, turnId, noSequence, timestamp, source.ToolCallId, source.ToolName)
+            ToolCallStartedEvent(
+                sessionId,
+                turnId,
+                noSequence,
+                timestamp,
+                source.ToolCallId,
+                source.ToolName,
+                source.ArgumentsJson
+            )
             :> SessionEvent
         | :? ToolCallOutputEvent as source ->
             ToolCallOutputEvent(sessionId, turnId, noSequence, timestamp, source.ToolCallId, source.Output)
             :> SessionEvent
         | :? ToolCallCompletedEvent as source ->
-            ToolCallCompletedEvent(sessionId, turnId, noSequence, timestamp, source.ToolCallId, source.Error)
+            ToolCallCompletedEvent(
+                sessionId,
+                turnId,
+                noSequence,
+                timestamp,
+                source.ToolCallId,
+                source.Error,
+                source.ResultText
+            )
             :> SessionEvent
         | :? PermissionRequestedEvent as source ->
             PermissionRequestedEvent(sessionId, turnId, noSequence, timestamp, source.RequestId, source.ToolName)
