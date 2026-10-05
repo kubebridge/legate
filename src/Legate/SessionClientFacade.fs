@@ -942,12 +942,20 @@ type SessionClientOperations =
         | None -> client.EventBus.Subscribe(client.Tenant, sessionId, fromSequence, cancellationToken)
 
     /// Reads the session's coarse transcript cells derived from its
-    /// journaled events.
+    /// journaled events. The read streams the journal through bounded
+    /// pages and derives cells incrementally with output-proportional
+    /// cost: serving every cell still fetches the historical pages and
+    /// holds the derived cells, but never retains a second complete
+    /// raw-event journal and never re-derives the whole prefix per page
+    /// (see the cost contract on <see cref="T:Legate.TranscriptReader" />).
+    /// Unknown sessions and expired journals are settled tails: the read
+    /// returns the cells derived from the events it saw (none on a fresh
+    /// unknown or expired journal). Callers needing an unknown-session
+    /// failure check existence first.
     /// <param name="client">The session client. Must not be null.</param>
     /// <param name="sessionId">The session whose transcript to read.</param>
     /// <param name="cancellationToken">Abandons the read.</param>
     /// <returns>The transcript cells.</returns>
-    /// <exception cref="T:Legate.SessionNotFoundException">The session id does not exist.</exception>
     [<Extension>]
     static member ReadTranscriptAsync
         (client: SessionClient, sessionId: SessionId, cancellationToken: CancellationToken)

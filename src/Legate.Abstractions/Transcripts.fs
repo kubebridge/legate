@@ -4,19 +4,33 @@ namespace Legate
 open System
 open System.Collections.Generic
 
-// Transcript-read contracts (issue 50). SessionCell is the coarse
-// transcript hosts list; SessionCellDeriver.Fold is the single normative
-// pure fold deriving one turn's cells from its journaled user message and
-// ordered events. This file adds the session-level read over that fold:
-// ReadTranscriptOptions carries the sub-agent include/exclude knob, and
-// TranscriptReader is the pure replayed-events-to-cells read the runtime's
-// paging loop feeds. The fold itself is untouched: derivation stays in
-// Cells.fs, stores keep events only, and no event field is added. The
-// sub-agent linkage reused here is the documented event-layer one: every
-// event raised inside a sub-agent turn carries the parent call's id on its
-// ToolCallId (Events.fs), so the reader attributes each tool-call id to
-// the turn of its first ToolCallStarted and treats any other turn
-// carrying that id as the sub-agent turn it spawned.
+// Transcript-read contracts (issue 50, incremental cost contract in issue
+// 388). SessionCell is the coarse transcript hosts list;
+// SessionCellDeriver.Fold is the single normative pure fold deriving one
+// turn's cells from its journaled user message and ordered events. This
+// file adds the session-level read over that fold: ReadTranscriptOptions
+// carries the sub-agent include/exclude knob, and TranscriptReader is the
+// pure replayed-events-to-cells read the runtime's paging loop feeds. The
+// fold itself is untouched: derivation stays in Cells.fs, stores keep
+// events only, and no event field is added. The sub-agent linkage reused
+// here is the documented event-layer one: every event raised inside a
+// sub-agent turn carries the parent call's id on its ToolCallId
+// (Events.fs), so the reader attributes each tool-call id to the turn of
+// its first ToolCallStarted and treats any other turn carrying that id as
+// the sub-agent turn it spawned.
+//
+// Cost contract: a full transcript read costs proportionally to its
+// output. Serving every cell still fetches the historical pages and holds
+// the derived cells, but never retains a second complete raw-event journal
+// beside the output and never re-derives the whole prefix per page. The
+// bounded incremental derivation behind the runtime read keeps only the
+// derived cells plus small linkage state: per-turn pending buffers (the
+// open assistant-text run, uncompleted tool outputs), the first-start-wins
+// tool-call starter map, the first-seen turn order, and the per-turn
+// observed call ids gated once at the end. Open text runs, uncompleted
+// tool calls, and interleaved turns keep correlation state proportional to
+// that open content, so no constant total memory or constant-time full
+// read is promised.
 
 /// Options for the <c>ReadTranscript</c> reader: whether the transcript
 /// keeps the cells derived from sub-agent turns. A plain class with
@@ -42,7 +56,10 @@ type ReadTranscriptOptions() =
 /// behind <see cref="T:Legate.ReadTranscriptOptions" />. Every method is
 /// pure: it reads the inputs, returns fresh cells, and performs no I/O.
 /// <see cref="T:Legate.SessionCellDeriver" /> remains the only transcript
-/// fold; this reader groups and gates, never re-derives.
+/// fold; this reader groups and gates, never re-derives. The runtime serves
+/// the same content incrementally page by page (issue 388) with identical
+/// output: pages only transport, the derivation folds the sequence, so the
+/// cost contract above applies to both paths.
 type TranscriptReader() =
 
     /// Derives the transcript cells from one session's replayed journal
