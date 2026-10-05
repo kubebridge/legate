@@ -61,7 +61,20 @@ let sampleEvents: (string * (unit -> SessionEvent)) list =
         "questionAnswered",
         fun () -> QuestionAnsweredEvent(sessionId, turnId, noSequence, stamp, "q-1", "blue") :> SessionEvent
         "usage", fun () -> UsageEvent(sessionId, turnId, noSequence, stamp, 1200L, 340L) :> SessionEvent
-        "compacted", fun () -> CompactedEvent(sessionId, turnId, noSequence, stamp, 9000L, 1200L) :> SessionEvent
+        "compacted",
+        fun () ->
+            CompactedEvent(
+                sessionId,
+                turnId,
+                noSequence,
+                stamp,
+                9000L,
+                1200L,
+                "kept facts",
+                ResizeArray<ChatMessage>() :> IReadOnlyList<ChatMessage>,
+                SessionEventContract.CompactedContextVersion
+            )
+            :> SessionEvent
         "compactionFailed",
         fun () -> CompactionFailedEvent(sessionId, turnId, noSequence, stamp, "model denied") :> SessionEvent
         "turnCompleted", fun () -> TurnCompletedEvent(sessionId, turnId, noSequence, stamp) :> SessionEvent
@@ -318,14 +331,40 @@ let ``Usage round-trips both token counts`` () =
     usage.OutputTokens |> should equal 7L
 
 [<Fact>]
-let ``Compacted round-trips both estimates`` () =
+let ``Compacted round-trips estimates, summary, and retained tail`` () =
+    let retained =
+        ResizeArray<ChatMessage>(
+            [|
+                ChatMessage(ChatRole.User, "kept question")
+                ChatMessage(ChatRole.Assistant, "kept answer")
+            |]
+        )
+        :> IReadOnlyList<ChatMessage>
+
     let restored =
         roundTrip "compacted" (fun () ->
-            CompactedEvent(sessionId, turnId, noSequence, stamp, 9000L, 1200L) :> SessionEvent)
+            CompactedEvent(
+                sessionId,
+                turnId,
+                noSequence,
+                stamp,
+                9000L,
+                1200L,
+                "kept facts",
+                retained,
+                SessionEventContract.CompactedContextVersion
+            )
+            :> SessionEvent)
 
     let compacted = restored :?> CompactedEvent
     compacted.BeforeEstimate |> should equal 9000L
     compacted.AfterEstimate |> should equal 1200L
+    compacted.Summary |> should equal "kept facts"
+
+    compacted.FormatVersion
+    |> should equal SessionEventContract.CompactedContextVersion
+
+    compacted.RetainedMessages.Count |> should equal 2
 
 [<Fact>]
 let ``CompactionFailed round-trips its failure reason`` () =

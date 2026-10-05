@@ -2,7 +2,9 @@
 module Legate.Tests.DotRenderTests
 
 open System
+open System.Collections.Generic
 open Legate
+open Microsoft.Extensions.AI
 open Dot.DotRender
 open Dot.DotDedup
 open FsUnit.Xunit
@@ -93,7 +95,18 @@ let private allEvents (s: SessionId) (t: TurnId) : SessionEvent list =
         QuestionAskedEvent(s, t, at 9, stamp, "q-1", "continue?") :> SessionEvent
         QuestionAnsweredEvent(s, t, at 10, stamp, "q-1", "yes") :> SessionEvent
         UsageEvent(s, t, at 11, stamp, 10L, 20L) :> SessionEvent
-        CompactedEvent(s, t, at 12, stamp, 100L, 40L) :> SessionEvent
+        CompactedEvent(
+            s,
+            t,
+            at 12,
+            stamp,
+            100L,
+            40L,
+            "kept facts",
+            ResizeArray<ChatMessage>() :> IReadOnlyList<ChatMessage>,
+            SessionEventContract.CompactedContextVersion
+        )
+        :> SessionEvent
         CompactionFailedEvent(s, t, at 13, stamp, "busy") :> SessionEvent
         TurnCompletedEvent(s, t, at 14, stamp) :> SessionEvent
         TurnAbortedEvent(s, t, at 15, stamp, StopCause.ExplicitAbort, "aborted") :> SessionEvent

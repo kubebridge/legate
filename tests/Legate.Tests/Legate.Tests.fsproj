@@ -176,6 +176,7 @@
     <Compile Include="ProductionStreamingTests.fs" />
     <Compile Include="OrdinaryHistoryTests.fs" />
     <Compile Include="ProductionCompactionTests.fs" />
+    <Compile Include="CompactedContextTests.fs" />
   </ItemGroup>
 
   <ItemGroup>

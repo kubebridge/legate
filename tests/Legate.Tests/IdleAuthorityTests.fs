@@ -583,7 +583,17 @@ let ``Stale host stamp rejects after an idle rebind moves the version`` () : Tas
         // The rebind bumped UpdatedAt past the stale stamp: the loser's
         // host write rejects with zero effects.
         let sentinel =
-            CompactedEvent(harness.SessionId, Unchecked.defaultof<TurnId>, Nullable(), DateTimeOffset.UtcNow, 8L, 4L)
+            CompactedEvent(
+                harness.SessionId,
+                Unchecked.defaultof<TurnId>,
+                Nullable(),
+                DateTimeOffset.UtcNow,
+                8L,
+                4L,
+                "host sentinel",
+                ResizeArray<ChatMessage>() :> IReadOnlyList<ChatMessage>,
+                SessionEventContract.CompactedContextVersion
+            )
             :> SessionEvent
 
         let! rejected =
@@ -618,7 +628,17 @@ let ``Host append to a closed session rejects and the session stays closed`` () 
         let! _ = store.CloseSession(tenant, created.Id, CancellationToken.None)
 
         let sentinel =
-            CompactedEvent(created.Id, Unchecked.defaultof<TurnId>, Nullable(), DateTimeOffset.UtcNow, 8L, 4L)
+            CompactedEvent(
+                created.Id,
+                Unchecked.defaultof<TurnId>,
+                Nullable(),
+                DateTimeOffset.UtcNow,
+                8L,
+                4L,
+                "host sentinel",
+                ResizeArray<ChatMessage>() :> IReadOnlyList<ChatMessage>,
+                SessionEventContract.CompactedContextVersion
+            )
             :> SessionEvent
 
         let! rejected =

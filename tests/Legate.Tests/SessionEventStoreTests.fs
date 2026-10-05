@@ -275,7 +275,10 @@ type FakeSessionEventStore() =
                                     Nullable sequence,
                                     event.Timestamp,
                                     compacted.BeforeEstimate,
-                                    compacted.AfterEstimate
+                                    compacted.AfterEstimate,
+                                    compacted.Summary,
+                                    compacted.RetainedMessages,
+                                    compacted.FormatVersion
                                 )
                                 :> SessionEvent
                             | :? AgentSwitchedEvent as switched ->

@@ -4,6 +4,7 @@ namespace Legate
 open System
 open System.Collections.Generic
 open System.Text.Json.Serialization
+open Microsoft.Extensions.AI
 
 // Session event contracts. A SessionEvent is one entry of the fine-grained,
 // ordered, journaled stream a session emits while a turn runs: what hosts
@@ -375,12 +376,20 @@ and [<Sealed>] UsageEvent
 /// The conversation was summarised by compaction: the summary replaced
 /// everything between the system message and the last kept messages. The
 /// estimates bound the size the compaction changed, not exact token counts.
+/// Carries the durable replacement context (issue 387): the summary text
+/// plus the retained current-format tail in complete provider-valid form,
+/// so later turns and fresh-process reopen rebuild the same compacted
+/// model input without replaying superseded history. The audit transcript
+/// is unchanged: this event still produces no transcript cell.
 /// <param name="sessionId">The session the event belongs to.</param>
 /// <param name="turnId">The turn that performed the compaction.</param>
 /// <param name="sequence">The event's per-session sequence number, or empty while in flight.</param>
 /// <param name="timestamp">When the event was raised.</param>
 /// <param name="beforeEstimate">The estimated token count of the conversation before compaction.</param>
 /// <param name="afterEstimate">The estimated token count after compaction, summary included.</param>
+/// <param name="summary">The durable summary text, without the display marker. Null only on journals written before issue 387; recovery rejects those explicitly.</param>
+/// <param name="retainedMessages">The retained current-format tail in complete provider-valid form, in conversational order, excluding the system message and the summary. Null only on journals written before issue 387; recovery rejects those explicitly.</param>
+/// <param name="formatVersion">The compacted-context format version. Must equal <see cref="F:Legate.SessionEventContract.CompactedContextVersion" /> for supported state; any other value rejects explicitly.</param>
 and [<Sealed>] CompactedEvent
     (
         sessionId: SessionId,
@@ -388,7 +397,10 @@ and [<Sealed>] CompactedEvent
         sequence: Nullable<int64>,
         timestamp: DateTimeOffset,
         beforeEstimate: int64,
-        afterEstimate: int64
+        afterEstimate: int64,
+        summary: string,
+        retainedMessages: IReadOnlyList<ChatMessage>,
+        formatVersion: int
     ) =
     inherit SessionEvent(sessionId, turnId, sequence, timestamp)
 
@@ -397,6 +409,23 @@ and [<Sealed>] CompactedEvent
 
     /// The estimated token count after compaction, summary included.
     member _.AfterEstimate = afterEstimate
+
+    /// The durable summary text, without the display marker. Null only on
+    /// journals written before issue 387; recovery rejects those
+    /// explicitly instead of replaying a marker without content.
+    member _.Summary: string = summary
+
+    /// The retained current-format tail in complete provider-valid form,
+    /// in conversational order, excluding the system message and the
+    /// summary. Null only on journals written before issue 387; recovery
+    /// rejects those explicitly instead of fabricating retained context.
+    member _.RetainedMessages: IReadOnlyList<ChatMessage> = retainedMessages
+
+    /// The compacted-context format version. Must equal
+    /// <see cref="F:Legate.SessionEventContract.CompactedContextVersion" />
+    /// for supported state; any other value rejects explicitly with a
+    /// clean start.
+    member _.FormatVersion = formatVersion
 
 /// Compaction failed but the turn continues without compaction: the model
 /// denied the summariser call, the provider errored, or the summary came
@@ -670,3 +699,12 @@ module SessionEventContract =
     /// explicitly with a clean start, never migrated.
     [<Literal>]
     let CurrentVersion = 2
+
+    /// The current compacted-context format version (issue 387): the
+    /// summary plus the retained current-format tail a
+    /// <see cref="T:Legate.CompactedEvent" /> carries. Readers accept
+    /// current only; a CompactedEvent with any other version, a null or
+    /// empty summary, or a null retained tail rejects explicitly with a
+    /// clean start, never migrated or fabricated.
+    [<Literal>]
+    let CompactedContextVersion = 1

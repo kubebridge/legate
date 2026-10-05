@@ -503,7 +503,18 @@ let ``Progress markers produce no cells and do not break a delta run`` () =
             TurnStartedEvent(sessionId, turnId, noSequence, stamp) :> SessionEvent
             TextDeltaEvent(sessionId, turnId, noSequence, stamp, "Hel") :> SessionEvent
             UsageEvent(sessionId, turnId, noSequence, stamp, 10L, 2L) :> SessionEvent
-            CompactedEvent(sessionId, turnId, noSequence, stamp, 100L, 20L) :> SessionEvent
+            CompactedEvent(
+                sessionId,
+                turnId,
+                noSequence,
+                stamp,
+                100L,
+                20L,
+                "kept facts",
+                ResizeArray<ChatMessage>() :> IReadOnlyList<ChatMessage>,
+                SessionEventContract.CompactedContextVersion
+            )
+            :> SessionEvent
             TextDeltaEvent(sessionId, turnId, noSequence, stamp, "lo") :> SessionEvent
             TurnCompletedEvent(sessionId, turnId, noSequence, stamp) :> SessionEvent
         ]
@@ -818,7 +829,20 @@ let ``The fold classifies a bare event of every kind per the mapped rule`` () =
             | "questionAnswered" ->
                 fun () -> QuestionAnsweredEvent(sessionId, turnId, noSequence, stamp, "q", "because") :> SessionEvent
             | "usage" -> fun () -> UsageEvent(sessionId, turnId, noSequence, stamp, 1L, 2L) :> SessionEvent
-            | "compacted" -> fun () -> CompactedEvent(sessionId, turnId, noSequence, stamp, 10L, 2L) :> SessionEvent
+            | "compacted" ->
+                fun () ->
+                    CompactedEvent(
+                        sessionId,
+                        turnId,
+                        noSequence,
+                        stamp,
+                        10L,
+                        2L,
+                        "kept facts",
+                        ResizeArray<ChatMessage>() :> IReadOnlyList<ChatMessage>,
+                        SessionEventContract.CompactedContextVersion
+                    )
+                    :> SessionEvent
             | "compactionFailed" ->
                 fun () -> CompactionFailedEvent(sessionId, turnId, noSequence, stamp, "model denied") :> SessionEvent
             | "turnCompleted" -> fun () -> TurnCompletedEvent(sessionId, turnId, noSequence, stamp) :> SessionEvent

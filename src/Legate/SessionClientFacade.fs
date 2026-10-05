@@ -364,7 +364,17 @@ type SessionClientOperations =
             UsageEvent(sessionId, turnId, noSequence, timestamp, source.InputTokens, source.OutputTokens)
             :> SessionEvent
         | :? CompactedEvent as source ->
-            CompactedEvent(sessionId, turnId, noSequence, timestamp, source.BeforeEstimate, source.AfterEstimate)
+            CompactedEvent(
+                sessionId,
+                turnId,
+                noSequence,
+                timestamp,
+                source.BeforeEstimate,
+                source.AfterEstimate,
+                source.Summary,
+                source.RetainedMessages,
+                source.FormatVersion
+            )
             :> SessionEvent
         | :? CompactionFailedEvent as source ->
             CompactionFailedEvent(sessionId, turnId, noSequence, timestamp, source.Reason) :> SessionEvent
