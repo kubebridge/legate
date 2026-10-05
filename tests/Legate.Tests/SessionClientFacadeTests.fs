@@ -848,7 +848,7 @@ let ``Reply resumes a suspended turn and Subscribe streams the lifecycle`` () : 
                 task {
                     let! created = openSession client
                     let waiter = settleWaiter created.Id
-                    let stream = collectStream client created.Id 0L 2
+                    let stream = collectStream client created.Id 0L 3
 
                     let prompt =
                         SessionClientOperations.PromptAsync(
@@ -1070,7 +1070,7 @@ let ``Abort while WaitingForInput refuses and Reply still resumes`` () : Task =
                         )
 
                     let! _ = awaitWhat prompt "the prompt to land"
-                    let! events = awaitWhat (collectStream client created.Id 0L 2) "the suspension"
+                    let! events = awaitWhat (collectStream client created.Id 0L 3) "the suspension"
 
                     let asked =
                         events
@@ -1400,7 +1400,7 @@ let ``ReadEvents pages by cursor and limit`` () : Task =
                             CancellationToken.None
                         )
 
-                    let! events = awaitWhat (collectStream client created.Id 0L 2) "the suspension"
+                    let! events = awaitWhat (collectStream client created.Id 0L 3) "the suspension"
 
                     let asked =
                         events
@@ -1961,7 +1961,7 @@ let ``Fork copies the prefix and references the source`` () : Task =
                         SessionClientOperations.OpenSessionAsync(client, agent, options, CancellationToken.None)
 
                     let waiter = settleWaiter created.Id
-                    let stream = collectStream client created.Id 0L 2
+                    let stream = collectStream client created.Id 0L 3
 
                     let! _ =
                         SessionClientOperations.PromptAsync(
@@ -2064,7 +2064,7 @@ let ``Fork clamps beyond-tail and allows closed and empty prefixes`` () : Task =
                 task {
                     let! created = openSession client
                     let waiter = settleWaiter created.Id
-                    let stream = collectStream client created.Id 0L 2
+                    let stream = collectStream client created.Id 0L 3
 
                     let! _ =
                         SessionClientOperations.PromptAsync(

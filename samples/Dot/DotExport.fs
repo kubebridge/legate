@@ -194,16 +194,22 @@ let readAllEventsAsync
         return collected :> IReadOnlyList<SessionEvent>
     }
 
-/// Summarises one journal pass: accepted prompts (started turns) plus
-/// folded follow-ups as messages, completed turns, and the UsageEvent token
-/// sums. Tool calls and live usage are absent from the journal on this
-/// path (the runtime journals neither per-call tool events nor usage
-/// checkpoints for facade-driven turns), so the REPL adds its settled-turn
-/// accumulation on top; never prices.
+/// Summarises one journal pass: accepted prompts (user evidence plus
+/// folded follow-ups) as messages, completed turns, and the UsageEvent token
+/// sums. Each accepted prompt journals exactly one UserMessageEvent (issue
+/// 366), so user evidence is the message count; journals written before
+/// user evidence existed carry no UserMessageEvents, and those fall back to
+/// the TurnStarted count as the prompt proxy. Tool calls journal per-call
+/// Started/Output/Completed markers for facade-driven turns, but markers
+/// are execution evidence, never prompts, so they never count as messages;
+/// live usage is absent from the journal on this path (the runtime journals
+/// no usage checkpoints for facade-driven turns), so the REPL adds its
+/// settled-turn accumulation on top; never prices.
 /// <param name="events">The journaled events.</param>
 /// <returns>User messages, completed turns, journal input tokens, and journal output tokens.</returns>
 let summarize (events: SessionEvent seq) : int * int * int64 * int64 =
     let mutable messages = 0
+    let mutable started = 0
     let mutable turns = 0
     let mutable inputTokens = 0L
     let mutable outputTokens = 0L
@@ -211,8 +217,10 @@ let summarize (events: SessionEvent seq) : int * int * int64 * int64 =
     if not (isNull (box events)) then
         for evt in events do
             if not (isNull (box evt)) then
-                if evt :? UserMessageEvent || evt :? TurnStartedEvent then
+                if evt :? UserMessageEvent then
                     messages <- messages + 1
+                elif evt :? TurnStartedEvent then
+                    started <- started + 1
                 elif evt :? TurnCompletedEvent then
                     turns <- turns + 1
                 elif evt :? UsageEvent then
@@ -220,7 +228,9 @@ let summarize (events: SessionEvent seq) : int * int * int64 * int64 =
                     inputTokens <- inputTokens + usage.InputTokens
                     outputTokens <- outputTokens + usage.OutputTokens
 
-    (messages, turns, inputTokens, outputTokens)
+    let reported = if messages > 0 then messages else started
+
+    (reported, turns, inputTokens, outputTokens)
 
 // ──────────────────────────────────────────────────────────────────────────
 // Writers

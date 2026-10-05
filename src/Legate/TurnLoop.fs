@@ -129,9 +129,14 @@ module internal TurnLoop =
     /// returning. Error is Some only when the invocation raised (an
     /// unknown or non-invokable tool counts as raised); denials carry
     /// their denial text with no error, and suspensions never observe:
-    /// a suspended call has not settled. The nested task-tool runner
-    /// journals these observations as the sub-agent execution markers the
-    /// transcript read links back to the parent call.
+    /// a suspended call has not settled. ArgumentsJson carries the JSON
+    /// object string of the settling call's arguments (null when the call
+    /// carried none): the production top-level journaling sink (issue 366)
+    /// carries it verbatim into ToolCallStartedEvent.ArgumentsJson so
+    /// ordinary-turn recovery rebuilds the exact call, never a hardcoded
+    /// placeholder. The nested task-tool runner journals these observations
+    /// as the sub-agent execution markers the transcript read links back
+    /// to the parent call.
     type ToolCallObservation =
         {
             /// The name the model called the tool by.
@@ -142,7 +147,29 @@ module internal TurnLoop =
             Text: string
             /// Why the invocation raised, or None when it returned.
             Error: string option
+            /// The JSON object string of the settling call's arguments, or
+            /// null when the call carried none.
+            ArgumentsJson: string | null
         }
+
+    /// Serializes one settled call's argument table to the JSON object
+    /// string the journal carries verbatim. Null arguments read as null
+    /// (recovery rejects those explicitly instead of replaying a fabricated
+    /// call); an empty table reads as the empty object; a serialization
+    /// failure reads as null rather than a wrong object, so a later replay
+    /// rejects explicitly instead of pairing a fabricated call.
+    /// <param name="call">The settled call. Null reads as null.</param>
+    /// <returns>The arguments JSON object string, or null.</returns>
+    let argumentsJsonOf (call: FunctionCallContent) : string | null =
+        if isNull (box call) || isNull (box call.Arguments) then
+            null
+        elif call.Arguments.Count = 0 then
+            "{}"
+        else
+            try
+                JsonSerializer.Serialize(call.Arguments)
+            with _ ->
+                null
 
     /// Internal loop tuning: the tool-result char limit plus the effective
     /// per-turn budget, with the optional last-moment claim fence. The
@@ -943,6 +970,7 @@ module internal TurnLoop =
                     ToolCallId = callId
                     Text = if isNull text then "" else text
                     Error = error
+                    ArgumentsJson = argumentsJsonOf call
                 }
         | None -> Task.FromResult(())
 
