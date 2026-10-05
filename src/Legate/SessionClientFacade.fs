@@ -1086,7 +1086,13 @@ module internal ClusterSubscriptions =
     let detachTimeout = TimeSpan.FromSeconds 5.0
 
     /// One cluster-mode subscription: entity batches with a direct store
-    /// fallback, resumed from the last delivered sequence.
+    /// fallback, resumed from the last observed sequence. The resumption
+    /// cursor advances only on actually observed delivery, never when a
+    /// batch is merely queued, so a queued-but-unobserved event always
+    /// re-surfaces on fallback replay; a separate poll frontier drives the
+    /// next entity request. At-least-once throughout: a repeated delivery
+    /// carries the identical durable identity (session id plus stamped
+    /// per-session sequence) for consumer-side dedup.
     type private ClusterSubscribeEnumerator
         (
             resolver: ISessionResolver,
@@ -1105,8 +1111,17 @@ module internal ClusterSubscriptions =
 
         let token = Guid.NewGuid().ToString("N")
         let queue = Queue<SessionEvent>()
+        // The observed-delivery cursor: the exclusive sequence a fresh
+        // resumption replays from. Advances only when an event is handed to
+        // the consumer in MoveNextAsync below, never when a batch is merely
+        // queued, so disconnecting with a full queue still recovers every
+        // queued-but-unobserved event from the fallback replay.
         let mutable resumeCursor = fromSequence
-        let mutable lastDelivered = fromSequence
+        // The poll frontier: the greatest sequence seen (or NextCursor).
+        // Drives the next entity request while queued events still await
+        // delivery; the fallback replay and any fresh resumption use the
+        // observed cursor above.
+        let mutable fetchCursor = fromSequence
         let mutable current: SessionEvent = Unchecked.defaultof<SessionEvent>
         let mutable finished = false
         let mutable detached = false
@@ -1180,16 +1195,16 @@ module internal ClusterSubscriptions =
             for evt in batch.Events do
                 if isNull (box evt) || evt.SessionId <> sessionId then
                     raise (SessionScopeRejectedException(SessionScopeRejectionReason.ResponseMismatch))
-                elif evt.Sequence.HasValue && evt.Sequence.Value <= lastDelivered then
+                elif evt.Sequence.HasValue && evt.Sequence.Value <= resumeCursor then
                     ()
                 else
                     queue.Enqueue(evt)
 
-                    if evt.Sequence.HasValue && evt.Sequence.Value > resumeCursor then
-                        resumeCursor <- evt.Sequence.Value
+                    if evt.Sequence.HasValue && evt.Sequence.Value > fetchCursor then
+                        fetchCursor <- evt.Sequence.Value
 
-            if batch.NextCursor > resumeCursor then
-                resumeCursor <- batch.NextCursor
+            if batch.NextCursor > fetchCursor then
+                fetchCursor <- batch.NextCursor
 
         let applyReplayPage (page: EventReplayPage) : unit =
             let events =
@@ -1199,7 +1214,7 @@ module internal ClusterSubscriptions =
                     page.Events |> Seq.filter (fun evt -> not (isNull (box evt))) |> Array.ofSeq
 
             for evt in events do
-                if evt.Sequence.HasValue && evt.Sequence.Value <= lastDelivered then
+                if evt.Sequence.HasValue && evt.Sequence.Value <= resumeCursor then
                     ()
                 else
                     let observed = CrossNodeSubscriptions.estimateEventBytes evt
@@ -1223,11 +1238,11 @@ module internal ClusterSubscriptions =
 
                     queue.Enqueue(evt)
 
-                    if evt.Sequence.HasValue && evt.Sequence.Value > resumeCursor then
-                        resumeCursor <- evt.Sequence.Value
+                    if evt.Sequence.HasValue && evt.Sequence.Value > fetchCursor then
+                        fetchCursor <- evt.Sequence.Value
 
-            if page.NextCursor.HasValue && page.NextCursor.Value > resumeCursor then
-                resumeCursor <- page.NextCursor.Value
+            if page.NextCursor.HasValue && page.NextCursor.Value > fetchCursor then
+                fetchCursor <- page.NextCursor.Value
 
         let throwForReplayOutcome (outcome: obj) : unit =
             match outcome with
@@ -1278,8 +1293,10 @@ module internal ClusterSubscriptions =
                                 let next = queue.Dequeue()
                                 current <- next
 
-                                if next.Sequence.HasValue && next.Sequence.Value > lastDelivered then
-                                    lastDelivered <- next.Sequence.Value
+                                // The only place the observed cursor moves:
+                                // handing the event to the consumer.
+                                if next.Sequence.HasValue && next.Sequence.Value > resumeCursor then
+                                    resumeCursor <- next.Sequence.Value
 
                                 if next :? SessionClosedEvent then
                                     finished <- true
@@ -1291,7 +1308,7 @@ module internal ClusterSubscriptions =
                                     {
                                         Tenant = tenant
                                         SessionId = sessionId
-                                        FromSequence = resumeCursor
+                                        FromSequence = fetchCursor
                                         SubscriberToken = token
                                     }
 

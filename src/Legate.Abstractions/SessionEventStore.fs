@@ -416,6 +416,19 @@ type ISessionEventStore =
     /// Subscribe paths never guess. There is no malformed-cursor branch: the
     /// cursor is an int64, and an out-of-range cursor resolves to end of
     /// stream.
+    ///
+    /// <para>Delivery contract: cross-node subscribers observe at-least-once
+    /// redelivery. A repeated page carries the identical durable identity
+    /// (session id plus stamped per-session sequence) and never represents
+    /// a second append or a second logical tool result; consumers
+    /// deduplicate on that pair. The resumption cursor is the exclusive
+    /// sequence and advances only on actually observed delivery, never on
+    /// queued-but-unobserved events: resume from the last observed cursor
+    /// to recover gap-free after lag, disconnect, ownership relocation, or
+    /// restart while the journal is retained. No durability is promised past
+    /// retention: an unknown session, an expired journal, and an exhausted
+    /// retained range fail explicitly instead of streaming a falsely
+    /// complete tail.</para>
     /// <param name="tenant">The tenant the session belongs to.</param>
     /// <param name="sessionId">The session whose journal to replay.</param>
     /// <param name="fromSequence">The exclusive cursor: replay events with a sequence strictly greater than it; 0 replays from the journal's first event.</param>

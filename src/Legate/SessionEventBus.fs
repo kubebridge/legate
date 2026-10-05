@@ -658,9 +658,14 @@ type SessionEventBus
 
     /// Subscribes to the session's events from the cursor: replays the
     /// journal via <see cref="M:Legate.ISessionEventStore.Replay*" /> up to
-    /// the live position, then yields live publishes gap-free with no
-    /// duplicates across the handoff. Events published during the replay
-    /// land in both paths and deduplicate by sequence. Unknown session
+    /// the live position, then yields live publishes gap-free with
+    /// best-effort sequence dedup across the handoff. Events published
+    /// during the replay land in both paths and deduplicate by sequence,
+    /// so the common case surfaces each event once; any repeated delivery
+    /// carries the identical durable identity (session id plus stamped
+    /// per-session sequence) and never represents a second append.
+    /// Resume from the last observed sequence to recover after lag,
+    /// disconnect, or restart while the journal is retained. Unknown session
     /// throws <see cref="T:Legate.SessionNotFoundException" /> and an
     /// expired journal throws
     /// <see cref="T:Legate.SessionJournalExpiredException" /> on the first

@@ -1487,3 +1487,373 @@ let ``Subscriber resumes gap-free across a real session-node restart`` () =
             stopQuietly serviceB
             stopQuietly serviceA
     }
+
+// ────────────────── Replay-to-live handoff and lag recovery (issue 382) ──
+
+/// Extracts the durable identity of each event: the (session, sequence)
+/// pair a repeated delivery must carry verbatim. Pure so the resumable
+/// tests stay straight-line awaits plus assertions.
+let private durableIdentities (received: IReadOnlyList<SessionEvent>) =
+    received
+    |> Seq.map (fun evt -> (evt.SessionId, evt.Sequence.Value))
+    |> Seq.toList
+
+[<Fact>]
+let ``Serve batch falls back to the store when the cursor precedes the cache floor`` () =
+    task {
+        let _, sessions, events = makeStores ()
+        let tenant = tenantOf "registry-floor"
+        let! sessionId, claim = makeSession sessions tenant (SessionId.New())
+        let options = defaultOptions ()
+        options.ReplayCacheSize <- 2
+        let hub = CrossNodeSubscriptions.SubscriptionHub(options)
+
+        let! _ =
+            appendViaWriter
+                events
+                tenant
+                sessionId
+                claim.Token
+                ([
+                    delta sessionId claim.TurnId "one"
+                    delta sessionId claim.TurnId "two"
+                    delta sessionId claim.TurnId "three"
+                    delta sessionId claim.TurnId "four"
+                    delta sessionId claim.TurnId "five"
+                ]
+                :> IReadOnlyList<_>)
+
+        // Warm the bounded cache from the store: only the last two survive.
+        let! warmed =
+            CrossNodeSubscriptions.serveBatchAsync (
+                events,
+                hub,
+                tenant,
+                sessionId,
+                0L,
+                100,
+                1048576,
+                CancellationToken.None
+            )
+
+        match warmed with
+        | CrossNodeSubscriptions.BatchPage batch ->
+            batch.Events
+            |> Seq.map (fun evt -> evt.Sequence.Value)
+            |> Seq.toList
+            |> should equal [ 1L; 2L; 3L; 4L; 5L ]
+        | _ -> failwith "expected the warming page"
+
+        hub.CacheCount |> should equal 2
+        hub.CacheFloor() |> should equal (Some 4L)
+
+        // A cursor behind the cache floor must replay the evicted prefix
+        // from the store instead of serving the cached tail alone: events
+        // one through three would otherwise skip silently.
+        let! recovered =
+            CrossNodeSubscriptions.serveBatchAsync (
+                events,
+                hub,
+                tenant,
+                sessionId,
+                0L,
+                100,
+                1048576,
+                CancellationToken.None
+            )
+
+        let identities =
+            match recovered with
+            | CrossNodeSubscriptions.BatchPage batch -> durableIdentities batch.Events
+            | _ -> failwith "expected the recovered page"
+
+        identities
+        |> should
+            equal
+            [
+                (sessionId, 1L)
+                (sessionId, 2L)
+                (sessionId, 3L)
+                (sessionId, 4L)
+                (sessionId, 5L)
+            ]
+
+        // A cursor at the floor still serves the cache without a store
+        // round-trip.
+        let! tail =
+            CrossNodeSubscriptions.serveBatchAsync (
+                events,
+                hub,
+                tenant,
+                sessionId,
+                4L,
+                100,
+                1048576,
+                CancellationToken.None
+            )
+
+        match tail with
+        | CrossNodeSubscriptions.BatchPage batch ->
+            batch.Events
+            |> Seq.map (fun evt -> evt.Sequence.Value)
+            |> Seq.toList
+            |> should equal [ 5L ]
+        | _ -> failwith "expected the cached tail"
+    }
+
+[<Fact>]
+let ``Router redelivers identical durable identity across resume overlap`` () =
+    task {
+        let system = localSystem ()
+
+        try
+            let _, sessions, events = makeStores ()
+            let tenant = tenantOf "router-duplicates"
+            let! sessionId, claim = makeSession sessions tenant (SessionId.New())
+            let options = defaultOptions ()
+
+            let hubs =
+                ConcurrentDictionary<TenantId * string, CrossNodeSubscriptions.SubscriptionHub>()
+
+            let entity = entityFor system sessionId events options hubs
+
+            let router =
+                ClusterSubscriptions.ClusterSubscribeRouter(stubResolver entity, events, options)
+
+            let! _ =
+                appendViaWriter
+                    events
+                    tenant
+                    sessionId
+                    claim.Token
+                    ([
+                        delta sessionId claim.TurnId "one"
+                        delta sessionId claim.TurnId "two"
+                        delta sessionId claim.TurnId "three"
+                    ]
+                    :> IReadOnlyList<_>)
+
+            let! first =
+                collectTakeBounded
+                    ((router :> ISubscribeRouter).Subscribe(tenant, sessionId, 0L, CancellationToken.None))
+                    1
+                    (TimeSpan.FromSeconds 15.0)
+
+            durableIdentities first |> should equal [ (sessionId, 1L) ]
+
+            // Resuming from the journal start redelivers event one: the
+            // repeated delivery carries the identical durable identity and
+            // never represents a second logical event.
+            let! overlapped =
+                collectTakeBounded
+                    ((router :> ISubscribeRouter).Subscribe(tenant, sessionId, 0L, CancellationToken.None))
+                    3
+                    (TimeSpan.FromSeconds 15.0)
+
+            durableIdentities overlapped
+            |> should
+                equal
+                [
+                    (sessionId, 1L)
+                    (sessionId, 2L)
+                    (sessionId, 3L)
+                ]
+
+            for evt in overlapped do
+                evt.TurnId |> should equal claim.TurnId
+
+            Seq.append first overlapped
+            |> Seq.map (fun evt -> (evt.SessionId, evt.Sequence.Value))
+            |> Seq.distinct
+            |> Seq.sortBy snd
+            |> Seq.toList
+            |> should
+                equal
+                [
+                    (sessionId, 1L)
+                    (sessionId, 2L)
+                    (sessionId, 3L)
+                ]
+        finally
+            system.Terminate().GetAwaiter().GetResult() |> ignore
+    }
+
+[<Fact>]
+let ``Router resumes partial take from the last observed cursor with no gaps`` () =
+    task {
+        let system = localSystem ()
+
+        try
+            let _, sessions, events = makeStores ()
+            let tenant = tenantOf "router-partial"
+            let! sessionId, claim = makeSession sessions tenant (SessionId.New())
+            let options = defaultOptions ()
+
+            let hubs =
+                ConcurrentDictionary<TenantId * string, CrossNodeSubscriptions.SubscriptionHub>()
+
+            let entity = entityFor system sessionId events options hubs
+
+            let router =
+                ClusterSubscriptions.ClusterSubscribeRouter(stubResolver entity, events, options)
+
+            let! _ =
+                appendViaWriter
+                    events
+                    tenant
+                    sessionId
+                    claim.Token
+                    ([
+                        delta sessionId claim.TurnId "one"
+                        delta sessionId claim.TurnId "two"
+                        delta sessionId claim.TurnId "three"
+                    ]
+                    :> IReadOnlyList<_>)
+
+            // Take one event then dispose: the queued-but-unobserved
+            // remainder must re-surface from the last observed cursor.
+            let! first =
+                collectTakeBounded
+                    ((router :> ISubscribeRouter).Subscribe(tenant, sessionId, 0L, CancellationToken.None))
+                    1
+                    (TimeSpan.FromSeconds 15.0)
+
+            durableIdentities first |> should equal [ (sessionId, 1L) ]
+
+            let! _ =
+                appendViaWriter
+                    events
+                    tenant
+                    sessionId
+                    claim.Token
+                    ([
+                        delta sessionId claim.TurnId "four"
+                        closed sessionId claim.TurnId
+                    ]
+                    :> IReadOnlyList<_>)
+
+            let! resumed =
+                collectBounded
+                    ((router :> ISubscribeRouter).Subscribe(tenant, sessionId, 1L, CancellationToken.None))
+                    (TimeSpan.FromSeconds 15.0)
+
+            assertGapFree resumed
+
+            resumed
+            |> Seq.map (fun evt -> evt.Sequence.Value)
+            |> Seq.distinct
+            |> Seq.sort
+            |> Seq.toList
+            |> should equal [ 2L; 3L; 4L; 5L ]
+        finally
+            system.Terminate().GetAwaiter().GetResult() |> ignore
+    }
+
+/// A delay seam completing at once: the facade-level subscription never
+/// waits on it, so virtual time needs no clock.
+type private NoWaitDelay() =
+    interface ILlmDelay with
+        member _.Delay(_, _) = Task.CompletedTask
+
+[<Fact>]
+let ``Public facade Subscribe over the cluster router covers duplicates with order and identity`` () =
+    task {
+        let system = localSystem ()
+
+        try
+            let _, sessions, events = makeStores ()
+            let tenant = tenantOf "facade-cluster"
+            use bus = new SessionEventBus(events)
+            let! sessionId, claim = makeSession sessions tenant (SessionId.New())
+            let! otherId, otherClaim = makeSession sessions tenant (SessionId.New())
+            let options = defaultOptions ()
+
+            let hubs =
+                ConcurrentDictionary<TenantId * string, CrossNodeSubscriptions.SubscriptionHub>()
+
+            let entity = entityFor system sessionId events options hubs
+
+            let router =
+                ClusterSubscriptions.ClusterSubscribeRouter(stubResolver entity, events, options)
+
+            let resolve (_: SessionId) (_: CancellationToken) : Task<IActorRef> =
+                Task.FromResult(Unchecked.defaultof<IActorRef>)
+
+            let client =
+                new SessionClient(
+                    sessions,
+                    tenant,
+                    resolve,
+                    bus,
+                    TimeSpan.FromSeconds 10.0,
+                    NoWaitDelay() :> ILlmDelay,
+                    None
+                )
+
+            client.SubscribeRouter <- Some(router :> ISubscribeRouter)
+
+            let! _ =
+                appendViaWriter
+                    events
+                    tenant
+                    sessionId
+                    claim.Token
+                    ([
+                        delta sessionId claim.TurnId "one"
+                        delta sessionId claim.TurnId "two"
+                    ]
+                    :> IReadOnlyList<_>)
+
+            let! _ =
+                appendViaWriter
+                    events
+                    tenant
+                    otherId
+                    otherClaim.Token
+                    ([
+                        delta otherId otherClaim.TurnId "other"
+                    ]
+                    :> IReadOnlyList<_>)
+
+            // Overlap the append with the replay/attachment: the collect
+            // runs while the tail lands.
+            let stream =
+                SessionClientOperations.Subscribe(client, sessionId, 0L, CancellationToken.None)
+
+            let collect = collectBounded stream (TimeSpan.FromSeconds 15.0)
+
+            let! _ =
+                appendViaWriter
+                    events
+                    tenant
+                    sessionId
+                    claim.Token
+                    ([
+                        delta sessionId claim.TurnId "three"
+                        delta sessionId claim.TurnId "four"
+                        closed sessionId claim.TurnId
+                    ]
+                    :> IReadOnlyList<_>)
+
+            let! received = collect
+
+            // Complete unique event coverage after consumer-side dedup on
+            // the durable identity: per-session order kept, session and
+            // turn identity preserved, the terminal event last, and no
+            // event from the sibling session leaking in.
+            for evt in received do
+                evt.SessionId |> should equal sessionId
+                evt.TurnId |> should equal claim.TurnId
+
+            let unique =
+                received
+                |> Seq.map (fun evt -> evt.Sequence.Value)
+                |> Seq.distinct
+                |> Seq.sort
+                |> Seq.toList
+
+            unique |> should equal [ 1L; 2L; 3L; 4L; 5L ]
+            (received[received.Count - 1] :? SessionClosedEvent) |> should equal true
+        finally
+            system.Terminate().GetAwaiter().GetResult() |> ignore
+    }
