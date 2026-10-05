@@ -3112,3 +3112,101 @@ let ``ReplyAsync refuses unknown routes before consuming input`` () : Task =
                     Assert.Equal(CompletionRoutingReason.Unknown, refusal.Reason)
                 })
     }
+
+// ──────────────────────────────────────────────────────────────────────────
+// Replay-to-live handoff and lag recovery (issue 382)
+
+/// Appends journal events under the given turn claim on a facade-created
+/// session, so the test drives the public Subscribe path over journaled
+/// evidence without running a model turn.
+let private appendJournaled
+    (client: SessionClient)
+    (sessionId: SessionId)
+    (claim: TurnClaim)
+    (texts: string list)
+    (close: bool)
+    : Task =
+    task {
+        let events = client.EventBus.EventStore
+        let tenant = client.Tenant
+        let now = DateTimeOffset.UtcNow
+        let noSequence = Unchecked.defaultof<Nullable<int64>>
+
+        let batch =
+            [
+                for text in texts do
+                    TextDeltaEvent(sessionId, claim.TurnId, noSequence, now, text) :> SessionEvent
+                if close then
+                    SessionClosedEvent(sessionId, claim.TurnId, noSequence, now) :> SessionEvent
+            ]
+            :> IReadOnlyList<_>
+
+        let! written =
+            JournalWriter.appendWithTokenAsync events tenant sessionId claim.Token batch CancellationToken.None
+
+        match written with
+        | JournalWriter.JournalAppended _ -> ()
+        | _ -> failwith "expected the journal append to land"
+    }
+
+[<Fact>]
+let ``Subscribe overlaps append with replay keeping order and identity`` () : Task =
+    task {
+        use provider =
+            (createServices (scripted [ ScriptStep.Text "done" ]) (sourced [])).BuildServiceProvider()
+
+        return!
+            withClient provider (fun client ->
+                task {
+                    let! created = openSession client
+                    let tenant = client.Tenant
+                    let inbox = UserMessagePayload(UserMessage.Text("facade-sub")) :> InboxPayload
+
+                    let! _ =
+                        client.Store.AppendInboxMessage(
+                            tenant,
+                            created.Id,
+                            inbox,
+                            DeliveryMode.Queue,
+                            CancellationToken.None
+                        )
+
+                    let! claimed =
+                        client.Store.ClaimNextTurn(
+                            tenant,
+                            created.Id,
+                            "facade-owner",
+                            TimeSpan.FromMinutes 5.,
+                            CancellationToken.None
+                        )
+
+                    let claim = (claimed :?> TurnLeaseRenewed).Claim
+                    do! appendJournaled client created.Id claim [ "one"; "two" ] false
+
+                    // Overlap the tail append with the replay/attachment:
+                    // the collect runs while events three through five land.
+                    let collect = collectStream client created.Id 0L 5
+                    do! appendJournaled client created.Id claim [ "three"; "four" ] true
+                    let! received = awaitWhat collect "the overlapped subscription"
+
+                    // Complete unique event coverage after consumer-side
+                    // dedup on the durable identity: per-session order kept,
+                    // session identity preserved, the terminal event last.
+                    for evt in received do
+                        evt.SessionId |> should equal created.Id
+
+                    let unique =
+                        received
+                        |> Seq.map (fun evt -> evt.Sequence.Value)
+                        |> Seq.distinct
+                        |> Seq.sort
+                        |> Seq.toList
+
+                    unique |> should equal [ 1L; 2L; 3L; 4L; 5L ]
+
+                    let ordered = received |> Seq.map (fun evt -> evt.Sequence.Value) |> Seq.toList
+
+                    ordered |> should equal (List.sort ordered)
+                    (received[received.Length - 1] :? SessionClosedEvent) |> should equal true
+                })
+    }

@@ -29,6 +29,10 @@ open System.Text.Json.Serialization
 /// them. Serialises polymorphically with System.Text.Json: every concrete
 /// event carries a stable <c>$type</c> discriminator on the wire, mirroring
 /// <see cref="T:Legate.TurnOutcome" /> and <see cref="T:Legate.Reply" />.
+/// Durable identity: the (session, sequence) pair names one journaled
+/// append. Cross-node redelivery repeats the identical pair and never a
+/// second logical event, so consumers deduplicate on it; the sequence is
+/// empty only while the event is in flight.
 /// The discriminator set is a wire contract:
 /// <list type="table">
 /// <item><term>turnStarted</term><description>a turn began running.</description></item>
