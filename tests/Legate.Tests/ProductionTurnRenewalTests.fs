@@ -286,6 +286,7 @@ let ``suspended renewal consumes no reply and resumes no work by itself`` () =
             None
             journal
             SessionStreaming.defaultBounds
+            None
 
     let heartbeat = Some(ClaimHeartbeat.fromSessions (SessionsOptions()))
 

@@ -175,6 +175,7 @@
     <Compile Include="ToolAdmissionFenceTests.fs" />
     <Compile Include="ProductionStreamingTests.fs" />
     <Compile Include="OrdinaryHistoryTests.fs" />
+    <Compile Include="ProductionCompactionTests.fs" />
   </ItemGroup>
 
   <ItemGroup>

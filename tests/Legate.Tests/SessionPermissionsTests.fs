@@ -184,6 +184,7 @@ let private productionRunner
         None
         journal
         SessionStreaming.defaultBounds
+        None
 
 // ──────────────────────────────────────────────────────────────────────────
 // Production spawn wiring: Ask suspends the live actor (Tasks 1+3)

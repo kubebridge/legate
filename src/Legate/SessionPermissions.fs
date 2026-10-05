@@ -415,6 +415,18 @@ module internal SessionPermissions =
             else
                 journalToolMarkersAsync eventStore tenant sessionId turnId observation)
 
+    /// Resolves the per-turn force-aware compaction hook for one production
+    /// attempt (issue 386): the facade supplies the store-backed wiring
+    /// (session model, catalog entry, Llm.Compaction/CompactionKeepMessages,
+    /// Pruning.ReservedBufferTokens, observer, policy, and the actor-shared
+    /// one-shot force cell) while the runner supplies the live attempt
+    /// (entry, turn id, 1-based attempt, and the turn's resolved chat
+    /// client). Returns Some hook to compact at iteration boundaries through
+    /// Compaction.createForceHook, or None to leave the resolved budget's
+    /// Compaction untouched. Runs outside the task computation, so a
+    /// miswired resolver fails fast like resolveInputs.
+    type ProductionCompactionResolver = InboxEntry -> TurnId -> int -> IChatClient -> TurnLoop.CompactionHook option
+
     /// Builds the production suspendable runner over
     /// TurnLoop.runSuspendableAsync plus the resume continuations: the
     /// runner SessionActor.spawnSuspendFactory threads into live session
@@ -433,6 +445,7 @@ module internal SessionPermissions =
     /// <param name="getSystemPrompt">The composed system prompt hook (issue 66), or None to run with no system message.</param>
     /// <param name="eventStore">The journal streaming deltas append to. Must not be null.</param>
     /// <param name="streaming">The per-attempt streaming journaler bounds.</param>
+    /// <param name="resolveCompaction">Resolves the per-turn force-aware compaction hook (issue 386), or None to leave the resolved budget's Compaction untouched (harness and unclaimed-shell shape).</param>
     /// <returns>The suspendable runner executing one attempt per call.</returns>
     let createRunner
         (client: IChatClient)
@@ -444,6 +457,7 @@ module internal SessionPermissions =
         (getSystemPrompt: PromptComposition.GetTurnSystemPrompt option)
         (eventStore: ISessionEventStore)
         (streaming: SessionStreaming.StreamingBounds)
+        (resolveCompaction: ProductionCompactionResolver option)
         : SessionActor.SuspendableRunner =
         ArgumentNullException.ThrowIfNull(client)
         ArgumentNullException.ThrowIfNull(store)
@@ -677,6 +691,22 @@ module internal SessionPermissions =
             match miswired with
             | Some failed -> failed
             | None ->
+                // Production compaction (issue 386): resolve the per-turn
+                // force-aware hook outside the task computation, so a
+                // miswired resolver fails fast like resolveInputs. The hook
+                // merges into every branch below (fresh, crash-rebuild, and
+                // both resumes), so resume continuations carry it without
+                // refiring turn-started semantics.
+                let compactionHook =
+                    match resolveCompaction with
+                    | Some resolve -> resolve entry turnId _attempt client
+                    | None -> loopOptions.Compaction
+
+                let baseOptions =
+                    { loopOptions with
+                        Compaction = compactionHook
+                    }
+
                 task {
 
                     // Per-attempt streaming journaler (issue 379): built
@@ -790,7 +820,7 @@ module internal SessionPermissions =
                             let onTextDelta, onReasoningDelta = streamingHooks ()
 
                             let merged =
-                                { loopOptions with
+                                { baseOptions with
                                     VerifyClaim = verifyForCurrentClaim ()
                                     OnTurnStarted = onTurnStarted
                                     OnUsageCheckpoint = onUsageCheckpoint
@@ -862,7 +892,7 @@ module internal SessionPermissions =
                         let onTextDelta, onReasoningDelta = streamingHooks ()
 
                         let merged =
-                            { loopOptions with
+                            { baseOptions with
                                 VerifyClaim = verifyForCurrentClaim ()
                                 OnTurnStarted = None
                                 OnUsageCheckpoint = onUsageCheckpoint
@@ -899,7 +929,7 @@ module internal SessionPermissions =
                         let onTextDelta, onReasoningDelta = streamingHooks ()
 
                         let merged =
-                            { loopOptions with
+                            { baseOptions with
                                 VerifyClaim = verifyForCurrentClaim ()
                                 OnTurnStarted = None
                                 OnUsageCheckpoint = onUsageCheckpoint
@@ -947,7 +977,7 @@ module internal SessionPermissions =
                         let onTextDelta, onReasoningDelta = streamingHooks ()
 
                         let merged =
-                            { loopOptions with
+                            { baseOptions with
                                 VerifyClaim = verifyForCurrentClaim ()
                                 OnTurnStarted = onTurnStarted
                                 OnUsageCheckpoint = onUsageCheckpoint

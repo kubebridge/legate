@@ -1537,7 +1537,11 @@ module internal SessionClientWiring =
     /// carries the agent (for the tool context) and the options snapshot
     /// (for the budget through TurnLoop.resolveBudget with the session
     /// AskUser winning over the configured default). Tool names validate
-    /// on assembly and first registration wins across sources.
+    /// on assembly and first registration wins across sources. The budget's
+    /// Compaction stays unset here: the production runner merges the
+    /// per-turn force-aware hook (issue 386) over these options, so the
+    /// hook carries the live turn id, attempt, claim, and actor-shared
+    /// force cell resolveInputs never sees.
     /// <param name="store">The durable store session rows persist through.</param>
     /// <param name="tenant">The tenant facade-driven sessions belong to.</param>
     /// <param name="sources">The registered tool sources, in registration order.</param>
@@ -1864,6 +1868,127 @@ module internal SessionClientWiring =
             // journaler under the running fenced claim with them.
             let streaming = SessionStreaming.boundsFromTurns legateOptions.Turns
 
+            let eventStore = bus.EventStore
+            let model = sessionModelOf clientOptions legateOptions
+
+            let catalog = provider.GetService<ILlmModelCatalog>()
+            let observer = provider.GetService<IUsageObserver>()
+            let modelPolicy = provider.GetService<IModelPolicy>()
+            let tenant = clientOptions.Tenant
+
+            // Actor-shared one-shot force cells (issue 386): compactFor arms
+            // the session's cell when Compact lands while Running, and the
+            // production runner's per-turn hook takes it at the next
+            // iteration boundary. One cell per session shared by both paths,
+            // so repeats coalesce and a refresh never drops an armed
+            // request; a cell with no armed request leaves threshold
+            // behavior unchanged.
+            let forces =
+                System.Collections.Concurrent.ConcurrentDictionary<SessionId, Compaction.CompactForce>()
+
+            let compactFor (sessionId: SessionId) (journalToken: string) : CompactDeps option =
+                let force = forces.GetOrAdd(sessionId, fun _ -> Compaction.CompactForce())
+
+                Some(
+                    {
+                        Llm = legateOptions.Llm
+                        ReservedBufferTokens = legateOptions.Pruning.ReservedBufferTokens
+                        SessionModel = model
+                        Catalog = catalog
+                        Client = client
+                        Observer = observer
+                        Policy = modelPolicy
+                        EventStore = eventStore
+                        JournalToken = journalToken
+                        Force = force
+                    }
+                )
+
+            /// Resolves the per-turn force-aware compaction hook for one
+            /// production attempt (issue 386): CompactionHookDeps from the
+            /// store-backed wiring (Llm.Compaction/CompactionKeepMessages,
+            /// the sessionModelOf session model plus its catalog entry,
+            /// Pruning.ReservedBufferTokens, observer, policy, and the live
+            /// tenant/session/turn/attempt) fenced by the ambient claim
+            /// (ControlAdmission plus LeaseAdmission at the last moment, the
+            /// journal landing under the running claim token like the
+            /// SessionPermissions evidence sinks) over the actor-shared
+            /// force cell, through Compaction.createForceHook into the
+            /// runSuspendableAsync iteration boundary. The summarizer runs
+            /// through the turn's resolved chat client with the configured
+            /// compaction model (or the session-model fallback) under the
+            /// model authorization policy. A null Llm section compacts
+            /// nothing (the harness shape); a throwing catalog falls back to
+            /// the unknown-model threshold instead of failing the turn.
+            let resolveCompaction
+                (entry: InboxEntry)
+                (turnId: TurnId)
+                (attempt: int)
+                (summarizer: IChatClient)
+                : TurnLoop.CompactionHook option =
+                match box legateOptions.Llm with
+                | :? LlmOptions as llm ->
+                    let catalogEntry =
+                        match box catalog with
+                        | :? ILlmModelCatalog as live ->
+                            try
+                                live.GetEntry(model)
+                            with _ ->
+                                Unchecked.defaultof<ModelCatalogEntry>
+                        | _ -> Unchecked.defaultof<ModelCatalogEntry>
+
+                    let sessionId = entry.SessionId
+
+                    let journalAsync (event: SessionEvent) : Task<JournalWriter.JournalWriteResult> =
+                        task {
+                            if isNull (box event) then
+                                return JournalWriter.JournalFailed "The compaction event was null."
+                            elif not (ControlAdmission.check ()) || not (LeaseAdmission.check ()) then
+                                return
+                                    JournalWriter.JournalRejected
+                                        "The turn lost its claim before the compaction journal landed."
+                            else
+                                match FencedClaimScope.currentClaim () with
+                                | Some claim when not (isNull (box claim)) && not (String.IsNullOrEmpty claim.Token) ->
+                                    let events = ResizeArray<SessionEvent>([| event |]) :> IReadOnlyList<SessionEvent>
+
+                                    return!
+                                        JournalWriter.appendWithTokenAsync
+                                            eventStore
+                                            tenant
+                                            sessionId
+                                            claim.Token
+                                            events
+                                            CancellationToken.None
+                                | _ -> return JournalWriter.JournalRejected "The turn holds no journal claim."
+                        }
+
+                    let isLeaseValid () : bool =
+                        ControlAdmission.check () && LeaseAdmission.check ()
+
+                    let force = forces.GetOrAdd(sessionId, fun _ -> Compaction.CompactForce())
+
+                    let deps: Compaction.CompactionHookDeps =
+                        {
+                            Client = summarizer
+                            SessionModel = model
+                            CompactionModel = llm.Compaction
+                            KeepMessages = llm.CompactionKeepMessages
+                            CatalogEntry = catalogEntry
+                            ReservedBufferTokens = legateOptions.Pruning.ReservedBufferTokens
+                            Observer = observer
+                            ModelPolicy = modelPolicy
+                            Tenant = tenant
+                            SessionId = sessionId
+                            TurnId = turnId
+                            Attempt = attempt
+                            JournalAsync = journalAsync
+                            IsLeaseValid = isLeaseValid
+                        }
+
+                    Some(Compaction.createForceHook force deps)
+                | _ -> None
+
             let runner: SessionActor.SuspendableRunner =
                 fun entry attempt allowed cursor reply seed token started usage skill turnId ->
                     workTracker.Track(fun () ->
@@ -1887,32 +2012,10 @@ module internal SessionClientWiring =
                                     (Some(systemPromptFor store clientOptions.Tenant))
                                     bus.EventStore
                                     streaming
+                                    (Some resolveCompaction)
 
                             return! run entry attempt allowed cursor reply seed token started usage skill turnId
                         })
-
-            let eventStore = bus.EventStore
-            let model = sessionModelOf clientOptions legateOptions
-
-            let catalog = provider.GetService<ILlmModelCatalog>()
-            let observer = provider.GetService<IUsageObserver>()
-            let modelPolicy = provider.GetService<IModelPolicy>()
-
-            let compactFor (_sessionId: SessionId) (journalToken: string) : CompactDeps option =
-                Some(
-                    {
-                        Llm = legateOptions.Llm
-                        ReservedBufferTokens = legateOptions.Pruning.ReservedBufferTokens
-                        SessionModel = model
-                        Catalog = catalog
-                        Client = client
-                        Observer = observer
-                        Policy = modelPolicy
-                        EventStore = eventStore
-                        JournalToken = journalToken
-                        Force = Compaction.CompactForce()
-                    }
-                )
 
             let entityFactory =
                 SessionActor.spawnSuspendFactoryRouted

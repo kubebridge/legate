@@ -223,6 +223,99 @@ let ``Rewrite keeps the system message plus the summary plus the last K`` () =
         planned[3] |> should equal history[history.Count - 1]
 
 [<Fact>]
+let ``Rewrite extends the tail past a result-call split`` () =
+    let callContents =
+        ResizeArray<AIContent>(
+            [|
+                FunctionCallContent("k9", "lookup") :> AIContent
+            |]
+        )
+        :> IList<AIContent>
+
+    let resultContents =
+        ResizeArray<AIContent>(
+            [|
+                FunctionResultContent("k9", "oslo") :> AIContent
+            |]
+        )
+        :> IList<AIContent>
+
+    let history =
+        ResizeArray<ChatMessage>(
+            [|
+                userMessage "one"
+                assistantMessage "two"
+                ChatMessage(ChatRole.Assistant, callContents)
+                ChatMessage(ChatRole.Tool, resultContents)
+                userMessage "three"
+            |]
+        )
+        :> IList<ChatMessage>
+
+    // Keep two retains the trailing result and user message: the
+    // pairing-safe cut extends back over the result's call instead of
+    // orphaning it.
+    match Compaction.planRewrite history "the gist" 2 with
+    | None -> failwith "Expected a rewrite plan."
+    | Some planned ->
+        planned.Length |> should equal 4
+        planned[0].Role |> should equal ChatRole.User
+        planned[1] |> should equal history[2]
+        planned[2] |> should equal history[3]
+        planned[3] |> should equal history[4]
+
+[<Fact>]
+let ``Rewrite keeps multi-call groups paired`` () =
+    let callContents =
+        ResizeArray<AIContent>(
+            [|
+                FunctionCallContent("k1", "lookup") :> AIContent
+                FunctionCallContent("k2", "lookup") :> AIContent
+            |]
+        )
+        :> IList<AIContent>
+
+    let firstResult =
+        ResizeArray<AIContent>(
+            [|
+                FunctionResultContent("k1", "oslo") :> AIContent
+            |]
+        )
+        :> IList<AIContent>
+
+    let secondResult =
+        ResizeArray<AIContent>(
+            [|
+                FunctionResultContent("k2", "bergen") :> AIContent
+            |]
+        )
+        :> IList<AIContent>
+
+    let history =
+        ResizeArray<ChatMessage>(
+            [|
+                userMessage "one"
+                ChatMessage(ChatRole.Assistant, callContents)
+                ChatMessage(ChatRole.Tool, firstResult)
+                ChatMessage(ChatRole.Tool, secondResult)
+                userMessage "two"
+            |]
+        )
+        :> IList<ChatMessage>
+
+    // Keep two retains the trailing result and user message: the cut
+    // extends back over the whole group so both results keep their calls.
+    match Compaction.planRewrite history "the gist" 2 with
+    | None -> failwith "Expected a rewrite plan."
+    | Some planned ->
+        planned.Length |> should equal 5
+        planned[0].Role |> should equal ChatRole.User
+        planned[1] |> should equal history[1]
+        planned[2] |> should equal history[2]
+        planned[3] |> should equal history[3]
+        planned[4] |> should equal history[4]
+
+[<Fact>]
 let ``Rewrite without a system prefix starts at the summary`` () =
     let history =
         ResizeArray<ChatMessage>(

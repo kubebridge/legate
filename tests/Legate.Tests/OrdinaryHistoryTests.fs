@@ -1325,6 +1325,7 @@ let private productionHistoryRunner
         None
         journal
         SessionStreaming.defaultBounds
+        None
 
 let private runRunnerFresh (runner: SessionActor.SuspendableRunner) (entry: InboxEntry) : TurnLoop.TurnLoopCompletion =
     runner entry 1 (HashSet<string>()) None None None CancellationToken.None None None None (TurnId.New())

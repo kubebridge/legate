@@ -403,10 +403,52 @@ module internal Compaction =
         let replaceable = history.Count - startIndex
         replaceable > 0 && keepMessages < replaceable
 
+    /// Collects the issued function-call ids in a history message, in
+    /// order. Null messages, null contents, and null or empty ids
+    /// contribute nothing. Pure.
+    /// <param name="message">The history message to read. May be null.</param>
+    /// <returns>The call ids the message carries, in order.</returns>
+    let private callIdsOf (message: ChatMessage) : string list =
+        if isNull (box message) || isNull (box message.Contents) then
+            []
+        else
+            [
+                for content in message.Contents do
+                    match content with
+                    | :? FunctionCallContent as call when
+                        not (isNull (box call)) && not (String.IsNullOrEmpty call.CallId)
+                        ->
+                        yield call.CallId
+                    | _ -> ()
+            ]
+
+    /// Collects the function-result call ids in a history message, in
+    /// order. Null messages, null contents, and null or empty ids
+    /// contribute nothing. Pure.
+    /// <param name="message">The history message to read. May be null.</param>
+    /// <returns>The call ids the message answers, in order.</returns>
+    let private resultIdsOf (message: ChatMessage) : string list =
+        if isNull (box message) || isNull (box message.Contents) then
+            []
+        else
+            [
+                for content in message.Contents do
+                    match content with
+                    | :? FunctionResultContent as result when
+                        not (isNull (box result)) && not (String.IsNullOrEmpty result.CallId)
+                        ->
+                        yield result.CallId
+                    | _ -> ()
+            ]
+
     /// Plans the rewritten history: the leading system message when
     /// present, one user message carrying the marked summary, then the last
-    /// keepMessages messages. Returns None when nothing would be replaced,
-    /// so the caller skips the summariser call. Pure.
+    /// keepMessages messages, extended backward past any tool-result/call
+    /// split so every retained result keeps its call with its actual id
+    /// (boundary-crossing and multi-call exchanges stay paired; the suffix
+    /// shape already keeps every retained call's later results). Returns
+    /// None when nothing would be replaced, so the caller skips the
+    /// summariser call. Pure.
     /// <param name="history">The running history. Must not be null.</param>
     /// <param name="summary">The summary text. Must not be null.</param>
     /// <param name="keepMessages">How many of the most recent messages to keep. Must be at least 0.</param>
@@ -429,9 +471,39 @@ module internal Compaction =
             let replaceable = history.Count - startIndex
             let tailCount = min keepMessages replaceable
 
+            // Pairing-safe cut: the positional tail may start on a tool
+            // result whose call sits outside the tail. Extend backward one
+            // message at a time until the tail head's results all answer a
+            // retained call (or the whole replaceable region is retained),
+            // so the next model call carries complete pairings with actual
+            // identifiers and no invented or orphaned results.
+            let mutable cutIndex = history.Count - tailCount
+            let retainedCalls = HashSet<string>(StringComparer.Ordinal)
+
+            for index in cutIndex .. history.Count - 1 do
+                for id in callIdsOf history[index] do
+                    retainedCalls.Add id |> ignore
+
+            let mutable settled = false
+
+            // An empty tail keeps nothing, so there is no head to pair:
+            // the bound below also skips the loop then.
+            while not settled && cutIndex > startIndex && cutIndex < history.Count do
+                let uncovered =
+                    resultIdsOf history[cutIndex]
+                    |> List.exists (fun id -> not (retainedCalls.Contains id))
+
+                if uncovered then
+                    cutIndex <- cutIndex - 1
+
+                    for id in callIdsOf history[cutIndex] do
+                        retainedCalls.Add id |> ignore
+                else
+                    settled <- true
+
             let tail =
                 [
-                    for index in history.Count - tailCount .. history.Count - 1 -> history[index]
+                    for index in cutIndex .. history.Count - 1 -> history[index]
                 ]
 
             let summaryMessage = ChatMessage(ChatRole.User, SummaryMarker + "\n" + summary)

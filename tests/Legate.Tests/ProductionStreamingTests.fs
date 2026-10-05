@@ -1794,6 +1794,7 @@ let ``runner losing the claim journals zero streaming writes`` () =
             None
             journal
             SessionStreaming.defaultBounds
+            None
 
     let attempt () =
         use _lease = LeaseAdmission.enter (fun () -> true)
