@@ -10,7 +10,9 @@ open System.Collections.Generic
 // parse back into the cell's Artifacts list through the shared
 // ArtifactReference helper. Pure: reads the cells, returns fresh cells for
 // enriched kinds, no I/O. Wired once in Transcripts.readTranscript, so
-// every served transcript carries the enrichment.
+// every served transcript carries the enrichment. Incremental reads (issue
+// 388) enrich once at the end over the derived cells only: enrichment
+// never retains raw events and never runs per page.
 module internal SessionArtifactEnrichment =
 
     /// Enriches one cell: a ToolResult cell whose content references
