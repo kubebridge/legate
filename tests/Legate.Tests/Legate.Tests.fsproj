@@ -182,6 +182,7 @@
     <Compile Include="CompactedContextTests.fs" />
     <Compile Include="BoundedReplayTests.fs" />
     <Compile Include="BoundedContextTests.fs" />
+    <Compile Include="LifecyclePipeTests.fs" />
   </ItemGroup>
 
   <ItemGroup>

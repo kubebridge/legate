@@ -441,7 +441,7 @@ type SessionHarness
                         try
                             let fresh = UserMessagePayload(UserMessage.Text "harness bootstrap") :> InboxPayload
 
-                            do!
+                            let! _ =
                                 store.AppendInboxMessage(
                                     resolved.Tenant,
                                     created.Id,

@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-#nowarn "3261"
-module Legate.LifecyclePipe
+module internal Legate.LifecyclePipe
 
 open System
 open System.Threading
@@ -142,7 +141,10 @@ let defer (pipe: PipeState<'M, 'A>) (message: 'M) (sender: IActorRef) : PipeStat
     if pipe.Deferred.Length >= MaxDeferredMessages then
         pipe, false
     else
-        { pipe with Deferred = pipe.Deferred @ [ message, sender ] }, true
+        { pipe with
+            Deferred = pipe.Deferred @ [ message, sender ]
+        },
+        true
 
 /// Matches a completion against the outstanding wait. On a hit the timer is
 /// disposed, the slot clears, and the caller runs the resumption against
@@ -188,6 +190,14 @@ let private toOutcome<'T> (finished: Task<'T>) : StoreOpResult<'T> =
         | null -> StoreError(InvalidOperationException("The lifecycle store task finished without a result.") :> exn)
         | aggregate -> StoreError(aggregate.GetBaseException())
 
+/// Boxes a store outcome for the actor message: outcomes are DU values,
+/// never null by construction, and the match proves it to the nullness
+/// checker instead of suppressing the warning.
+let private boxOutcome<'T> (outcome: StoreOpResult<'T>) : obj =
+    match box outcome with
+    | null -> failwith "LifecyclePipe.boxOutcome: a store outcome boxed to null."
+    | boxed -> boxed
+
 /// Unboxes one wait's outcome back to the Result sites match on. Safe by
 /// construction: only this wait's completion carries this op id.
 let private toPublic<'T> (outcome: obj) : Result<'T, exn> =
@@ -205,7 +215,6 @@ let timeoutError (label: string) (timeout: TimeSpan) : exn =
         sprintf "The lifecycle store wait '%s' stayed outstanding past its %g-second bound." label timeout.TotalSeconds
     )
     :> exn
-
 
 /// Starts a lifecycle store wait the caller already started on the actor
 /// thread: a completed wait runs its resumption inline (fast path, today's
@@ -254,7 +263,10 @@ let start<'T, 'M, 'A>
         let boxedResume (current: 'A) (currentPipe: PipeState<'M, 'A>) (outcome: obj) : Cont<'M, unit> =
             resume current currentPipe (toPublic<'T> outcome)
 
-        let timeoutOutcome: obj = box (StoreError(timeoutError label timeout))
+        // Boxed for this wait's result type: the resumption unboxes to
+        // StoreOpResult<'T>, so an unannotated box would default to
+        // StoreOpResult<obj> and fail the cast on timeout.
+        let timeoutOutcome: obj = boxOutcome<'T> (StoreError(timeoutError label timeout))
 
         let timer: ITimer | null =
             if timeout > TimeSpan.Zero then
@@ -273,25 +285,24 @@ let start<'T, 'M, 'A>
 
         task.ContinueWith(fun (finished: Task<'T>) ->
             try
-                self.Tell(packCompleted (opId, incarnation, box (toOutcome finished)))
+                self.Tell(packCompleted (opId, incarnation, boxOutcome (toOutcome finished)))
                 |> ignore
             with _ ->
                 ())
         |> ignore
 
         suspend
-            {
-                pipe with
-                    NextOpId = opId + 1L
-                    Outstanding =
-                        Some
-                            {
-                                OpId = opId
-                                Label = label
-                                Resume = boxedResume
-                                TimeoutOutcome = timeoutOutcome
-                                Timer = timer
-                            }
+            { pipe with
+                NextOpId = opId + 1L
+                Outstanding =
+                    Some
+                        {
+                            OpId = opId
+                            Label = label
+                            Resume = boxedResume
+                            TimeoutOutcome = timeoutOutcome
+                            Timer = timer
+                        }
             }
 
 /// Starts a non-generic lifecycle store wait by projecting it onto

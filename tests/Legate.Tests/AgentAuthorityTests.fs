@@ -239,6 +239,7 @@ let private spawnGated
             OnInjectJournaled = None
             Logger = null
             Compact = None
+            StorePipe = None
         }
 
     let deps: SessionActor.SuspendDeps =

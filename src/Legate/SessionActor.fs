@@ -359,7 +359,6 @@ type private PipeStarter<'M, 'A> =
         PackTimeout: int64 * Guid -> 'M
     }
 
-
 // ──────────────────────────────────────────────────────────────────────────
 // Behaviour
 
@@ -1554,7 +1553,8 @@ module internal SessionActor =
                 starter
                 (fun () -> Compaction.tryCompactCoreAsync true request)
                 "compact-core"
-                (fun args3 pipe3 -> function
+                (fun args3 pipe3 ->
+                    function
                     | Ok Compaction.NotNeeded -> cont CompactNotNeeded args3 pipe3
                     | Ok(Compaction.Compacted(beforeEstimate, afterEstimate, _, _)) ->
                         cont (CompactCompleted(beforeEstimate, afterEstimate)) args3 pipe3
@@ -1581,7 +1581,8 @@ module internal SessionActor =
                 starter
                 (fun () -> props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
                 "compact-stamp"
-                (fun args3 pipe3 -> function
+                (fun args3 pipe3 ->
+                    function
                     | Ok session ->
                         match session with
                         | null -> runCore history None args3 pipe3
@@ -1595,13 +1596,14 @@ module internal SessionActor =
             starter
             (fun () ->
                 BoundedReplay.readSuffixWithBaseAsync
-                        compact.EventStore
-                        props.Tenant
-                        props.SessionId
-                        100
-                        cancellationToken)
+                    compact.EventStore
+                    props.Tenant
+                    props.SessionId
+                    100
+                    cancellationToken)
             "compact-replay"
-            (fun args2 pipe2 -> function
+            (fun args2 pipe2 ->
+                function
                 | Error(:? TurnLoop.TurnLeaseLostException) -> cont CompactFenced args2 pipe2
                 | Error(:? OperationCanceledException) -> cont CompactNotNeeded args2 pipe2
                 | Error error -> raise error
@@ -1659,7 +1661,8 @@ module internal SessionActor =
             starter
             (fun () -> props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
             "auto-close-read"
-            (fun args2 pipe2 -> function
+            (fun args2 pipe2 ->
+                function
                 | Ok session ->
                     match session with
                     | null -> cont false args2 pipe2
@@ -1702,15 +1705,17 @@ module internal SessionActor =
             starter
             (fun () -> props.Store.MarkInboxConsumed(props.Tenant, props.SessionId, positions, CancellationToken.None))
             "consume-and-close/consume"
-            (fun args2 pipe2 -> function
+            (fun args2 pipe2 ->
+                function
                 | Error error -> raise error
-                | Ok () ->
+                | Ok() ->
                     startPipedWaitUnit
                         starter
                         (fun () -> props.Store.CloseSession(props.Tenant, props.SessionId, CancellationToken.None))
                         "consume-and-close/close"
-                        (fun args3 pipe3 -> function
-                            | Ok () ->
+                        (fun args3 pipe3 ->
+                            function
+                            | Ok() ->
                                 // Bounded transient state (issue 384): the
                                 // durable close landed, so the session's hub
                                 // and live hints release. Transient-only.
@@ -1810,7 +1815,8 @@ module internal SessionActor =
                 starter
                 (fun () -> props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
                 "dispatch-completion/read"
-                (fun args2 pipe2 -> function
+                (fun args2 pipe2 ->
+                    function
                     | Error _ -> cont None args2 pipe2
                     | Ok session ->
                         match session with
@@ -1831,14 +1837,15 @@ module internal SessionActor =
                                 startPipedWait
                                     starter
                                     (fun () ->
-                                            props.Store.EnqueueCompletionOutbox(
-                                                props.Tenant,
-                                                destinationId,
-                                                completion,
-                                                CancellationToken.None
-                                            ))
+                                        props.Store.EnqueueCompletionOutbox(
+                                            props.Tenant,
+                                            destinationId,
+                                            completion,
+                                            CancellationToken.None
+                                        ))
                                     "dispatch-completion/enqueue"
-                                    (fun args3 pipe3 -> function
+                                    (fun args3 pipe3 ->
+                                        function
                                         | Ok row when not (isNull (box row)) -> cont (Some row.Completion) args3 pipe3
                                         | Ok _ -> cont None args3 pipe3
                                         | Error _ -> cont None args3 pipe3)
@@ -1873,7 +1880,8 @@ module internal SessionActor =
             starter
             (fun () -> props.Store.CloseSession(props.Tenant, props.SessionId, cancellationToken))
             "close-session"
-            (fun args2 pipe2 -> function
+            (fun args2 pipe2 ->
+                function
                 | Error error -> raise error
                 | Ok closed ->
                     // Bounded transient state (issue 384): the durable
@@ -1957,7 +1965,8 @@ module internal SessionActor =
                 starter
                 (fun () -> props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
                 "start-turn-snapshot"
-                (fun args2 pipe2 -> function
+                (fun args2 pipe2 ->
+                    function
                     | Ok session ->
                         match session with
                         | null -> cont (TurnId.New()) args2 pipe2
@@ -2042,26 +2051,28 @@ module internal SessionActor =
                 starter
                 (fun () -> props.Store.MarkInboxConsumed(props.Tenant, props.SessionId, positions, cancellationToken))
                 "settle-consume"
-                (fun args2 pipe2 -> function
+                (fun args2 pipe2 ->
+                    function
                     | Error error -> raise error
-                    | Ok () ->
+                    | Ok() ->
                         Telemetry.addQueueDepth -1
 
                         let args2c =
-                            { args2 with PendingCount = max 0 (args2.PendingCount - 1) }
+                            { args2 with
+                                PendingCount = max 0 (args2.PendingCount - 1)
+                            }
 
                         startPipedWait
                             starter
                             (fun () -> props.Store.ReadPendingInbox(props.Tenant, props.SessionId, cancellationToken))
                             "settle-drain"
-                            (fun args3 pipe3 -> function
+                            (fun args3 pipe3 ->
+                                function
                                 | Error error -> raise error
                                 | Ok pending ->
                                     let args4 =
-                                        {
-                                            args3 with
-                                                PendingCount =
-                                                    if isNull (box pending) then 0 else pending.Count
+                                        { args3 with
+                                            PendingCount = if isNull (box pending) then 0 else pending.Count
                                         }
 
                                     match selectDrainableEntries pending with
@@ -2077,15 +2088,16 @@ module internal SessionActor =
                                         startPipedWaitUnit
                                             starter
                                             (fun () ->
-                                                    props.Store.UpdateSessionState(
-                                                        props.Tenant,
-                                                        props.SessionId,
-                                                        SessionState.Idle,
-                                                        cancellationToken
-                                                    ))
+                                                props.Store.UpdateSessionState(
+                                                    props.Tenant,
+                                                    props.SessionId,
+                                                    SessionState.Idle,
+                                                    cancellationToken
+                                                ))
                                             "settle-idle"
-                                            (fun args5 pipe5 -> function
-                                                | Ok () -> cont (SessionState.Idle, None) args5 pipe5
+                                            (fun args5 pipe5 ->
+                                                function
+                                                | Ok() -> cont (SessionState.Idle, None) args5 pipe5
                                                 | Error error -> raise error)
                                             suspendWith
                                             args4
@@ -2178,13 +2190,21 @@ module internal SessionActor =
             : Cont<SessionActorMessage, unit> =
             startPipedWait
                 starter
-                (fun () -> props.Store.AppendInboxMessage(props.Tenant, props.SessionId, payload, delivery, cancellationToken))
+                (fun () ->
+                    props.Store.AppendInboxMessage(props.Tenant, props.SessionId, payload, delivery, cancellationToken))
                 "append-inbox"
-                (fun args2 pipe2 -> function
+                (fun args2 pipe2 ->
+                    function
                     | Error error -> raise error
                     | Ok appended ->
                         Telemetry.addQueueDepth 1
-                        cont appended { args2 with PendingCount = args2.PendingCount + 1 } pipe2)
+
+                        cont
+                            appended
+                            { args2 with
+                                PendingCount = args2.PendingCount + 1
+                            }
+                            pipe2)
                 suspendWith
                 args
                 pipe
@@ -2212,52 +2232,64 @@ module internal SessionActor =
             (args: BehaviorLoopArgs)
             (pipe: BehaviorPipe)
             : Cont<SessionActorMessage, unit> =
-            withAppend payload delivery cancellationToken (fun appended args2 pipe2 ->
-                startPipedWaitUnit
-                    starter
-                    (fun () ->
+            withAppend
+                payload
+                delivery
+                cancellationToken
+                (fun appended args2 pipe2 ->
+                    startPipedWaitUnit
+                        starter
+                        (fun () ->
                             props.Store.UpdateSessionState(
                                 props.Tenant,
                                 props.SessionId,
                                 SessionState.Running,
                                 cancellationToken
                             ))
-                    "start-idle-turn/running"
-                    (fun args3 pipe3 -> function
-                        | Error error -> raise error
-                        | Ok () ->
-                            startPipedWait
-                                starter
-                                (fun () -> props.Store.ReadPendingInbox(props.Tenant, props.SessionId, cancellationToken))
-                                "start-idle-turn/drain"
-                                (fun args4 pipe4 -> function
-                                    | Error error -> raise error
-                                    | Ok pending ->
-                                        let args5 =
-                                            {
-                                                args4 with
-                                                    PendingCount =
-                                                        if isNull (box pending) then 0 else pending.Count
-                                            }
+                        "start-idle-turn/running"
+                        (fun args3 pipe3 ->
+                            function
+                            | Error error -> raise error
+                            | Ok() ->
+                                startPipedWait
+                                    starter
+                                    (fun () ->
+                                        props.Store.ReadPendingInbox(
+                                            props.Tenant,
+                                            props.SessionId,
+                                            cancellationToken
+                                        ))
+                                    "start-idle-turn/drain"
+                                    (fun args4 pipe4 ->
+                                        function
+                                        | Error error -> raise error
+                                        | Ok pending ->
+                                            let args5 =
+                                                { args4 with
+                                                    PendingCount = if isNull (box pending) then 0 else pending.Count
+                                                }
 
-                                        let first =
-                                            selectDrainableEntries pending
-                                            |> List.tryHead
-                                            |> Option.defaultValue appended
+                                            let first =
+                                                selectDrainableEntries pending
+                                                |> List.tryHead
+                                                |> Option.defaultValue appended
 
-                                        withTurnIdSnapshot
-                                            (fun turnId args6 pipe6 ->
-                                                let next = startTurnNow first turnId
-                                                cont (appended, next) args6 pipe6)
-                                            suspendWith
-                                            args5
-                                            pipe4)
-                                suspendWith
-                                args3
-                                pipe3)
-                    suspendWith
-                    args2
-                    pipe2) suspendWith args pipe
+                                            withTurnIdSnapshot
+                                                (fun turnId args6 pipe6 ->
+                                                    let next = startTurnNow first turnId
+                                                    cont (appended, next) args6 pipe6)
+                                                suspendWith
+                                                args5
+                                                pipe4)
+                                    suspendWith
+                                    args3
+                                    pipe3)
+                        suspendWith
+                        args2
+                        pipe2)
+                suspendWith
+                args
+                pipe
 
         /// Writes the durable close and continues with the stored session:
         /// the hub and live hints release only once the write landed.
@@ -2299,24 +2331,22 @@ module internal SessionActor =
                     starter
                     (fun () -> props.Store.ReadPendingInbox(props.Tenant, props.SessionId, CancellationToken.None))
                     "recover-inbox"
-                    (fun args3 pipe3 -> function
+                    (fun args3 pipe3 ->
+                        function
                         | Ok pending ->
                             suspendWith
-                                {
-                                    args3 with
-                                        State = state
-                                        Activation = Ready
-                                        PendingCount =
-                                            if isNull (box pending) then 0 else pending.Count
+                                { args3 with
+                                    State = state
+                                    Activation = Ready
+                                    PendingCount = if isNull (box pending) then 0 else pending.Count
                                 }
                                 pipe3
                         | Error(:? SessionNotFoundException) ->
                             suspendWith
-                                {
-                                    args3 with
-                                        State = state
-                                        Activation = Ready
-                                        PendingCount = 0
+                                { args3 with
+                                    State = state
+                                    Activation = Ready
+                                    PendingCount = 0
                                 }
                                 pipe3
                         | Error error -> raise error)
@@ -2328,7 +2358,8 @@ module internal SessionActor =
                 starter
                 (fun () -> props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
                 "recover-session"
-                (fun args2 pipe2 -> function
+                (fun args2 pipe2 ->
+                    function
                     | Error error -> raise error
                     | Ok found ->
                         match found with
@@ -2339,15 +2370,16 @@ module internal SessionActor =
                                 startPipedWaitUnit
                                     starter
                                     (fun () ->
-                                            props.Store.UpdateSessionState(
-                                                props.Tenant,
-                                                props.SessionId,
-                                                SessionState.Idle,
-                                                CancellationToken.None
-                                            ))
+                                        props.Store.UpdateSessionState(
+                                            props.Tenant,
+                                            props.SessionId,
+                                            SessionState.Idle,
+                                            CancellationToken.None
+                                        ))
                                     "recover-release-running"
-                                    (fun args3 pipe3 -> function
-                                        | Ok () -> readInbox SessionState.Idle args3 pipe3
+                                    (fun args3 pipe3 ->
+                                        function
+                                        | Ok() -> readInbox SessionState.Idle args3 pipe3
                                         | Error error -> raise error)
                                     suspendWith
                                     args2
@@ -2366,22 +2398,27 @@ module internal SessionActor =
                 // A requested close owns the durable write now that the
                 // pipe drains: every recorded sender shares the one write
                 // and observes the same stored session.
-                withCloseWrite token (fun closed args2 pipe2 -> actor {
-                    for sender, _ in args2.Closing do
-                        sender <! closed
+                withCloseWrite
+                    token
+                    (fun closed args2 pipe2 ->
+                        actor {
+                            for sender, _ in args2.Closing do
+                                sender <! closed
 
-                    return!
-                        loop
-                            {
-                                args2 with
-                                    State = SessionState.Closed
-                                    Running = None
-                                    Arbitration = StopArbitration.Undecided
-                                    PendingStop = None
-                                    Closing = []
-                            }
-                            pipe2
-                }) suspendWith args pipe
+                            return!
+                                loop
+                                    { args2 with
+                                        State = SessionState.Closed
+                                        Running = None
+                                        Arbitration = StopArbitration.Undecided
+                                        PendingStop = None
+                                        Closing = []
+                                    }
+                                    pipe2
+                        })
+                    suspendWith
+                    args
+                    pipe
             | _ ->
                 match LifecyclePipe.tryTakeDeferred pipe with
                 | Some((message, sender), pipe') -> handleMessage message sender args pipe'
@@ -2405,8 +2442,7 @@ module internal SessionActor =
                     | None -> return! loop args pipe
                 | LifecycleStoreTimeout(opId, incarnation) ->
                     match LifecyclePipe.tryComplete pipe opId incarnation with
-                    | Some(outstanding, pipe') ->
-                        return! outstanding.Resume args pipe' outstanding.TimeoutOutcome
+                    | Some(outstanding, pipe') -> return! outstanding.Resume args pipe' outstanding.TimeoutOutcome
                     | None -> return! loop args pipe
                 | _ when args.Activation = Recovering ->
                     // The recover chain is in flight: everything waits
@@ -2431,17 +2467,15 @@ module internal SessionActor =
                             ->
                             let nextArbitration, won = StopArbitration.applyStop args.Arbitration cause
 
-                            let nextStop =
-                                if won then Some(cause, reason) else args.PendingStop
+                            let nextStop = if won then Some(cause, reason) else args.PendingStop
 
                             if won then
                                 inFlight.Cts.Cancel()
 
                             let args2 =
-                                {
-                                    args with
-                                        Arbitration = nextArbitration
-                                        PendingStop = nextStop
+                                { args with
+                                    Arbitration = nextArbitration
+                                    PendingStop = nextStop
                                 }
 
                             sender <! takeSnapshot args2
@@ -2461,7 +2495,12 @@ module internal SessionActor =
                     // The turn cancellation applies now; the durable write
                     // lands through the loop entry once the pipe drains, so
                     // shutdown stays responsive behind a delayed dependency.
-                    return! loop { args with Closing = args.Closing @ [ sender, cancellationToken ] } pipe
+                    return!
+                        loop
+                            { args with
+                                Closing = args.Closing @ [ sender, cancellationToken ]
+                            }
+                            pipe
                 | GetSnapshot ->
                     sender <! takeSnapshot args
                     return! loop args pipe
@@ -2495,21 +2534,21 @@ module internal SessionActor =
                                 payload
                                 DeliveryMode.Queue
                                 cancellationToken
-                                (fun (appended, next) args2 pipe2 -> actor {
-                                    sender <! PromptAccepted appended
-                                    logScoped null "The session accepted a prompt and started a turn."
+                                (fun (appended, next) args2 pipe2 ->
+                                    actor {
+                                        sender <! PromptAccepted appended
+                                        logScoped null "The session accepted a prompt and started a turn."
 
-                                    return!
-                                        loop
-                                            {
-                                                args2 with
+                                        return!
+                                            loop
+                                                { args2 with
                                                     State = SessionState.Running
                                                     Running = Some next
                                                     Arbitration = StopArbitration.Undecided
                                                     PendingStop = None
-                                            }
-                                            pipe2
-                                })
+                                                }
+                                                pipe2
+                                    })
                                 suspendWith
                                 args
                                 pipe
@@ -2520,11 +2559,12 @@ module internal SessionActor =
                                 payload
                                 DeliveryMode.Queue
                                 cancellationToken
-                                (fun appended args2 pipe2 -> actor {
-                                    sender <! PromptAccepted appended
-                                    logScoped null "The session accepted a prompt while busy."
-                                    return! loop args2 pipe2
-                                })
+                                (fun appended args2 pipe2 ->
+                                    actor {
+                                        sender <! PromptAccepted appended
+                                        logScoped null "The session accepted a prompt while busy."
+                                        return! loop args2 pipe2
+                                    })
                                 suspendWith
                                 args
                                 pipe
@@ -2536,11 +2576,12 @@ module internal SessionActor =
                                 payload
                                 DeliveryMode.Queue
                                 cancellationToken
-                                (fun appended args2 pipe2 -> actor {
-                                    sender <! PromptAccepted appended
-                                    logScoped null "The session accepted a prompt while out of range."
-                                    return! loop args2 pipe2
-                                })
+                                (fun appended args2 pipe2 ->
+                                    actor {
+                                        sender <! PromptAccepted appended
+                                        logScoped null "The session accepted a prompt while out of range."
+                                        return! loop args2 pipe2
+                                    })
                                 suspendWith
                                 args
                                 pipe
@@ -2556,21 +2597,21 @@ module internal SessionActor =
                                 payload
                                 DeliveryMode.Inject
                                 cancellationToken
-                                (fun (appended, next) args2 pipe2 -> actor {
-                                    sender <! PromptAccepted appended
-                                    logScoped null "The session accepted an injected prompt and started a turn."
+                                (fun (appended, next) args2 pipe2 ->
+                                    actor {
+                                        sender <! PromptAccepted appended
+                                        logScoped null "The session accepted an injected prompt and started a turn."
 
-                                    return!
-                                        loop
-                                            {
-                                                args2 with
+                                        return!
+                                            loop
+                                                { args2 with
                                                     State = SessionState.Running
                                                     Running = Some next
                                                     Arbitration = StopArbitration.Undecided
                                                     PendingStop = None
-                                            }
-                                            pipe2
-                                })
+                                                }
+                                                pipe2
+                                    })
                                 suspendWith
                                 args
                                 pipe
@@ -2584,11 +2625,12 @@ module internal SessionActor =
                                 payload
                                 DeliveryMode.Inject
                                 cancellationToken
-                                (fun appended args2 pipe2 -> actor {
-                                    sender <! PromptAccepted appended
-                                    logScoped null "The session accepted an injected prompt while busy."
-                                    return! loop args2 pipe2
-                                })
+                                (fun appended args2 pipe2 ->
+                                    actor {
+                                        sender <! PromptAccepted appended
+                                        logScoped null "The session accepted an injected prompt while busy."
+                                        return! loop args2 pipe2
+                                    })
                                 suspendWith
                                 args
                                 pipe
@@ -2598,11 +2640,12 @@ module internal SessionActor =
                                 payload
                                 DeliveryMode.Inject
                                 cancellationToken
-                                (fun appended args2 pipe2 -> actor {
-                                    sender <! PromptAccepted appended
-                                    logScoped null "The session accepted an injected prompt while out of range."
-                                    return! loop args2 pipe2
-                                })
+                                (fun appended args2 pipe2 ->
+                                    actor {
+                                        sender <! PromptAccepted appended
+                                        logScoped null "The session accepted an injected prompt while out of range."
+                                        return! loop args2 pipe2
+                                    })
                                 suspendWith
                                 args
                                 pipe
@@ -2618,21 +2661,21 @@ module internal SessionActor =
                                 payload
                                 DeliveryMode.Interrupt
                                 cancellationToken
-                                (fun (appended, next) args2 pipe2 -> actor {
-                                    sender <! PromptAccepted appended
-                                    logScoped null "The session accepted an interrupt prompt and started a turn."
+                                (fun (appended, next) args2 pipe2 ->
+                                    actor {
+                                        sender <! PromptAccepted appended
+                                        logScoped null "The session accepted an interrupt prompt and started a turn."
 
-                                    return!
-                                        loop
-                                            {
-                                                args2 with
+                                        return!
+                                            loop
+                                                { args2 with
                                                     State = SessionState.Running
                                                     Running = Some next
                                                     Arbitration = StopArbitration.Undecided
                                                     PendingStop = None
-                                            }
-                                            pipe2
-                                })
+                                                }
+                                                pipe2
+                                    })
                                 suspendWith
                                 args
                                 pipe
@@ -2651,41 +2694,44 @@ module internal SessionActor =
                                 payload
                                 DeliveryMode.Interrupt
                                 cancellationToken
-                                (fun appended args2 pipe2 -> actor {
-                                    match args2.Running with
-                                    | Some inFlight ->
-                                        let nextArbitration, won =
-                                            StopArbitration.applyStop args2.Arbitration StopCause.ExplicitAbort
+                                (fun appended args2 pipe2 ->
+                                    actor {
+                                        match args2.Running with
+                                        | Some inFlight ->
+                                            let nextArbitration, won =
+                                                StopArbitration.applyStop args2.Arbitration StopCause.ExplicitAbort
 
-                                        let nextStop =
+                                            let nextStop =
+                                                if won then
+                                                    Some(StopCause.ExplicitAbort, InterruptReason)
+                                                else
+                                                    args2.PendingStop
+
                                             if won then
-                                                Some(StopCause.ExplicitAbort, InterruptReason)
-                                            else
-                                                args2.PendingStop
+                                                inFlight.Cts.Cancel()
 
-                                        if won then
-                                            inFlight.Cts.Cancel()
+                                            sender <! PromptAccepted appended
 
-                                        sender <! PromptAccepted appended
-                                        logScoped
-                                            null
-                                            "The session accepted an interrupt prompt and pre-empted the running turn."
+                                            logScoped
+                                                null
+                                                "The session accepted an interrupt prompt and pre-empted the running turn."
 
-                                        return!
-                                            loop
-                                                {
-                                                    args2 with
+                                            return!
+                                                loop
+                                                    { args2 with
                                                         Arbitration = nextArbitration
                                                         PendingStop = nextStop
-                                                }
-                                                pipe2
-                                    | None ->
-                                        sender <! PromptAccepted appended
-                                        logScoped
-                                            null
-                                            "The session accepted an interrupt prompt with no turn in flight."
-                                        return! loop args2 pipe2
-                                })
+                                                    }
+                                                    pipe2
+                                        | None ->
+                                            sender <! PromptAccepted appended
+
+                                            logScoped
+                                                null
+                                                "The session accepted an interrupt prompt with no turn in flight."
+
+                                            return! loop args2 pipe2
+                                    })
                                 suspendWith
                                 args
                                 pipe
@@ -2698,11 +2744,12 @@ module internal SessionActor =
                                 payload
                                 DeliveryMode.Interrupt
                                 cancellationToken
-                                (fun appended args2 pipe2 -> actor {
-                                    sender <! PromptAccepted appended
-                                    logScoped null "The session accepted an interrupt prompt while suspended."
-                                    return! loop args2 pipe2
-                                })
+                                (fun appended args2 pipe2 ->
+                                    actor {
+                                        sender <! PromptAccepted appended
+                                        logScoped null "The session accepted an interrupt prompt while suspended."
+                                        return! loop args2 pipe2
+                                    })
                                 suspendWith
                                 args
                                 pipe
@@ -2712,10 +2759,11 @@ module internal SessionActor =
                                 payload
                                 DeliveryMode.Interrupt
                                 cancellationToken
-                                (fun appended args2 pipe2 -> actor {
-                                    sender <! PromptAccepted appended
-                                    return! loop args2 pipe2
-                                })
+                                (fun appended args2 pipe2 ->
+                                    actor {
+                                        sender <! PromptAccepted appended
+                                        return! loop args2 pipe2
+                                    })
                                 suspendWith
                                 args
                                 pipe
@@ -2731,7 +2779,8 @@ module internal SessionActor =
                                 starter
                                 (fun () -> control.ReadAbortTarget(tenant, sessionId, CancellationToken.None))
                                 "observe-host-abort"
-                                (fun args2 pipe2 -> function
+                                (fun args2 pipe2 ->
+                                    function
                                     | Error error -> raise error
                                     | Ok target ->
                                         match target with
@@ -2756,10 +2805,9 @@ module internal SessionActor =
                                                         args2.PendingStop
 
                                                 loop
-                                                    {
-                                                        args2 with
-                                                            Arbitration = next
-                                                            PendingStop = selected
+                                                    { args2 with
+                                                        Arbitration = next
+                                                        PendingStop = selected
                                                     }
                                                     pipe2
                                         | _ -> loop args2 pipe2)
@@ -2784,10 +2832,11 @@ module internal SessionActor =
                                     props
                                     compact
                                     cancellationToken
-                                    (fun reply args2 pipe2 -> actor {
-                                        sender <! reply
-                                        return! loop args2 pipe2
-                                    })
+                                    (fun reply args2 pipe2 ->
+                                        actor {
+                                            sender <! reply
+                                            return! loop args2 pipe2
+                                        })
                                     suspendWith
                                     args
                                     pipe
@@ -2827,92 +2876,94 @@ module internal SessionActor =
                                     starter
                                     props
                                     result
-                                    (fun _ args2 pipe2 -> actor {
-                                        if result.Status = TurnStatus.Completed then
-                                            return!
-                                                withAutoCloseEnabled
-                                                    starter
-                                                    props
-                                                    (fun enabled args3 pipe3 -> actor {
-                                                        if enabled then
-                                                            // AutoClose (issue 82): the first Completed
-                                                            // turn closes the session store-first instead
-                                                            // of draining. Aborted and Failed results
-                                                            // never take this path, so failed runs stay
-                                                            // open for inspection.
-                                                            return!
-                                                                withConsumeAndClose
-                                                                    starter
-                                                                    props
-                                                                    entry
-                                                                    (fun () args4 pipe4 -> actor {
-                                                                        return!
-                                                                            loop
-                                                                                {
-                                                                                    args4 with
-                                                                                        State = SessionState.Closed
-                                                                                        Running = None
-                                                                                        Arbitration =
-                                                                                            StopArbitration.Undecided
-                                                                                        PendingStop = None
-                                                                                        PendingCount =
-                                                                                            max
-                                                                                                0
-                                                                                                (args4.PendingCount
-                                                                                                - 1)
-                                                                                }
-                                                                                pipe4
-                                                                    })
-                                                                    suspendWith
-                                                                    args3
-                                                                    pipe3
-                                                        else
-                                                            return!
-                                                                withSettle
-                                                                    entry
-                                                                    CancellationToken.None
-                                                                    (fun (nextState, nextRunning) args4 pipe4 ->
-                                                                        actor {
-                                                                            return!
-                                                                                loop
-                                                                                    {
-                                                                                        args4 with
-                                                                                            State = nextState
-                                                                                            Running = nextRunning
-                                                                                            Arbitration =
-                                                                                                StopArbitration.Undecided
-                                                                                            PendingStop = None
-                                                                                    }
-                                                                                    pipe4
-                                                                        })
-                                                                    suspendWith
-                                                                    args3
-                                                                    pipe3
-                                                    })
-                                                    suspendWith
-                                                    args2
-                                                    pipe2
-                                        else
-                                            return!
-                                                withSettle
-                                                    entry
-                                                    CancellationToken.None
-                                                    (fun (nextState, nextRunning) args3 pipe3 -> actor {
-                                                        return!
-                                                            loop
-                                                                {
-                                                                    args3 with
-                                                                        State = nextState
-                                                                        Running = nextRunning
-                                                                        Arbitration = StopArbitration.Undecided
-                                                                        PendingStop = None
-                                                                }
-                                                                pipe3
-                                                    })
-                                                    suspendWith
-                                                    args2
-                                                    pipe2
-                                    })
+                                    (fun _ args2 pipe2 ->
+                                        actor {
+                                            if result.Status = TurnStatus.Completed then
+                                                return!
+                                                    withAutoCloseEnabled
+                                                        starter
+                                                        props
+                                                        (fun enabled args3 pipe3 ->
+                                                            actor {
+                                                                if enabled then
+                                                                    // AutoClose (issue 82): the first Completed
+                                                                    // turn closes the session store-first instead
+                                                                    // of draining. Aborted and Failed results
+                                                                    // never take this path, so failed runs stay
+                                                                    // open for inspection.
+                                                                    return!
+                                                                        withConsumeAndClose
+                                                                            starter
+                                                                            props
+                                                                            entry
+                                                                            (fun () args4 pipe4 ->
+                                                                                actor {
+                                                                                    return!
+                                                                                        loop
+                                                                                            { args4 with
+                                                                                                State =
+                                                                                                    SessionState.Closed
+                                                                                                Running = None
+                                                                                                Arbitration =
+                                                                                                    StopArbitration.Undecided
+                                                                                                PendingStop = None
+                                                                                                PendingCount =
+                                                                                                    max
+                                                                                                        0
+                                                                                                        (args4.PendingCount
+                                                                                                         - 1)
+                                                                                            }
+                                                                                            pipe4
+                                                                                })
+                                                                            suspendWith
+                                                                            args3
+                                                                            pipe3
+                                                                else
+                                                                    return!
+                                                                        withSettle
+                                                                            entry
+                                                                            CancellationToken.None
+                                                                            (fun (nextState, nextRunning) args4 pipe4 ->
+                                                                                actor {
+                                                                                    return!
+                                                                                        loop
+                                                                                            { args4 with
+                                                                                                State = nextState
+                                                                                                Running = nextRunning
+                                                                                                Arbitration =
+                                                                                                    StopArbitration.Undecided
+                                                                                                PendingStop = None
+                                                                                            }
+                                                                                            pipe4
+                                                                                })
+                                                                            suspendWith
+                                                                            args3
+                                                                            pipe3
+                                                            })
+                                                        suspendWith
+                                                        args2
+                                                        pipe2
+                                            else
+                                                return!
+                                                    withSettle
+                                                        entry
+                                                        CancellationToken.None
+                                                        (fun (nextState, nextRunning) args3 pipe3 ->
+                                                            actor {
+                                                                return!
+                                                                    loop
+                                                                        { args3 with
+                                                                            State = nextState
+                                                                            Running = nextRunning
+                                                                            Arbitration = StopArbitration.Undecided
+                                                                            PendingStop = None
+                                                                        }
+                                                                        pipe3
+                                                            })
+                                                        suspendWith
+                                                        args2
+                                                        pipe2
+                                        })
                                     suspendWith
                                     args
                                     pipe
@@ -2933,27 +2984,28 @@ module internal SessionActor =
                                     starter
                                     props
                                     settled
-                                    (fun _ args2 pipe2 -> actor {
-                                        return!
-                                            withSettle
-                                                entry
-                                                CancellationToken.None
-                                                (fun (nextState, nextRunning) args3 pipe3 -> actor {
-                                                    return!
-                                                        loop
-                                                            {
-                                                                args3 with
-                                                                    State = nextState
-                                                                    Running = nextRunning
-                                                                    Arbitration = StopArbitration.Undecided
-                                                                    PendingStop = None
-                                                            }
-                                                            pipe3
-                                                })
-                                                suspendWith
-                                                args2
-                                                pipe2
-                                    })
+                                    (fun _ args2 pipe2 ->
+                                        actor {
+                                            return!
+                                                withSettle
+                                                    entry
+                                                    CancellationToken.None
+                                                    (fun (nextState, nextRunning) args3 pipe3 ->
+                                                        actor {
+                                                            return!
+                                                                loop
+                                                                    { args3 with
+                                                                        State = nextState
+                                                                        Running = nextRunning
+                                                                        Arbitration = StopArbitration.Undecided
+                                                                        PendingStop = None
+                                                                    }
+                                                                    pipe3
+                                                        })
+                                                    suspendWith
+                                                    args2
+                                                    pipe2
+                                        })
                                     suspendWith
                                     args
                                     pipe
@@ -2974,18 +3026,18 @@ module internal SessionActor =
                                 withSettle
                                     entry
                                     CancellationToken.None
-                                    (fun (nextState, nextRunning) args2 pipe2 -> actor {
-                                        return!
-                                            loop
-                                                {
-                                                    args2 with
+                                    (fun (nextState, nextRunning) args2 pipe2 ->
+                                        actor {
+                                            return!
+                                                loop
+                                                    { args2 with
                                                         State = nextState
                                                         Running = nextRunning
                                                         Arbitration = StopArbitration.Undecided
                                                         PendingStop = None
-                                                }
-                                                pipe2
-                                    })
+                                                    }
+                                                    pipe2
+                                        })
                                     suspendWith
                                     args
                                     pipe
@@ -3003,18 +3055,18 @@ module internal SessionActor =
                                 withSettle
                                     entry
                                     CancellationToken.None
-                                    (fun (nextState, nextRunning) args2 pipe2 -> actor {
-                                        return!
-                                            loop
-                                                {
-                                                    args2 with
+                                    (fun (nextState, nextRunning) args2 pipe2 ->
+                                        actor {
+                                            return!
+                                                loop
+                                                    { args2 with
                                                         State = nextState
                                                         Running = nextRunning
                                                         Arbitration = StopArbitration.Undecided
                                                         PendingStop = None
-                                                }
-                                                pipe2
-                                    })
+                                                    }
+                                                    pipe2
+                                        })
                                     suspendWith
                                     args
                                     pipe
@@ -3716,8 +3768,7 @@ module internal SessionActor =
             Self = self
             Clock = config.Clock
             Timeout = config.Timeout
-            PackCompleted =
-                fun (opId, incarnation, outcome) -> SuspendableStoreCompleted(opId, incarnation, outcome)
+            PackCompleted = fun (opId, incarnation, outcome) -> SuspendableStoreCompleted(opId, incarnation, outcome)
             PackTimeout = fun (opId, incarnation) -> SuspendableStoreTimeout(opId, incarnation)
         }
 
@@ -4298,7 +4349,6 @@ module internal SessionActor =
 
                 checkedTarget.Outcome = ControlOperationOutcome.Applied
 
-
         let decideControl (entry: InboxEntry) (candidate: TurnResult) =
             match controlStore, controlReports.TryGetValue entry.Position with
             | Some control, (true, (turn, claim, id)) ->
@@ -4390,7 +4440,6 @@ module internal SessionActor =
                 completedControlReports.Add id |> ignore
             | _ -> ()
 
-
         // The on-demand compaction wiring the Idle compact path runs: the
         // spawn wiring at first, refreshed by the SetAgent swap with each
         // re-prime, so later Compacts journal under the live token.
@@ -4414,7 +4463,6 @@ module internal SessionActor =
                 | _ -> None
             with _ ->
                 None
-
 
         /// Re-primes the journal through the spawn wiring: a fresh bootstrap
         /// plus ClaimNextTurn, or None when the host never re-primes, the
@@ -4451,7 +4499,6 @@ module internal SessionActor =
                 | _ -> false
             with _ ->
                 false
-
 
         /// Explicit graph settlement takes priority over the unified-store fallback.
         let settlementStore: ISessionSettlementStore option =
@@ -5227,7 +5274,6 @@ module internal SessionActor =
                 | None -> None
             | _ -> None
 
-
         /// Maps a reported result to the Aborted result a won stop settles:
         /// the stop cause wins over whatever the detached turn reported,
         /// even a success, so settlement and stop stay mutually exclusive.
@@ -5274,7 +5320,6 @@ module internal SessionActor =
                     Outcome = TurnFailed(reason) :> TurnOutcome
                 }
 
-
         /// Journals the in-call marker for one turn entering its first
         /// provider call (issue 284): a TurnStartedEvent under the given
         /// journal token through the fenced writer. The caller snapshots
@@ -5314,8 +5359,6 @@ module internal SessionActor =
                 | JournalWriter.JournalFailed _ -> ()
             }
 
-
-
         /// Reads the failure reason to journal for a Failed result: the
         /// typed outcome reason when present, else the assistant text,
         /// else a fixed fallback. Never synthesizes secrets: both sources
@@ -5332,8 +5375,6 @@ module internal SessionActor =
                 rejected.Reason
             | _ when not (String.IsNullOrEmpty result.AssistantText) -> result.AssistantText
             | _ -> "The turn failed."
-
-
 
         /// Builds the Failed result an authority refusal settles: zero
         /// iterations and usage, the typed rejection carrying which branch
@@ -5358,9 +5399,6 @@ module internal SessionActor =
         /// path reads explicitly.
         /// <param name="reason">Why the turn refused to run. Never contains secrets or tool arguments.</param>
         let journalAuthorityFailure (_reason: string) : unit = ()
-
-
-
 
         let armTimeout (requestId: string) (timeoutCts: CancellationTokenSource) : unit =
             let delayTask =
@@ -5489,16 +5527,16 @@ module internal SessionActor =
                 starter
                 (fun () -> props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
                 "validate-route"
-                (fun args2 pipe2 -> function
+                (fun args2 pipe2 ->
+                    function
                     | Error error -> raise error
                     | Ok session ->
                         match session with
-                        | null ->
-                            raise (SessionNotFoundException(props.SessionId, "The session does not exist."))
+                        | null -> raise (SessionNotFoundException(props.SessionId, "The session does not exist."))
                         | s ->
                             try
                                 checkRoute s
-                                cont (Choice1Of2 ()) args2 pipe2
+                                cont (Choice1Of2()) args2 pipe2
                             with :? CompletionRoutingException as error ->
                                 cont (Choice2Of2 error) args2 pipe2)
                 suspendWith
@@ -5524,7 +5562,8 @@ module internal SessionActor =
                     starter
                     (fun () -> control.ReadAbortTarget(props.Tenant, props.SessionId, CancellationToken.None))
                     "durable-stop"
-                    (fun args2 pipe2 -> function
+                    (fun args2 pipe2 ->
+                        function
                         | Error error -> raise error
                         | Ok target ->
                             match target with
@@ -5534,10 +5573,7 @@ module internal SessionActor =
                                 | null -> cont None args2 pipe2
                                 | stop ->
                                     cont
-                                        (Some(
-                                            stop.Cause.Value,
-                                            stop.Reason |> Option.ofObj |> Option.defaultValue ""
-                                        ))
+                                        (Some(stop.Cause.Value, stop.Reason |> Option.ofObj |> Option.defaultValue ""))
                                         args2
                                         pipe2)
                     suspendWith
@@ -5562,7 +5598,8 @@ module internal SessionActor =
                 starter
                 (fun () -> props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
                 "current-turn-snapshot"
-                (fun args2 pipe2 -> function
+                (fun args2 pipe2 ->
+                    function
                     | Ok session ->
                         match session with
                         | null -> cont None args2 pipe2
@@ -5588,24 +5625,22 @@ module internal SessionActor =
             (args: SuspendLoopArgs)
             (pipe: SuspendPipe)
             : Cont<SuspendableActorMessage, unit> =
-            match suspend.AgentStore with
-            | null -> cont (HashSet<string>()) args pipe
-            | _ ->
-                startPipedWait
-                    starter
-                    (fun () -> props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
-                    "read-grants"
-                    (fun args2 pipe2 -> function
-                        | Ok session ->
-                            match session with
-                            | null -> cont (HashSet<string>()) args2 pipe2
-                            | s when isNull (box s.PermissionGrants) -> cont (HashSet<string>()) args2 pipe2
-                            | s -> cont (HashSet<string>(s.PermissionGrants :> seq<string>)) args2 pipe2
-                        | Error(:? SessionNotFoundException) -> cont (HashSet<string>()) args2 pipe2
-                        | Error error -> raise error)
-                    suspendWith
-                    args
-                    pipe
+            startPipedWait
+                starter
+                (fun () -> props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
+                "read-grants"
+                (fun args2 pipe2 ->
+                    function
+                    | Ok session ->
+                        match session with
+                        | null -> cont (HashSet<string>()) args2 pipe2
+                        | s when isNull (box s.PermissionGrants) -> cont (HashSet<string>()) args2 pipe2
+                        | s -> cont (HashSet<string>(s.PermissionGrants :> seq<string>)) args2 pipe2
+                    | Error(:? SessionNotFoundException) -> cont (HashSet<string>()) args2 pipe2
+                    | Error error -> raise error)
+                suspendWith
+                args
+                pipe
 
         /// Reads the session's current agent for the switch audit, piped: a
         /// missing row or a read failure reads as the fallback, like before.
@@ -5626,7 +5661,8 @@ module internal SessionActor =
                 starter
                 (fun () -> props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
                 "previous-agent"
-                (fun args2 pipe2 -> function
+                (fun args2 pipe2 ->
+                    function
                     | Ok session ->
                         match session with
                         | null -> cont fallback args2 pipe2
@@ -5659,7 +5695,8 @@ module internal SessionActor =
                     starter
                     (fun () -> props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
                     "check-agent-authority/session"
-                    (fun args2 pipe2 -> function
+                    (fun args2 pipe2 ->
+                        function
                         | Error _ -> cont None args2 pipe2
                         | Ok session ->
                             match session with
@@ -5671,7 +5708,8 @@ module internal SessionActor =
                                     starter
                                     (fun () -> agentStore.GetAgent(props.Tenant, agentId, CancellationToken.None))
                                     "check-agent-authority/agent"
-                                    (fun args3 pipe3 -> function
+                                    (fun args3 pipe3 ->
+                                        function
                                         | Error _ -> cont None args3 pipe3
                                         | Ok agent ->
                                             match agent with
@@ -5742,18 +5780,24 @@ module internal SessionActor =
                 (fun _ args2 pipe2 ->
                     startPipedWaitUnit
                         starter
-                        (fun () -> props.Store.MarkInboxConsumed(props.Tenant, props.SessionId, positions, CancellationToken.None))
+                        (fun () ->
+                            props.Store.MarkInboxConsumed(
+                                props.Tenant,
+                                props.SessionId,
+                                positions,
+                                CancellationToken.None
+                            ))
                         "settle-authority-refusal/consume"
                         (fun args3 pipe3 _ ->
                             startPipedWaitUnit
                                 starter
                                 (fun () ->
-                                        props.Store.UpdateSessionState(
-                                            props.Tenant,
-                                            props.SessionId,
-                                            SessionState.Idle,
-                                            CancellationToken.None
-                                        ))
+                                    props.Store.UpdateSessionState(
+                                        props.Tenant,
+                                        props.SessionId,
+                                        SessionState.Idle,
+                                        CancellationToken.None
+                                    ))
                                 "settle-authority-refusal/idle"
                                 (fun args4 pipe4 _ -> cont () args4 pipe4)
                                 suspendWith
@@ -5785,7 +5829,8 @@ module internal SessionActor =
                 starter
                 (fun () -> props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
                 "settle-primed/read"
-                (fun args2 pipe2 -> function
+                (fun args2 pipe2 ->
+                    function
                     | Ok session ->
                         match session with
                         | null -> cont () args2 pipe2
@@ -5803,13 +5848,13 @@ module internal SessionActor =
                             startPipedWait
                                 starter
                                 (fun () ->
-                                        props.Store.SettleTurn(
-                                            props.Tenant,
-                                            claim,
-                                            TurnStatus.Completed,
-                                            null,
-                                            CancellationToken.None
-                                        ))
+                                    props.Store.SettleTurn(
+                                        props.Tenant,
+                                        claim,
+                                        TurnStatus.Completed,
+                                        null,
+                                        CancellationToken.None
+                                    ))
                                 "settle-primed/settle"
                                 (fun args3 pipe3 _ -> cont () args3 pipe3)
                                 suspendWith
@@ -5839,9 +5884,11 @@ module internal SessionActor =
             : Cont<SuspendableActorMessage, unit> =
             startPipedWait
                 starter
-                (fun () -> props.Store.SettleTurn(props.Tenant, claim, TurnStatus.Completed, null, CancellationToken.None))
+                (fun () ->
+                    props.Store.SettleTurn(props.Tenant, claim, TurnStatus.Completed, null, CancellationToken.None))
                 "settle-turn-quiet"
-                (fun args2 pipe2 -> function
+                (fun args2 pipe2 ->
+                    function
                     | Ok(:? TurnSettled) -> cont true args2 pipe2
                     | Ok(:? TurnAlreadySettled) -> cont true args2 pipe2
                     | Ok _ -> cont false args2 pipe2
@@ -5873,14 +5920,21 @@ module internal SessionActor =
                     starter
                     (fun () -> reprime ())
                     "reprime-journal"
-                    (fun args2 pipe2 -> function
+                    (fun args2 pipe2 ->
+                        function
                         | Error _ -> cont None None args2 pipe2
                         | Ok fresh ->
                             startPipedWait
                                 starter
-                                (fun () -> props.Store.ReadPendingInbox(props.Tenant, props.SessionId, CancellationToken.None))
+                                (fun () ->
+                                    props.Store.ReadPendingInbox(
+                                        props.Tenant,
+                                        props.SessionId,
+                                        CancellationToken.None
+                                    ))
                                 "reprime-refresh"
-                                (fun args3 pipe3 -> function
+                                (fun args3 pipe3 ->
+                                    function
                                     | Ok pending when not (isNull (box pending)) ->
                                         cont fresh (Some pending.Count) args3 pipe3
                                     | Ok _ -> cont fresh (Some 0) args3 pipe3
@@ -5911,7 +5965,8 @@ module internal SessionActor =
                 starter
                 (fun () -> props.Store.ReadPendingInbox(props.Tenant, props.SessionId, CancellationToken.None))
                 "inbox-empty"
-                (fun args2 pipe2 -> function
+                (fun args2 pipe2 ->
+                    function
                     | Ok pending when not (isNull (box pending)) -> cont (pending.Count = 0) args2 pipe2
                     | Ok _ -> cont true args2 pipe2
                     | Error _ -> cont false args2 pipe2)
@@ -5942,7 +5997,8 @@ module internal SessionActor =
                 starter
                 (fun () -> props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
                 "apply-agent/stamp"
-                (fun args2 pipe2 -> function
+                (fun args2 pipe2 ->
+                    function
                     | Ok session ->
                         match session with
                         | null -> cont None args2 pipe2
@@ -5950,15 +6006,16 @@ module internal SessionActor =
                             startPipedWait
                                 starter
                                 (fun () ->
-                                        JournalWriter.appendHostAsync
-                                            suspend.EventStore
-                                            props.Tenant
-                                            props.SessionId
-                                            s.UpdatedAt
-                                            batch
-                                            CancellationToken.None)
+                                    JournalWriter.appendHostAsync
+                                        suspend.EventStore
+                                        props.Tenant
+                                        props.SessionId
+                                        s.UpdatedAt
+                                        batch
+                                        CancellationToken.None)
                                 "apply-agent/journal"
-                                (fun args3 pipe3 -> function
+                                (fun args3 pipe3 ->
+                                    function
                                     | Ok outcome -> cont (Some outcome) args3 pipe3
                                     | Error _ -> cont None args3 pipe3)
                                 suspendWith
@@ -6033,23 +6090,23 @@ module internal SessionActor =
                                                                 startPipedWaitUnit
                                                                     starter
                                                                     (fun () ->
-                                                                            props.Store.SetSessionAgent(
-                                                                                props.Tenant,
-                                                                                props.SessionId,
-                                                                                target,
-                                                                                CancellationToken.None
-                                                                            ))
+                                                                        props.Store.SetSessionAgent(
+                                                                            props.Tenant,
+                                                                            props.SessionId,
+                                                                            target,
+                                                                            CancellationToken.None
+                                                                        ))
                                                                     "apply-agent/rebind"
-                                                                    (fun args7 pipe7 -> function
-                                                                        | Ok () ->
+                                                                    (fun args7 pipe7 ->
+                                                                        function
+                                                                        | Ok() ->
                                                                             withReprime
                                                                                 (fun restored count args8 pipe8 ->
                                                                                     let args8c =
                                                                                         match count with
                                                                                         | Some c ->
-                                                                                            {
-                                                                                                args8 with
-                                                                                                    PendingCount = c
+                                                                                            { args8 with
+                                                                                                PendingCount = c
                                                                                             }
                                                                                         | None -> args8
 
@@ -6057,7 +6114,8 @@ module internal SessionActor =
                                                                                     | Some fresh2 ->
                                                                                         swapJournal fresh2
                                                                                         cont true args8c pipe8
-                                                                                    | None -> cont false args8c pipe8)
+                                                                                    | None ->
+                                                                                        cont false args8c pipe8)
                                                                                 suspendWith
                                                                                 args7
                                                                                 pipe7
@@ -6067,14 +6125,14 @@ module internal SessionActor =
                                                                                     let args8c =
                                                                                         match count with
                                                                                         | Some c ->
-                                                                                            {
-                                                                                                args8 with
-                                                                                                    PendingCount = c
+                                                                                            { args8 with
+                                                                                                PendingCount = c
                                                                                             }
                                                                                         | None -> args8
 
                                                                                     match restored with
-                                                                                    | Some fresh2 -> swapJournal fresh2
+                                                                                    | Some fresh2 ->
+                                                                                        swapJournal fresh2
                                                                                     | None -> ()
 
                                                                                     cont false args8c pipe8)
@@ -6231,16 +6289,17 @@ module internal SessionActor =
                 startPipedWait
                     starter
                     (fun () ->
-                            control.BindControlTarget(
-                                props.Tenant,
-                                props.SessionId,
-                                turn,
-                                entry.Position,
-                                claim,
-                                CancellationToken.None
-                            ))
+                        control.BindControlTarget(
+                            props.Tenant,
+                            props.SessionId,
+                            turn,
+                            entry.Position,
+                            claim,
+                            CancellationToken.None
+                        ))
                     "bind-control"
-                    (fun args2 pipe2 -> function
+                    (fun args2 pipe2 ->
+                        function
                         | Error error -> onError error args2 pipe2
                         | Ok bound ->
                             if bound.Outcome <> ControlOperationOutcome.Applied then
@@ -6289,18 +6348,18 @@ module internal SessionActor =
                 startPipedWait
                     starter
                     (fun () ->
-                            control.CheckControlTarget(
-                                props.Tenant,
-                                props.SessionId,
-                                turn,
-                                position,
-                                claim,
-                                CancellationToken.None
-                            ))
+                        control.CheckControlTarget(
+                            props.Tenant,
+                            props.SessionId,
+                            turn,
+                            position,
+                            claim,
+                            CancellationToken.None
+                        ))
                     "control-admission"
-                    (fun args2 pipe2 -> function
-                        | Ok verified when verified.Outcome = ControlOperationOutcome.Applied ->
-                            cont () args2 pipe2
+                    (fun args2 pipe2 ->
+                        function
+                        | Ok verified when verified.Outcome = ControlOperationOutcome.Applied -> cont () args2 pipe2
                         | Ok _ -> onError (TurnLoop.TurnLeaseLostException()) args2 pipe2
                         | Error error -> onError error args2 pipe2)
                     suspendWith
@@ -6402,8 +6461,7 @@ module internal SessionActor =
 
                         use _fenceScope =
                             match controlReports.TryGetValue entry.Position with
-                            | true, (_, claim, _) when not (isNull (box claim)) ->
-                                FencedClaimScope.enter (Some claim)
+                            | true, (_, claim, _) when not (isNull (box claim)) -> FencedClaimScope.enter (Some claim)
                             | _ ->
                                 match controlPrime with
                                 | Some claim when not (isNull (box claim)) -> FencedClaimScope.enter (Some claim)
@@ -6500,8 +6558,7 @@ module internal SessionActor =
                         startHeartbeat entry attempt runTurnId boundClaim
                     | _ ->
                         match controlPrime with
-                        | Some prime when not (isNull (box prime)) ->
-                            startHeartbeat entry attempt runTurnId prime
+                        | Some prime when not (isNull (box prime)) -> startHeartbeat entry attempt runTurnId prime
                         | _ -> ()
 
                     startRunner runTurnId argsX pipeX
@@ -6519,15 +6576,16 @@ module internal SessionActor =
                     startPipedWait
                         starter
                         (fun () ->
-                                ClaimFence.updateSessionStateAsync
-                                    props.Store
-                                    props.Tenant
-                                    claim
-                                    props.SessionId
-                                    SessionState.Running
-                                    CancellationToken.None)
+                            ClaimFence.updateSessionStateAsync
+                                props.Store
+                                props.Tenant
+                                claim
+                                props.SessionId
+                                SessionState.Running
+                                CancellationToken.None)
                         "start-running-fenced"
-                        (fun args3 pipe3 -> function
+                        (fun args3 pipe3 ->
+                            function
                             | Ok true -> proceed args3 pipe3
                             | Ok false -> onError (TurnLoop.TurnLeaseLostException()) args3 pipe3
                             | Error error -> onError error args3 pipe3)
@@ -6538,15 +6596,16 @@ module internal SessionActor =
                     startPipedWaitUnit
                         starter
                         (fun () ->
-                                props.Store.UpdateSessionState(
-                                    props.Tenant,
-                                    props.SessionId,
-                                    SessionState.Running,
-                                    CancellationToken.None
-                                ))
+                            props.Store.UpdateSessionState(
+                                props.Tenant,
+                                props.SessionId,
+                                SessionState.Running,
+                                CancellationToken.None
+                            ))
                         "start-running"
-                        (fun args3 pipe3 -> function
-                            | Ok () -> proceed args3 pipe3
+                        (fun args3 pipe3 ->
+                            function
+                            | Ok() -> proceed args3 pipe3
                             | Error error -> onError error args3 pipe3)
                         suspendWith
                         args2
@@ -6600,7 +6659,8 @@ module internal SessionActor =
                 // provider call and stale execution never authorizes.
                 use _controlScope =
                     match controlReports.TryGetValue parked.Entry.Position with
-                    | true, (turn, claim, _) -> ControlAdmission.enter (controlAdmission turn parked.Entry.Position claim)
+                    | true, (turn, claim, _) ->
+                        ControlAdmission.enter (controlAdmission turn parked.Entry.Position claim)
                     | _ -> ControlAdmission.enter (fun () -> true)
 
                 use _leaseScope =
@@ -6726,18 +6786,18 @@ module internal SessionActor =
                 startPipedWait
                     starter
                     (fun () ->
-                            control.CheckControlTarget(
-                                props.Tenant,
-                                props.SessionId,
-                                turn,
-                                parked.Entry.Position,
-                                claim,
-                                CancellationToken.None
-                            ))
+                        control.CheckControlTarget(
+                            props.Tenant,
+                            props.SessionId,
+                            turn,
+                            parked.Entry.Position,
+                            claim,
+                            CancellationToken.None
+                        ))
                     "resume-admission"
-                    (fun args2 pipe2 -> function
-                        | Ok verified when verified.Outcome = ControlOperationOutcome.Applied ->
-                            runResumed args2 pipe2
+                    (fun args2 pipe2 ->
+                        function
+                        | Ok verified when verified.Outcome = ControlOperationOutcome.Applied -> runResumed args2 pipe2
                         | Ok _ ->
                             raise (
                                 InvalidSessionStateException(
@@ -6772,26 +6832,25 @@ module internal SessionActor =
                 (fun choice args2 pipe2 ->
                     match choice with
                     | Choice2Of2 error -> raise error
-                    | Choice1Of2 () ->
+                    | Choice1Of2() ->
                         withTryApplyPendingWhenIdle
                             (fun () args3 pipe3 ->
                                 startPipedWait
                                     starter
                                     (fun () ->
-                                            props.Store.ReadPendingInbox(
-                                                props.Tenant,
-                                                props.SessionId,
-                                                CancellationToken.None
-                                            ))
+                                        props.Store.ReadPendingInbox(
+                                            props.Tenant,
+                                            props.SessionId,
+                                            CancellationToken.None
+                                        ))
                                     "drain-after-refusal/read"
-                                    (fun args4 pipe4 -> function
+                                    (fun args4 pipe4 ->
+                                        function
                                         | Error error -> raise error
                                         | Ok pending ->
                                             let args4c =
-                                                {
-                                                    args4 with
-                                                        PendingCount =
-                                                            if isNull (box pending) then 0 else pending.Count
+                                                { args4 with
+                                                    PendingCount = if isNull (box pending) then 0 else pending.Count
                                                 }
 
                                             match selectDrainableEntries pending with
@@ -6808,16 +6867,17 @@ module internal SessionActor =
                                                             startPipedWaitUnit
                                                                 starter
                                                                 (fun () ->
-                                                                        props.Store.UpdateSessionState(
-                                                                            props.Tenant,
-                                                                            props.SessionId,
-                                                                            SessionState.Running,
-                                                                            CancellationToken.None
-                                                                        ))
+                                                                    props.Store.UpdateSessionState(
+                                                                        props.Tenant,
+                                                                        props.SessionId,
+                                                                        SessionState.Running,
+                                                                        CancellationToken.None
+                                                                    ))
                                                                 "drain-after-refusal/running"
-                                                                (fun args6 pipe6 -> function
+                                                                (fun args6 pipe6 ->
+                                                                    function
                                                                     | Error error -> raise error
-                                                                    | Ok () ->
+                                                                    | Ok() ->
                                                                         withReadGrants
                                                                             (fun grants args7 pipe7 ->
                                                                                 withStartSuspendable
@@ -6861,15 +6921,16 @@ module internal SessionActor =
                                                 startPipedWaitUnit
                                                     starter
                                                     (fun () ->
-                                                            props.Store.UpdateSessionState(
-                                                                props.Tenant,
-                                                                props.SessionId,
-                                                                SessionState.Idle,
-                                                                CancellationToken.None
-                                                            ))
+                                                        props.Store.UpdateSessionState(
+                                                            props.Tenant,
+                                                            props.SessionId,
+                                                            SessionState.Idle,
+                                                            CancellationToken.None
+                                                        ))
                                                     "drain-after-refusal/idle"
-                                                    (fun args5 pipe5 -> function
-                                                        | Ok () -> cont SessionState.Idle args5 pipe5
+                                                    (fun args5 pipe5 ->
+                                                        function
+                                                        | Ok() -> cont SessionState.Idle args5 pipe5
                                                         | Error error -> raise error)
                                                     suspendWith
                                                     args4c
@@ -6937,15 +6998,16 @@ module internal SessionActor =
                     startPipedWait
                         starter
                         (fun () ->
-                                JournalWriter.appendWithTokenAsync
-                                    suspend.EventStore
-                                    props.Tenant
-                                    props.SessionId
-                                    journalToken
-                                    events
-                                    CancellationToken.None)
+                            JournalWriter.appendWithTokenAsync
+                                suspend.EventStore
+                                props.Tenant
+                                props.SessionId
+                                journalToken
+                                events
+                                CancellationToken.None)
                         "journal-suspend"
-                        (fun args2 pipe2 -> function
+                        (fun args2 pipe2 ->
+                            function
                             | Ok outcome -> cont outcome args2 pipe2
                             | Error error -> raise error)
                         suspendWith
@@ -6958,7 +7020,8 @@ module internal SessionActor =
                     starter
                     (fun () -> control.ReadAbortTarget(props.Tenant, props.SessionId, CancellationToken.None))
                     "journal-suspend/target"
-                    (fun args2 pipe2 -> function
+                    (fun args2 pipe2 ->
+                        function
                         | Error error -> raise error
                         | Ok target ->
                             match target with
@@ -7038,15 +7101,16 @@ module internal SessionActor =
                         startPipedWait
                             starter
                             (fun () ->
-                                    JournalWriter.appendWithTokenAsync
-                                        suspend.EventStore
-                                        props.Tenant
-                                        props.SessionId
-                                        journalToken
-                                        events
-                                        CancellationToken.None)
+                                JournalWriter.appendWithTokenAsync
+                                    suspend.EventStore
+                                    props.Tenant
+                                    props.SessionId
+                                    journalToken
+                                    events
+                                    CancellationToken.None)
                             "journal-resolve"
-                            (fun args2 pipe2 -> function
+                            (fun args2 pipe2 ->
+                                function
                                 | Ok outcome -> cont outcome args2 pipe2
                                 | Error error -> raise error)
                             suspendWith
@@ -7059,7 +7123,8 @@ module internal SessionActor =
                     starter
                     (fun () -> control.ReadAbortTarget(props.Tenant, props.SessionId, CancellationToken.None))
                     "journal-resolve/target"
-                    (fun args2 pipe2 -> function
+                    (fun args2 pipe2 ->
+                        function
                         | Error error -> raise error
                         | Ok target ->
                             match target with
@@ -7141,13 +7206,13 @@ module internal SessionActor =
                 startPipedWait
                     starter
                     (fun () ->
-                            JournalWriter.appendWithTokenAsync
-                                suspend.EventStore
-                                props.Tenant
-                                props.SessionId
-                                journalToken
-                                events
-                                CancellationToken.None)
+                        JournalWriter.appendWithTokenAsync
+                            suspend.EventStore
+                            props.Tenant
+                            props.SessionId
+                            journalToken
+                            events
+                            CancellationToken.None)
                     "journal-settled-completion"
                     (fun args2 pipe2 _ -> cont () args2 pipe2)
                     suspendWith
@@ -7180,23 +7245,23 @@ module internal SessionActor =
                 let stamp = DateTimeOffset.UtcNow
 
                 let event =
-                    TurnFailedEvent(props.SessionId, turnId, Nullable<int64>(), stamp, AskTimeoutReason)
-                    :> SessionEvent
+                    TurnFailedEvent(props.SessionId, turnId, Nullable<int64>(), stamp, AskTimeoutReason) :> SessionEvent
 
                 let events = ResizeArray<SessionEvent>([| event |]) :> IReadOnlyList<SessionEvent>
 
                 startPipedWait
                     starter
                     (fun () ->
-                            JournalWriter.appendWithTokenAsync
-                                suspend.EventStore
-                                props.Tenant
-                                props.SessionId
-                                journalToken
-                                events
-                                CancellationToken.None)
+                        JournalWriter.appendWithTokenAsync
+                            suspend.EventStore
+                            props.Tenant
+                            props.SessionId
+                            journalToken
+                            events
+                            CancellationToken.None)
                     "journal-timeout"
-                    (fun args2 pipe2 -> function
+                    (fun args2 pipe2 ->
+                        function
                         | Ok _ -> cont () args2 pipe2
                         | Error error -> raise error)
                     suspendWith
@@ -7243,29 +7308,28 @@ module internal SessionActor =
                 startPipedWait
                     starter
                     (fun () ->
-                            control.TryDecideControlTarget(
-                                props.Tenant,
-                                props.SessionId,
-                                turn,
-                                entry.Position,
-                                claim,
-                                id,
-                                candidate.Status,
-                                cause,
-                                reason,
-                                CancellationToken.None
-                            ))
+                        control.TryDecideControlTarget(
+                            props.Tenant,
+                            props.SessionId,
+                            turn,
+                            entry.Position,
+                            claim,
+                            id,
+                            candidate.Status,
+                            cause,
+                            reason,
+                            CancellationToken.None
+                        ))
                     "decide-control"
-                    (fun args2 pipe2 -> function
+                    (fun args2 pipe2 ->
+                        function
                         | Error error -> raise error
                         | Ok decided ->
                             match decided.Outcome, decided.Decision with
                             | ControlOperationOutcome.Applied, evidence ->
                                 match evidence with
                                 | null ->
-                                    raise (
-                                        InvalidOperationException("Applied control decision has no evidence.")
-                                    )
+                                    raise (InvalidOperationException("Applied control decision has no evidence."))
                                 | evidence when evidence.Status = TurnStatus.Aborted ->
                                     cont
                                         { candidate with
@@ -7319,17 +7383,18 @@ module internal SessionActor =
                 startPipedWait
                     starter
                     (fun () ->
-                            control.RetireControlTarget(
-                                props.Tenant,
-                                props.SessionId,
-                                turn,
-                                entry.Position,
-                                claim,
-                                id,
-                                CancellationToken.None
-                            ))
+                        control.RetireControlTarget(
+                            props.Tenant,
+                            props.SessionId,
+                            turn,
+                            entry.Position,
+                            claim,
+                            id,
+                            CancellationToken.None
+                        ))
                     "retire-control"
-                    (fun args2 pipe2 -> function
+                    (fun args2 pipe2 ->
+                        function
                         | Error error -> raise error
                         | Ok retired ->
                             if retired.Outcome <> ControlOperationOutcome.Applied then
@@ -7347,7 +7412,6 @@ module internal SessionActor =
                     args
                     pipe
             | _ -> cont () args pipe
-
 
         /// Settles a turn whose suspend/resolve journal write never landed
         /// as Failed with the typed reason, piped: consumes the entry and
@@ -7386,17 +7450,20 @@ module internal SessionActor =
                     startPipedWaitUnit
                         starter
                         (fun () ->
-                                props.Store.MarkInboxConsumed(
-                                    props.Tenant,
-                                    props.SessionId,
-                                    positions,
-                                    CancellationToken.None
-                                ))
+                            props.Store.MarkInboxConsumed(
+                                props.Tenant,
+                                props.SessionId,
+                                positions,
+                                CancellationToken.None
+                            ))
                         "settle-journal-failure/consume"
-                        (fun args3 pipe3 -> function
-                            | Ok () ->
+                        (fun args3 pipe3 ->
+                            function
+                            | Ok() ->
                                 let args3c =
-                                    { args3 with PendingCount = max 0 (args3.PendingCount - 1) }
+                                    { args3 with
+                                        PendingCount = max 0 (args3.PendingCount - 1)
+                                    }
 
                                 notifySettled decided
                                 notifyPosition entry.Position
@@ -7412,15 +7479,16 @@ module internal SessionActor =
                                                 startPipedWaitUnit
                                                     starter
                                                     (fun () ->
-                                                            props.Store.UpdateSessionState(
-                                                                props.Tenant,
-                                                                props.SessionId,
-                                                                SessionState.Idle,
-                                                                CancellationToken.None
-                                                            ))
+                                                        props.Store.UpdateSessionState(
+                                                            props.Tenant,
+                                                            props.SessionId,
+                                                            SessionState.Idle,
+                                                            CancellationToken.None
+                                                        ))
                                                     "settle-journal-failure/idle"
-                                                    (fun args6 pipe6 -> function
-                                                        | Ok () -> cont () args6 pipe6
+                                                    (fun args6 pipe6 ->
+                                                        function
+                                                        | Ok() -> cont () args6 pipe6
                                                         | Error error -> raise error)
                                                     suspendWith
                                                     args5
@@ -7470,13 +7538,13 @@ module internal SessionActor =
                         startPipedWait
                             starter
                             (fun () ->
-                                    ClaimFence.settleTurnAsync
-                                        props.Store
-                                        props.Tenant
-                                        claim
-                                        TurnStatus.Completed
-                                        null
-                                        CancellationToken.None)
+                                ClaimFence.settleTurnAsync
+                                    props.Store
+                                    props.Tenant
+                                    claim
+                                    TurnStatus.Completed
+                                    null
+                                    CancellationToken.None)
                             "settle-completed-prime"
                             (fun args3 pipe3 _ -> cont () args3 pipe3)
                             suspendWith
@@ -7508,7 +7576,11 @@ module internal SessionActor =
                 match runningTurnId with
                 | Some _ as resolved -> cont resolved args pipe
                 | None ->
-                    withCurrentTurnSnapshot (fun snapshot args2 pipe2 -> cont snapshot args2 pipe2) suspendWith args pipe
+                    withCurrentTurnSnapshot
+                        (fun snapshot args2 pipe2 -> cont snapshot args2 pipe2)
+                        suspendWith
+                        args
+                        pipe
 
         /// Drains the committed settlement's authoritative following entry,
         /// piped (issue 363): the provider-selected runnable candidate,
@@ -7559,8 +7631,7 @@ module internal SessionActor =
                                     following
                                     failure
                                     reason
-                                    (fun () args4 pipe4 ->
-                                        withDrainAfterRefusal cont suspendWith args4 pipe4)
+                                    (fun () args4 pipe4 -> withDrainAfterRefusal cont suspendWith args4 pipe4)
                                     suspendWith
                                     args3
                                     pipe3)
@@ -7599,15 +7670,16 @@ module internal SessionActor =
                 startPipedWaitUnit
                     starter
                     (fun () ->
-                            capable.AdmitExecution(
-                                props.Tenant,
-                                props.SessionId,
-                                entry.Position,
-                                claim,
-                                CancellationToken.None
-                            ))
+                        capable.AdmitExecution(
+                            props.Tenant,
+                            props.SessionId,
+                            entry.Position,
+                            claim,
+                            CancellationToken.None
+                        ))
                     "settle/admit"
                     (fun args2 pipe2 _ ->
+
                         let execution =
                             match executionId with
                             | Some id -> Nullable id
@@ -7628,7 +7700,8 @@ module internal SessionActor =
                             starter
                             (fun () -> capable.SettleExecution(props.Tenant, request, CancellationToken.None))
                             "settle/execution"
-                            (fun args3 pipe3 -> function
+                            (fun args3 pipe3 ->
+                                function
                                 | Ok outcome -> cont (Some outcome) args3 pipe3
                                 | Error _ -> cont None args3 pipe3)
                             suspendWith
@@ -7663,15 +7736,16 @@ module internal SessionActor =
                 startPipedWait
                     starter
                     (fun () ->
-                            ClaimFence.consumeInboxAsync
-                                props.Store
-                                props.Tenant
-                                claim
-                                props.SessionId
-                                positions
-                                CancellationToken.None)
+                        ClaimFence.consumeInboxAsync
+                            props.Store
+                            props.Tenant
+                            claim
+                            props.SessionId
+                            positions
+                            CancellationToken.None)
                     "consume-under-claim"
-                    (fun args2 pipe2 -> function
+                    (fun args2 pipe2 ->
+                        function
                         | Ok landed -> cont landed args2 pipe2
                         | Error error -> raise error)
                     suspendWith
@@ -7680,10 +7754,12 @@ module internal SessionActor =
             | None ->
                 startPipedWaitUnit
                     starter
-                    (fun () -> props.Store.MarkInboxConsumed(props.Tenant, props.SessionId, positions, CancellationToken.None))
+                    (fun () ->
+                        props.Store.MarkInboxConsumed(props.Tenant, props.SessionId, positions, CancellationToken.None))
                     "consume-legacy"
-                    (fun args2 pipe2 -> function
-                        | Ok () -> cont true args2 pipe2
+                    (fun args2 pipe2 ->
+                        function
+                        | Ok() -> cont true args2 pipe2
                         | Error error -> raise error)
                     suspendWith
                     args
@@ -7713,15 +7789,16 @@ module internal SessionActor =
                 startPipedWait
                     starter
                     (fun () ->
-                            ClaimFence.updateSessionStateAsync
-                                props.Store
-                                props.Tenant
-                                claim
-                                props.SessionId
-                                state
-                                CancellationToken.None)
+                        ClaimFence.updateSessionStateAsync
+                            props.Store
+                            props.Tenant
+                            claim
+                            props.SessionId
+                            state
+                            CancellationToken.None)
                     "update-state-under-claim"
-                    (fun args2 pipe2 -> function
+                    (fun args2 pipe2 ->
+                        function
                         | Ok landed -> cont landed args2 pipe2
                         | Error error -> raise error)
                     suspendWith
@@ -7730,10 +7807,12 @@ module internal SessionActor =
             | None ->
                 startPipedWaitUnit
                     starter
-                    (fun () -> props.Store.UpdateSessionState(props.Tenant, props.SessionId, state, CancellationToken.None))
+                    (fun () ->
+                        props.Store.UpdateSessionState(props.Tenant, props.SessionId, state, CancellationToken.None))
                     "update-state-legacy"
-                    (fun args2 pipe2 -> function
-                        | Ok () -> cont true args2 pipe2
+                    (fun args2 pipe2 ->
+                        function
+                        | Ok() -> cont true args2 pipe2
                         | Error error -> raise error)
                     suspendWith
                     args
@@ -7778,12 +7857,9 @@ module internal SessionActor =
                             && decision.Decision = PermissionDecisionKind.AllowForSession
                             ->
                             let toolName =
-                                if not (String.IsNullOrEmpty cursorTool) then
-                                    cursorTool
-                                elif not (String.IsNullOrEmpty rebuiltTool) then
-                                    rebuiltTool
-                                else
-                                    ""
+                                if not (String.IsNullOrEmpty cursorTool) then cursorTool
+                                elif not (String.IsNullOrEmpty rebuiltTool) then rebuiltTool
+                                else ""
 
                             if String.IsNullOrEmpty toolName then
                                 cont true args2 pipe2
@@ -7795,15 +7871,16 @@ module internal SessionActor =
                                     startPipedWait
                                         starter
                                         (fun () ->
-                                                ClaimFence.grantSessionToolAsync
-                                                    props.Store
-                                                    props.Tenant
-                                                    claim
-                                                    props.SessionId
-                                                    toolName
-                                                    CancellationToken.None)
+                                            ClaimFence.grantSessionToolAsync
+                                                props.Store
+                                                props.Tenant
+                                                claim
+                                                props.SessionId
+                                                toolName
+                                                CancellationToken.None)
                                         "grant-under-claim"
-                                        (fun args3 pipe3 -> function
+                                        (fun args3 pipe3 ->
+                                            function
                                             | Ok granted -> cont granted args3 pipe3
                                             | Error error -> raise error)
                                         suspendWith
@@ -7813,15 +7890,16 @@ module internal SessionActor =
                                     startPipedWaitUnit
                                         starter
                                         (fun () ->
-                                                props.Store.GrantSessionTool(
-                                                    props.Tenant,
-                                                    props.SessionId,
-                                                    toolName,
-                                                    CancellationToken.None
-                                                ))
+                                            props.Store.GrantSessionTool(
+                                                props.Tenant,
+                                                props.SessionId,
+                                                toolName,
+                                                CancellationToken.None
+                                            ))
                                         "grant-legacy"
-                                        (fun args3 pipe3 -> function
-                                            | Ok () -> cont true args3 pipe3
+                                        (fun args3 pipe3 ->
+                                            function
+                                            | Ok() -> cont true args3 pipe3
                                             | Error error -> raise error)
                                         suspendWith
                                         args2
@@ -7840,11 +7918,11 @@ module internal SessionActor =
         let replyRouteRefusal (sender: IActorRef) (error: CompletionRoutingException) : unit =
             sender
             <! {
-                Tenant = props.Tenant
-                SessionId = props.SessionId
-                DestinationId = error.DestinationId
-                Reason = error.Reason
-            }
+                   Tenant = props.Tenant
+                   SessionId = props.SessionId
+                   DestinationId = error.DestinationId
+                   Reason = error.Reason
+               }
 
         /// Appends one inbox entry, piped, refreshing the pending-count
         /// cache: the entry the prompt and reply arms durable store.
@@ -7867,12 +7945,19 @@ module internal SessionActor =
             : Cont<SuspendableActorMessage, unit> =
             startPipedWait
                 starter
-                (fun () -> props.Store.AppendInboxMessage(props.Tenant, props.SessionId, payload, delivery, cancellationToken))
+                (fun () ->
+                    props.Store.AppendInboxMessage(props.Tenant, props.SessionId, payload, delivery, cancellationToken))
                 "prompt-append"
-                (fun args2 pipe2 -> function
+                (fun args2 pipe2 ->
+                    function
                     | Error error -> raise error
                     | Ok appended ->
-                        cont appended { args2 with PendingCount = args2.PendingCount + 1 } pipe2)
+                        cont
+                            appended
+                            { args2 with
+                                PendingCount = args2.PendingCount + 1
+                            }
+                            pipe2)
                 suspendWith
                 args
                 pipe
@@ -7896,14 +7981,14 @@ module internal SessionActor =
                 starter
                 (fun () -> props.Store.ReadPendingInbox(props.Tenant, props.SessionId, cancellationToken))
                 "prompt-drain"
-                (fun args2 pipe2 -> function
+                (fun args2 pipe2 ->
+                    function
                     | Error error -> raise error
                     | Ok pending ->
                         cont
                             pending
-                            {
-                                args2 with
-                                    PendingCount = if isNull (box pending) then 0 else pending.Count
+                            { args2 with
+                                PendingCount = if isNull (box pending) then 0 else pending.Count
                             }
                             pipe2)
                 suspendWith
@@ -7983,10 +8068,9 @@ module internal SessionActor =
                                                                         sender <! PromptAccepted appended
 
                                                                         suspendWith
-                                                                            {
-                                                                                args9 with
-                                                                                    State = SessionState.Running
-                                                                                    Suspended = None
+                                                                            { args9 with
+                                                                                State = SessionState.Running
+                                                                                Suspended = None
                                                                             }
                                                                             pipe9)
                                                                     (fun error args9 pipe9 ->
@@ -8009,10 +8093,9 @@ module internal SessionActor =
                                                                         sender <! PromptAccepted appended
 
                                                                         suspendWith
-                                                                            {
-                                                                                args9 with
-                                                                                    State = next
-                                                                                    Suspended = None
+                                                                            { args9 with
+                                                                                State = next
+                                                                                Suspended = None
                                                                             }
                                                                             pipe9)
                                                                     suspendWith
@@ -8114,12 +8197,7 @@ module internal SessionActor =
                                                         args5
                                                         pipe5
                                                 | following ->
-                                                    withDrainSettledFollowing
-                                                        following
-                                                        cont
-                                                        suspendWith
-                                                        args5
-                                                        pipe5
+                                                    withDrainSettledFollowing following cont suspendWith args5 pipe5
                                             else
                                                 // The settled entry is consumed: an empty
                                                 // inbox is quiescent, so a recorded
@@ -8196,18 +8274,21 @@ module internal SessionActor =
                                 startPipedWaitUnit
                                     starter
                                     (fun () ->
-                                            props.Store.MarkInboxConsumed(
-                                                props.Tenant,
-                                                props.SessionId,
-                                                positions,
-                                                CancellationToken.None
-                                            ))
+                                        props.Store.MarkInboxConsumed(
+                                            props.Tenant,
+                                            props.SessionId,
+                                            positions,
+                                            CancellationToken.None
+                                        ))
                                     "settle-entry/consume"
-                                    (fun args4 pipe4 -> function
+                                    (fun args4 pipe4 ->
+                                        function
                                         | Error error -> raise error
-                                        | Ok () ->
+                                        | Ok() ->
                                             let args4c =
-                                                { args4 with PendingCount = max 0 (args4.PendingCount - 1) }
+                                                { args4 with
+                                                    PendingCount = max 0 (args4.PendingCount - 1)
+                                                }
 
                                             notifySettled decided
                                             notifyPosition entry.Position
@@ -8221,9 +8302,7 @@ module internal SessionActor =
                                                         withRetireControl
                                                             entry
                                                             (fun () args7 pipe7 ->
-                                                                if
-                                                                    decided.Status = TurnStatus.Completed
-                                                                then
+                                                                if decided.Status = TurnStatus.Completed then
                                                                     withAutoCloseEnabled
                                                                         starter
                                                                         props
@@ -8239,27 +8318,32 @@ module internal SessionActor =
                                                                                 startPipedWaitUnit
                                                                                     starter
                                                                                     (fun () ->
-                                                                                            props.Store.CloseSession(
-                                                                                                props.Tenant,
-                                                                                                props.SessionId,
-                                                                                                CancellationToken.None
-                                                                                            ))
+                                                                                        props.Store.CloseSession(
+                                                                                            props.Tenant,
+                                                                                            props.SessionId,
+                                                                                            CancellationToken.None
+                                                                                        ))
                                                                                     "settle-entry/autoclose"
-                                                                                    (fun args9 pipe9 -> function
-                                                                                        | Error error -> raise error
-                                                                                        | Ok () ->
+                                                                                    (fun args9 pipe9 ->
+                                                                                        function
+                                                                                        | Error error ->
+                                                                                            raise error
+                                                                                        | Ok() ->
                                                                                             let args9c =
-                                                                                                {
-                                                                                                    args9 with
-                                                                                                        PendingCount =
-                                                                                                            max
-                                                                                                                0
-                                                                                                                (args9.PendingCount
-                                                                                                                - 1)
+                                                                                                { args9 with
+                                                                                                    PendingCount =
+                                                                                                        max
+                                                                                                            0
+                                                                                                            (args9.PendingCount
+                                                                                                             - 1)
                                                                                                 }
 
                                                                                             pendingAgent <- None
-                                                                                            cont SessionState.Closed args9c pipe9)
+
+                                                                                            cont
+                                                                                                SessionState.Closed
+                                                                                                args9c
+                                                                                                pipe9)
                                                                                     suspendWith
                                                                                     args8
                                                                                     pipe8
@@ -8296,26 +8380,41 @@ module internal SessionActor =
                                                                             withCheckAgentAuthority
                                                                                 (fun authority args9 pipe9 ->
                                                                                     match authority with
-                                                                                    | None when args9.Closing <> [] ->
+                                                                                    | None when
+                                                                                        args9.Closing <> []
+                                                                                        ->
                                                                                         // A requested close owns the session now:
                                                                                         // the entry stays durable, but no turn
                                                                                         // starts into the close.
-                                                                                        cont SessionState.Idle args9 pipe9
+                                                                                        cont
+                                                                                            SessionState.Idle
+                                                                                            args9
+                                                                                            pipe9
                                                                                     | None ->
                                                                                         withReadGrants
-                                                                                            (fun grants args10 pipe10 ->
+                                                                                            (fun
+                                                                                                grants
+                                                                                                args10
+                                                                                                pipe10 ->
                                                                                                 withStartSuspendable
                                                                                                     following
                                                                                                     1
                                                                                                     grants
                                                                                                     None
-                                                                                                    (fun () args11 pipe11 ->
+                                                                                                    (fun
+                                                                                                        ()
+                                                                                                        args11
+                                                                                                        pipe11 ->
                                                                                                         cont
                                                                                                             SessionState.Running
                                                                                                             args11
                                                                                                             pipe11)
-                                                                                                    (fun error _ _ ->
-                                                                                                        raise error)
+                                                                                                    (fun
+                                                                                                        error
+                                                                                                        _
+                                                                                                        _ ->
+                                                                                                        raise
+                                                                                                            error)
                                                                                                     suspendWith
                                                                                                     args10
                                                                                                     pipe10)
@@ -8353,8 +8452,7 @@ module internal SessionActor =
                                                                             // above already journaled under the live
                                                                             // token, so the settle lands after it.
                                                                             if
-                                                                                decided.Status
-                                                                                = TurnStatus.Completed
+                                                                                decided.Status = TurnStatus.Completed
                                                                             then
                                                                                 withSettleCompletedPrime
                                                                                     (fun () args9 pipe9 ->
@@ -8375,15 +8473,16 @@ module internal SessionActor =
                                                         startPipedWaitUnit
                                                             starter
                                                             (fun () ->
-                                                                    props.Store.UpdateSessionState(
-                                                                        props.Tenant,
-                                                                        props.SessionId,
-                                                                        SessionState.Idle,
-                                                                        CancellationToken.None
-                                                                    ))
+                                                                props.Store.UpdateSessionState(
+                                                                    props.Tenant,
+                                                                    props.SessionId,
+                                                                    SessionState.Idle,
+                                                                    CancellationToken.None
+                                                                ))
                                                             "settle-entry/idle"
-                                                            (fun args9 pipe9 -> function
-                                                                | Ok () -> cont SessionState.Idle args9 pipe9
+                                                            (fun args9 pipe9 ->
+                                                                function
+                                                                | Ok() -> cont SessionState.Idle args9 pipe9
                                                                 | Error error -> raise error)
                                                             suspendWith
                                                             args8
@@ -8401,8 +8500,7 @@ module internal SessionActor =
                                                         withJournalSettledCompletion
                                                             tid
                                                             decided
-                                                            (fun () args6 pipe6 ->
-                                                                afterJournalLegacy args6 pipe6)
+                                                            (fun () args6 pipe6 -> afterJournalLegacy args6 pipe6)
                                                             suspendWith
                                                             args5
                                                             pipe5
@@ -8435,11 +8533,10 @@ module internal SessionActor =
                             sender <! closed
 
                         loop
-                            {
-                                args2 with
-                                    State = SessionState.Closed
-                                    Suspended = None
-                                    Closing = []
+                            { args2 with
+                                State = SessionState.Closed
+                                Suspended = None
+                                Closing = []
                             }
                             pipe2)
                     suspendWith
@@ -8447,9 +8544,7 @@ module internal SessionActor =
                     pipe
             | _ ->
                 match args.PendingResume with
-                | Some(entry, attempt, allowed, seed) when
-                    not (LifecyclePipe.isBusy pipe) && not args.Seeding
-                    ->
+                | Some(entry, attempt, allowed, seed) when not (LifecyclePipe.isBusy pipe) && not args.Seeding ->
                     // Crash-resume start deferred to the loop (issue 390):
                     // the interrupted turn restarts as a new attempt only
                     // once the seeding read landed and no wait is
@@ -8462,11 +8557,10 @@ module internal SessionActor =
                         seed
                         (fun () args2 pipe2 ->
                             loop
-                                {
-                                    args2 with
-                                        State = SessionState.Running
-                                        Suspended = None
-                                        PendingResume = None
+                                { args2 with
+                                    State = SessionState.Running
+                                    Suspended = None
+                                    PendingResume = None
                                 }
                                 pipe2)
                         (fun error _ _ -> raise error)
@@ -8515,9 +8609,7 @@ module internal SessionActor =
                     loop args pipe
                 | [] ->
                     match args.State, args.Suspended with
-                    | SessionState.Running, None when
-                        cause = StopCause.ExplicitAbort || cause = StopCause.HostShutdown
-                        ->
+                    | SessionState.Running, None when cause = StopCause.ExplicitAbort || cause = StopCause.HostShutdown ->
                         // First cause wins: the detached suspendable turn
                         // runs un-cancellable, so the recorded stop wins at
                         // its next report.
@@ -8553,7 +8645,11 @@ module internal SessionActor =
                 // The durable write lands through the loop entry once the
                 // pipe drains, so shutdown stays responsive behind a
                 // delayed dependency.
-                loop { args with Closing = args.Closing @ [ sender, cancellationToken ] } pipe
+                loop
+                    { args with
+                        Closing = args.Closing @ [ sender, cancellationToken ]
+                    }
+                    pipe
             | SuspendableGetSnapshot ->
                 sender <! takeSuspendSnapshot args
                 loop args pipe
@@ -8594,12 +8690,13 @@ module internal SessionActor =
                         | Choice2Of2 error ->
                             replyRouteRefusal sender error
                             loop args2 pipe2
-                        | Choice1Of2 () ->
+                        | Choice1Of2() ->
                             match args2.State, args2.Suspended, replyRequestId reply with
                             | _, _, _ when replyInFlight ->
                                 reject
                                     (replyRequestId reply |> Option.defaultValue "")
                                     "A reply is already being consumed."
+
                                 loop args2 pipe2
                             | SessionState.WaitingForInput, Some _, Some requestId ->
                                 withDurableStop
@@ -8622,24 +8719,24 @@ module internal SessionActor =
                                                     startPipedWait
                                                         starter
                                                         (fun () ->
-                                                                props.Store.AppendInboxMessage(
-                                                                    props.Tenant,
-                                                                    props.SessionId,
-                                                                    ReplyPayload(reply),
-                                                                    DeliveryMode.Queue,
-                                                                    CancellationToken.None
-                                                                ))
+                                                            props.Store.AppendInboxMessage(
+                                                                props.Tenant,
+                                                                props.SessionId,
+                                                                ReplyPayload(reply),
+                                                                DeliveryMode.Queue,
+                                                                CancellationToken.None
+                                                            ))
                                                         "reply-append"
-                                                        (fun args4 pipe4 -> function
+                                                        (fun args4 pipe4 ->
+                                                            function
                                                             | Error error -> raise error
                                                             | Ok appended ->
                                                                 replyInFlight <- true
                                                                 suspendSelf.Tell(ReplyEntry appended, sender)
 
                                                                 loop
-                                                                    {
-                                                                        args4 with
-                                                                            PendingCount = args4.PendingCount + 1
+                                                                    { args4 with
+                                                                        PendingCount = args4.PendingCount + 1
                                                                     }
                                                                     pipe4)
                                                         suspendWith
@@ -8664,700 +8761,956 @@ module internal SessionActor =
                     suspendWith
                     args
                     pipe
-                | SuspendableQueuePrompt(payload, cancellationToken) ->
-                    withValidateRoute
-                        (fun choice args2 pipe2 ->
-                            match choice with
-                            | Choice2Of2 error ->
-                                replyRouteRefusal sender error
+            | SuspendableQueuePrompt(payload, cancellationToken) ->
+                withValidateRoute
+                    (fun choice args2 pipe2 ->
+                        match choice with
+                        | Choice2Of2 error ->
+                            replyRouteRefusal sender error
+                            loop args2 pipe2
+                        | Choice1Of2() ->
+                            match args2.State with
+                            | SessionState.Closed ->
+                                sender <! PromptRejected SessionState.Closed
                                 loop args2 pipe2
-                            | Choice1Of2 () ->
-                                match args2.State with
-                                | SessionState.Closed ->
-                                    sender <! PromptRejected SessionState.Closed
-                                    loop args2 pipe2
-                                | SessionState.Idle ->
-                                    idlePromptArm
-                                        payload
-                                        DeliveryMode.Queue
-                                        cancellationToken
-                                        sender
-                                        suspendWith
-                                        args2
-                                        pipe2
-                                | SessionState.Running
-                                | SessionState.WaitingForInput ->
-                                    withAppendInbox
-                                        payload
-                                        DeliveryMode.Queue
-                                        cancellationToken
-                                        (fun appended args3 pipe3 ->
-                                            sender <! PromptAccepted appended
-                                            loop args3 pipe3)
-                                        suspendWith
-                                        args2
-                                        pipe2
-                                | _ ->
-                                    withAppendInbox
-                                        payload
-                                        DeliveryMode.Queue
-                                        cancellationToken
-                                        (fun appended args3 pipe3 ->
-                                            sender <! PromptAccepted appended
-                                            loop args3 pipe3)
-                                        suspendWith
-                                        args2
-                                        pipe2)
-                        suspendWith
-                        args
-                        pipe
-                | SuspendableInjectPrompt(payload, cancellationToken) ->
-                    withValidateRoute
-                        (fun choice args2 pipe2 ->
-                            match choice with
-                            | Choice2Of2 error ->
-                                replyRouteRefusal sender error
+                            | SessionState.Idle ->
+                                idlePromptArm
+                                    payload
+                                    DeliveryMode.Queue
+                                    cancellationToken
+                                    sender
+                                    suspendWith
+                                    args2
+                                    pipe2
+                            | SessionState.Running
+                            | SessionState.WaitingForInput ->
+                                withAppendInbox
+                                    payload
+                                    DeliveryMode.Queue
+                                    cancellationToken
+                                    (fun appended args3 pipe3 ->
+                                        sender <! PromptAccepted appended
+                                        loop args3 pipe3)
+                                    suspendWith
+                                    args2
+                                    pipe2
+                            | _ ->
+                                withAppendInbox
+                                    payload
+                                    DeliveryMode.Queue
+                                    cancellationToken
+                                    (fun appended args3 pipe3 ->
+                                        sender <! PromptAccepted appended
+                                        loop args3 pipe3)
+                                    suspendWith
+                                    args2
+                                    pipe2)
+                    suspendWith
+                    args
+                    pipe
+            | SuspendableInjectPrompt(payload, cancellationToken) ->
+                withValidateRoute
+                    (fun choice args2 pipe2 ->
+                        match choice with
+                        | Choice2Of2 error ->
+                            replyRouteRefusal sender error
+                            loop args2 pipe2
+                        | Choice1Of2() ->
+                            match args2.State with
+                            | SessionState.Closed ->
+                                sender <! PromptRejected SessionState.Closed
                                 loop args2 pipe2
-                            | Choice1Of2 () ->
-                                match args2.State with
-                                | SessionState.Closed ->
-                                    sender <! PromptRejected SessionState.Closed
-                                    loop args2 pipe2
-                                | SessionState.Idle ->
-                                    idlePromptArm
-                                        payload
-                                        DeliveryMode.Inject
-                                        cancellationToken
-                                        sender
-                                        suspendWith
-                                        args2
-                                        pipe2
-                                | SessionState.Running
-                                | SessionState.WaitingForInput ->
-                                    // Append-and-wait: the running turn folds the entry
-                                    // at its next iteration boundary through the runner's
-                                    // drain hooks, and a suspended turn leaves it for the
-                                    // settle drain. Never aborts.
-                                    withAppendInbox
-                                        payload
-                                        DeliveryMode.Inject
-                                        cancellationToken
-                                        (fun appended args3 pipe3 ->
-                                            sender <! PromptAccepted appended
-                                            loop args3 pipe3)
-                                        suspendWith
-                                        args2
-                                        pipe2
-                                | _ ->
-                                    withAppendInbox
-                                        payload
-                                        DeliveryMode.Inject
-                                        cancellationToken
-                                        (fun appended args3 pipe3 ->
-                                            sender <! PromptAccepted appended
-                                            loop args3 pipe3)
-                                        suspendWith
-                                        args2
-                                        pipe2)
-                        suspendWith
-                        args
-                        pipe
-                | SuspendableInterruptPrompt(payload, cancellationToken) ->
-                    withValidateRoute
-                        (fun choice args2 pipe2 ->
-                            match choice with
-                            | Choice2Of2 error ->
-                                replyRouteRefusal sender error
+                            | SessionState.Idle ->
+                                idlePromptArm
+                                    payload
+                                    DeliveryMode.Inject
+                                    cancellationToken
+                                    sender
+                                    suspendWith
+                                    args2
+                                    pipe2
+                            | SessionState.Running
+                            | SessionState.WaitingForInput ->
+                                // Append-and-wait: the running turn folds the entry
+                                // at its next iteration boundary through the runner's
+                                // drain hooks, and a suspended turn leaves it for the
+                                // settle drain. Never aborts.
+                                withAppendInbox
+                                    payload
+                                    DeliveryMode.Inject
+                                    cancellationToken
+                                    (fun appended args3 pipe3 ->
+                                        sender <! PromptAccepted appended
+                                        loop args3 pipe3)
+                                    suspendWith
+                                    args2
+                                    pipe2
+                            | _ ->
+                                withAppendInbox
+                                    payload
+                                    DeliveryMode.Inject
+                                    cancellationToken
+                                    (fun appended args3 pipe3 ->
+                                        sender <! PromptAccepted appended
+                                        loop args3 pipe3)
+                                    suspendWith
+                                    args2
+                                    pipe2)
+                    suspendWith
+                    args
+                    pipe
+            | SuspendableInterruptPrompt(payload, cancellationToken) ->
+                withValidateRoute
+                    (fun choice args2 pipe2 ->
+                        match choice with
+                        | Choice2Of2 error ->
+                            replyRouteRefusal sender error
+                            loop args2 pipe2
+                        | Choice1Of2() ->
+                            match args2.State with
+                            | SessionState.Closed ->
+                                sender <! PromptRejected SessionState.Closed
                                 loop args2 pipe2
-                            | Choice1Of2 () ->
-                                match args2.State with
-                                | SessionState.Closed ->
-                                    sender <! PromptRejected SessionState.Closed
-                                    loop args2 pipe2
-                                | SessionState.Idle ->
-                                    idlePromptArm
-                                        payload
-                                        DeliveryMode.Interrupt
-                                        cancellationToken
-                                        sender
-                                        suspendWith
-                                        args2
-                                        pipe2
-                                | SessionState.Running ->
-                                    // Pre-empt through the abort verb: the entry joins
-                                    // the inbox first so the settle drain finds it
-                                    // first, then the pending stop records
-                                    // ExplicitAbort. The detached suspendable turn runs
-                                    // un-cancellable, so the stop wins at its next
-                                    // report and the settle drains the Interrupt entry
-                                    // first. A stop that already won keeps the first
-                                    // cause; the new entry still drains after the settle.
-                                    withAppendInbox
-                                        payload
-                                        DeliveryMode.Interrupt
-                                        cancellationToken
-                                        (fun appended args3 pipe3 ->
-                                            if pendingStop.IsNone then
-                                                pendingStop <- Some(StopCause.ExplicitAbort, InterruptReason)
+                            | SessionState.Idle ->
+                                idlePromptArm
+                                    payload
+                                    DeliveryMode.Interrupt
+                                    cancellationToken
+                                    sender
+                                    suspendWith
+                                    args2
+                                    pipe2
+                            | SessionState.Running ->
+                                // Pre-empt through the abort verb: the entry joins
+                                // the inbox first so the settle drain finds it
+                                // first, then the pending stop records
+                                // ExplicitAbort. The detached suspendable turn runs
+                                // un-cancellable, so the stop wins at its next
+                                // report and the settle drains the Interrupt entry
+                                // first. A stop that already won keeps the first
+                                // cause; the new entry still drains after the settle.
+                                withAppendInbox
+                                    payload
+                                    DeliveryMode.Interrupt
+                                    cancellationToken
+                                    (fun appended args3 pipe3 ->
+                                        if pendingStop.IsNone then
+                                            pendingStop <- Some(StopCause.ExplicitAbort, InterruptReason)
 
-                                            sender <! PromptAccepted appended
-                                            loop args3 pipe3)
-                                        suspendWith
-                                        args2
-                                        pipe2
-                                | SessionState.WaitingForInput ->
-                                    // Append-and-wait: nothing runs to pre-empt and
-                                    // Reply still resumes the suspended turn.
-                                    withAppendInbox
-                                        payload
-                                        DeliveryMode.Interrupt
-                                        cancellationToken
-                                        (fun appended args3 pipe3 ->
-                                            sender <! PromptAccepted appended
-                                            loop args3 pipe3)
-                                        suspendWith
-                                        args2
-                                        pipe2
-                                | _ ->
-                                    withAppendInbox
-                                        payload
-                                        DeliveryMode.Interrupt
-                                        cancellationToken
-                                        (fun appended args3 pipe3 ->
-                                            sender <! PromptAccepted appended
-                                            loop args3 pipe3)
-                                        suspendWith
-                                        args2
-                                        pipe2)
-                        suspendWith
-                        args
-                        pipe
-                | SuspendableFinished(entry, completion, attempt, allowed) ->
-                    match args.State, args.Suspended with
-                    | SessionState.Running, None when
-                        controlReports.ContainsKey entry.Position
-                        && (let _, _, id = controlReports[entry.Position] in completedControlReports.Contains id)
-                        ->
-                        loop args pipe
-                    | SessionState.Running, None ->
-                        withDurableStop
-                            (fun durableOpt args2 pipe2 ->
-                                // A recorded stop wins over whatever the detached
-                                // turn reported, even a success or a suspension: map
-                                // to Aborted and clear the cell. Settlement already
-                                // won when the cell is empty.
-                                let stop = durableOpt |> Option.orElse pendingStop
+                                        sender <! PromptAccepted appended
+                                        loop args3 pipe3)
+                                    suspendWith
+                                    args2
+                                    pipe2
+                            | SessionState.WaitingForInput ->
+                                // Append-and-wait: nothing runs to pre-empt and
+                                // Reply still resumes the suspended turn.
+                                withAppendInbox
+                                    payload
+                                    DeliveryMode.Interrupt
+                                    cancellationToken
+                                    (fun appended args3 pipe3 ->
+                                        sender <! PromptAccepted appended
+                                        loop args3 pipe3)
+                                    suspendWith
+                                    args2
+                                    pipe2
+                            | _ ->
+                                withAppendInbox
+                                    payload
+                                    DeliveryMode.Interrupt
+                                    cancellationToken
+                                    (fun appended args3 pipe3 ->
+                                        sender <! PromptAccepted appended
+                                        loop args3 pipe3)
+                                    suspendWith
+                                    args2
+                                    pipe2)
+                    suspendWith
+                    args
+                    pipe
+            | SuspendableFinished(entry, completion, attempt, allowed) ->
+                match args.State, args.Suspended with
+                | SessionState.Running, None when
+                    controlReports.ContainsKey entry.Position
+                    && (let _, _, id = controlReports[entry.Position] in completedControlReports.Contains id)
+                    ->
+                    loop args pipe
+                | SessionState.Running, None ->
+                    withDurableStop
+                        (fun durableOpt args2 pipe2 ->
+                            // A recorded stop wins over whatever the detached
+                            // turn reported, even a success or a suspension: map
+                            // to Aborted and clear the cell. Settlement already
+                            // won when the cell is empty.
+                            let stop = durableOpt |> Option.orElse pendingStop
 
-                                let carried =
-                                    match stop with
-                                    | Some(cause, reason) -> mapSuspendAborted cause reason completion.Result
-                                    | None -> completion.Result
+                            let carried =
+                                match stop with
+                                | Some(cause, reason) -> mapSuspendAborted cause reason completion.Result
+                                | None -> completion.Result
 
-                                match completion.Suspension, stop with
-                                | Some cursor, None ->
-                                    // Execution-owned WaitingForInput (issue 377):
-                                    // fenced under the captured claim. A rejection
-                                    // means a takeover winner owns the turn: zero
-                                    // effects, no park, no journal.
-                                    withUpdateStateUnderClaim
-                                        entry
-                                        SessionState.WaitingForInput
-                                        (fun landed args3 pipe3 ->
-                                            if not landed then
-                                                cancelHeartbeat ()
-                                                runningTurnId <- None
-                                                loop { args3 with Suspended = None } pipe3
-                                            else
-                                                withJournalSuspend
-                                                    cursor
-                                                    (fun journalOutcome args4 pipe4 ->
-                                                        match journalOutcome with
-                                                        | JournalWriter.JournalAppended _ ->
-                                                            let timeoutCts = new CancellationTokenSource()
-
-                                                            let carriedAllowed =
-                                                                if isNull (box allowed) then
-                                                                    HashSet<string>()
-                                                                else
-                                                                    allowed
-
-                                                            // No running attempt remains once parked:
-                                                            // the parked turn id carries the settle
-                                                            // identity from here on.
-                                                            runningTurnId <- None
-
-                                                            withSettlingTurnId
-                                                                completion.TurnId
-                                                                (fun settlingId args5 pipe5 ->
-                                                                    let parked =
-                                                                        {
-                                                                            Entry = entry
-                                                                            TurnId =
-                                                                                match settlingId with
-                                                                                | Some live -> live
-                                                                                | None ->
-                                                                                    Unchecked.defaultof<TurnId>
-                                                                            Cursor = Some cursor
-                                                                            Rebuilt = None
-                                                                            Allowed = carriedAllowed
-                                                                            Attempt = attempt
-                                                                            TimeoutCts = timeoutCts
-                                                                        }
-
-                                                                    armTimeout cursor.RequestId timeoutCts
-
-                                                                    loop
-                                                                        {
-                                                                            args5 with
-                                                                                State = SessionState.WaitingForInput
-                                                                                Suspended = Some parked
-                                                                        }
-                                                                        pipe5)
-                                                                suspendWith
-                                                                args4
-                                                                pipe4
-                                                        | JournalWriter.JournalRejected rejection ->
-                                                            // The suspend event never landed: parking
-                                                            // would strand the turn on a missing journal
-                                                            // entry, so the turn fails with the typed
-                                                            // reason instead.
-                                                            cancelHeartbeat ()
-
-                                                            withSettleJournalFailure
-                                                                entry
-                                                                (sprintf
-                                                                    "The journal append was rejected: %s."
-                                                                    rejection)
-                                                                (fun () args5 pipe5 ->
-                                                                    loop
-                                                                        {
-                                                                            args5 with
-                                                                                State = SessionState.Idle
-                                                                                Suspended = None
-                                                                        }
-                                                                        pipe5)
-                                                                suspendWith
-                                                                args4
-                                                                pipe4
-                                                        | JournalWriter.JournalFailed failure ->
-                                                            cancelHeartbeat ()
-
-                                                            withSettleJournalFailure
-                                                                entry
-                                                                failure
-                                                                (fun () args5 pipe5 ->
-                                                                    loop
-                                                                        {
-                                                                            args5 with
-                                                                                State = SessionState.Idle
-                                                                                Suspended = None
-                                                                        }
-                                                                        pipe5)
-                                                                suspendWith
-                                                                args4
-                                                                pipe4)
-                                                    suspendWith
-                                                    args3
-                                                    pipe3)
-                                        suspendWith
-                                        args2
-                                        pipe2
-                                | _ ->
-                                    // Settled, or suspended after a stop won: the
-                                    // stop settles Aborted with no suspend event
-                                    // journaled and nothing parked for a Reply. The
-                                    // settling id resolves completion-carried, then
-                                    // turn-cell, then snapshot, else the terminal
-                                    // journals nothing.
-                                    withSettlingTurnId
-                                        completion.TurnId
-                                        (fun settling args3 pipe3 ->
-                                            // End the finishing attempt's heartbeat before
-                                            // settling: a drained following turn starts its
-                                            // own heartbeat after this cancel.
+                            match completion.Suspension, stop with
+                            | Some cursor, None ->
+                                // Execution-owned WaitingForInput (issue 377):
+                                // fenced under the captured claim. A rejection
+                                // means a takeover winner owns the turn: zero
+                                // effects, no park, no journal.
+                                withUpdateStateUnderClaim
+                                    entry
+                                    SessionState.WaitingForInput
+                                    (fun landed args3 pipe3 ->
+                                        if not landed then
                                             cancelHeartbeat ()
+                                            runningTurnId <- None
+                                            loop { args3 with Suspended = None } pipe3
+                                        else
+                                            withJournalSuspend
+                                                cursor
+                                                (fun journalOutcome args4 pipe4 ->
+                                                    match journalOutcome with
+                                                    | JournalWriter.JournalAppended _ ->
+                                                        let timeoutCts = new CancellationTokenSource()
 
-                                            settleEntryNowChain
-                                                entry
-                                                carried
-                                                settling
-                                                (fun next args4 pipe4 ->
-                                                    loop
-                                                        {
-                                                            args4 with
-                                                                State = next
-                                                                Suspended = None
-                                                        }
-                                                        pipe4)
+                                                        let carriedAllowed =
+                                                            if isNull (box allowed) then
+                                                                HashSet<string>()
+                                                            else
+                                                                allowed
+
+                                                        // No running attempt remains once parked:
+                                                        // the parked turn id carries the settle
+                                                        // identity from here on.
+                                                        runningTurnId <- None
+
+                                                        withSettlingTurnId
+                                                            completion.TurnId
+                                                            (fun settlingId args5 pipe5 ->
+                                                                let parked =
+                                                                    {
+                                                                        Entry = entry
+                                                                        TurnId =
+                                                                            match settlingId with
+                                                                            | Some live -> live
+                                                                            | None -> Unchecked.defaultof<TurnId>
+                                                                        Cursor = Some cursor
+                                                                        Rebuilt = None
+                                                                        Allowed = carriedAllowed
+                                                                        Attempt = attempt
+                                                                        TimeoutCts = timeoutCts
+                                                                    }
+
+                                                                armTimeout cursor.RequestId timeoutCts
+
+                                                                loop
+                                                                    { args5 with
+                                                                        State = SessionState.WaitingForInput
+                                                                        Suspended = Some parked
+                                                                    }
+                                                                    pipe5)
+                                                            suspendWith
+                                                            args4
+                                                            pipe4
+                                                    | JournalWriter.JournalRejected rejection ->
+                                                        // The suspend event never landed: parking
+                                                        // would strand the turn on a missing journal
+                                                        // entry, so the turn fails with the typed
+                                                        // reason instead.
+                                                        cancelHeartbeat ()
+
+                                                        withSettleJournalFailure
+                                                            entry
+                                                            (sprintf "The journal append was rejected: %s." rejection)
+                                                            (fun () args5 pipe5 ->
+                                                                loop
+                                                                    { args5 with
+                                                                        State = SessionState.Idle
+                                                                        Suspended = None
+                                                                    }
+                                                                    pipe5)
+                                                            suspendWith
+                                                            args4
+                                                            pipe4
+                                                    | JournalWriter.JournalFailed failure ->
+                                                        cancelHeartbeat ()
+
+                                                        withSettleJournalFailure
+                                                            entry
+                                                            failure
+                                                            (fun () args5 pipe5 ->
+                                                                loop
+                                                                    { args5 with
+                                                                        State = SessionState.Idle
+                                                                        Suspended = None
+                                                                    }
+                                                                    pipe5)
+                                                            suspendWith
+                                                            args4
+                                                            pipe4)
                                                 suspendWith
                                                 args3
                                                 pipe3)
-                                        suspendWith
-                                        args2
-                                        pipe2)
-                            suspendWith
-                            args
-                            pipe
-                    | SessionState.WaitingForInput, Some parked when parked.Cursor.IsNone && parked.Rebuilt.IsSome ->
-                        // Crash-retry path should never produce a running
-                        // finish while still parked; ignore stale completions.
-                        loop args pipe
-                    | _ -> loop args pipe
-                | SuspendableFaulted(entry, error, _, faultTurnId) ->
-                    match args.State, args.Suspended with
-                    | SessionState.Running, None when
-                        controlReports.ContainsKey entry.Position
-                        && (let _, _, id = controlReports[entry.Position] in completedControlReports.Contains id)
-                        ->
-                        loop args pipe
-                    | SessionState.Running, None ->
-                        withDurableStop
-                            (fun durableOpt args2 pipe2 ->
-                                // A recorded stop wins even over a real fault:
-                                // settle Aborted under the cause instead of failing
-                                // silently. The cell clears on every fault settle.
-                                let stop = durableOpt |> Option.orElse pendingStop
-
-                                // The fault's settling id (issue 289): the
-                                // message-carried id, then the turn cell, then the
-                                // snapshot; None (fault before any mint) journals
-                                // nothing while the settle effects run unchanged.
-                                let resolveSettling (cont: TurnId option -> SuspendCont) : SuspendCont =
-                                    fun argsX pipeX ->
-                                        match faultTurnId with
-                                        | Some _ as resolved -> cont resolved argsX pipeX
-                                        | None ->
-                                            match runningTurnId with
-                                            | Some _ as resolved -> cont resolved argsX pipeX
-                                            | None ->
-                                                withCurrentTurnSnapshot
-                                                    (fun snapshot argsY pipeY -> cont snapshot argsY pipeY)
-                                                    suspendWith
-                                                    argsX
-                                                    pipeX
-
-                                resolveSettling
+                                    suspendWith
+                                    args2
+                                    pipe2
+                            | _ ->
+                                // Settled, or suspended after a stop won: the
+                                // stop settles Aborted with no suspend event
+                                // journaled and nothing parked for a Reply. The
+                                // settling id resolves completion-carried, then
+                                // turn-cell, then snapshot, else the terminal
+                                // journals nothing.
+                                withSettlingTurnId
+                                    completion.TurnId
                                     (fun settling args3 pipe3 ->
-                                        let candidate =
-                                            match stop with
-                                            | Some(cause, reason) -> abortedSuspendResult cause reason
-                                            | None ->
-                                                {
-                                                    AssistantText = ""
-                                                    Status = TurnStatus.Failed
-                                                    Iterations = 0
-                                                    Usage = { InputTokens = 0L; OutputTokens = 0L }
-                                                    Outcome =
-                                                        TurnFailed(ProviderFailureReason.formatFault error)
-                                                        :> TurnOutcome
-                                                }
+                                        // End the finishing attempt's heartbeat before
+                                        // settling: a drained following turn starts its
+                                        // own heartbeat after this cancel.
+                                        cancelHeartbeat ()
 
-                                        withDecideControl
+                                        settleEntryNowChain
                                             entry
-                                            candidate
-                                            (fun selected args4 pipe4 ->
-                                                withTrySettleSuspendable
-                                                    entry
-                                                    selected
-                                                    settling
-                                                    (fun outcomeOpt args5 pipe5 ->
-                                                        let positions =
-                                                            [| entry.Position |] :> IReadOnlyList<int64>
-
-                                                        match outcomeOpt with
-                                                        | Some outcome when
-                                                            outcome.Status = SessionSettlementStatus.Applied
-                                                            ->
-                                                            // Committed winner (issue 363): the atomic
-                                                            // boundary already consumed the entry, chose the
-                                                            // lifecycle disposition and the queued candidate,
-                                                            // enqueued the completion under the stable key,
-                                                            // and released the prime at quiescence. Publish
-                                                            // only this winner: observe once, journal the
-                                                            // terminal event best-effort, then drain the
-                                                            // authoritative following entry or rest at
-                                                            // quiescence. No unfenced execution cleanup runs
-                                                            // here.
-                                                            pendingStop <- None
-                                                            runningTurnId <- None
-                                                            cancelHeartbeat ()
-                                                            notifySettled selected
-                                                            notifyPosition entry.Position
-
-                                                            let afterJournal args6 pipe6 =
-                                                                withRetireControl
-                                                                    entry
-                                                                    (fun () args7 pipe7 ->
-                                                                        if outcome.State = SessionState.Closed then
-                                                                            pendingAgent <- None
-
-                                                                            loop
-                                                                                {
-                                                                                    args7 with
-                                                                                        State = SessionState.Closed
-                                                                                        Suspended = None
-                                                                                }
-                                                                                pipe7
-                                                                        elif outcome.State = SessionState.Running then
-                                                                            match outcome.Following with
-                                                                            | null ->
-                                                                                withTryApplyPendingWhenIdle
-                                                                                    (fun () args8 pipe8 ->
-                                                                                        loop
-                                                                                            {
-                                                                                                args8 with
-                                                                                                    State =
-                                                                                                        SessionState.Idle
-                                                                                                    Suspended = None
-                                                                                            }
-                                                                                            pipe8)
-                                                                                    suspendWith
-                                                                                    args7
-                                                                                    pipe7
-                                                                            | following ->
-                                                                                withDrainSettledFollowing
-                                                                                    following
-                                                                                    (fun next args8 pipe8 ->
-                                                                                        loop
-                                                                                            {
-                                                                                                args8 with
-                                                                                                    State = next
-                                                                                                    Suspended = None
-                                                                                            }
-                                                                                            pipe8)
-                                                                                    suspendWith
-                                                                                    args7
-                                                                                    pipe7
-                                                                        else
-                                                                            // The faulted entry is consumed and the
-                                                                            // lifecycle write already landed in the
-                                                                            // atomic boundary: an empty inbox is
-                                                                            // quiescent, so a recorded rebind applies
-                                                                            // here; entries remaining were drained above.
-                                                                            withTryApplyPendingWhenIdle
-                                                                                (fun () args8 pipe8 ->
-                                                                                    loop
-                                                                                        {
-                                                                                            args8 with
-                                                                                                State =
-                                                                                                    SessionState.Idle
-                                                                                                Suspended = None
-                                                                                        }
-                                                                                        pipe8)
-                                                                                suspendWith
-                                                                                args7
-                                                                                pipe7)
-                                                                    suspendWith
-                                                                    args6
-                                                                    pipe6
-
-                                                            match settling with
-                                                            | Some tid ->
-                                                                withJournalSettledCompletion
-                                                                    tid
-                                                                    selected
-                                                                    (fun () args6 pipe6 ->
-                                                                        afterJournal args6 pipe6)
-                                                                    suspendWith
-                                                                    args5
-                                                                    pipe5
-                                                            | None -> afterJournal args5 pipe5
-                                                        | Some outcome when
-                                                            outcome.Status = SessionSettlementStatus.AlreadyApplied
-                                                            ->
-                                                            // Identical retry already committed: suppress
-                                                            // every duplicate effect and honor the recorded
-                                                            // disposition as the loop state only.
-                                                            pendingStop <- None
-                                                            runningTurnId <- None
-                                                            cancelHeartbeat ()
-
-                                                            if outcome.State = SessionState.Closed then
-                                                                pendingAgent <- None
-
-                                                                loop
-                                                                    {
-                                                                        args5 with
-                                                                            State = SessionState.Closed
-                                                                            Suspended = None
-                                                                    }
-                                                                    pipe5
-                                                            elif outcome.State = SessionState.Running then
-                                                                loop
-                                                                    {
-                                                                        args5 with
-                                                                            State = SessionState.Running
-                                                                            Suspended = None
-                                                                    }
-                                                                    pipe5
-                                                            else
-                                                                loop
-                                                                    {
-                                                                        args5 with
-                                                                            State = SessionState.Idle
-                                                                            Suspended = None
-                                                                    }
-                                                                    pipe5
-                                                        | Some _ ->
-                                                            // Rejected: a takeover winner owns the turn now.
-                                                            // Zero effects from this loser.
-                                                            runningTurnId <- None
-                                                            cancelHeartbeat ()
-                                                            loop { args5 with Suspended = None } pipe5
-                                                        | None ->
-                                                            // No capability or claim (unclaimed test shells)
-                                                            // or a faulted settlement call: the legacy
-                                                            // store-first path below.
-                                                            startPipedWaitUnit
-                                                                starter
-                                                                (fun () ->
-                                                                        props.Store.MarkInboxConsumed(
-                                                                            props.Tenant,
-                                                                            props.SessionId,
-                                                                            positions,
-                                                                            CancellationToken.None
-                                                                        ))
-                                                                "faulted/consume"
-                                                                (fun args6 pipe6 -> function
-                                                                    | Error error -> raise error
-                                                                    | Ok () ->
-                                                                        let args6c =
-                                                                            {
-                                                                                args6 with
-                                                                                    PendingCount =
-                                                                                        max
-                                                                                            0
-                                                                                            (args6.PendingCount - 1)
-                                                                            }
-
-                                                                        pendingStop <- None
-                                                                        runningTurnId <- None
-                                                                        cancelHeartbeat ()
-                                                                        notifySettled selected
-                                                                        notifyPosition entry.Position
-
-                                                                        withDispatchCompletion
-                                                                            starter
-                                                                            props
-                                                                            selected
-                                                                            (fun _ args7 pipe7 ->
-                                                                                let afterJournalLegacy args8 pipe8 =
-                                                                                    withRetireControl
-                                                                                        entry
-                                                                                        (fun () args9 pipe9 ->
-                                                                                            startPipedWaitUnit
-                                                                                                starter
-                                                                                                (fun () ->
-                                                                                                        props.Store.UpdateSessionState(
-                                                                                                            props.Tenant,
-                                                                                                            props.SessionId,
-                                                                                                            SessionState.Idle,
-                                                                                                            CancellationToken.None
-                                                                                                        ))
-                                                                                                "faulted/idle"
-                                                                                                (fun args10 pipe10 ->
-                                                                                                    function
-                                                                                                    | Ok () ->
-                                                                                                        withTryApplyPendingWhenIdle
-                                                                                                            (fun () args11 pipe11 ->
-                                                                                                                // The faulted entry is consumed and no turn runs:
-                                                                                                                // an empty inbox is quiescent, so a recorded rebind
-                                                                                                                // applies here; entries remaining keep it pending
-                                                                                                                // for the Idle handler.
-                                                                                                                loop
-                                                                                                                    {
-                                                                                                                        args11 with
-                                                                                                                            State =
-                                                                                                                                SessionState.Idle
-                                                                                                                            Suspended =
-                                                                                                                                None
-                                                                                                                    }
-                                                                                                                    pipe11)
-                                                                                                            suspendWith
-                                                                                                            args10
-                                                                                                            pipe10
-                                                                                                    | Error error ->
-                                                                                                        raise error)
-                                                                                                suspendWith
-                                                                                                args9
-                                                                                                pipe9)
-                                                                                        suspendWith
-                                                                                        args8
-                                                                                        pipe8
-
-                                                                                match settling with
-                                                                                | Some tid ->
-                                                                                    withJournalSettledCompletion
-                                                                                        tid
-                                                                                        selected
-                                                                                        (fun () args8 pipe8 ->
-                                                                                            afterJournalLegacy
-                                                                                                args8
-                                                                                                pipe8)
-                                                                                        suspendWith
-                                                                                        args7
-                                                                                        pipe7
-                                                                                | None ->
-                                                                                    afterJournalLegacy args7 pipe7)
-                                                                            suspendWith
-                                                                            args6c
-                                                                            pipe6)
-                                                                suspendWith
-                                                                args5
-                                                                pipe5)
-                                                    suspendWith
-                                                    args4
+                                            carried
+                                            settling
+                                            (fun next args4 pipe4 ->
+                                                loop
+                                                    { args4 with
+                                                        State = next
+                                                        Suspended = None
+                                                    }
                                                     pipe4)
                                             suspendWith
                                             args3
                                             pipe3)
+                                    suspendWith
                                     args2
                                     pipe2)
-                            suspendWith
-                            args
-                            pipe
-                    | _ -> loop args pipe
-                | ReplyEntry replyEntry ->
-                    replyInFlight <- false;
-                    withValidateRoute
-                        (fun choice args2 pipe2 ->
-                            match choice with
-                            | Choice2Of2 error ->
-                                replyRouteRefusal sender error
-                                loop args2 pipe2
-                            | Choice1Of2 () ->
-                                match args2.State, args2.Suspended with
-                                | SessionState.WaitingForInput, Some _ ->
-                                    withDurableStop
-                                        (fun stopOpt args3 pipe3 ->
-                                            match stopOpt with
-                                            | Some _ ->
-                                                sender
-                                                <! Status.Failure(
-                                                    InvalidSessionStateException(
-                                                        props.SessionId,
-                                                        "controlPending",
-                                                        "Accepted stop forbids reply consumption or resume."
-                                                    )
-                                                )
+                        suspendWith
+                        args
+                        pipe
+                | SessionState.WaitingForInput, Some parked when parked.Cursor.IsNone && parked.Rebuilt.IsSome ->
+                    // Crash-retry path should never produce a running
+                    // finish while still parked; ignore stale completions.
+                    loop args pipe
+                | _ -> loop args pipe
+            | SuspendableFaulted(entry, error, _, faultTurnId) ->
+                match args.State, args.Suspended with
+                | SessionState.Running, None when
+                    controlReports.ContainsKey entry.Position
+                    && (let _, _, id = controlReports[entry.Position] in completedControlReports.Contains id)
+                    ->
+                    loop args pipe
+                | SessionState.Running, None ->
+                    withDurableStop
+                        (fun durableOpt args2 pipe2 ->
+                            // A recorded stop wins even over a real fault:
+                            // settle Aborted under the cause instead of failing
+                            // silently. The cell clears on every fault settle.
+                            let stop = durableOpt |> Option.orElse pendingStop
 
-                                                loop args3 pipe3
-                                            | None ->
-                                                match args3.Suspended with
-                                                | Some parked ->
-                                                    let replyOpt: Reply option =
-                                                        match replyEntry.Payload with
-                                                        | :? ReplyPayload as payload when
-                                                            not (isNull (box payload))
-                                                            ->
-                                                            if isNull (box payload.Reply) then
-                                                                None
-                                                            else
-                                                                Some payload.Reply
-                                                        | _ -> None
+                            // The fault's settling id (issue 289): the
+                            // message-carried id, then the turn cell, then the
+                            // snapshot; None (fault before any mint) journals
+                            // nothing while the settle effects run unchanged.
+                            let resolveSettling (cont: TurnId option -> SuspendCont) : SuspendCont =
+                                fun argsX pipeX ->
+                                    match faultTurnId with
+                                    | Some _ as resolved -> cont resolved argsX pipeX
+                                    | None ->
+                                        match runningTurnId with
+                                        | Some _ as resolved -> cont resolved argsX pipeX
+                                        | None ->
+                                            withCurrentTurnSnapshot
+                                                (fun snapshot argsY pipeY -> cont snapshot argsY pipeY)
+                                                suspendWith
+                                                argsX
+                                                pipeX
 
-                                                    match replyOpt with
+                            resolveSettling
+                                (fun settling args3 pipe3 ->
+                                    let candidate =
+                                        match stop with
+                                        | Some(cause, reason) -> abortedSuspendResult cause reason
+                                        | None ->
+                                            {
+                                                AssistantText = ""
+                                                Status = TurnStatus.Failed
+                                                Iterations = 0
+                                                Usage = { InputTokens = 0L; OutputTokens = 0L }
+                                                Outcome =
+                                                    TurnFailed(ProviderFailureReason.formatFault error) :> TurnOutcome
+                                            }
+
+                                    withDecideControl
+                                        entry
+                                        candidate
+                                        (fun selected args4 pipe4 ->
+                                            withTrySettleSuspendable
+                                                entry
+                                                selected
+                                                settling
+                                                (fun outcomeOpt args5 pipe5 ->
+                                                    let positions = [| entry.Position |] :> IReadOnlyList<int64>
+
+                                                    match outcomeOpt with
+                                                    | Some outcome when
+                                                        outcome.Status = SessionSettlementStatus.Applied
+                                                        ->
+                                                        // Committed winner (issue 363): the atomic
+                                                        // boundary already consumed the entry, chose the
+                                                        // lifecycle disposition and the queued candidate,
+                                                        // enqueued the completion under the stable key,
+                                                        // and released the prime at quiescence. Publish
+                                                        // only this winner: observe once, journal the
+                                                        // terminal event best-effort, then drain the
+                                                        // authoritative following entry or rest at
+                                                        // quiescence. No unfenced execution cleanup runs
+                                                        // here.
+                                                        pendingStop <- None
+                                                        runningTurnId <- None
+                                                        cancelHeartbeat ()
+                                                        notifySettled selected
+                                                        notifyPosition entry.Position
+
+                                                        let afterJournal args6 pipe6 =
+                                                            withRetireControl
+                                                                entry
+                                                                (fun () args7 pipe7 ->
+                                                                    if outcome.State = SessionState.Closed then
+                                                                        pendingAgent <- None
+
+                                                                        loop
+                                                                            { args7 with
+                                                                                State = SessionState.Closed
+                                                                                Suspended = None
+                                                                            }
+                                                                            pipe7
+                                                                    elif outcome.State = SessionState.Running then
+                                                                        match outcome.Following with
+                                                                        | null ->
+                                                                            withTryApplyPendingWhenIdle
+                                                                                (fun () args8 pipe8 ->
+                                                                                    loop
+                                                                                        { args8 with
+                                                                                            State =
+                                                                                                SessionState.Idle
+                                                                                            Suspended = None
+                                                                                        }
+                                                                                        pipe8)
+                                                                                suspendWith
+                                                                                args7
+                                                                                pipe7
+                                                                        | following ->
+                                                                            withDrainSettledFollowing
+                                                                                following
+                                                                                (fun next args8 pipe8 ->
+                                                                                    loop
+                                                                                        { args8 with
+                                                                                            State = next
+                                                                                            Suspended = None
+                                                                                        }
+                                                                                        pipe8)
+                                                                                suspendWith
+                                                                                args7
+                                                                                pipe7
+                                                                    else
+                                                                        // The faulted entry is consumed and the
+                                                                        // lifecycle write already landed in the
+                                                                        // atomic boundary: an empty inbox is
+                                                                        // quiescent, so a recorded rebind applies
+                                                                        // here; entries remaining were drained above.
+                                                                        withTryApplyPendingWhenIdle
+                                                                            (fun () args8 pipe8 ->
+                                                                                loop
+                                                                                    { args8 with
+                                                                                        State = SessionState.Idle
+                                                                                        Suspended = None
+                                                                                    }
+                                                                                    pipe8)
+                                                                            suspendWith
+                                                                            args7
+                                                                            pipe7)
+                                                                suspendWith
+                                                                args6
+                                                                pipe6
+
+                                                        match settling with
+                                                        | Some tid ->
+                                                            withJournalSettledCompletion
+                                                                tid
+                                                                selected
+                                                                (fun () args6 pipe6 -> afterJournal args6 pipe6)
+                                                                suspendWith
+                                                                args5
+                                                                pipe5
+                                                        | None -> afterJournal args5 pipe5
+                                                    | Some outcome when
+                                                        outcome.Status = SessionSettlementStatus.AlreadyApplied
+                                                        ->
+                                                        // Identical retry already committed: suppress
+                                                        // every duplicate effect and honor the recorded
+                                                        // disposition as the loop state only.
+                                                        pendingStop <- None
+                                                        runningTurnId <- None
+                                                        cancelHeartbeat ()
+
+                                                        if outcome.State = SessionState.Closed then
+                                                            pendingAgent <- None
+
+                                                            loop
+                                                                { args5 with
+                                                                    State = SessionState.Closed
+                                                                    Suspended = None
+                                                                }
+                                                                pipe5
+                                                        elif outcome.State = SessionState.Running then
+                                                            loop
+                                                                { args5 with
+                                                                    State = SessionState.Running
+                                                                    Suspended = None
+                                                                }
+                                                                pipe5
+                                                        else
+                                                            loop
+                                                                { args5 with
+                                                                    State = SessionState.Idle
+                                                                    Suspended = None
+                                                                }
+                                                                pipe5
+                                                    | Some _ ->
+                                                        // Rejected: a takeover winner owns the turn now.
+                                                        // Zero effects from this loser.
+                                                        runningTurnId <- None
+                                                        cancelHeartbeat ()
+                                                        loop { args5 with Suspended = None } pipe5
                                                     | None ->
+                                                        // No capability or claim (unclaimed test shells)
+                                                        // or a faulted settlement call: the legacy
+                                                        // store-first path below.
+                                                        startPipedWaitUnit
+                                                            starter
+                                                            (fun () ->
+                                                                props.Store.MarkInboxConsumed(
+                                                                    props.Tenant,
+                                                                    props.SessionId,
+                                                                    positions,
+                                                                    CancellationToken.None
+                                                                ))
+                                                            "faulted/consume"
+                                                            (fun args6 pipe6 ->
+                                                                function
+                                                                | Error error -> raise error
+                                                                | Ok() ->
+                                                                    let args6c =
+                                                                        { args6 with
+                                                                            PendingCount =
+                                                                                max 0 (args6.PendingCount - 1)
+                                                                        }
+
+                                                                    pendingStop <- None
+                                                                    runningTurnId <- None
+                                                                    cancelHeartbeat ()
+                                                                    notifySettled selected
+                                                                    notifyPosition entry.Position
+
+                                                                    withDispatchCompletion
+                                                                        starter
+                                                                        props
+                                                                        selected
+                                                                        (fun _ args7 pipe7 ->
+                                                                            let afterJournalLegacy args8 pipe8 =
+                                                                                withRetireControl
+                                                                                    entry
+                                                                                    (fun () args9 pipe9 ->
+                                                                                        startPipedWaitUnit
+                                                                                            starter
+                                                                                            (fun () ->
+                                                                                                props
+                                                                                                    .Store
+                                                                                                    .UpdateSessionState(
+                                                                                                        props.Tenant,
+                                                                                                        props.SessionId,
+                                                                                                        SessionState.Idle,
+                                                                                                        CancellationToken.None
+                                                                                                    ))
+                                                                                            "faulted/idle"
+                                                                                            (fun args10 pipe10 ->
+                                                                                                function
+                                                                                                | Ok() ->
+                                                                                                    withTryApplyPendingWhenIdle
+                                                                                                        (fun
+                                                                                                            ()
+                                                                                                            args11
+                                                                                                            pipe11 ->
+                                                                                                            // The faulted entry is consumed and no turn runs:
+                                                                                                            // an empty inbox is quiescent, so a recorded rebind
+                                                                                                            // applies here; entries remaining keep it pending
+                                                                                                            // for the Idle handler.
+                                                                                                            loop
+                                                                                                                { args11 with
+                                                                                                                    State =
+                                                                                                                        SessionState.Idle
+                                                                                                                    Suspended =
+                                                                                                                        None
+                                                                                                                }
+                                                                                                                pipe11)
+                                                                                                        suspendWith
+                                                                                                        args10
+                                                                                                        pipe10
+                                                                                                | Error error ->
+                                                                                                    raise error)
+                                                                                            suspendWith
+                                                                                            args9
+                                                                                            pipe9)
+                                                                                    suspendWith
+                                                                                    args8
+                                                                                    pipe8
+
+                                                                            match settling with
+                                                                            | Some tid ->
+                                                                                withJournalSettledCompletion
+                                                                                    tid
+                                                                                    selected
+                                                                                    (fun () args8 pipe8 ->
+                                                                                        afterJournalLegacy
+                                                                                            args8
+                                                                                            pipe8)
+                                                                                    suspendWith
+                                                                                    args7
+                                                                                    pipe7
+                                                                            | None ->
+                                                                                afterJournalLegacy args7 pipe7)
+                                                                        suspendWith
+                                                                        args6c
+                                                                        pipe6)
+                                                            suspendWith
+                                                            args5
+                                                            pipe5)
+                                                suspendWith
+                                                args4
+                                                pipe4)
+                                        suspendWith
+                                        args3
+                                        pipe3)
+                                args2
+                                pipe2)
+                        suspendWith
+                        args
+                        pipe
+                | _ -> loop args pipe
+            | ReplyEntry replyEntry ->
+                replyInFlight <- false
+
+                withValidateRoute
+                    (fun choice args2 pipe2 ->
+                        match choice with
+                        | Choice2Of2 error ->
+                            replyRouteRefusal sender error
+                            loop args2 pipe2
+                        | Choice1Of2() ->
+                            match args2.State, args2.Suspended with
+                            | SessionState.WaitingForInput, Some _ ->
+                                withDurableStop
+                                    (fun stopOpt args3 pipe3 ->
+                                        match stopOpt with
+                                        | Some _ ->
+                                            sender
+                                            <! Status.Failure(
+                                                InvalidSessionStateException(
+                                                    props.SessionId,
+                                                    "controlPending",
+                                                    "Accepted stop forbids reply consumption or resume."
+                                                )
+                                            )
+
+                                            loop args3 pipe3
+                                        | None ->
+                                            match args3.Suspended with
+                                            | Some parked ->
+                                                let replyOpt: Reply option =
+                                                    match replyEntry.Payload with
+                                                    | :? ReplyPayload as payload when not (isNull (box payload)) ->
+                                                        if isNull (box payload.Reply) then
+                                                            None
+                                                        else
+                                                            Some payload.Reply
+                                                    | _ -> None
+
+                                                match replyOpt with
+                                                | None ->
+                                                    let error =
+                                                        ReplyMismatchException(
+                                                            props.SessionId,
+                                                            "",
+                                                            "The reply carried no answer for the pending request."
+                                                        )
+
+                                                    sender <! ReplyRejected error
+                                                    loop args3 pipe3
+                                                | Some reply ->
+                                                    let requestOpt = replyRequestId reply
+
+                                                    let expectedOpt: string option =
+                                                        match parked.Cursor with
+                                                        | Some cursor -> Some cursor.RequestId
+                                                        | None ->
+                                                            match parked.Rebuilt with
+                                                            | Some rebuilt -> Some rebuilt.RequestId
+                                                            | None -> None
+
+                                                    match requestOpt, expectedOpt with
+                                                    | Some requestId, Some expected when
+                                                        String.Equals(requestId, expected, StringComparison.Ordinal)
+                                                        ->
+                                                        if args3.Resolved.Contains(requestId) then
+                                                            let error =
+                                                                ReplyMismatchException(
+                                                                    props.SessionId,
+                                                                    requestId,
+                                                                    "The reply answers an already-resolved request."
+                                                                )
+
+                                                            sender <! ReplyRejected error
+                                                            loop args3 pipe3
+                                                        else
+                                                            try
+                                                                parked.TimeoutCts.Cancel()
+                                                            with _ ->
+                                                                ()
+
+                                                            let positions =
+                                                                [| replyEntry.Position |] :> IReadOnlyList<int64>
+
+                                                            // Reply consumption (issue 377): fenced
+                                                            // under the parked claim. A rejection
+                                                            // means a takeover winner owns the turn:
+                                                            // zero effects, host retries.
+                                                            withConsumeUnderClaim
+                                                                parked.Entry
+                                                                positions
+                                                                (fun consumed args4 pipe4 ->
+                                                                    if not consumed then
+                                                                        let error =
+                                                                            ReplyMismatchException(
+                                                                                props.SessionId,
+                                                                                requestId,
+                                                                                "The reply arrived after a takeover and was not consumed."
+                                                                            )
+
+                                                                        sender <! ReplyRejected error
+                                                                        loop args4 pipe4
+                                                                    else
+                                                                        let args4c =
+                                                                            { args4 with
+                                                                                PendingCount =
+                                                                                    max 0 (args4.PendingCount - 1)
+                                                                            }
+
+                                                                        withJournalResolve
+                                                                            reply
+                                                                            (fun journalOutcome args5 pipe5 ->
+                                                                                match journalOutcome with
+                                                                                | JournalWriter.JournalAppended _ ->
+                                                                                    args5.Resolved.Add(requestId)
+                                                                                    |> ignore
+
+                                                                                    let cursorTool =
+                                                                                        match parked.Cursor with
+                                                                                        | Some cursor ->
+                                                                                            cursor.ToolName
+                                                                                        | None -> ""
+
+                                                                                    let rebuiltTool =
+                                                                                        match parked.Rebuilt with
+                                                                                        | Some rebuilt ->
+                                                                                            rebuilt.ToolName
+                                                                                        | None -> ""
+
+                                                                                    // Resume Running plus grant
+                                                                                    // (issue 377): fenced under the
+                                                                                    // parked claim with a single
+                                                                                    // branch. A rejection after a
+                                                                                    // landed consume and journal keeps
+                                                                                    // those pre-takeover commits and
+                                                                                    // stops without resuming.
+                                                                                    withResumeFencedWrites
+                                                                                        parked.Entry
+                                                                                        parked.Allowed
+                                                                                        cursorTool
+                                                                                        rebuiltTool
+                                                                                        reply
+                                                                                        (fun resumed args6 pipe6 ->
+                                                                                            if not resumed then
+                                                                                                cancelHeartbeat ()
+
+                                                                                                loop
+                                                                                                    { args6 with
+                                                                                                        Suspended =
+                                                                                                            args6.Suspended
+                                                                                                    }
+                                                                                                    pipe6
+                                                                                            else
+                                                                                                sender
+                                                                                                <! ReplyAccepted
+                                                                                                    replyEntry
+
+                                                                                                let nextAttempt =
+                                                                                                    parked.Attempt
+                                                                                                    + 1
+
+                                                                                                match
+                                                                                                    parked.Cursor
+                                                                                                with
+                                                                                                | Some _ ->
+                                                                                                    if
+                                                                                                        args6.Closing
+                                                                                                        <> []
+                                                                                                    then
+                                                                                                        // A requested close owns the session now:
+                                                                                                        // the consumed reply still acks Accepted,
+                                                                                                        // but no resumed turn starts into the close.
+                                                                                                        sender
+                                                                                                        <! ReplyAccepted
+                                                                                                            replyEntry
+
+                                                                                                        loop
+                                                                                                            args6
+                                                                                                            pipe6
+                                                                                                    else
+                                                                                                        withResumeSuspendable
+                                                                                                            parked
+                                                                                                            reply
+                                                                                                            nextAttempt
+                                                                                                            (fun
+                                                                                                                ()
+                                                                                                                args7
+                                                                                                                pipe7 ->
+                                                                                                                loop
+                                                                                                                    { args7 with
+                                                                                                                        State =
+                                                                                                                            SessionState.Running
+                                                                                                                        Suspended =
+                                                                                                                            None
+                                                                                                                    }
+                                                                                                                    pipe7)
+                                                                                                            suspendWith
+                                                                                                            args6
+                                                                                                            pipe6
+                                                                                                | None ->
+                                                                                                    if
+                                                                                                        args6.Closing
+                                                                                                        <> []
+                                                                                                    then
+                                                                                                        sender
+                                                                                                        <! ReplyAccepted
+                                                                                                            replyEntry
+
+                                                                                                        loop
+                                                                                                            args6
+                                                                                                            pipe6
+                                                                                                    else
+                                                                                                        withStartSuspendable
+                                                                                                            parked.Entry
+                                                                                                            nextAttempt
+                                                                                                            parked.Allowed
+                                                                                                            None
+                                                                                                            (fun
+                                                                                                                ()
+                                                                                                                args8
+                                                                                                                pipe8 ->
+                                                                                                                loop
+                                                                                                                    { args8 with
+                                                                                                                        State =
+                                                                                                                            SessionState.Running
+                                                                                                                        Suspended =
+                                                                                                                            None
+                                                                                                                    }
+                                                                                                                    pipe8)
+                                                                                                            (fun
+                                                                                                                error
+                                                                                                                _
+                                                                                                                _ ->
+                                                                                                                raise
+                                                                                                                    error)
+                                                                                                            suspendWith
+                                                                                                            args6
+                                                                                                            pipe6)
+                                                                                        suspendWith
+                                                                                        args5
+                                                                                        pipe5
+                                                                                | JournalWriter.JournalRejected rejection ->
+                                                                                    // The resolve event never landed: resuming
+                                                                                    // would strand the turn on a missing
+                                                                                    // journal entry, so the turn fails with
+                                                                                    // the typed reason instead. The reply
+                                                                                    // matched and is consumed, so it still
+                                                                                    // acks Accepted, and the request id is
+                                                                                    // recorded so a redelivery replays
+                                                                                    // Accepted instead of ReplyMismatch.
+                                                                                    args5.Resolved.Add(requestId)
+                                                                                    |> ignore
+
+                                                                                    withSettleJournalFailure
+                                                                                        parked.Entry
+                                                                                        (sprintf
+                                                                                            "The journal append was rejected: %s."
+                                                                                            rejection)
+                                                                                        (fun () args6 pipe6 ->
+                                                                                            sender
+                                                                                            <! ReplyAccepted
+                                                                                                replyEntry
+
+                                                                                            loop
+                                                                                                { args6 with
+                                                                                                    State =
+                                                                                                        SessionState.Idle
+                                                                                                    Suspended =
+                                                                                                        None
+                                                                                                }
+                                                                                                pipe6)
+                                                                                        suspendWith
+                                                                                        args5
+                                                                                        pipe5
+                                                                                | JournalWriter.JournalFailed failure ->
+                                                                                    args5.Resolved.Add(requestId)
+                                                                                    |> ignore
+
+                                                                                    withSettleJournalFailure
+                                                                                        parked.Entry
+                                                                                        failure
+                                                                                        (fun () args6 pipe6 ->
+                                                                                            sender
+                                                                                            <! ReplyAccepted
+                                                                                                replyEntry
+
+                                                                                            loop
+                                                                                                { args6 with
+                                                                                                    State =
+                                                                                                        SessionState.Idle
+                                                                                                    Suspended =
+                                                                                                        None
+                                                                                                }
+                                                                                                pipe6)
+                                                                                        suspendWith
+                                                                                        args5
+                                                                                        pipe5)
+                                                                            suspendWith
+                                                                            args4c
+                                                                            pipe4)
+                                                                suspendWith
+                                                                args3
+                                                                pipe3
+                                                    | Some requestId, _ ->
+                                                        let error =
+                                                            ReplyMismatchException(
+                                                                props.SessionId,
+                                                                requestId,
+                                                                "The reply answered no pending request."
+                                                            )
+
+                                                        sender <! ReplyRejected error
+                                                        loop args3 pipe3
+                                                    | None, _ ->
                                                         let error =
                                                             ReplyMismatchException(
                                                                 props.SessionId,
@@ -9367,682 +9720,391 @@ module internal SessionActor =
 
                                                         sender <! ReplyRejected error
                                                         loop args3 pipe3
-                                                    | Some reply ->
-                                                        let requestOpt = replyRequestId reply
+                                            | None ->
+                                                let error =
+                                                    ReplyMismatchException(
+                                                        props.SessionId,
+                                                        "",
+                                                        "The session has no pending request for the reply."
+                                                    )
 
-                                                        let expectedOpt: string option =
-                                                            match parked.Cursor with
-                                                            | Some cursor -> Some cursor.RequestId
-                                                            | None ->
-                                                                match parked.Rebuilt with
-                                                                | Some rebuilt -> Some rebuilt.RequestId
-                                                                | None -> None
+                                                sender <! ReplyRejected error
+                                                loop args3 pipe3)
+                                    suspendWith
+                                    args2
+                                    pipe2
+                            | _ ->
+                                let requestId: string =
+                                    match replyEntry.Payload with
+                                    | :? ReplyPayload as payload when not (isNull (box payload)) ->
+                                        match replyRequestId payload.Reply with
+                                        | Some id -> id
+                                        | None -> ""
+                                    | _ -> ""
 
-                                                        match requestOpt, expectedOpt with
-                                                        | Some requestId, Some expected when
-                                                            String.Equals(
-                                                                requestId,
-                                                                expected,
-                                                                StringComparison.Ordinal
-                                                            )
-                                                            ->
-                                                            if args3.Resolved.Contains(requestId) then
-                                                                let error =
-                                                                    ReplyMismatchException(
-                                                                        props.SessionId,
-                                                                        requestId,
-                                                                        "The reply answers an already-resolved request."
-                                                                    )
+                                let error =
+                                    ReplyMismatchException(
+                                        props.SessionId,
+                                        requestId,
+                                        "The session has no pending request for the reply."
+                                    )
 
-                                                                sender <! ReplyRejected error
-                                                                loop args3 pipe3
-                                                            else
-                                                                try
-                                                                    parked.TimeoutCts.Cancel()
-                                                                with _ ->
-                                                                    ()
+                                sender <! ReplyRejected error
+                                loop args2 pipe2)
+                    suspendWith
+                    args
+                    pipe
+            | SuspendTimedOut requestId ->
+                match args.State, args.Suspended with
+                | SessionState.WaitingForInput, Some parked ->
+                    let expectedOpt: string option =
+                        match parked.Cursor with
+                        | Some cursor -> Some cursor.RequestId
+                        | None ->
+                            match parked.Rebuilt with
+                            | Some rebuilt -> Some rebuilt.RequestId
+                            | None -> None
 
-                                                                let positions =
-                                                                    [| replyEntry.Position |] :> IReadOnlyList<int64>
+                    match expectedOpt with
+                    | Some expected when String.Equals(requestId, expected, StringComparison.Ordinal) ->
+                        try
+                            parked.TimeoutCts.Cancel()
+                        with _ ->
+                            ()
 
-                                                                // Reply consumption (issue 377): fenced
-                                                                // under the parked claim. A rejection
-                                                                // means a takeover winner owns the turn:
-                                                                // zero effects, host retries.
-                                                                withConsumeUnderClaim
-                                                                    parked.Entry
-                                                                    positions
-                                                                    (fun consumed args4 pipe4 ->
-                                                                        if not consumed then
-                                                                            let error =
-                                                                                ReplyMismatchException(
-                                                                                    props.SessionId,
-                                                                                    requestId,
-                                                                                    "The reply arrived after a takeover and was not consumed."
-                                                                                )
+                        let positions = [| parked.Entry.Position |] :> IReadOnlyList<int64>
 
-                                                                            sender <! ReplyRejected error
-                                                                            loop args4 pipe4
-                                                                        else
-                                                                            let args4c =
-                                                                                {
-                                                                                    args4 with
-                                                                                        PendingCount =
-                                                                                            max
-                                                                                                0
-                                                                                                (args4.PendingCount
-                                                                                                - 1)
-                                                                                }
+                        withDecideControl
+                            parked.Entry
+                            (timeoutResult ())
+                            (fun decided args2 pipe2 ->
+                                // The timeout settled the turn Failed: a
+                                // recorded stop loses to the settlement.
+                                pendingStop <- None
 
-                                                                            withJournalResolve
-                                                                                reply
-                                                                                (fun journalOutcome args5 pipe5 ->
-                                                                                    match journalOutcome with
-                                                                                    | JournalWriter.JournalAppended _ ->
-                                                                                        args5.Resolved.Add(requestId)
-                                                                                        |> ignore
-
-                                                                                        let cursorTool =
-                                                                                            match parked.Cursor with
-                                                                                            | Some cursor ->
-                                                                                                cursor.ToolName
-                                                                                            | None -> ""
-
-                                                                                        let rebuiltTool =
-                                                                                            match parked.Rebuilt with
-                                                                                            | Some rebuilt ->
-                                                                                                rebuilt.ToolName
-                                                                                            | None -> ""
-
-                                                                                        // Resume Running plus grant
-                                                                                        // (issue 377): fenced under the
-                                                                                        // parked claim with a single
-                                                                                        // branch. A rejection after a
-                                                                                        // landed consume and journal keeps
-                                                                                        // those pre-takeover commits and
-                                                                                        // stops without resuming.
-                                                                                        withResumeFencedWrites
-                                                                                            parked.Entry
-                                                                                            parked.Allowed
-                                                                                            cursorTool
-                                                                                            rebuiltTool
-                                                                                            reply
-                                                                                            (fun resumed args6 pipe6 ->
-                                                                                                if not resumed then
-                                                                                                    cancelHeartbeat ()
-
-                                                                                                    loop
-                                                                                                        {
-                                                                                                            args6 with
-                                                                                                                Suspended =
-                                                                                                                    args6.Suspended
-                                                                                                        }
-                                                                                                        pipe6
-                                                                                                else
-                                                                                                    sender
-                                                                                                    <! ReplyAccepted
-                                                                                                        replyEntry
-
-                                                                                                    let nextAttempt =
-                                                                                                        parked.Attempt
-                                                                                                        + 1
-
-                                                                                                    match parked.Cursor with
-                                                                                                    | Some _ ->
-                                                                                                        if
-                                                                                                            args6.Closing
-                                                                                                            <> []
-                                                                                                        then
-                                                                                                            // A requested close owns the session now:
-                                                                                                            // the consumed reply still acks Accepted,
-                                                                                                            // but no resumed turn starts into the close.
-                                                                                                            sender
-                                                                                                            <! ReplyAccepted
-                                                                                                                replyEntry
-
-                                                                                                            loop
-                                                                                                                args6
-                                                                                                                pipe6
-                                                                                                        else
-                                                                                                            withResumeSuspendable
-                                                                                                                parked
-                                                                                                                reply
-                                                                                                                nextAttempt
-                                                                                                                (fun () args7 pipe7 ->
-                                                                                                                    loop
-                                                                                                                        {
-                                                                                                                            args7 with
-                                                                                                                                State =
-                                                                                                                                    SessionState.Running
-                                                                                                                                Suspended =
-                                                                                                                                    None
-                                                                                                                        }
-                                                                                                                        pipe7)
-                                                                                                                suspendWith
-                                                                                                                args6
-                                                                                                                pipe6
-                                                                                                    | None ->
-                                                                                                        if
-                                                                                                            args6.Closing
-                                                                                                            <> []
-                                                                                                        then
-                                                                                                            sender
-                                                                                                            <! ReplyAccepted
-                                                                                                                replyEntry
-
-                                                                                                            loop
-                                                                                                                args6
-                                                                                                                pipe6
-                                                                                                        else
-                                                                                                            withStartSuspendable
-                                                                                                                parked.Entry
-                                                                                                                nextAttempt
-                                                                                                                parked.Allowed
-                                                                                                                None
-                                                                                                                (fun () args8 pipe8 ->
-                                                                                                                    loop
-                                                                                                                        {
-                                                                                                                            args8 with
-                                                                                                                                State =
-                                                                                                                                    SessionState.Running
-                                                                                                                                Suspended =
-                                                                                                                                    None
-                                                                                                                        }
-                                                                                                                        pipe8)
-                                                                                                                (fun error
-                                                                                                                    _
-                                                                                                                    _ ->
-                                                                                                                    raise
-                                                                                                                        error)
-                                                                                                                suspendWith
-                                                                                                                args6
-                                                                                                                pipe6)
-                                                                                            suspendWith
-                                                                                            args5
-                                                                                            pipe5
-                                                                                    | JournalWriter.JournalRejected rejection ->
-                                                                                        // The resolve event never landed: resuming
-                                                                                        // would strand the turn on a missing
-                                                                                        // journal entry, so the turn fails with
-                                                                                        // the typed reason instead. The reply
-                                                                                        // matched and is consumed, so it still
-                                                                                        // acks Accepted, and the request id is
-                                                                                        // recorded so a redelivery replays
-                                                                                        // Accepted instead of ReplyMismatch.
-                                                                                        args5.Resolved.Add(requestId)
-                                                                                        |> ignore
-
-                                                                                        withSettleJournalFailure
-                                                                                            parked.Entry
-                                                                                            (sprintf
-                                                                                                "The journal append was rejected: %s."
-                                                                                                rejection)
-                                                                                            (fun () args6 pipe6 ->
-                                                                                                sender
-                                                                                                <! ReplyAccepted
-                                                                                                    replyEntry
-
-                                                                                                loop
-                                                                                                    {
-                                                                                                        args6 with
-                                                                                                            State =
-                                                                                                                SessionState.Idle
-                                                                                                            Suspended =
-                                                                                                                None
-                                                                                                    }
-                                                                                                    pipe6)
-                                                                                            suspendWith
-                                                                                            args5
-                                                                                            pipe5
-                                                                                    | JournalWriter.JournalFailed failure ->
-                                                                                        args5.Resolved.Add(requestId)
-                                                                                        |> ignore
-
-                                                                                        withSettleJournalFailure
-                                                                                            parked.Entry
-                                                                                            failure
-                                                                                            (fun () args6 pipe6 ->
-                                                                                                sender
-                                                                                                <! ReplyAccepted
-                                                                                                    replyEntry
-
-                                                                                                loop
-                                                                                                    {
-                                                                                                        args6 with
-                                                                                                            State =
-                                                                                                                SessionState.Idle
-                                                                                                            Suspended =
-                                                                                                                None
-                                                                                                    }
-                                                                                                    pipe6)
-                                                                                            suspendWith
-                                                                                            args5
-                                                                                            pipe5)
-                                                                                suspendWith
-                                                                                args4c
-                                                                                pipe4)
-                                                                    suspendWith
-                                                                    args3
-                                                                    pipe3
-                                                        | Some requestId, _ ->
-                                                            let error =
-                                                                ReplyMismatchException(
-                                                                    props.SessionId,
-                                                                    requestId,
-                                                                    "The reply answered no pending request."
-                                                                )
-
-                                                            sender <! ReplyRejected error
-                                                            loop args3 pipe3
-                                                        | None, _ ->
-                                                            let error =
-                                                                ReplyMismatchException(
-                                                                    props.SessionId,
-                                                                    "",
-                                                                    "The reply carried no answer for the pending request."
-                                                                )
-
-                                                            sender <! ReplyRejected error
-                                                            loop args3 pipe3
-                                                | None ->
-                                                    let error =
-                                                        ReplyMismatchException(
-                                                            props.SessionId,
-                                                            "",
-                                                            "The session has no pending request for the reply."
-                                                        )
-
-                                                    sender <! ReplyRejected error
-                                                    loop args3 pipe3)
-                                        suspendWith
-                                        args2
-                                        pipe2
-                                | _ ->
-                                    let requestId: string =
-                                        match replyEntry.Payload with
-                                        | :? ReplyPayload as payload when not (isNull (box payload)) ->
-                                            match replyRequestId payload.Reply with
-                                            | Some id -> id
-                                            | None -> ""
-                                        | _ -> ""
-
-                                    let error =
-                                        ReplyMismatchException(
+                                startPipedWaitUnit
+                                    starter
+                                    (fun () ->
+                                        props.Store.MarkInboxConsumed(
+                                            props.Tenant,
                                             props.SessionId,
-                                            requestId,
-                                            "The session has no pending request for the reply."
-                                        )
+                                            positions,
+                                            CancellationToken.None
+                                        ))
+                                    "suspend-timeout/consume"
+                                    (fun args3 pipe3 ->
+                                        function
+                                        | Error error -> raise error
+                                        | Ok() ->
+                                            let args3c =
+                                                { args3 with
+                                                    PendingCount = max 0 (args3.PendingCount - 1)
+                                                }
 
-                                    sender <! ReplyRejected error
-                                    loop args2 pipe2)
+                                            withJournalTimeout
+                                                parked.TurnId
+                                                (fun () args4 pipe4 ->
+                                                    notifySettled decided
+                                                    notifyPosition parked.Entry.Position
+
+                                                    withDispatchCompletion
+                                                        starter
+                                                        props
+                                                        decided
+                                                        (fun _ args5 pipe5 ->
+                                                            withRetireControl
+                                                                parked.Entry
+                                                                (fun () args6 pipe6 ->
+                                                                    cancelHeartbeat ()
+
+                                                                    startPipedWaitUnit
+                                                                        starter
+                                                                        (fun () ->
+                                                                            props.Store.UpdateSessionState(
+                                                                                props.Tenant,
+                                                                                props.SessionId,
+                                                                                SessionState.Idle,
+                                                                                CancellationToken.None
+                                                                            ))
+                                                                        "suspend-timeout/idle"
+                                                                        (fun args7 pipe7 ->
+                                                                            function
+                                                                            | Ok() ->
+                                                                                loop
+                                                                                    { args7 with
+                                                                                        State = SessionState.Idle
+                                                                                        Suspended = None
+                                                                                    }
+                                                                                    pipe7
+                                                                            | Error error -> raise error)
+                                                                        suspendWith
+                                                                        args6
+                                                                        pipe6)
+                                                                suspendWith
+                                                                args5
+                                                                pipe5)
+                                                        suspendWith
+                                                        args4
+                                                        pipe4)
+                                                suspendWith
+                                                args3c
+                                                pipe3)
+                                    suspendWith
+                                    args2
+                                    pipe2)
+                            suspendWith
+                            args
+                            pipe
+                    | _ -> loop args pipe
+                | _ -> loop args pipe
+            | SuspendableObserveHostAbort(tenant, sessionId, turn) ->
+                if
+                    tenant = props.Tenant
+                    && sessionId = props.SessionId
+                    && runningTurnId = Some turn
+                then
+                    withDurableStop
+                        (fun stopOpt args2 pipe2 ->
+                            match stopOpt with
+                            | Some stop -> pendingStop <- Some stop
+                            | None -> ()
+
+                            loop args2 pipe2)
                         suspendWith
                         args
                         pipe
-                | SuspendTimedOut requestId ->
-                    match args.State, args.Suspended with
-                    | SessionState.WaitingForInput, Some parked ->
-                        let expectedOpt: string option =
-                            match parked.Cursor with
-                            | Some cursor -> Some cursor.RequestId
-                            | None ->
-                                match parked.Rebuilt with
-                                | Some rebuilt -> Some rebuilt.RequestId
-                                | None -> None
+                else
+                    loop args pipe
+            | SuspendableCompactSession cancellationToken ->
+                match args.State with
+                | SessionState.Closed ->
+                    sender <! CompactRejected SessionState.Closed
+                    loop args pipe
+                | SessionState.Idle ->
+                    match currentCompact with
+                    | None ->
+                        sender <! CompactNotNeeded
+                        loop args pipe
+                    | Some compact ->
+                        compactIdleNowPiped
+                            starter
+                            props
+                            compact
+                            cancellationToken
+                            (fun reply args2 pipe2 ->
+                                sender <! reply
+                                loop args2 pipe2)
+                            suspendWith
+                            args
+                            pipe
+                | SessionState.Running ->
+                    match currentCompact with
+                    | Some compact when not (isNull (box compact.Force)) ->
+                        compact.Force.Request()
+                        sender <! CompactDeferred
+                        loop args pipe
+                    | _ ->
+                        // Unconfigured: no boundary hook shares the
+                        // one-shot cell, so nothing can fire later.
+                        sender <! CompactNotNeeded
+                        loop args pipe
+                | SessionState.WaitingForInput ->
+                    // A suspended turn owns the history, so an on-demand
+                    // compact no-ops.
+                    sender <! CompactNotNeeded
+                    loop args pipe
+                | _ ->
+                    // Out-of-range stored state: stay durable but
+                    // compact nothing.
+                    sender <! CompactNotNeeded
+                    loop args pipe
+            | SuspendableSetAgent(agentId, cancellationToken) ->
+                match args.State with
+                | SessionState.Closed ->
+                    sender <! SetAgentRejected SessionState.Closed
+                    loop args pipe
+                | _ ->
+                    pendingAgent <- Some agentId
 
-                        match expectedOpt with
-                        | Some expected when String.Equals(requestId, expected, StringComparison.Ordinal) ->
-                            try
-                                parked.TimeoutCts.Cancel()
-                            with _ ->
-                                ()
+                    let afterApply args2 pipe2 =
+                        startPipedWait
+                            starter
+                            (fun () -> requireSessionAsync props.Store props.Tenant props.SessionId cancellationToken)
+                            "set-agent/read"
+                            (fun args3 pipe3 ->
+                                function
+                                | Error error -> raise error
+                                | Ok current ->
+                                    match pendingAgent with
+                                    | None -> sender <! SetAgentApplied current
+                                    | Some _ -> sender <! SetAgentPending current
 
-                            let positions = [| parked.Entry.Position |] :> IReadOnlyList<int64>
+                                    loop args3 pipe3)
+                            suspendWith
+                            args2
+                            pipe2
 
-                            withDecideControl
-                                parked.Entry
-                                (timeoutResult ())
-                                (fun decided args2 pipe2 ->
-                                    // The timeout settled the turn Failed: a
-                                    // recorded stop loses to the settlement.
-                                    pendingStop <- None
+                    if args.State = SessionState.Idle || args.State = SessionState.WaitingForInput then
+                        // No turn task runs in these states: an empty
+                        // inbox applies the rebind at once, queued
+                        // entries keep it pending. (A parked suspension
+                        // keeps its entry pending, so a Waiting session
+                        // applies at the post-resume settle boundary,
+                        // never mid-suspension: claiming there would
+                        // steal the parked entry and leak the protocol
+                        // bootstrap as a turn.)
+                        withTryApplyPendingWhenIdle (fun () args2 pipe2 -> afterApply args2 pipe2) suspendWith args pipe
+                    else
+                        afterApply args pipe
+            | SuspendableCheckInbox ->
+                withValidateRoute
+                    (fun choice args2 pipe2 ->
+                        match choice with
+                        | Choice2Of2 error ->
+                            replyRouteRefusal sender error
+                            loop args2 pipe2
+                        | Choice1Of2() ->
+                            match args2.State with
+                            | SessionState.Idle ->
+                                // The dispatch wake: the mailbox serializes this
+                                // against prompts, and the in-memory Idle re-check
+                                // above is the last word, so a wake racing a prompt
+                                // or a second wake collapses to a no-op or ordered
+                                // queueing. Never appends: only the oldest drainable
+                                // entry already stored starts, through the same
+                                // start path the Idle prompt arms use.
+                                startPipedWait
+                                    starter
+                                    (fun () ->
+                                        props.Store.ReadPendingInbox(
+                                            props.Tenant,
+                                            props.SessionId,
+                                            CancellationToken.None
+                                        ))
+                                    "check-inbox/read"
+                                    (fun args3 pipe3 ->
+                                        function
+                                        | Error(:? SessionNotFoundException) -> loop args3 pipe3
+                                        | Error error -> raise error
+                                        | Ok pending ->
+                                            let args3c =
+                                                { args3 with
+                                                    PendingCount = if isNull (box pending) then 0 else pending.Count
+                                                }
 
-                                    startPipedWaitUnit
-                                        starter
-                                        (fun () ->
-                                                props.Store.MarkInboxConsumed(
-                                                    props.Tenant,
-                                                    props.SessionId,
-                                                    positions,
-                                                    CancellationToken.None
-                                                ))
-                                        "suspend-timeout/consume"
-                                        (fun args3 pipe3 -> function
-                                            | Error error -> raise error
-                                            | Ok () ->
-                                                let args3c =
-                                                    {
-                                                        args3 with
-                                                            PendingCount = max 0 (args3.PendingCount - 1)
-                                                    }
-
-                                                withJournalTimeout
-                                                    parked.TurnId
-                                                    (fun () args4 pipe4 ->
-                                                        notifySettled decided
-                                                        notifyPosition parked.Entry.Position
-
-                                                        withDispatchCompletion
-                                                            starter
-                                                            props
-                                                            decided
-                                                            (fun _ args5 pipe5 ->
-                                                                withRetireControl
-                                                                    parked.Entry
+                                            match selectDrainableEntries pending with
+                                            | first :: _ ->
+                                                // A settled Idle child has released its prime. Claim
+                                                // the pending entry through the existing provider path,
+                                                // retaining this original envelope for the start below.
+                                                let reprimeThenStart args4 pipe4 =
+                                                    withCheckAgentAuthority
+                                                        (fun authority args5 pipe5 ->
+                                                            match authority with
+                                                            | None when
+                                                                suspend.ReprimeJournal.IsSome && controlPrime.IsNone
+                                                                ->
+                                                                loop args5 pipe5
+                                                            | None ->
+                                                                startPipedWaitUnit
+                                                                    starter
+                                                                    (fun () ->
+                                                                        props.Store.UpdateSessionState(
+                                                                            props.Tenant,
+                                                                            props.SessionId,
+                                                                            SessionState.Running,
+                                                                            CancellationToken.None
+                                                                        ))
+                                                                    "check-inbox/running"
+                                                                    (fun args6 pipe6 ->
+                                                                        function
+                                                                        | Error error -> raise error
+                                                                        | Ok() ->
+                                                                            withReadGrants
+                                                                                (fun grants args7 pipe7 ->
+                                                                                    if args7.Closing <> [] then
+                                                                                        loop args7 pipe7
+                                                                                    else
+                                                                                        withStartSuspendable
+                                                                                            first
+                                                                                            1
+                                                                                            grants
+                                                                                            None
+                                                                                            (fun () args8 pipe8 ->
+                                                                                                loop
+                                                                                                    { args8 with
+                                                                                                        State =
+                                                                                                            SessionState.Running
+                                                                                                        Suspended =
+                                                                                                            None
+                                                                                                    }
+                                                                                                    pipe8)
+                                                                                            (fun error _ _ ->
+                                                                                                raise error)
+                                                                                            suspendWith
+                                                                                            args7
+                                                                                            pipe7)
+                                                                                suspendWith
+                                                                                args6
+                                                                                pipe6)
+                                                                    suspendWith
+                                                                    args5
+                                                                    pipe5
+                                                            | Some(failure, reason) ->
+                                                                withSettleAuthorityRefusal
+                                                                    first
+                                                                    failure
+                                                                    reason
                                                                     (fun () args6 pipe6 ->
-                                                                        cancelHeartbeat ()
-
-                                                                        startPipedWaitUnit
-                                                                            starter
-                                                                            (fun () ->
-                                                                                    props.Store.UpdateSessionState(
-                                                                                        props.Tenant,
-                                                                                        props.SessionId,
-                                                                                        SessionState.Idle,
-                                                                                        CancellationToken.None
-                                                                                    ))
-                                                                            "suspend-timeout/idle"
-                                                                            (fun args7 pipe7 -> function
-                                                                                | Ok () ->
-                                                                                    loop
-                                                                                        {
-                                                                                            args7 with
-                                                                                                State =
-                                                                                                    SessionState.Idle
-                                                                                                Suspended = None
-                                                                                        }
-                                                                                        pipe7
-                                                                                | Error error -> raise error)
+                                                                        withDrainAfterRefusal
+                                                                            (fun next args7 pipe7 ->
+                                                                                loop
+                                                                                    { args7 with
+                                                                                        State = next
+                                                                                        Suspended = None
+                                                                                    }
+                                                                                    pipe7)
                                                                             suspendWith
                                                                             args6
                                                                             pipe6)
                                                                     suspendWith
                                                                     args5
                                                                     pipe5)
-                                                            suspendWith
-                                                            args4
-                                                            pipe4)
+                                                        suspendWith
+                                                        args4
+                                                        pipe4
+
+                                                withCurrentTurnSnapshot
+                                                    (fun snapshot args4 pipe4 ->
+                                                        match snapshot with
+                                                        | None when suspend.ReprimeJournal.IsSome ->
+                                                            withReprime
+                                                                (fun fresh count args5 pipe5 ->
+                                                                    let args5c =
+                                                                        match count with
+                                                                        | Some c -> { args5 with PendingCount = c }
+                                                                        | None -> args5
+
+                                                                    match fresh with
+                                                                    | Some live -> swapJournal live
+                                                                    | None -> ()
+
+                                                                    reprimeThenStart args5c pipe5)
+                                                                suspendWith
+                                                                args4
+                                                                pipe4
+                                                        | _ -> reprimeThenStart args4 pipe4)
                                                     suspendWith
                                                     args3c
-                                                    pipe3)
-                                        suspendWith
-                                        args2
-                                        pipe2)
-                                suspendWith
-                                args
-                                pipe
-                        | _ -> loop args pipe
-                    | _ -> loop args pipe
-                | SuspendableObserveHostAbort(tenant, sessionId, turn) ->
-                    if
-                        tenant = props.Tenant
-                        && sessionId = props.SessionId
-                        && runningTurnId = Some turn
-                    then
-                        withDurableStop
-                            (fun stopOpt args2 pipe2 ->
-                                match stopOpt with
-                                | Some stop -> pendingStop <- Some stop
-                                | None -> ()
-
-                                loop args2 pipe2)
-                            suspendWith
-                            args
-                            pipe
-                    else
-                        loop args pipe
-                | SuspendableCompactSession cancellationToken ->
-                    match args.State with
-                    | SessionState.Closed ->
-                        sender <! CompactRejected SessionState.Closed
-                        loop args pipe
-                    | SessionState.Idle ->
-                        match currentCompact with
-                        | None ->
-                            sender <! CompactNotNeeded
-                            loop args pipe
-                        | Some compact ->
-                            compactIdleNowPiped
-                                starter
-                                props
-                                compact
-                                cancellationToken
-                                (fun reply args2 pipe2 ->
-                                    sender <! reply
-                                    loop args2 pipe2)
-                                suspendWith
-                                args
-                                pipe
-                    | SessionState.Running ->
-                        match currentCompact with
-                        | Some compact when not (isNull (box compact.Force)) ->
-                            compact.Force.Request()
-                            sender <! CompactDeferred
-                            loop args pipe
-                        | _ ->
-                            // Unconfigured: no boundary hook shares the
-                            // one-shot cell, so nothing can fire later.
-                            sender <! CompactNotNeeded
-                            loop args pipe
-                    | SessionState.WaitingForInput ->
-                        // A suspended turn owns the history, so an on-demand
-                        // compact no-ops.
-                        sender <! CompactNotNeeded
-                        loop args pipe
-                    | _ ->
-                        // Out-of-range stored state: stay durable but
-                        // compact nothing.
-                        sender <! CompactNotNeeded
-                        loop args pipe
-                | SuspendableSetAgent(agentId, cancellationToken) ->
-                    match args.State with
-                    | SessionState.Closed ->
-                        sender <! SetAgentRejected SessionState.Closed
-                        loop args pipe
-                    | _ ->
-                        pendingAgent <- Some agentId
-
-                        let afterApply args2 pipe2 =
-                            startPipedWait
-                                starter
-                                (fun () -> requireSessionAsync props.Store props.Tenant props.SessionId cancellationToken)
-                                "set-agent/read"
-                                (fun args3 pipe3 -> function
-                                    | Error error -> raise error
-                                    | Ok current ->
-                                        match pendingAgent with
-                                        | None -> sender <! SetAgentApplied current
-                                        | Some _ -> sender <! SetAgentPending current
-
-                                        loop args3 pipe3)
-                                suspendWith
-                                args2
-                                pipe2
-
-                        if args.State = SessionState.Idle || args.State = SessionState.WaitingForInput then
-                            // No turn task runs in these states: an empty
-                            // inbox applies the rebind at once, queued
-                            // entries keep it pending. (A parked suspension
-                            // keeps its entry pending, so a Waiting session
-                            // applies at the post-resume settle boundary,
-                            // never mid-suspension: claiming there would
-                            // steal the parked entry and leak the protocol
-                            // bootstrap as a turn.)
-                            withTryApplyPendingWhenIdle
-                                (fun () args2 pipe2 -> afterApply args2 pipe2)
-                                suspendWith
-                                args
-                                pipe
-                        else
-                            afterApply args pipe
-                | SuspendableCheckInbox ->
-                    withValidateRoute
-                        (fun choice args2 pipe2 ->
-                            match choice with
-                            | Choice2Of2 error ->
-                                replyRouteRefusal sender error
-                                loop args2 pipe2
-                            | Choice1Of2 () ->
-                                match args2.State with
-                                | SessionState.Idle ->
-                                    // The dispatch wake: the mailbox serializes this
-                                    // against prompts, and the in-memory Idle re-check
-                                    // above is the last word, so a wake racing a prompt
-                                    // or a second wake collapses to a no-op or ordered
-                                    // queueing. Never appends: only the oldest drainable
-                                    // entry already stored starts, through the same
-                                    // start path the Idle prompt arms use.
-                                    startPipedWait
-                                        starter
-                                        (fun () ->
-                                                props.Store.ReadPendingInbox(
-                                                    props.Tenant,
-                                                    props.SessionId,
-                                                    CancellationToken.None
-                                                ))
-                                        "check-inbox/read"
-                                        (fun args3 pipe3 -> function
-                                            | Error(:? SessionNotFoundException) -> loop args3 pipe3
-                                            | Error error -> raise error
-                                            | Ok pending ->
-                                                let args3c =
-                                                    {
-                                                        args3 with
-                                                            PendingCount =
-                                                                if isNull (box pending) then
-                                                                    0
-                                                                else
-                                                                    pending.Count
-                                                    }
-
-                                                match selectDrainableEntries pending with
-                                                | first :: _ ->
-                                                    // A settled Idle child has released its prime. Claim
-                                                    // the pending entry through the existing provider path,
-                                                    // retaining this original envelope for the start below.
-                                                    let reprimeThenStart args4 pipe4 =
-                                                        withCheckAgentAuthority
-                                                            (fun authority args5 pipe5 ->
-                                                                match authority with
-                                                                | None when
-                                                                    suspend.ReprimeJournal.IsSome
-                                                                    && controlPrime.IsNone
-                                                                    ->
-                                                                    loop args5 pipe5
-                                                                | None ->
-                                                                    startPipedWaitUnit
-                                                                        starter
-                                                                        (fun () ->
-                                                                                props.Store.UpdateSessionState(
-                                                                                    props.Tenant,
-                                                                                    props.SessionId,
-                                                                                    SessionState.Running,
-                                                                                    CancellationToken.None
-                                                                                ))
-                                                                        "check-inbox/running"
-                                                                        (fun args6 pipe6 -> function
-                                                                            | Error error -> raise error
-                                                                            | Ok () ->
-                                                                                withReadGrants
-                                                                                    (fun grants args7 pipe7 ->
-                                                                                        if args7.Closing <> [] then
-                                                                                            loop args7 pipe7
-                                                                                        else
-                                                                                            withStartSuspendable
-                                                                                                first
-                                                                                                1
-                                                                                                grants
-                                                                                                None
-                                                                                                (fun () args8 pipe8 ->
-                                                                                                    loop
-                                                                                                        {
-                                                                                                            args8 with
-                                                                                                                State =
-                                                                                                                    SessionState.Running
-                                                                                                                Suspended =
-                                                                                                                    None
-                                                                                                        }
-                                                                                                        pipe8)
-                                                                                                (fun error _ _ ->
-                                                                                                    raise error)
-                                                                                                suspendWith
-                                                                                                args7
-                                                                                                pipe7)
-                                                                                    suspendWith
-                                                                                    args6
-                                                                                    pipe6)
-                                                                        suspendWith
-                                                                        args5
-                                                                        pipe5
-                                                                | Some(failure, reason) ->
-                                                                    withSettleAuthorityRefusal
-                                                                        first
-                                                                        failure
-                                                                        reason
-                                                                        (fun () args6 pipe6 ->
-                                                                            withDrainAfterRefusal
-                                                                                (fun next args7 pipe7 ->
-                                                                                    loop
-                                                                                        {
-                                                                                            args7 with
-                                                                                                State = next
-                                                                                                Suspended = None
-                                                                                        }
-                                                                                        pipe7)
-                                                                                suspendWith
-                                                                                args6
-                                                                                pipe6)
-                                                                        suspendWith
-                                                                        args5
-                                                                        pipe5)
-                                                            suspendWith
-                                                            args4
-                                                            pipe4
-
-                                                    withCurrentTurnSnapshot
-                                                        (fun snapshot args4 pipe4 ->
-                                                            match snapshot with
-                                                            | None when suspend.ReprimeJournal.IsSome ->
-                                                                withReprime
-                                                                    (fun fresh count args5 pipe5 ->
-                                                                        let args5c =
-                                                                            match count with
-                                                                            | Some c ->
-                                                                                {
-                                                                                    args5 with
-                                                                                        PendingCount = c
-                                                                                }
-                                                                            | None -> args5
-
-                                                                        match fresh with
-                                                                        | Some live -> swapJournal live
-                                                                        | None -> ()
-
-                                                                        reprimeThenStart args5c pipe5)
-                                                                    suspendWith
-                                                                    args4
-                                                                    pipe4
-                                                            | _ -> reprimeThenStart args4 pipe4)
-                                                        suspendWith
-                                                        args3c
-                                                        pipe3
-                                                | [] -> loop args3c pipe3)
-                                        suspendWith
-                                        args2
-                                        pipe2
-                                | _ -> loop args2 pipe2)
-                        suspendWith
-                        args
-                        pipe
+                                                    pipe3
+                                            | [] -> loop args3c pipe3)
+                                    suspendWith
+                                    args2
+                                    pipe2
+                            | _ -> loop args2 pipe2)
+                    suspendWith
+                    args
+                    pipe
 
         and suspendWith (args: SuspendLoopArgs) (pipe: SuspendPipe) : Cont<SuspendableActorMessage, unit> =
             loop args pipe
@@ -10074,7 +10136,9 @@ module internal SessionActor =
                 // failed probe from failing the resume.
                 let crashSeed: IList<ChatMessage> option =
                     try
-                        match lastJournalTurnId suspend.EventStore props.Tenant props.SessionId CancellationToken.None with
+                        match
+                            lastJournalTurnId suspend.EventStore props.Tenant props.SessionId CancellationToken.None
+                        with
                         | Some interrupted ->
                             Some(
                                 rehydrateCrashHistory
@@ -10108,22 +10172,30 @@ module internal SessionActor =
             }
 
         let initialPipe: SuspendPipe =
-            { LifecyclePipe.empty () with Deferred = initialDeferred }
+            { LifecyclePipe.empty () with
+                Deferred = initialDeferred
+            }
 
         startPipedWait
             starter
             (fun () -> props.Store.ReadPendingInbox(props.Tenant, props.SessionId, CancellationToken.None))
             "seed-inbox-count"
-            (fun args2 pipe2 -> function
+            (fun args2 pipe2 ->
+                function
                 | Ok pending ->
                     loop
-                        {
-                            args2 with
-                                Seeding = false
-                                PendingCount = if isNull (box pending) then 0 else pending.Count
+                        { args2 with
+                            Seeding = false
+                            PendingCount = if isNull (box pending) then 0 else pending.Count
                         }
                         pipe2
-                | Error(:? SessionNotFoundException) -> loop { args2 with Seeding = false; PendingCount = 0 } pipe2
+                | Error(:? SessionNotFoundException) ->
+                    loop
+                        { args2 with
+                            Seeding = false
+                            PendingCount = 0
+                        }
+                        pipe2
                 | Error error -> raise error)
             suspendWith
             initialArgs
@@ -10818,11 +10890,11 @@ module internal SessionActor =
 
                             ()
 
-                        let! claimed = store.ClaimNextTurn(tenant, id, claimOwner, leaseDuration, CancellationToken.None)
+                        let! claimed =
+                            store.ClaimNextTurn(tenant, id, claimOwner, leaseDuration, CancellationToken.None)
 
                         match claimed with
-                        | :? TurnLeaseRenewed as renewed when not (isNull (box renewed)) ->
-                            return Some renewed.Claim
+                        | :? TurnLeaseRenewed as renewed when not (isNull (box renewed)) -> return Some renewed.Claim
                         | :? TurnLeaseHeld as held when not (isNull (box held)) -> return Some held.Claim
                         | :? TurnLeaseExpiring as expiring when not (isNull (box expiring)) ->
                             return Some expiring.Claim
@@ -10841,7 +10913,12 @@ module internal SessionActor =
         let checkRoute (id: SessionId) (session: Session) : unit =
             if isNull (box session.Options) then
                 raise (
-                    CompletionRoutingException(Nullable tenant, Nullable id, null, CompletionRoutingReason.UnsupportedFormat)
+                    CompletionRoutingException(
+                        Nullable tenant,
+                        Nullable id,
+                        null,
+                        CompletionRoutingReason.UnsupportedFormat
+                    )
                 )
 
             session.Options.ValidatePersistence()
@@ -10850,7 +10927,9 @@ module internal SessionActor =
             | Some registry, _ -> registry.Validate session
             | None, null -> ()
             | None, routeId ->
-                raise (CompletionRoutingException(Nullable tenant, Nullable id, routeId, CompletionRoutingReason.Unknown))
+                raise (
+                    CompletionRoutingException(Nullable tenant, Nullable id, routeId, CompletionRoutingReason.Unknown)
+                )
 
         /// Answers every message with its failure once activation proved
         /// impossible: the spawn would have thrown, so the actor exists
@@ -10893,8 +10972,7 @@ module internal SessionActor =
                     PackTimeout = fun (opId, incarnation) -> SuspendableStoreTimeout(opId, incarnation)
                 }
 
-            let rec suspendB (_: unit) (pipe: LifecyclePipe.PipeState<SuspendableActorMessage, unit>) =
-                loopB () pipe
+            let rec suspendB (_: unit) (pipe: LifecyclePipe.PipeState<SuspendableActorMessage, unit>) = loopB () pipe
 
             and loopB () (pipe: LifecyclePipe.PipeState<SuspendableActorMessage, unit>) =
                 actor {
@@ -10907,8 +10985,7 @@ module internal SessionActor =
                         | None -> return! loopB () pipe
                     | SuspendableStoreTimeout(opId, incarnation) ->
                         match LifecyclePipe.tryComplete pipe opId incarnation with
-                        | Some(outstanding, pipe') ->
-                            return! outstanding.Resume () pipe' outstanding.TimeoutOutcome
+                        | Some(outstanding, pipe') -> return! outstanding.Resume () pipe' outstanding.TimeoutOutcome
                         | None -> return! loopB () pipe
                     | SuspendableGetSnapshot when not (LifecyclePipe.isBusy pipe) ->
                         let sender = mailbox.Sender()
@@ -10918,25 +10995,28 @@ module internal SessionActor =
                                 starter
                                 (fun () -> requireSessionAsync store tenant captured CancellationToken.None)
                                 "blocked/snapshot-session"
-                                (fun () pipe2 -> function
+                                (fun () pipe2 ->
+                                    function
                                     | Error e -> raise e
                                     | Ok session ->
                                         startPipedWait
                                             starter
-                                            (fun () -> store.ReadPendingInbox(tenant, captured, CancellationToken.None))
+                                            (fun () ->
+                                                store.ReadPendingInbox(tenant, captured, CancellationToken.None))
                                             "blocked/snapshot-inbox"
-                                            (fun () pipe3 -> function
+                                            (fun () pipe3 ->
+                                                function
                                                 | Error e -> raise e
                                                 | Ok pending ->
                                                     sender
                                                     <! {
-                                                        SessionId = captured
-                                                        State = session.State
-                                                        PendingCount =
-                                                            if isNull (box pending) then 0 else pending.Count
-                                                        RunningPosition = None
-                                                        PendingRequestId = null
-                                                    }
+                                                           SessionId = captured
+                                                           State = session.State
+                                                           PendingCount =
+                                                               if isNull (box pending) then 0 else pending.Count
+                                                           RunningPosition = None
+                                                           PendingRequestId = null
+                                                       }
 
                                                     loopB () pipe3)
                                             suspendB
@@ -10968,12 +11048,10 @@ module internal SessionActor =
             let primeBranch (recovery: ControlTargetRecovery | null) : Task<ActivationOutcome> =
                 task {
                     try
-                        let! primedOpt = primeClaimTask captured
-
-                        let primed =
+                        let! primed =
                             match recovery with
-                            | null -> primedOpt
-                            | r -> r.Claim |> Option.ofObj
+                            | null -> primeClaimTask captured
+                            | r -> Task.FromResult(r.Claim |> Option.ofObj)
 
                         if primed.IsNone then
                             return
@@ -11030,8 +11108,7 @@ module internal SessionActor =
                     let! session = store.GetSession(tenant, captured, CancellationToken.None)
 
                     match session with
-                    | null ->
-                        return Failed(SessionNotFoundException(captured, "The session does not exist."))
+                    | null -> return Failed(SessionNotFoundException(captured, "The session does not exist."))
                     | s ->
                         let routeOutcome =
                             try
@@ -11214,7 +11291,8 @@ module internal SessionActor =
                 starter
                 (fun () -> chainTask)
                 "activate/chain"
-                (fun _ pipe2 -> function
+                (fun _ pipe2 ->
+                    function
                     | Error failure -> becomeFailed failure pipe2
                     | Ok outcome ->
                         match outcome with
@@ -11241,21 +11319,14 @@ module internal SessionActor =
                         spawn
                             context
                             name
-                            (behaviorWithSuspendRouted
-                                (fun () -> ())
-                                check
-                                props
-                                suspend
-                                clock
-                                heartbeatOptions
-                                []
-                                )
+                            (behaviorWithSuspendRouted (fun () -> ()) check props suspend clock heartbeatOptions [])
                     | Refused error -> spawn context name (blockedPiped error captured)
                     | Failed failure -> raise failure
                 else
                     spawn context name (activatingWithTask captured chainTask)
             else
                 spawn context name (actorOf (fun (_: obj) -> ()))
+
     let spawnSuspendFactory
         store
         tenant
