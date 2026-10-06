@@ -131,6 +131,45 @@ let ``Sessions Validate flags an invalid auto-title model`` () =
     SessionsOptions(AutoTitle = true, AutoTitleModel = "anthropic/claude-sonnet").Validate()
     |> should equal null
 
+[<Fact>]
+let ``Sessions transient bounds carry documented finite defaults`` () =
+    let options = SessionsOptions()
+    options.MaxWaitHubs |> should equal 16384
+    options.MaxSettledResultsPerHub |> should equal 8
+    options.MaxSettleWaitersPerHub |> should equal 64
+    options.MaxPositionHints |> should equal 16384
+    options.MaxPositionHintObservers |> should equal 128
+    options.MaxSyncSessionsPerClient |> should equal 2048
+    options.MaxAutoTitleSessions |> should equal 1024
+    options.WaitPollInterval |> should equal (TimeSpan.FromMilliseconds 50.0)
+    options.Validate() |> should equal null
+
+[<Fact>]
+let ``Sessions Validate flags transient bound violations`` () =
+    SessionsOptions(MaxWaitHubs = 0).Validate()
+    |> should equal "MaxWaitHubs must be at least 1."
+
+    SessionsOptions(MaxSettledResultsPerHub = 0).Validate()
+    |> should equal "MaxSettledResultsPerHub must be at least 1."
+
+    SessionsOptions(MaxSettleWaitersPerHub = 0).Validate()
+    |> should equal "MaxSettleWaitersPerHub must be at least 1."
+
+    SessionsOptions(MaxPositionHints = 0).Validate()
+    |> should equal "MaxPositionHints must be at least 1."
+
+    SessionsOptions(MaxPositionHintObservers = 0).Validate()
+    |> should equal "MaxPositionHintObservers must be at least 1."
+
+    SessionsOptions(MaxSyncSessionsPerClient = 0).Validate()
+    |> should equal "MaxSyncSessionsPerClient must be at least 1."
+
+    SessionsOptions(MaxAutoTitleSessions = 0).Validate()
+    |> should equal "MaxAutoTitleSessions must be at least 1."
+
+    SessionsOptions(WaitPollInterval = TimeSpan.Zero).Validate()
+    |> should equal "WaitPollInterval must be positive."
+
 // ──────────────────────────────────────────────────────────────────────────
 // Turns
 

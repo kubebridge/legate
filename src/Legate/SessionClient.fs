@@ -105,6 +105,10 @@ type SessionClient
             raise (ArgumentOutOfRangeException(nameof defaultBound, "The default wait bound must be positive."))
 
     let semaphores = ConcurrentDictionary<SessionId, SemaphoreSlim>()
+    let syncGate = obj ()
+    let syncUse = Dictionary<SessionId, int>()
+    let mutable maxSyncSessions = (SessionsOptions()).MaxSyncSessionsPerClient |> max 1
+    let mutable waitPollInterval = (SessionsOptions()).WaitPollInterval
     let mutable autoTitle: AutoTitleDeps option = None
     let mutable subscribeRouter: ISubscribeRouter option = None
     let mutable completionEra: CompletionEra.CompletionEraMarker option = None
@@ -203,9 +207,162 @@ type SessionClient
         and set (value: AutoTitleDeps option) = autoTitle <- value
 
     /// The per-session gate serialising concurrent prompts so Queue append
-    /// order stays deterministic.
+    /// order stays deterministic. Acquiring pairs with
+    /// <see cref="M:Legate.SessionClient.ReleaseSlot(Legate.SessionId)" />:
+    /// every acquired slot is released exactly once, so the client always
+    /// knows which entries are held or about to be held. Past the
+    /// configured per-client bound a new session evicts an unheld entry
+    /// first, else rejects with the typed admission error; held entries
+    /// are never evicted, so eviction never introduces overlapping critical
+    /// sections for one session.
     member internal _.SemaphoreFor(sessionId: SessionId) : SemaphoreSlim =
-        semaphores.GetOrAdd(sessionId, fun _ -> new SemaphoreSlim(1, 1))
+        lock syncGate (fun () ->
+            match semaphores.TryGetValue(sessionId) with
+            | true, sem when not (isNull (box sem)) ->
+                syncUse[sessionId] <-
+                    (match syncUse.TryGetValue(sessionId) with
+                     | true, refs -> refs + 1
+                     | _ -> 1)
+
+                sem
+            | _ ->
+                if semaphores.Count < maxSyncSessions then
+                    let sem = new SemaphoreSlim(1, 1)
+                    semaphores[sessionId] <- sem
+                    syncUse[sessionId] <- 1
+                    sem
+                else
+                    let mutable evicted = Unchecked.defaultof<SemaphoreSlim>
+
+                    for entry in semaphores.ToArray() do
+                        if isNull (box evicted) && not (isNull (box entry.Value)) then
+                            let held =
+                                match syncUse.TryGetValue(entry.Key) with
+                                | true, refs -> refs > 0
+                                | _ -> false
+
+                            if not held then
+                                match semaphores.TryRemove(entry.Key) with
+                                | true, removed when Object.ReferenceEquals(removed, entry.Value) ->
+                                    syncUse.Remove(entry.Key) |> ignore
+                                    evicted <- removed
+                                | _ -> ()
+
+                    if isNull (box evicted) then
+                        raise (
+                            AdmissionRejectedException(
+                                "sessionSyncAtCapacity",
+                                sprintf
+                                    "The client tracks %d session synchronization entries; the session was rejected without disturbing a held entry."
+                                    maxSyncSessions
+                            )
+                        )
+                    else
+                        try
+                            evicted.Dispose()
+                        with _ ->
+                            ()
+
+                        let sem = new SemaphoreSlim(1, 1)
+                        semaphores[sessionId] <- sem
+                        syncUse[sessionId] <- 1
+                        sem)
+
+    /// Releases one slot acquired through
+    /// <see cref="M:Legate.SessionClient.SemaphoreFor(Legate.SessionId)" />.
+    /// Every acquire pairs with exactly one release, on success and on
+    /// failure alike.
+    /// <param name="sessionId">The session the slot was acquired for.</param>
+    member internal _.ReleaseSlot(sessionId: SessionId) : unit =
+        lock syncGate (fun () ->
+            match syncUse.TryGetValue(sessionId) with
+            | true, refs when refs > 0 -> syncUse[sessionId] <- refs - 1
+            | _ -> ())
+
+    /// The per-session synchronization entries this client tracks.
+    member internal _.TrackedSyncCount: int = lock syncGate (fun () -> semaphores.Count)
+
+    /// The per-session synchronization entries this client tracks before a
+    /// new session evicts or rejects. Must stay at least 1; set once from
+    /// the configured Sessions options, tests set it directly.
+    member internal _.MaxSyncSessions
+        with get () = lock syncGate (fun () -> maxSyncSessions)
+        and set (value: int) =
+            if value < 1 then
+                raise (ArgumentOutOfRangeException(nameof value, "The per-client sync bound must be at least 1."))
+
+            lock syncGate (fun () -> maxSyncSessions <- value)
+
+    /// The poll cadence between durable re-reads while no live hint fires:
+    /// remote, restarted, and reconnected observers converge on this beat.
+    /// Live local observers wake on the hint instead of waiting out the
+    /// poll. Must stay positive; set once from the configured Sessions
+    /// options (50 ms by default), tests set it directly.
+    member internal _.WaitPollInterval
+        with get () = lock syncGate (fun () -> waitPollInterval)
+        and set (value: TimeSpan) =
+            if value <= TimeSpan.Zero then
+                raise (ArgumentOutOfRangeException(nameof value, "The wait poll interval must be positive."))
+
+            lock syncGate (fun () -> waitPollInterval <- value)
+
+    /// Releases the session's synchronization entry when neither held nor
+    /// about to be held: the semaphore is disposed and a later prompt
+    /// starts from a fresh gate. Held entries stay until their slots
+    /// release, so release never introduces overlapping critical sections.
+    /// The auto-title marker releases on the expiry path instead: failures
+    /// clear it and successes keep it by design, and the table cap bounds
+    /// it.
+    /// <param name="sessionId">The session to release.</param>
+    /// <returns>True when an entry was held and removed.</returns>
+    member internal _.ReleaseSession(sessionId: SessionId) : bool =
+        lock syncGate (fun () ->
+            match syncUse.TryGetValue(sessionId) with
+            | true, refs when refs > 0 -> false
+            | _ ->
+                match semaphores.TryRemove(sessionId) with
+                | true, sem when not (isNull (box sem)) ->
+                    syncUse.Remove(sessionId) |> ignore
+
+                    try
+                        sem.Dispose()
+                    with _ ->
+                        ()
+
+                    true
+                | _ ->
+                    syncUse.Remove(sessionId) |> ignore
+                    false)
+
+    /// Releases every unheld synchronization entry. Held entries stay until
+    /// their slots release.
+    /// <returns>How many entries were removed.</returns>
+    member internal _.ReleaseAll() : int =
+        lock syncGate (fun () ->
+            let mutable removed = 0
+
+            for entry in semaphores.ToArray() do
+                let held =
+                    match syncUse.TryGetValue(entry.Key) with
+                    | true, refs -> refs > 0
+                    | _ -> false
+
+                if not held then
+                    match semaphores.TryRemove(entry.Key) with
+                    | true, sem when Object.ReferenceEquals(sem, entry.Value) ->
+                        syncUse.Remove(entry.Key) |> ignore
+                        removed <- removed + 1
+
+                        try
+                            sem.Dispose()
+                        with _ ->
+                            ()
+                    | _ -> ()
+
+            removed)
+
+    interface IDisposable with
+        member this.Dispose() = this.ReleaseAll() |> ignore
 
     /// The router Subscribe streams through: Local mode delegates to the
     /// process-local event bus; the cluster modes route through the owning
@@ -257,7 +414,60 @@ module internal SessionAutoTitle =
     /// generation fires per session per process. Entries clear when the
     /// call fails or yields nothing, so a later prompt retries; a titled
     /// session never refires because the stored title is non-empty.
-    let private fired = ConcurrentDictionary<TenantId * SessionId, byte>()
+    /// Bounded (issue 384): past the cap new sessions skip titling until
+    /// entries release, and session close plus the explicit release entry
+    /// point drop them. Titling is best-effort and never fails a prompt,
+    /// so the cap skips visibly through logs, never by throwing.
+    type internal AutoTitleTracker(maxEntries: int) =
+
+        let gate = obj ()
+        let fired = ConcurrentDictionary<TenantId * SessionId, byte>()
+        let mutable cap = max 1 maxEntries
+
+        /// How many sessions currently hold a fired marker.
+        member _.TrackedCount: int = fired.Count
+
+        /// The entries tracked before a new session skips titling.
+        member _.MaxEntries
+            with get () = lock gate (fun () -> cap)
+            and set (value: int) =
+                if value < 1 then
+                    raise (ArgumentOutOfRangeException(nameof value, "The auto-title bound must be at least 1."))
+
+                lock gate (fun () -> cap <- value)
+
+        /// Marks the session fired when no marker exists and the table has
+        /// room: true means this caller owns the generation.
+        member _.TryMark(tenant: TenantId, sessionId: SessionId) : bool =
+            match fired.TryGetValue((tenant, sessionId)) with
+            | true, _ -> false
+            | _ ->
+                lock gate (fun () ->
+                    if fired.ContainsKey((tenant, sessionId)) then false
+                    elif fired.Count >= cap then false
+                    else fired.TryAdd((tenant, sessionId), 0uy))
+
+        /// Drops the session's marker so a later prompt retries.
+        member _.Release(tenant: TenantId, sessionId: SessionId) : unit =
+            fired.TryRemove((tenant, sessionId)) |> ignore
+
+    let private tracker = AutoTitleTracker((SessionsOptions()).MaxAutoTitleSessions)
+
+    /// Replaces the bound the process-wide auto-title table enforces. Host
+    /// wiring calls this once from the configured Sessions options; the
+    /// bound is process-wide and last-write-wins across tenants.
+    /// <param name="maxEntries">The entries tracked before new sessions skip titling. Must be at least 1.</param>
+    let Configure (maxEntries: int) : unit = tracker.MaxEntries <- maxEntries
+
+    /// How many sessions currently hold a fired marker.
+    let TrackedCount () : int = tracker.TrackedCount
+
+    /// Drops the session's fired marker so a later prompt retries: session
+    /// close and expiry release here. A titled session never refires
+    /// because the stored title is non-empty.
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="sessionId">The session to release.</param>
+    let Release (tenant: TenantId) (sessionId: SessionId) : unit = tracker.Release(tenant, sessionId)
 
     /// Concatenates a message's text parts with newlines, mirroring the
     /// transcript folding; a message with no text parts reads as empty.
@@ -383,7 +593,7 @@ module internal SessionAutoTitle =
 
                             if String.IsNullOrWhiteSpace promptText then
                                 ()
-                            elif not (fired.TryAdd((client.Tenant, sessionId), 0uy)) then
+                            elif not (tracker.TryMark(client.Tenant, sessionId)) then
                                 ()
                             else
                                 let mutable keep = false
@@ -459,7 +669,7 @@ module internal SessionAutoTitle =
                                         log deps.Logger true sessionId (sprintf "failed: %s" reason)
                                 finally
                                     if not keep then
-                                        fired.TryRemove((client.Tenant, sessionId)) |> ignore
+                                        tracker.Release(client.Tenant, sessionId)
             with _ ->
                 ()
         }
@@ -532,45 +742,48 @@ type SessionClientExtensions =
             let! cursor = SessionClientExtensions.CursorAsync(bus, tenant, sessionId, cancellationToken)
 
             let semaphore = client.SemaphoreFor(sessionId)
-            do! semaphore.WaitAsync(cancellationToken)
-
             let mutable entryOpt: InboxEntry option = None
             let mutable promptError: exn option = None
 
             try
-                let! current = store.GetSession(tenant, sessionId, cancellationToken)
+                do! semaphore.WaitAsync(cancellationToken)
 
-                match current with
-                | null -> raise (SessionNotFoundException(sessionId, "The session does not exist."))
-                | live -> client.ValidateCompletionRoute live
+                try
+                    let! current = store.GetSession(tenant, sessionId, cancellationToken)
 
-                // Fail fast on unsupported providers before accepting work:
-                // without the settlement capability no durable observation
-                // exists, and no process-local fallback is safe.
-                client.RequireSettlementStore() |> ignore
+                    match current with
+                    | null -> raise (SessionNotFoundException(sessionId, "The session does not exist."))
+                    | live -> client.ValidateCompletionRoute live
 
-                let! resolved = client.Resolve(sessionId, cancellationToken)
+                    // Fail fast on unsupported providers before accepting work:
+                    // without the settlement capability no durable observation
+                    // exists, and no process-local fallback is safe.
+                    client.RequireSettlementStore() |> ignore
 
-                let! entry =
-                    SessionActor.promptSuspendableAsync store tenant sessionId resolved message cancellationToken
+                    let! resolved = client.Resolve(sessionId, cancellationToken)
 
-                // Titling never blocks or fails the turn: the shared
-                // helper no-ops unless the host opted in and the stored
-                // title is still empty.
-                SessionAutoTitle.fire client sessionId message
+                    let! entry =
+                        SessionActor.promptSuspendableAsync store tenant sessionId resolved message cancellationToken
 
-                entryOpt <- Some entry
-            with ex ->
-                // Wait-abandonment (issue 85 decision): a cancellation racing
-                // the prompt never aborts the turn. AbortSession would fault
-                // the suspendable actor, whose mailbox has no such arm (its
-                // runner is invoked with CancellationToken.None), and Abort
-                // on WaitingForInput is a no-op per #35 anyway. Rethrow and
-                // leave any appended turn running to settle normally. The
-                // Abort client verb remains the explicit abort path.
-                promptError <- Some ex
+                    // Titling never blocks or fails the turn: the shared
+                    // helper no-ops unless the host opted in and the stored
+                    // title is still empty.
+                    SessionAutoTitle.fire client sessionId message
 
-            semaphore.Release() |> ignore
+                    entryOpt <- Some entry
+                with ex ->
+                    // Wait-abandonment (issue 85 decision): a cancellation racing
+                    // the prompt never aborts the turn. AbortSession would fault
+                    // the suspendable actor, whose mailbox has no such arm (its
+                    // runner is invoked with CancellationToken.None), and Abort
+                    // on WaitingForInput is a no-op per #35 anyway. Rethrow and
+                    // leave any appended turn running to settle normally. The
+                    // Abort client verb remains the explicit abort path.
+                    promptError <- Some ex
+
+                semaphore.Release() |> ignore
+            finally
+                client.ReleaseSlot(sessionId)
 
             match promptError, entryOpt with
             | Some error, _ -> return raise error
@@ -875,11 +1088,11 @@ type SessionClientExtensions =
             | session -> return session
         }
 
-    /// The poll cadence between durable re-reads while no live hint fires:
-    /// remote, restarted, and reconnected observers converge on this beat.
-    /// Live local observers wake on the hint instead of waiting out the
-    /// poll.
-    static member internal WaitPollInterval = TimeSpan.FromMilliseconds 50.0
+    /// The poll cadence between durable re-reads while no live hint fires,
+    /// read from the owning client: remote, restarted, and reconnected
+    /// observers converge on this beat. Live local observers wake on the
+    /// hint instead of waiting out the poll.
+    static member private PollIntervalOf(client: SessionClient) : TimeSpan = client.WaitPollInterval
 
     /// Reads the committed winning observation once when terminal: Some
     /// only when the durable row carries a winner. Never throws for storage
@@ -984,7 +1197,10 @@ type SessionClientExtensions =
                             | None -> ()
                         | None ->
                             let pollTask =
-                                client.WaitDelay.Delay(SessionClientExtensions.WaitPollInterval, CancellationToken.None)
+                                client.WaitDelay.Delay(
+                                    SessionClientExtensions.PollIntervalOf(client),
+                                    CancellationToken.None
+                                )
 
                             let candidates = ResizeArray<Task>()
                             candidates.Add(hint)
