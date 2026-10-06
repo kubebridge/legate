@@ -81,44 +81,34 @@ module internal SessionPermissions =
             PromptComposition.prependSystemPrompt history systemPrompt
             history
 
-    /// Replays one session's journal in sequence order from cursor 0,
-    /// concatenating bounded pages. Pages only transport: every page split
-    /// replays identically, mirroring the Transcripts.readTranscript
-    /// invariant. Unknown session, expired journal, and end of stream all
-    /// stop the replay, so a fresh session assembles from an empty prefix.
+    /// Replays one session's working-context journal as the bounded
+    /// base-plus-suffix recovery input (issue 389): the shared
+    /// checkpoint-resumed suffix read (the last observed CompactedEvent
+    /// sequence, else the last consumed sequence) with continuity
+    /// validation, feeding the #387 base-plus-suffix shape. The one full
+    /// read after (re)start with an unknown checkpoint is the documented
+    /// initial reconstruction; a stale checkpoint falls back to explicit
+    /// reconstruction, never silent truncation. Unknown session, expired
+    /// journal, and end of stream settle to the base plus what was seen,
+    /// so a fresh session assembles from an empty prefix. Cancellation is
+    /// observed between bounded units.
     /// <param name="eventStore">The journal to replay. Must not be null.</param>
     /// <param name="tenant">The tenant the session belongs to.</param>
     /// <param name="sessionId">The session to replay.</param>
-    /// <returns>The journaled events in sequence order.</returns>
+    /// <param name="cancellationToken">Token that abandons the replay.</param>
+    /// <returns>The base-plus-suffix recovery input in sequence order.</returns>
     let private replayJournalAsync
         (eventStore: ISessionEventStore)
         (tenant: TenantId)
         (sessionId: SessionId)
+        (cancellationToken: CancellationToken)
         : Task<IReadOnlyList<SessionEvent>> =
         ArgumentNullException.ThrowIfNull(eventStore)
 
         task {
-            let collected = ResizeArray<SessionEvent>()
-            let mutable cursor = 0L
-            let mutable paging = true
+            let! read = BoundedReplay.readSuffixWithBaseAsync eventStore tenant sessionId 100 cancellationToken
 
-            while paging do
-                let! outcome = eventStore.Replay(tenant, sessionId, cursor, 100, CancellationToken.None)
-
-                match outcome with
-                | :? EventReplayPage as page when not (isNull (box page)) ->
-                    if not (isNull (box page.Events)) then
-                        for event in page.Events do
-                            if not (isNull (box event)) then
-                                collected.Add(event)
-
-                    if page.NextCursor.HasValue then
-                        cursor <- page.NextCursor.Value
-                    else
-                        paging <- false
-                | _ -> paging <- false
-
-            return collected :> IReadOnlyList<SessionEvent>
+            return BoundedReplay.recoveryInputOf read
         }
 
     /// Maps one history rejection to the client-safe turn-fault reason. The
@@ -159,30 +149,38 @@ module internal SessionPermissions =
             sprintf "The compacted context version %d is unsupported: start a clean session." version
 
     /// Assembles the ordinary-turn history for a seedless fresh run (issues
-    /// 366 and 387): replays the journal from cursor 0, folds the prefix
-    /// through the shared compacted-base builder (the last successful
-    /// enriched CompactedEvent supplies the summary plus the retained
-    /// current-format tail, superseded pre-compaction context drops),
-    /// appends the executing entry's initial user message in conversational
-    /// order, then leads with the composed system prompt exactly once. The
-    /// composed prompt is never journaled, so prepend-once never duplicates.
-    /// A rejection (or an unreadable journal) reads as an Error carrying the
-    /// turn-fault reason: the runner fails the turn before any provider call
-    /// instead of fabricating history.
+    /// 366 and 387, bounded by 389): replays through the shared
+    /// checkpoint-resumed compacted-base read (the last successful enriched
+    /// CompactedEvent supplies the summary plus the retained current-format
+    /// tail, superseded pre-compaction context drops), appends the executing
+    /// entry's initial user message in conversational order, then leads with
+    /// the composed system prompt exactly once. Once compacted, successive
+    /// turns replay only the post-checkpoint suffix: with current context
+    /// and newly applicable evidence held fixed, growing superseded history
+    /// adds no repeated full-prefix scan or full historical copy, and the
+    /// one full read after (re)start is the documented initial
+    /// reconstruction. Without a compacted base the whole prefix is still
+    /// applicable context, so the read scans from cursor 0 like before.
+    /// The composed prompt is never journaled, so prepend-once never
+    /// duplicates. A rejection (or an unreadable journal) reads as an Error
+    /// carrying the turn-fault reason: the runner fails the turn before any
+    /// provider call instead of fabricating history.
     /// <param name="eventStore">The journal to replay. Must not be null.</param>
     /// <param name="tenant">The tenant the session belongs to.</param>
     /// <param name="entry">The inbox entry the run executes.</param>
     /// <param name="systemPrompt">The composed system prompt, or null for the user-only shape.</param>
+    /// <param name="cancellationToken">Token that abandons the replay.</param>
     /// <returns>The assembled history, or the explicit fault reason.</returns>
     let private assembleOrdinaryHistoryAsync
         (eventStore: ISessionEventStore)
         (tenant: TenantId)
         (entry: InboxEntry)
         (systemPrompt: string | null)
+        (cancellationToken: CancellationToken)
         : Task<Result<IList<ChatMessage>, string>> =
         task {
             try
-                let! events = replayJournalAsync eventStore tenant entry.SessionId
+                let! events = replayJournalAsync eventStore tenant entry.SessionId cancellationToken
 
                 match ConversationRecovery.tryRecoverCompacted events with
                 | Error rejection -> return Error(historyRejectionReason rejection)
@@ -778,7 +776,7 @@ module internal SessionPermissions =
                         let! freshHistory =
                             match seed with
                             | Some _ -> task { return Ok(historyOf entry systemPrompt seed) }
-                            | None -> assembleOrdinaryHistoryAsync eventStore tenant entry systemPrompt
+                            | None -> assembleOrdinaryHistoryAsync eventStore tenant entry systemPrompt runnerToken
 
                         match freshHistory with
                         | Error reason ->

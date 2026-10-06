@@ -2,6 +2,7 @@
 namespace Legate
 
 open System
+open System.Collections.Concurrent
 open System.Collections.Generic
 open System.Threading
 open System.Threading.Tasks
@@ -1339,48 +1340,32 @@ module internal SessionActor =
         (cancellationToken: CancellationToken)
         : SessionCompactReply =
         try
-            // Resolve the idle history through the shared compacted base:
-            // the last successful enriched CompactedEvent supplies the
-            // summary plus the retained current-format tail, superseded
-            // pre-compaction context drops, and the suffix folds in order.
-            // Lossy display cells never feed the summariser: required
-            // content is never reconstructed from them. A rejection
+            // Resolve the idle history through the shared checkpoint-resumed
+            // compacted base (issue 389): the last successful enriched
+            // CompactedEvent supplies the summary plus the retained
+            // current-format tail, superseded pre-compaction context drops,
+            // and only the post-checkpoint suffix replays with continuity
+            // validation. The one full read after (re)start with an unknown
+            // checkpoint is the documented initial reconstruction; a stale
+            // checkpoint falls back to explicit reconstruction. Lossy
+            // display cells never feed the summariser: required content is
+            // never reconstructed from them. A rejection
             // (unsupported/incomplete compacted state or unreadable
             // journal) truthfully no-ops with no success published; the
             // next production turn rejects explicitly with a clean start.
-            let collected = ResizeArray<SessionEvent>()
-            let mutable cursor = 0L
-            let mutable paging = true
+            let suffixRead =
+                awaitTask (
+                    BoundedReplay.readSuffixWithBaseAsync
+                        compact.EventStore
+                        props.Tenant
+                        props.SessionId
+                        100
+                        cancellationToken
+                )
 
-            while paging do
-                cancellationToken.ThrowIfCancellationRequested()
+            let collected = BoundedReplay.recoveryInputOf suffixRead
 
-                let outcome =
-                    awaitTask (compact.EventStore.Replay(props.Tenant, props.SessionId, cursor, 100, cancellationToken))
-
-                if isNull (box outcome) then
-                    paging <- false
-                else
-                    match outcome with
-                    | :? EventReplayPage as page when not (isNull (box page)) ->
-                        if isNull (box page.Events) then
-                            paging <- false
-                        elif page.NextCursor.HasValue then
-                            for ev in page.Events do
-                                if not (isNull (box ev)) then
-                                    collected.Add(ev)
-
-                            cursor <- page.NextCursor.Value
-                        else
-                            for ev in page.Events do
-                                if not (isNull (box ev)) then
-                                    collected.Add(ev)
-
-                            paging <- false
-                    | _ -> paging <- false
-
-            let baseResolution =
-                ConversationRecovery.tryRecoverCompacted (collected :> IReadOnlyList<SessionEvent>)
+            let baseResolution = ConversationRecovery.tryRecoverCompacted collected
 
             match baseResolution with
             | Error _ when collected.Count > 0 ->
@@ -2719,78 +2704,193 @@ module internal SessionActor =
                 Some answer.QuestionId
         | _ -> None
 
-    /// Rebuilds the pending request from the journal: replays from the
-    /// start and returns the latest PermissionRequested or QuestionAsked
-    /// with no matching resolve after it. A resolve matches when its
-    /// request id equals the ask id. Returns None when nothing is pending.
+    // ────────────────── Bounded tail probes (issue 389) ──────────────────
+    //
+    // Checkpoint-resumed tail probes: each probe keeps its own per-session
+    // (cursor, state) checkpoint and replays only the post-checkpoint
+    // suffix through the shared hardened consume, merging into the cached
+    // state. The one full read with no checkpoint is the documented
+    // initial reconstruction; a stale checkpoint (a gap between the cached
+    // cursor and the first suffix sequence) falls back to explicit
+    // reconstruction from cursor 0, never silent truncation. Probes retain
+    // only small folded state (one pending option, one turn option, one
+    // flag, or the turn-proportional marker sets for the orphan probe),
+    // never the raw journal.
+
+    /// Per-session probe checkpoints, keyed by "tenant|session|probe".
+    let private probeCursors = ConcurrentDictionary<string, int64>()
+    let private pendingStates = ConcurrentDictionary<string, RebuiltPending option>()
+    let private lastTurnStates = ConcurrentDictionary<string, TurnId option>()
+    let private tailFlagStates = ConcurrentDictionary<string, bool>()
+    let private orphanMarkers = ConcurrentDictionary<string, ResizeArray<TurnId>>()
+    let private orphanTerminals = ConcurrentDictionary<string, HashSet<TurnId>>()
+
+    /// Clears all tail-probe checkpoints. Tests only.
+    let clearProbeCheckpoints () : unit =
+        probeCursors.Clear()
+        pendingStates.Clear()
+        lastTurnStates.Clear()
+        tailFlagStates.Clear()
+        orphanMarkers.Clear()
+        orphanTerminals.Clear()
+
+    /// Builds one probe's checkpoint key. Tenant and session scope the
+    /// checkpoint so cached probe state never crosses isolation boundaries.
+    let private probeKey (probe: string) (tenant: TenantId) (sessionId: SessionId) : string =
+        sprintf "%O|%O|%s" tenant sessionId probe
+
+    /// Consumes one probe's suffix: the post-checkpoint pages through the
+    /// shared hardened consume, or the full journal from cursor 0 when no
+    /// checkpoint exists (the documented initial reconstruction). A stale
+    /// checkpoint (the first suffix sequence skips past the cached cursor
+    /// plus one) falls back to explicit reconstruction from cursor 0.
+    /// Unstamped sequences skip gap validation.
+    /// <param name="probe">The probe name scoping the checkpoint.</param>
+    /// <param name="eventStore">The journal to replay.</param>
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="sessionId">The session to consume.</param>
+    /// <param name="cancellationToken">Token that abandons the consume.</param>
+    /// <returns>The suffix events in sequence order with the end cursor and whether a fallback ran.</returns>
+    let private consumeProbeSuffixAsync
+        (probe: string)
+        (eventStore: ISessionEventStore)
+        (tenant: TenantId)
+        (sessionId: SessionId)
+        (cancellationToken: CancellationToken)
+        : Task<IReadOnlyList<SessionEvent> * int64 * bool> =
+        task {
+            let key = probeKey probe tenant sessionId
+
+            let cached =
+                match probeCursors.TryGetValue(key) with
+                | true, cursor -> Some cursor
+                | false, _ -> None
+
+            match cached with
+            | None ->
+                let suffix = ResizeArray<SessionEvent>()
+
+                let! stats =
+                    BoundedReplay.consumePagesAsync eventStore tenant sessionId 0L 100 cancellationToken suffix.Add
+
+                probeCursors[key] <- stats.LastCursor
+                return (suffix :> IReadOnlyList<SessionEvent>), stats.LastCursor, false
+            | Some resumeFrom ->
+                let suffix = ResizeArray<SessionEvent>()
+
+                let! stats =
+                    BoundedReplay.consumePagesAsync
+                        eventStore
+                        tenant
+                        sessionId
+                        resumeFrom
+                        100
+                        cancellationToken
+                        suffix.Add
+
+                let gap =
+                    if suffix.Count = 0 then
+                        false
+                    else
+                        let first = suffix[0]
+
+                        if isNull (box first) then
+                            false
+                        elif first.Sequence.HasValue then
+                            first.Sequence.Value <> resumeFrom + 1L
+                        else
+                            false
+
+                if gap then
+                    let full = ResizeArray<SessionEvent>()
+
+                    let! fullStats =
+                        BoundedReplay.consumePagesAsync eventStore tenant sessionId 0L 100 cancellationToken full.Add
+
+                    probeCursors[key] <- fullStats.LastCursor
+                    return (full :> IReadOnlyList<SessionEvent>), fullStats.LastCursor, true
+                else
+                    probeCursors[key] <- stats.LastCursor
+                    return (suffix :> IReadOnlyList<SessionEvent>), stats.LastCursor, false
+        }
+
+    /// Rebuilds the pending request from the journal (issue 389): replays
+    /// only the post-checkpoint suffix through the shared hardened consume
+    /// and merges into the cached pending, so successive probes add no
+    /// repeated full-prefix scan. The one full read with no checkpoint is
+    /// the documented initial reconstruction; a stale checkpoint falls back
+    /// to explicit reconstruction. Returns the latest PermissionRequested
+    /// or QuestionAsked with no matching resolve after it. A resolve
+    /// matches when its request id equals the ask id. Returns None when
+    /// nothing is pending.
     /// <param name="eventStore">The journal to replay.</param>
     /// <param name="tenant">The tenant the session belongs to.</param>
     /// <param name="sessionId">The session to rebuild.</param>
+    /// <param name="cancellationToken">Token that abandons the replay.</param>
     /// <returns>The rebuilt pending, or None.</returns>
     let rebuildPendingFromJournal
         (eventStore: ISessionEventStore)
         (tenant: TenantId)
         (sessionId: SessionId)
+        (cancellationToken: CancellationToken)
         : RebuiltPending option =
         ArgumentNullException.ThrowIfNull(eventStore)
 
-        let rec replay cursor (pending: RebuiltPending option) =
-            let outcome =
-                awaitTask (eventStore.Replay(tenant, sessionId, cursor, 100, CancellationToken.None))
+        let foldOne (current: RebuiltPending option) (event: SessionEvent) : RebuiltPending option =
+            if isNull (box event) then
+                current
+            else
+                match event with
+                | :? PermissionRequestedEvent as asked when not (isNull (box asked)) ->
+                    Some
+                        {
+                            RequestId = asked.RequestId
+                            ToolName = asked.ToolName
+                            Kind = TurnLoop.PermissionSuspension
+                            QuestionText = ""
+                        }
+                | :? QuestionAskedEvent as asked when not (isNull (box asked)) ->
+                    Some
+                        {
+                            RequestId = asked.QuestionId
+                            ToolName = TurnLoop.AskUserToolName
+                            Kind = TurnLoop.QuestionSuspension
+                            QuestionText = asked.Question
+                        }
+                | :? PermissionResolvedEvent as resolved when not (isNull (box resolved)) ->
+                    match current with
+                    | Some awaiting when String.Equals(awaiting.RequestId, resolved.RequestId, StringComparison.Ordinal) ->
+                        None
+                    | _ -> current
+                | :? QuestionAnsweredEvent as answered when not (isNull (box answered)) ->
+                    match current with
+                    | Some awaiting when
+                        String.Equals(awaiting.RequestId, answered.QuestionId, StringComparison.Ordinal)
+                        ->
+                        None
+                    | _ -> current
+                | _ -> current
 
-            match outcome with
-            | :? EventReplayPage as page when not (isNull (box page)) ->
-                let mutable current = pending
-                let mutable nextCursor = cursor
+        let key = probeKey "pending" tenant sessionId
 
-                if not (isNull (box page.Events)) then
-                    for event in page.Events do
-                        if not (isNull (box event)) then
-                            match event with
-                            | :? PermissionRequestedEvent as asked when not (isNull (box asked)) ->
-                                current <-
-                                    Some
-                                        {
-                                            RequestId = asked.RequestId
-                                            ToolName = asked.ToolName
-                                            Kind = TurnLoop.PermissionSuspension
-                                            QuestionText = ""
-                                        }
-                            | :? QuestionAskedEvent as asked when not (isNull (box asked)) ->
-                                current <-
-                                    Some
-                                        {
-                                            RequestId = asked.QuestionId
-                                            ToolName = TurnLoop.AskUserToolName
-                                            Kind = TurnLoop.QuestionSuspension
-                                            QuestionText = asked.Question
-                                        }
-                            | :? PermissionResolvedEvent as resolved when not (isNull (box resolved)) ->
-                                match current with
-                                | Some awaiting when
-                                    String.Equals(awaiting.RequestId, resolved.RequestId, StringComparison.Ordinal)
-                                    ->
-                                    current <- None
-                                | _ -> ()
-                            | :? QuestionAnsweredEvent as answered when not (isNull (box answered)) ->
-                                match current with
-                                | Some awaiting when
-                                    String.Equals(awaiting.RequestId, answered.QuestionId, StringComparison.Ordinal)
-                                    ->
-                                    current <- None
-                                | _ -> ()
-                            | _ -> ()
+        let seed =
+            match pendingStates.TryGetValue(key) with
+            | true, cached -> cached
+            | false, _ -> None
 
-                    if page.NextCursor.HasValue then
-                        nextCursor <- page.NextCursor.Value
+        let suffix, _, hadFallback =
+            awaitTask (consumeProbeSuffixAsync "pending" eventStore tenant sessionId cancellationToken)
 
-                if page.NextCursor.HasValue then
-                    replay nextCursor current
-                else
-                    current
-            | _ -> pending
+        let start = if hadFallback then None else seed
 
-        replay 0L None
+        let mutable current = start
+
+        if not (isNull (box suffix)) then
+            for event in suffix do
+                current <- foldOne current event
+
+        pendingStates[key] <- current
+        current
 
     /// In-memory resumption note appended to a crash-rehydrated history.
     /// Never journaled, so no wire-contract change and no duplication
@@ -2835,119 +2935,141 @@ module internal SessionActor =
         history.Add(ChatMessage(ChatRole.System, CrashResumptionNote))
         history
 
-    /// Rehydrates a crash-interrupted turn's history from the journal: pages
-    /// Replay from cursor 0 through the shared transcript read (which folds
-    /// every turn through SessionCellDeriver.Fold), drops the interrupted
-    /// turn's tool cells, and appends the in-memory resumption note. The
-    /// journal is append-only: old-attempt events stay, nothing journals.
-    /// Unknown session, expired journal, and end of stream read as the note
-    /// alone, so recovery never fails spuriously.
+    /// Rehydrates a crash-interrupted turn's history from the journal (issue
+    /// 389): pages through the shared incremental transcript read (which
+    /// folds every turn through SessionCellDeriver.Fold with no full raw
+    /// retention beside the output, under the #388 cursor/cancellation
+    /// contract), drops the interrupted turn's tool cells, and appends the
+    /// in-memory resumption note. Crash recovery runs once per restart, so
+    /// this full read is the documented exceptional initial
+    /// reconstruction; ordinary continuation never repeats it (it resumes
+    /// from the BoundedReplay checkpoint instead). The journal is
+    /// append-only: old-attempt events stay, nothing journals. Unknown
+    /// session, expired journal, and end of stream read as the note alone,
+    /// so recovery never fails spuriously. Cancellation is observed between
+    /// bounded units: a cancelled rehydrate raises instead of advertising
+    /// complete context.
     /// <param name="eventStore">The journal to replay.</param>
     /// <param name="tenant">The tenant the session belongs to.</param>
     /// <param name="sessionId">The session to rehydrate.</param>
     /// <param name="interruptedTurn">The interrupted turn whose tool cells drop.</param>
+    /// <param name="cancellationToken">Token that abandons the replay.</param>
     /// <returns>The rehydrated history with the resumption note.</returns>
     let rehydrateCrashHistory
         (eventStore: ISessionEventStore)
         (tenant: TenantId)
         (sessionId: SessionId)
         (interruptedTurn: TurnId)
+        (cancellationToken: CancellationToken)
         : IList<ChatMessage> =
         ArgumentNullException.ThrowIfNull(eventStore)
 
         let options = ReadTranscriptOptions()
 
         let cells =
-            awaitTask (Transcripts.readTranscript eventStore tenant sessionId options 100 CancellationToken.None)
+            awaitTask (Transcripts.readTranscript eventStore tenant sessionId options 100 cancellationToken)
 
         rehydrateHistoryFromCells cells interruptedTurn
 
-    /// Reads the interrupted turn id as the journal's most recent turn: the
-    /// last event's turn in sequence order. Returns None when the journal
-    /// carries no events, so the caller falls back to a fresh turn id.
+    /// Reads the interrupted turn id as the journal's most recent turn
+    /// (issue 389): the last event's turn in sequence order, checkpoint
+    /// resumed so successive probes add no repeated full-prefix scan. The
+    /// one full read with no checkpoint is the documented initial
+    /// reconstruction; a stale checkpoint falls back to explicit
+    /// reconstruction. Returns None when the journal carries no events, so
+    /// the caller falls back to a fresh turn id.
     /// <param name="eventStore">The journal to replay.</param>
     /// <param name="tenant">The tenant the session belongs to.</param>
     /// <param name="sessionId">The session to inspect.</param>
+    /// <param name="cancellationToken">Token that abandons the replay.</param>
     /// <returns>The most recent turn id, or None on an empty journal.</returns>
-    let lastJournalTurnId (eventStore: ISessionEventStore) (tenant: TenantId) (sessionId: SessionId) : TurnId option =
+    let lastJournalTurnId
+        (eventStore: ISessionEventStore)
+        (tenant: TenantId)
+        (sessionId: SessionId)
+        (cancellationToken: CancellationToken)
+        : TurnId option =
         ArgumentNullException.ThrowIfNull(eventStore)
 
-        let rec replay cursor (last: TurnId option) =
-            let outcome =
-                awaitTask (eventStore.Replay(tenant, sessionId, cursor, 100, CancellationToken.None))
+        let key = probeKey "lastTurn" tenant sessionId
 
-            match outcome with
-            | :? EventReplayPage as page when not (isNull (box page)) ->
-                let mutable current = last
-                let mutable nextCursor = cursor
+        let seed =
+            match lastTurnStates.TryGetValue(key) with
+            | true, cached -> cached
+            | false, _ -> None
 
-                if not (isNull (box page.Events)) then
-                    for event in page.Events do
-                        if not (isNull (box event)) then
-                            current <- Some event.TurnId
+        let suffix, _, hadFallback =
+            awaitTask (consumeProbeSuffixAsync "lastTurn" eventStore tenant sessionId cancellationToken)
 
-                    if page.NextCursor.HasValue then
-                        nextCursor <- page.NextCursor.Value
+        let mutable current = if hadFallback then None else seed
 
-                if page.NextCursor.HasValue then
-                    replay nextCursor current
-                else
-                    current
-            | _ -> last
+        // Track whether the (re)read saw any event at all: a fallback full
+        // scan with no events reads as None like the empty journal.
+        let mutable observed = false
 
-        replay 0L None
+        if not (isNull (box suffix)) then
+            for event in suffix do
+                if not (isNull (box event)) then
+                    observed <- true
+                    current <- Some event.TurnId
+
+        if hadFallback && not observed then
+            current <- None
+
+        lastTurnStates[key] <- current
+        current
 
     /// Reads whether the journal tail holds an unterminated turn (issue
-    /// 287): the last TurnStartedEvent with no terminal after it
-    /// (TurnCompleted, TurnFailed, TurnAborted, or SessionClosed). A
-    /// marker-only journal (a single TurnStartedEvent, the mid-LLM-call kill
-    /// shape) reads as true; an empty journal reads as false, so a Running
-    /// row with no work to recover still idles instead of failing
-    /// spuriously. Completion journals nothing, so this check runs only for
-    /// Running rows with an empty inbox: Idle rows (including healthy
-    /// completions, which also end marker-only) never consult it, and a
-    /// settled orphan flips to Idle with its TurnFailedEvent terminal, so a
-    /// later restart reads false and stays quiet. Read-only: never appends.
+    /// 287, bounded by 389): the last TurnStartedEvent with no terminal
+    /// after it (TurnCompleted, TurnFailed, TurnAborted, or SessionClosed),
+    /// checkpoint resumed so successive probes add no repeated full-prefix
+    /// scan. A marker-only journal (a single TurnStartedEvent, the
+    /// mid-LLM-call kill shape) reads as true; an empty journal reads as
+    /// false, so a Running row with no work to recover still idles instead
+    /// of failing spuriously. Completion journals nothing, so this check
+    /// runs only for Running rows with an empty inbox: Idle rows (including
+    /// healthy completions, which also end marker-only) never consult it,
+    /// and a settled orphan flips to Idle with its TurnFailedEvent
+    /// terminal, so a later restart reads false and stays quiet. Read-only:
+    /// never appends. Cancellation is observed between bounded units.
     /// <param name="eventStore">The journal to replay.</param>
     /// <param name="tenant">The tenant the session belongs to.</param>
     /// <param name="sessionId">The session to inspect.</param>
+    /// <param name="cancellationToken">Token that abandons the replay.</param>
     /// <returns>True when the tail shows an unterminated turn.</returns>
-    let hasUnterminatedTurnTail (eventStore: ISessionEventStore) (tenant: TenantId) (sessionId: SessionId) : bool =
+    let hasUnterminatedTurnTail
+        (eventStore: ISessionEventStore)
+        (tenant: TenantId)
+        (sessionId: SessionId)
+        (cancellationToken: CancellationToken)
+        : bool =
         ArgumentNullException.ThrowIfNull(eventStore)
 
-        let rec replay cursor (started: bool) =
-            let outcome =
-                try
-                    awaitTask (eventStore.Replay(tenant, sessionId, cursor, 100, CancellationToken.None))
-                with _ ->
-                    Unchecked.defaultof<EventReplayOutcome>
+        let key = probeKey "tailFlag" tenant sessionId
 
-            match outcome with
-            | :? EventReplayPage as page when not (isNull (box page)) ->
-                let mutable current = started
-                let mutable nextCursor = cursor
+        let seed =
+            match tailFlagStates.TryGetValue(key) with
+            | true, cached -> cached
+            | false, _ -> false
 
-                if not (isNull (box page.Events)) then
-                    for event in page.Events do
-                        if not (isNull (box event)) then
-                            match event with
-                            | :? TurnStartedEvent -> current <- true
-                            | :? TurnCompletedEvent -> current <- false
-                            | :? TurnFailedEvent -> current <- false
-                            | :? TurnAbortedEvent -> current <- false
-                            | :? SessionClosedEvent -> current <- false
-                            | _ -> ()
+        let suffix, _, hadFallback =
+            awaitTask (consumeProbeSuffixAsync "tailFlag" eventStore tenant sessionId cancellationToken)
 
-                    if page.NextCursor.HasValue then
-                        nextCursor <- page.NextCursor.Value
+        let mutable current = if hadFallback then false else seed
 
-                if page.NextCursor.HasValue then
-                    replay nextCursor current
-                else
-                    current
-            | _ -> started
+        if not (isNull (box suffix)) then
+            for event in suffix do
+                if not (isNull (box event)) then
+                    match event with
+                    | :? TurnStartedEvent -> current <- true
+                    | :? TurnCompletedEvent -> current <- false
+                    | :? TurnFailedEvent -> current <- false
+                    | :? TurnAbortedEvent -> current <- false
+                    | :? SessionClosedEvent -> current <- false
+                    | _ -> ()
 
-        replay 0L false
+        tailFlagStates[key] <- current
+        current
 
     /// The suspendable session actor: like behavior but driving the
     /// suspendable runner, entering WaitingForInput store-first on suspend,
@@ -3575,76 +3697,65 @@ module internal SessionActor =
         /// orphan, so marker-for-live-id alone would stay quiet forever.
         /// The orphan id survives only in the journal.
         /// <param name="liveId">The live turn to inspect.</param>
+        /// <param name="cancellationToken">Token that abandons the replay.</param>
         /// <returns>The marker flag and terminal flag for the live id, plus the latest unterminated marker id.</returns>
-        let journalOrphanState (liveId: TurnId) : bool * bool * TurnId option =
-            let rec replay
-                cursor
-                (marker: bool)
-                (terminal: bool)
-                (markers: ResizeArray<TurnId>)
-                (terminals: HashSet<TurnId>)
-                =
-                let outcome =
-                    try
-                        awaitTask (
-                            suspend.EventStore.Replay(
-                                props.Tenant,
-                                props.SessionId,
-                                cursor,
-                                100,
-                                CancellationToken.None
-                            )
-                        )
-                    with _ ->
-                        Unchecked.defaultof<EventReplayOutcome>
+        let journalOrphanState (liveId: TurnId) (cancellationToken: CancellationToken) : bool * bool * TurnId option =
+            let key = sprintf "%O|%O|orphan" props.Tenant props.SessionId
 
-                match outcome with
-                | :? EventReplayPage as page when not (isNull (box page)) ->
-                    let mutable foundMarker = marker
-                    let mutable foundTerminal = terminal
-                    let mutable nextCursor = cursor
-
-                    if not (isNull (box page.Events)) then
-                        for event in page.Events do
-                            if not (isNull (box event)) then
-                                if event.TurnId.Equals(liveId) then
-                                    match event with
-                                    | :? TurnStartedEvent -> foundMarker <- true
-                                    | :? TurnCompletedEvent
-                                    | :? TurnFailedEvent
-                                    | :? TurnAbortedEvent
-                                    | :? SessionClosedEvent -> foundTerminal <- true
-                                    | _ -> ()
-
-                                match event with
-                                | :? TurnStartedEvent -> markers.Add(event.TurnId)
-                                | :? TurnCompletedEvent
-                                | :? TurnFailedEvent
-                                | :? TurnAbortedEvent
-                                | :? SessionClosedEvent -> terminals.Add(event.TurnId) |> ignore
-                                | _ -> ()
-
-                        if page.NextCursor.HasValue then
-                            nextCursor <- page.NextCursor.Value
-
-                    if page.NextCursor.HasValue then
-                        replay nextCursor foundMarker foundTerminal markers terminals
-                    else
-                        let fallback =
-                            markers
-                            |> Seq.filter (fun candidate -> not (terminals.Contains(candidate)))
-                            |> Seq.tryLast
-
-                        foundMarker, foundTerminal, fallback
+            let markers =
+                match orphanMarkers.TryGetValue(key) with
+                | true, cached when not (isNull (box cached)) -> cached
                 | _ ->
-                    let fallback =
-                        markers
-                        |> Seq.filter (fun candidate -> not (terminals.Contains(candidate)))
-                        |> Seq.tryLast
+                    let created = ResizeArray<TurnId>()
+                    orphanMarkers[key] <- created
+                    created
 
-                    marker, terminal, fallback
+            let terminals =
+                match orphanTerminals.TryGetValue(key) with
+                | true, cached when not (isNull (box cached)) -> cached
+                | _ ->
+                    let created = HashSet<TurnId>()
+                    orphanTerminals[key] <- created
+                    created
 
-            replay 0L false false (ResizeArray<TurnId>()) (HashSet<TurnId>())
+            let suffix, _, hadFallback =
+                awaitTask (
+                    consumeProbeSuffixAsync "orphan" suspend.EventStore props.Tenant props.SessionId cancellationToken
+                )
+
+            if hadFallback then
+                // Explicit reconstruction: the cached sets describe a
+                // skipped prefix, so rebuild them from the full suffix.
+                markers.Clear()
+                terminals.Clear()
+
+            if not (isNull (box suffix)) then
+                for event in suffix do
+                    if not (isNull (box event)) then
+                        match event with
+                        | :? TurnStartedEvent -> markers.Add(event.TurnId)
+                        | :? TurnCompletedEvent
+                        | :? TurnFailedEvent
+                        | :? TurnAbortedEvent
+                        | :? SessionClosedEvent -> terminals.Add(event.TurnId) |> ignore
+                        | _ -> ()
+
+            let mutable foundMarker = false
+            let mutable foundTerminal = false
+
+            for marker in markers do
+                if marker.Equals(liveId) then
+                    foundMarker <- true
+
+            if foundMarker then
+                foundTerminal <- terminals.Contains(liveId)
+
+            let fallback =
+                markers
+                |> Seq.filter (fun candidate -> not (terminals.Contains(candidate)))
+                |> Seq.tryLast
+
+            foundMarker, foundTerminal, fallback
 
         /// Reads whether the live turn is an orphan (issue 289), in order:
         /// the settling id (the live id when its marker stands unterminated,
@@ -3655,9 +3766,10 @@ module internal SessionActor =
         /// prime quietly after failing the orphan (a never-ran prime
         /// journals nothing).
         /// <param name="liveId">The live turn to probe.</param>
+        /// <param name="cancellationToken">Token that abandons the journal probe.</param>
         /// <returns>The settling turn id with the won prime claim, or None when the session stays quiet.</returns>
-        let probeOrphanTurn (liveId: TurnId) : (TurnId * TurnClaim) option =
-            let marker, terminal, fallback = journalOrphanState liveId
+        let probeOrphanTurn (liveId: TurnId) (cancellationToken: CancellationToken) : (TurnId * TurnClaim) option =
+            let marker, terminal, fallback = journalOrphanState liveId cancellationToken
 
             let settling = if marker && not terminal then Some liveId else fallback
 
@@ -3773,7 +3885,11 @@ module internal SessionActor =
                             // spuriously.
                             let orphaned =
                                 try
-                                    hasUnterminatedTurnTail suspend.EventStore props.Tenant props.SessionId
+                                    hasUnterminatedTurnTail
+                                        suspend.EventStore
+                                        props.Tenant
+                                        props.SessionId
+                                        CancellationToken.None
                                 with _ ->
                                     false
 
@@ -3807,7 +3923,11 @@ module internal SessionActor =
                             // exists. An empty tail idles as before.
                             let orphaned =
                                 try
-                                    hasUnterminatedTurnTail suspend.EventStore props.Tenant props.SessionId
+                                    hasUnterminatedTurnTail
+                                        suspend.EventStore
+                                        props.Tenant
+                                        props.SessionId
+                                        CancellationToken.None
                                 with _ ->
                                     false
 
@@ -3828,7 +3948,7 @@ module internal SessionActor =
                                 SessionState.Idle, None, None
                 | SessionState.WaitingForInput ->
                     let rebuilt =
-                        rebuildPendingFromJournal suspend.EventStore props.Tenant props.SessionId
+                        rebuildPendingFromJournal suspend.EventStore props.Tenant props.SessionId CancellationToken.None
 
                     SessionState.WaitingForInput, rebuilt, None
                 | SessionState.Idle ->
@@ -3846,7 +3966,17 @@ module internal SessionActor =
                     if session.CurrentTurnId.HasValue then
                         let liveId = session.CurrentTurnId.Value
 
-                        match probeOrphanTurn liveId with
+                        // The actor thread carries no cancellation token:
+                        // the probe still bounds through hardening plus its
+                        // checkpoint, and stays quiet when the journal will
+                        // not read.
+                        let orphan =
+                            try
+                                probeOrphanTurn liveId CancellationToken.None
+                            with _ ->
+                                None
+
+                        match orphan with
                         | None -> SessionState.Idle, None, None
                         | Some(settlingId, prime) ->
                             let drainable =
@@ -6504,12 +6634,22 @@ module internal SessionActor =
             // seeds the resumed run's runner input in-memory (never
             // journaled, so replay cursors stay untouched); a rehydration
             // failure falls back to a seedless retry from the inbox entry
-            // per the existing crash-retry precedent.
+            // per the existing crash-retry precedent. The spawn thread
+            // carries no cancellation token: the probes still bound through
+            // hardening plus their checkpoints, and the guard below keeps a
+            // failed probe from failing the resume.
             let crashSeed: IList<ChatMessage> option =
                 try
-                    match lastJournalTurnId suspend.EventStore props.Tenant props.SessionId with
+                    match lastJournalTurnId suspend.EventStore props.Tenant props.SessionId CancellationToken.None with
                     | Some interrupted ->
-                        Some(rehydrateCrashHistory suspend.EventStore props.Tenant props.SessionId interrupted)
+                        Some(
+                            rehydrateCrashHistory
+                                suspend.EventStore
+                                props.Tenant
+                                props.SessionId
+                                interrupted
+                                CancellationToken.None
+                        )
                     | None -> None
                 with _ ->
                     None
