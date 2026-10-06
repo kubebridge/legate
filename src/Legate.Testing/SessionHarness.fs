@@ -570,6 +570,7 @@ type SessionHarness
                 let baseProps: SessionActorProps =
                     {
                         Store = store
+                        Settlement = None
                         Tenant = resolved.Tenant
                         SessionId = created.Id
                         RunTurn = (fun _ _ -> Task.FromResult(unusedResult))

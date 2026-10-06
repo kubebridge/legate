@@ -355,6 +355,7 @@ let private spawnSuspendable
     let baseProps: SessionActorProps =
         {
             Store = store
+            Settlement = None
             Tenant = tenant
             SessionId = sessionId
             RunTurn = (fun _ _ -> Task.FromResult(completed "unused"))

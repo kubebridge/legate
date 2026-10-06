@@ -237,6 +237,7 @@ module ControlActorProtocolTests =
                         (fun _ _ -> None)
                         null
                         (fun _ _ _ -> Task.FromResult false)
+                        None
 
                 let! child = factoryActor system factory created.Id
                 let! _ = SessionActor.getSuspendSnapshotAsync child ct
@@ -344,6 +345,7 @@ module ControlActorProtocolTests =
                         (fun _ _ -> None)
                         null
                         (fun _ _ _ -> Task.FromResult false)
+                        None
 
                 let! child = factoryActor system factory created.Id
                 let! snapshot = SessionActor.getSuspendSnapshotAsync child ct
@@ -418,6 +420,7 @@ module ControlActorProtocolTests =
                     null
                     (fun _ _ _ -> Task.FromResult false)
                     System.TimeProvider.System
+                    None
                     None
 
             use system = ActorSystem.Create("route-" + Guid.NewGuid().ToString("N"))
@@ -511,6 +514,7 @@ module ControlActorProtocolTests =
         let props: SessionActorProps =
             {
                 Store = store
+                Settlement = None
                 Tenant = tenant
                 SessionId = created.Id
                 RunTurn = (fun _ _ -> Task.FromResult completed)

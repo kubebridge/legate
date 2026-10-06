@@ -108,6 +108,7 @@ let private startServiceWith
             (fun _ _ _ -> Task.FromResult false)
             clock
             heartbeat
+            None
 
     let _router = LocalActorSystem.spawnRouterWith system factory
     system
@@ -485,6 +486,7 @@ let ``unsupported journal format fails closed without rebinding a heartbeat`` ()
             (fun _ _ _ -> Task.FromResult false)
             clock
             (Some(ClaimHeartbeat.fromSessions (SessionsOptions())))
+            None
 
     use system = ActorSystem.Create("unsupported-" + Guid.NewGuid().ToString("N"))
 

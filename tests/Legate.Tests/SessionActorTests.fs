@@ -93,6 +93,7 @@ let private spawnSession
     let props: SessionActorProps =
         {
             Store = store
+            Settlement = None
             Tenant = tenant
             SessionId = sessionId
             RunTurn = runTurn
@@ -116,6 +117,7 @@ let private spawnSessionWithProbe
     let props: SessionActorProps =
         {
             Store = store
+            Settlement = None
             Tenant = tenant
             SessionId = sessionId
             RunTurn = runTurn
@@ -1131,6 +1133,7 @@ let private spawnSuspendable
     let baseProps: SessionActorProps =
         {
             Store = store
+            Settlement = None
             Tenant = tenant
             SessionId = sessionId
             RunTurn = (fun _ _ -> Task.FromResult(completed "unused"))
@@ -1707,6 +1710,7 @@ let private spawnSessionFull
     let props: SessionActorProps =
         {
             Store = store
+            Settlement = None
             Tenant = tenant
             SessionId = sessionId
             RunTurn = runTurn
@@ -2500,6 +2504,7 @@ let private spawnSessionWithCompact
     let props: SessionActorProps =
         {
             Store = store
+            Settlement = None
             Tenant = tenant
             SessionId = sessionId
             RunTurn = runTurn
@@ -3255,6 +3260,7 @@ let ``Session actor prompt and settle carry all six scopes and leak no secret`` 
     let props: SessionActorProps =
         {
             Store = store
+            Settlement = None
             Tenant = tenant
             SessionId = created.Id
             RunTurn = runner.Func
@@ -3457,6 +3463,7 @@ let private spawnSuspendableOver
     let baseProps: SessionActorProps =
         {
             Store = store
+            Settlement = None
             Tenant = tenant
             SessionId = sessionId
             RunTurn = (fun _ _ -> Task.FromResult(completed "unused"))
@@ -3770,6 +3777,7 @@ let ``Kill mid-turn restarts exactly once with the journal prefix intact`` () =
         let baseProps: SessionActorProps =
             {
                 Store = store
+                Settlement = None
                 Tenant = tenant
                 SessionId = created.Id
                 RunTurn = (fun _ _ -> Task.FromResult(completed "unused"))
@@ -3895,6 +3903,7 @@ let ``Running with empty inbox and marker-only journal settles Failed instead of
     let baseProps: SessionActorProps =
         {
             Store = store
+            Settlement = None
             Tenant = tenant
             SessionId = created.Id
             RunTurn = (fun _ _ -> Task.FromResult(completed "unused"))
@@ -4052,6 +4061,7 @@ let ``Orphan fail takeover loser journals nothing under the fresh token`` () =
         let baseProps: SessionActorProps =
             {
                 Store = store
+                Settlement = None
                 Tenant = tenant
                 SessionId = sessionId
                 RunTurn = (fun _ _ -> Task.FromResult(completed "unused"))
@@ -4329,6 +4339,7 @@ let private spawnReprimeable
     let baseProps: SessionActorProps =
         {
             Store = store
+            Settlement = None
             Tenant = tenantId
             SessionId = sessionId
             RunTurn = (fun _ _ -> Task.FromResult(completed "unused"))
@@ -4727,6 +4738,7 @@ let private spawnProbe
     let baseProps: SessionActorProps =
         {
             Store = store
+            Settlement = None
             Tenant = tenant
             SessionId = sessionId
             RunTurn = (fun _ _ -> Task.FromResult(completed "unused"))

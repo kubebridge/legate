@@ -954,6 +954,7 @@ let private spawnWriterActor
     let baseProps: SessionActorProps =
         {
             Store = store
+            Settlement = None
             Tenant = tenant
             SessionId = sessionId
             RunTurn = (fun _ _ -> Task.FromResult(unusedResult))

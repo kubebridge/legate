@@ -128,6 +128,7 @@
     <Compile Include="PromptAndWaitTests.fs" />
     <Compile Include="SessionClientFacadeTests.fs" />
     <Compile Include="OperationReceiptsTests.fs" />
+    <Compile Include="OperationWaitTests.fs" />
     <Compile Include="ConversationEvidenceTests.fs" />
     <Compile Include="LegateCliSmokeTests.fs" />
     <Compile Include="../../samples/Dot/DotConfig.fs" Link="DotConfigUnderTest.fs" />
@@ -151,6 +152,7 @@
     <Compile Include="TenantRemotingAcceptanceTests.fs" />
     <Compile Include="TenantRoutingDuplicateTests.fs" />
     <Compile Include="SqliteSessionStoreTests.fs" />
+    <Compile Include="SqliteOperationWaitTests.fs" />
     <Compile Include="ControlActorProtocolTests.fs" />
     <Compile Include="SqliteSessionListTests.fs" />
     <Compile Include="SqliteSessionEventStoreTests.fs" />

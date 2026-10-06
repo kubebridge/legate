@@ -147,7 +147,7 @@ idempotency key.
 | Sessions | `OpenSession`, `ResumeSession`, `GetSession`, `ListSessions`, `Close`, `Fork`, `SetAgent` |
 | Prompting | `Prompt(sessionId, UserMessage, DeliveryMode)` where `DeliveryMode` is `Queue`, `Inject`, or `Interrupt`, returning `AcceptedOperation` |
 | Replying | `Reply(sessionId, Reply)` returning `AcceptedOperation` |
-| Observation | `GetOperationResultAsync(AcceptedOperation)` returning `OperationResult` with `OperationStatus` |
+| Observation | `GetOperationResultAsync(AcceptedOperation)` returning `OperationResult` with `OperationStatus`, `WaitForOperationAsync(AcceptedOperation, bound)` waiting for the committed terminal observation |
 | Control | `Abort`, `Compact` |
 | Reading | `ReadTranscript`, `ReadEvents(fromSequence)`, `Subscribe(sessionId, fromSequence)` as `IAsyncEnumerable<SessionEvent>` |
 | Sugar | `PromptAndWait` extension returning `TurnResult` |
@@ -193,6 +193,35 @@ providers fail fast before accepting work that needs durable
 observation, with no process-local or unfenced fallback. Unsupported old
 formats reject with `CompletionRoutingException`
 (`UnsupportedFormat`) and a clean-start requirement.
+
+### Receipt-bound waits
+
+Every wait identifies its operation by the receipt's immutable inbox
+position and resolves from the same authoritative
+`execution_settlements` row as `GetOperationResultAsync`, so concurrent
+observers cannot steal one another's results and multiple observers of
+one operation obtain the same committed outcome. `WaitForOperationAsync`
+takes the receipt and a bound and returns the terminal `OperationResult`;
+`PromptAndWait` prompts over `Queue` delivery and then observes that
+prompt's receipt the same way, returning the winning `TurnResult`.
+
+No registration before prompting is required: completion before
+subscription resolves on the first durable read, completion racing
+subscription converges on a live settlement hint plus re-read, and late,
+reconnected, restarted, and separate-process observers poll the same
+durable truth within the retention window. The live hint only wakes the
+observer; it never carries a verdict, and waits never manufacture
+settlement.
+
+Cancelling a wait or lapsing its bound abandons only that observation:
+the turn keeps running, the result is never consumed, another observer is
+never cancelled, and a later wait for the same receipt remains valid. A
+settlement that already won still returns after cancellation. Suspension
+on a permission request surfaces as the typed approval exception instead
+of settling. Explicit abort stays on `Abort`. The legacy
+`WaitForSettleAsync` companion (wait for the next settle without a
+receipt) remains for interactive hosts that queue the wait before
+prompting; prefer receipt-bound waits everywhere else.
 
 ### Turn lifecycle
 
