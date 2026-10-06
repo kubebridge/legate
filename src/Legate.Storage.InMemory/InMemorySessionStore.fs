@@ -583,6 +583,25 @@ type InMemorySessionStore(database: InMemoryDatabase) =
                         | _ -> rejected ())
             |> ok
 
+        member _.TryReadCommitted(tenant, sessionId, position, _) =
+            lock database.Gate (fun () ->
+                let key = (tenant, sessionId, position)
+
+                match database.ExecutionSettlements.TryGetValue key with
+                | true, (_, outcome) -> outcome
+                | false, _ -> Unchecked.defaultof<SessionSettlementOutcome>)
+            |> ok
+
+        member _.TryReadEntry(tenant, sessionId, position, _) =
+            lock database.Gate (fun () ->
+                match database.Inboxes.TryGetValue((tenant, sessionId)) with
+                | true, entries ->
+                    match entries |> Seq.tryFind (fun entry -> entry.Position = position) with
+                    | Some entry -> entry
+                    | None -> Unchecked.defaultof<InboxEntry>
+                | false, _ -> Unchecked.defaultof<InboxEntry>)
+            |> ok
+
     interface ISessionStore with
 
         member _.CreateSession(tenant, session, _) =

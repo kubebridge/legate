@@ -145,11 +145,54 @@ idempotency key.
 | Area | Members |
 |---|---|
 | Sessions | `OpenSession`, `ResumeSession`, `GetSession`, `ListSessions`, `Close`, `Fork`, `SetAgent` |
-| Prompting | `Prompt(sessionId, UserMessage, DeliveryMode)` where `DeliveryMode` is `Queue`, `Inject`, or `Interrupt` |
-| Replying | `Reply(sessionId, Reply)` |
+| Prompting | `Prompt(sessionId, UserMessage, DeliveryMode)` where `DeliveryMode` is `Queue`, `Inject`, or `Interrupt`, returning `AcceptedOperation` |
+| Replying | `Reply(sessionId, Reply)` returning `AcceptedOperation` |
+| Observation | `GetOperationResultAsync(AcceptedOperation)` returning `OperationResult` with `OperationStatus` |
 | Control | `Abort`, `Compact` |
 | Reading | `ReadTranscript`, `ReadEvents(fromSequence)`, `Subscribe(sessionId, fromSequence)` as `IAsyncEnumerable<SessionEvent>` |
 | Sugar | `PromptAndWait` extension returning `TurnResult` |
+
+### Accepted-operation receipts and authoritative result lookup
+
+Every accepted `Prompt` (all `DeliveryMode`) and `Reply` returns an
+`AcceptedOperation` receipt: the session id, the immutable per-session
+inbox `Position`, the durable `OperationId` (`InboxEntry.TurnId` stamped
+at accept for user messages; the default sentinel for reply entries and
+legacy rows), the `OperationKind` (`Queue`, `Inject`, `Interrupt`,
+`Reply`), and the accept timestamp. Rejected input throws and returns
+nothing claiming acceptance. Concurrent accepted inputs carry distinct
+positions and are distinguishable.
+
+Correlation semantics: `Queue` acts on the message once the running turn
+finishes; `Inject` folds into the running turn at its next iteration
+boundary and never promises an independent turn; `Interrupt` pre-empts
+the running turn (settled as `Aborted` under `ExplicitAbort`) and is
+never confused with the displaced turn or following queued work; `Reply`
+resumes the suspended real turn with attempt+1 and never starts one.
+Acceptance is not execution: it promises neither start nor success.
+
+`GetOperationResultAsync` observes one receipt behind a tenant-scoped
+lookup over the single authoritative `execution_settlements` row for
+`(tenant, session, position)`. `Pending` means accepted with no
+committed winner yet (with the associated real turn when known);
+`Terminal` carries the committed winning `TurnResult` (success, failure,
+or abort, including setup failure after acceptance); `Unknown` means the
+session entry is missing or mismatched in this tenant; `Unavailable`
+means storage failed and is never terminal. Unknown sessions (including
+other-tenant sessions) throw `SessionNotFoundException`, so receipt
+possession grants neither access nor turn ownership. Stale or losing
+reports never replace the committed winner.
+
+Availability and retention: committed success, failure, and abort
+outcomes stay available to late and separate-process readers after
+restart for the documented bounded retention window, including sinkless
+sessions. Completion delivery or outbox cleanup never destroys the
+observation record early. Retention is bounded, never permanent, and no
+outcome is reconstructed from incomplete journal history. Unsupported
+providers fail fast before accepting work that needs durable
+observation, with no process-local or unfenced fallback. Unsupported old
+formats reject with `CompletionRoutingException`
+(`UnsupportedFormat`) and a clean-start requirement.
 
 ### Turn lifecycle
 
@@ -301,6 +344,15 @@ count and bytes, batch size) are host-configured runtime options; a breach
 throws `EventLimitExceededException` with structured properties before any
 part of the batch lands. Sanitisation is a runtime concern applied before
 the append; the store persists what it is given and validates only bounds.
+
+`ISessionSettlementStore` is the additive atomic settlement capability
+beside `ISessionStore`: `AdmitExecution`/`SettleExecution` commit the
+single winning terminal settlement per `(tenant, session, position)`, and
+`TryReadCommitted`/`TryReadEntry` serve durable observation behind
+`GetOperationResultAsync` with no new table, migration, or backfill. Reads
+are tenant-scoped and winner-only; correlation is evidence, never claim
+authority. Custom providers implement the full capability or fail fast
+before accepting work that needs it.
 
 `IAgentStore` and `IAgentCustomToolStore` are the durable store contracts
 for agent definitions and the custom HTTP tools enabled per agent. Every

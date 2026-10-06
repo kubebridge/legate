@@ -129,3 +129,38 @@ type ISessionSettlementStore =
     abstract SettleExecution:
         tenant: TenantId * request: SessionSettlementRequest * cancellationToken: CancellationToken ->
             Task<SessionSettlementOutcome>
+
+    /// Reads the committed winning settlement for one inbox position, or
+    /// null when no terminal settlement has committed yet. Serves only the
+    /// single authoritative <c>execution_settlements</c> row for
+    /// (tenant, session, position): stale or losing completion reports never
+    /// replace it, and an unsettled position reads as null, never a
+    /// fabricated result. The returned correlation is evidence, never claim
+    /// authority: callers must not treat the receipt or this read as
+    /// permission to act for the turn. Tenant-scoped: rows of another tenant
+    /// are invisible. Custom providers without this capability fail fast
+    /// before the runtime accepts work that requires durable observation,
+    /// with no process-local or unfenced fallback.
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="sessionId">The session containing the entry.</param>
+    /// <param name="position">The immutable inbox entry position.</param>
+    /// <param name="cancellationToken">Token that abandons the read.</param>
+    /// <returns>The winning settlement outcome, or null when unsettled.</returns>
+    abstract TryReadCommitted:
+        tenant: TenantId * sessionId: SessionId * position: int64 * cancellationToken: CancellationToken ->
+            Task<SessionSettlementOutcome | null>
+
+    /// Reads one inbox entry by position including consumed rows, or null
+    /// when no entry carries that position in this tenant and session.
+    /// Consumed entries stay readable until the retention policy removes
+    /// them; pending entries read the same way. Tenant-scoped: rows of
+    /// another tenant are invisible. Correlation is evidence, never claim
+    /// authority.
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="sessionId">The session containing the entry.</param>
+    /// <param name="position">The immutable inbox entry position.</param>
+    /// <param name="cancellationToken">Token that abandons the read.</param>
+    /// <returns>The entry, or null when absent.</returns>
+    abstract TryReadEntry:
+        tenant: TenantId * sessionId: SessionId * position: int64 * cancellationToken: CancellationToken ->
+            Task<InboxEntry | null>

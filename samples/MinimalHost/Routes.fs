@@ -211,7 +211,7 @@ let private promptHandler (sessionText: string) : HttpHandler =
                         {
                             SessionId = entry.SessionId.ToString()
                             Position = entry.Position
-                            Delivery = entry.Delivery.ToString()
+                            Delivery = entry.Kind.ToString()
                         }
                         next
                         ctx
@@ -240,7 +240,7 @@ let private replyHandler (sessionText: string) : HttpHandler =
                         {
                             SessionId = entry.SessionId.ToString()
                             Position = entry.Position
-                            Delivery = entry.Delivery.ToString()
+                            Delivery = entry.Kind.ToString()
                         }
                         next
                         ctx

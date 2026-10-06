@@ -774,3 +774,84 @@ type PostgresSessionSettlementStore(options: PostgresOptions, timeProvider: Time
                                         receiptUpdate.ExecuteNonQuery() |> ignore
                                         outcome)
             }
+
+        member this.TryReadCommitted(tenant, sessionId, position, ct) =
+            task {
+                this.EnsureMigrated()
+                ct.ThrowIfCancellationRequested()
+
+                return
+                    transact options (fun connection transaction ->
+                        ct.ThrowIfCancellationRequested()
+
+                        use query =
+                            command
+                                connection
+                                transaction
+                                $"SELECT outcome_json FROM {this.SettlementsTable} WHERE tenant = @t AND session_id = @sid AND position = @pos"
+
+                        textParam query "t" (tenant.ToString())
+                        textParam query "sid" (sessionId.ToString())
+                        longParam query "pos" position
+
+                        use reader = query.ExecuteReader()
+
+                        if reader.Read() && not (reader.IsDBNull(0)) then
+                            let outcomeJson = reader.GetString(0)
+                            reader.Close()
+
+                            if String.IsNullOrWhiteSpace outcomeJson then
+                                Unchecked.defaultof<SessionSettlementOutcome>
+                            else
+                                this.Deserialize<SessionSettlementOutcome>(outcomeJson)
+                        else
+                            reader.Close()
+                            Unchecked.defaultof<SessionSettlementOutcome>)
+            }
+
+        member this.TryReadEntry(tenant, sessionId, position, ct) =
+            task {
+                this.EnsureMigrated()
+                ct.ThrowIfCancellationRequested()
+
+                return
+                    transact options (fun connection transaction ->
+                        ct.ThrowIfCancellationRequested()
+
+                        use query =
+                            command
+                                connection
+                                transaction
+                                $"SELECT payload_json, delivery_mode, consumed, appended_at, turn_id FROM {this.InboxTable} WHERE session_id = @sid AND tenant = @t AND position = @pos"
+
+                        textParam query "sid" (sessionId.ToString())
+                        textParam query "t" (tenant.ToString())
+                        longParam query "pos" position
+
+                        use reader = query.ExecuteReader()
+
+                        if reader.Read() then
+                            let payload = this.Deserialize<InboxPayload>(reader.GetString(0))
+                            let delivery = Enum.Parse<DeliveryMode>(reader.GetString(1), false)
+                            let consumed = reader.GetBoolean(2)
+                            let appendedAt = parseStamp (reader.GetString(3))
+                            let turnText: string | null = getTextOrNull reader 4
+                            reader.Close()
+
+                            {
+                                SessionId = sessionId
+                                Position = position
+                                Payload = payload
+                                Delivery = delivery
+                                Consumed = consumed
+                                AppendedAt = appendedAt
+                                TurnId =
+                                    match turnText with
+                                    | null -> Unchecked.defaultof<TurnId>
+                                    | text when String.IsNullOrWhiteSpace(text) -> Unchecked.defaultof<TurnId>
+                                    | text -> TurnId.Parse(text)
+                            }
+                        else
+                            reader.Close()
+                            Unchecked.defaultof<InboxEntry>)
+            }

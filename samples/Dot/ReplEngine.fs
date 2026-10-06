@@ -1035,7 +1035,7 @@ type Engine
                             cancellationToken
                         )
 
-                    promptTask.ContinueWith(fun (completed: Task<InboxEntry>) ->
+                    promptTask.ContinueWith(fun (completed: Task<AcceptedOperation>) ->
                         if not completed.IsCompletedSuccessfully then
                             let error =
                                 match completed.Exception with
@@ -1088,7 +1088,7 @@ type Engine
                             cancellationToken
                         )
 
-                    promptTask.ContinueWith(fun (completed: Task<InboxEntry>) ->
+                    promptTask.ContinueWith(fun (completed: Task<AcceptedOperation>) ->
                         if not completed.IsCompletedSuccessfully then
                             let error =
                                 match completed.Exception with
