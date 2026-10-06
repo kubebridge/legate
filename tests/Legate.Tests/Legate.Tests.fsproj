@@ -177,6 +177,8 @@
     <Compile Include="OrdinaryHistoryTests.fs" />
     <Compile Include="ProductionCompactionTests.fs" />
     <Compile Include="CompactedContextTests.fs" />
+    <Compile Include="BoundedReplayTests.fs" />
+    <Compile Include="BoundedContextTests.fs" />
   </ItemGroup>
 
   <ItemGroup>
