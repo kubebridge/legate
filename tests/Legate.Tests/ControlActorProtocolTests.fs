@@ -712,7 +712,7 @@ module ControlActorProtocolTests =
 
                 // The recovered original operation must also be observable by
                 // late, independent receipt waiters, not just journal readers.
-                let observer = SessionClient(store, tenant, resolve, bus, bound, delay, None)
+                let observer = new SessionClient(store, tenant, resolve, bus, bound, delay, None)
                 observer.SettlementStore <- Some settlement
                 let receipt = SessionClientExtensions.ToReceipt(entry)
 
