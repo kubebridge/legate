@@ -178,18 +178,7 @@ type SessionClientOperations =
     /// reject decorated journals that forward to the composed store.
     /// <param name="client">The session client. Must not be null.</param>
     static member private RequireSettlement(client: SessionClient) : ISessionSettlementStore =
-        match client.SettlementStore with
-        | Some capable -> capable
-        | None ->
-            match box client.Store with
-            | :? ISessionSettlementStore as capable -> capable
-            | _ ->
-                let ex =
-                    InvalidOperationException(
-                        "The configured ISessionStore must implement ISessionSettlementStore to accept work requiring durable receipts."
-                    )
-
-                raise ex
+        client.RequireSettlementStore()
 
     /// Maps an accepted inbox entry to its public durable receipt: the
     /// immutable position plus the turn identity stamped at accept.
@@ -197,21 +186,7 @@ type SessionClientOperations =
     /// independent turn; user messages map from their delivery mode.
     /// <param name="entry">The accepted inbox entry. Must not be null.</param>
     static member private ToReceipt(entry: InboxEntry | null) : AcceptedOperation =
-        if isNull (box entry) then
-            raise (ArgumentNullException(nameof entry))
-
-        let present = unbox<InboxEntry> (box entry)
-
-        let kind =
-            match box present.Payload with
-            | :? ReplyPayload -> OperationKind.Reply
-            | _ ->
-                match present.Delivery with
-                | DeliveryMode.Inject -> OperationKind.Inject
-                | DeliveryMode.Interrupt -> OperationKind.Interrupt
-                | _ -> OperationKind.Queue
-
-        AcceptedOperation(present.SessionId, present.Position, present.TurnId, kind, present.AppendedAt)
+        SessionClientExtensions.ToReceipt(entry)
 
     /// Reads the source journal prefix a fork copies: the events with a
     /// stamped sequence through upToSequence (inclusive), in sequence
@@ -674,168 +649,158 @@ type SessionClientOperations =
         if isNull (box receipt) then
             raise (ArgumentNullException(nameof receipt))
 
+        SessionClientExtensions.ReadOperationAsync(client, receipt, cancellationToken)
+
+    /// Observes one accepted operation through its receipt until it
+    /// settles: returns the committed winning terminal observation. Every
+    /// wait identifies its operation by the receipt's immutable inbox
+    /// position, so concurrent observers cannot steal one another's results
+    /// and multiple observers of the same operation obtain the same
+    /// committed outcome. Completion before subscription resolves on the
+    /// first durable read with no registration required; completion racing
+    /// subscription converges on the live hint plus re-read; late,
+    /// reconnected, restarted, and separate-process observers poll the same
+    /// durable truth within the documented retention window. Cancelling the
+    /// wait or lapsing the bound abandons only this observation: the turn
+    /// keeps running, the result is never consumed, and a later wait for
+    /// the same receipt remains valid. Storage failures never report a
+    /// terminal verdict; unknown sessions (including other-tenant sessions)
+    /// throw, so receipt possession grants neither access nor turn
+    /// ownership. Explicit abort stays on <c>AbortAsync</c>.
+    /// <param name="client">The session client. Must not be null.</param>
+    /// <param name="receipt">The accepted-operation receipt. Must not be null.</param>
+    /// <param name="bound">How long to wait for the settlement; must be positive. The turn keeps running past it.</param>
+    /// <param name="cancellationToken">Abandons the wait, never the turn: the observation ends and a later wait for the same receipt remains valid.</param>
+    /// <returns>The committed winning terminal observation.</returns>
+    /// <exception cref="T:Legate.SessionNotFoundException">The session id does not exist in this tenant.</exception>
+    /// <exception cref="T:Legate.DeadlineExceededException">The wait bound lapsed with the turn left running.</exception>
+    [<Extension>]
+    static member WaitForOperationAsync
+        (client: SessionClient, receipt: AcceptedOperation, bound: TimeSpan, cancellationToken: CancellationToken)
+        : Task<OperationResult> =
+        ArgumentNullException.ThrowIfNull(client)
+
+        if isNull (box receipt) then
+            raise (ArgumentNullException(nameof receipt))
+
+        if bound <= TimeSpan.Zero then
+            raise (ArgumentOutOfRangeException(nameof bound, "The operation wait bound must be positive."))
+
         task {
             let tenant = client.Tenant
             let sessionId = receipt.SessionId
             let position = receipt.Position
 
-            let! current = SessionClientOperations.RequireAsync(client, sessionId, cancellationToken)
-            client.ValidateCompletionRoute current
-            let settlement = SessionClientOperations.RequireSettlement client
+            // Fail fast before waiting: unknown sessions (including
+            // other-tenant sessions), route violations, and unsupported
+            // providers surface now instead of lapsing the bound.
+            let! first = SessionClientExtensions.ReadOperationAsync(client, receipt, CancellationToken.None)
 
-            let receiptKind = receipt.Kind
-            let receiptTurn = receipt.OperationId
+            match first.Status with
+            | OperationStatus.Terminal -> return first
+            | _ ->
+                use boundCts = new CancellationTokenSource()
+                let cancelTcs = TaskCompletionSource<bool>()
 
-            let toUnknown () =
-                OperationResult(
-                    sessionId,
-                    position,
-                    receiptKind,
-                    OperationStatus.Unknown,
-                    Nullable(),
-                    Unchecked.defaultof<TurnResult>
-                )
+                use _registration =
+                    cancellationToken.Register(fun () -> cancelTcs.TrySetResult(true) |> ignore)
 
-            let toUnavailable () =
-                OperationResult(
-                    sessionId,
-                    position,
-                    receiptKind,
-                    OperationStatus.Unavailable,
-                    Nullable(),
-                    Unchecked.defaultof<TurnResult>
-                )
+                if cancellationToken.IsCancellationRequested then
+                    cancelTcs.TrySetResult(true) |> ignore
 
-            let mutable entryFailed = false
-            let mutable committedFailed = false
+                let boundTask = client.WaitDelay.Delay(bound, boundCts.Token)
+                let cancelTask = cancelTcs.Task
 
-            let! entry =
-                task {
-                    try
-                        return! settlement.TryReadEntry(tenant, sessionId, position, cancellationToken)
-                    with _ ->
-                        entryFailed <- true
-                        return null
-                }
+                let mutable outcome: OperationResult option = None
+                let mutable failure: exn option = None
 
-            let! committed =
-                task {
-                    try
-                        return! settlement.TryReadCommitted(tenant, sessionId, position, cancellationToken)
-                    with _ ->
-                        committedFailed <- true
-                        return null
-                }
+                while outcome.IsNone && failure.IsNone do
+                    // Settlement fast-path: a commit before or during the
+                    // subscribe still converges here.
+                    let! fast = SessionClientExtensions.TryTerminalAsync(client, receipt)
 
-            let entryMissing = isNull (box entry)
+                    match fast with
+                    | Some settled -> outcome <- Some settled
+                    | None ->
+                        let hint, unsubscribe = PromptWaitHubs.SubscribePosition tenant sessionId position
 
-            let committedPresent = not (isNull (box committed))
+                        try
+                            // The commit raced the subscribe: re-read before
+                            // parking on the hint, since the actor always
+                            // commits before notifying.
+                            let! raced = SessionClientExtensions.TryTerminalAsync(client, receipt)
 
-            let committedResult: TurnResult | null =
-                if committedPresent then
-                    (unbox<SessionSettlementOutcome> (box committed)).Result
-                else
-                    null
+                            match raced with
+                            | Some settled -> outcome <- Some settled
+                            | None ->
+                                let pollTask =
+                                    client.WaitDelay.Delay(
+                                        SessionClientExtensions.WaitPollInterval,
+                                        CancellationToken.None
+                                    )
 
-            let hasWinner = committedPresent && not (isNull (box committedResult))
+                                let candidates = ResizeArray<Task>()
+                                candidates.Add(hint)
+                                candidates.Add(boundTask)
+                                candidates.Add(cancelTask)
+                                candidates.Add(pollTask)
 
-            let winnerResult: TurnResult =
-                if hasWinner then
-                    unbox<TurnResult> (box committedResult)
-                else
-                    Unchecked.defaultof<TurnResult>
+                                let! _winner = Task.WhenAny(candidates)
 
-            if entryFailed || committedFailed then
-                // Storage failure is never terminal and never fabricated:
-                // a winner already in hand still reads Terminal (it is the
-                // committed truth), otherwise the observation is Unavailable.
-                if hasWinner then
-                    let knownTurn =
-                        if receiptTurn <> Unchecked.defaultof<TurnId> then
-                            Nullable receiptTurn
-                        else
-                            Nullable()
+                                // Settlement wins every tie, mirroring
+                                // StopArbitration: re-read before honoring
+                                // any other side.
+                                let! committed = SessionClientExtensions.TryTerminalAsync(client, receipt)
 
-                    return
-                        OperationResult(
-                            sessionId,
-                            position,
-                            receiptKind,
-                            OperationStatus.Terminal,
-                            knownTurn,
-                            winnerResult
-                        )
-                else
-                    return toUnavailable ()
-            elif entryMissing then
-                if hasWinner then
-                    let knownTurn =
-                        if receiptTurn <> Unchecked.defaultof<TurnId> then
-                            Nullable receiptTurn
-                        else
-                            Nullable()
+                                match committed with
+                                | Some settled -> outcome <- Some settled
+                                | None ->
+                                    if cancelTask.IsCompleted then
+                                        // Wait-abandonment: never abort the
+                                        // turn from here. Abandon only this
+                                        // observation and throw with the turn
+                                        // left running; a later wait for the
+                                        // same receipt remains valid.
+                                        cancellationToken.ThrowIfCancellationRequested()
 
-                    return
-                        OperationResult(
-                            sessionId,
-                            position,
-                            receiptKind,
-                            OperationStatus.Terminal,
-                            knownTurn,
-                            winnerResult
-                        )
-                else
-                    return toUnknown ()
-            else
-                let present = unbox<InboxEntry> (box entry)
+                                        failure <- Some(OperationCanceledException(cancellationToken))
+                                    elif boundTask.IsCompletedSuccessfully then
+                                        failure <-
+                                            Some(
+                                                DeadlineExceededException(
+                                                    "WaitForOperation",
+                                                    "The operation wait exceeded its bound while the turn kept running."
+                                                )
+                                                :> exn
+                                            )
+                                    elif boundTask.IsFaulted then
+                                        // The seam faulted: surface it rather
+                                        // than hanging.
+                                        let inner =
+                                            match boundTask.Exception with
+                                            | null -> Exception("The operation-wait delay failed.")
+                                            | aggregate when aggregate.InnerExceptions.Count > 0 ->
+                                                aggregate.InnerExceptions[0]
+                                            | aggregate -> aggregate :> exn
 
-                if present.SessionId <> sessionId then
-                    return toUnknown ()
-                else
-                    let entryKind = SessionClientOperations.ToReceipt(present).Kind
+                                        failure <- Some inner
+                                    else
+                                        // A hint or poll fired with nothing
+                                        // committed yet: loop and re-read the
+                                        // durable row.
+                                        ()
+                        finally
+                            unsubscribe ()
 
-                    if entryKind <> receiptKind then
-                        return toUnknown ()
-                    else if
-                        present.TurnId <> Unchecked.defaultof<TurnId>
-                        && receiptTurn <> Unchecked.defaultof<TurnId>
-                        && present.TurnId <> receiptTurn
-                    then
-                        return toUnknown ()
-                    else
-                        let knownTurn =
-                            if receiptTurn <> Unchecked.defaultof<TurnId> then
-                                Nullable receiptTurn
-                            elif present.TurnId <> Unchecked.defaultof<TurnId> then
-                                Nullable present.TurnId
-                            else
-                                Nullable()
+                try
+                    boundCts.Cancel()
+                with _ ->
+                    ()
 
-                        if hasWinner then
-                            return
-                                OperationResult(
-                                    sessionId,
-                                    position,
-                                    receiptKind,
-                                    OperationStatus.Terminal,
-                                    knownTurn,
-                                    winnerResult
-                                )
-                        else
-                            // Accepted but with no committed winner yet:
-                            // a clean null read is Pending (the turn may
-                            // still run, fold, or resume), never
-                            // Unavailable. True storage failure already
-                            // returned above via the failure flags.
-                            return
-                                OperationResult(
-                                    sessionId,
-                                    position,
-                                    receiptKind,
-                                    OperationStatus.Pending,
-                                    knownTurn,
-                                    Unchecked.defaultof<TurnResult>
-                                )
+                match outcome, failure with
+                | Some settled, _ -> return settled
+                | None, Some error -> return raise error
+                | None, _ -> return raise (InvalidOperationException("The operation wait resolved with no outcome."))
         }
 
     /// Reads the exact current control target without activating an actor or loading its options.
@@ -1106,7 +1071,11 @@ type SessionClientOperations =
     /// observing them on the event stream); settlement, the wait bound, and
     /// the caller's cancellation do. Queue the wait before prompting:
     /// a settle with no waiter only records, so a turn settling first
-    /// would leave a later wait hanging until its bound.
+    /// would leave a later wait hanging until its bound. Legacy companion
+    /// to the receipt-bound <c>WaitForOperationAsync</c>: prefer waiting on
+    /// the accepted operation's receipt, which needs no pre-registration,
+    /// survives late subscription, reconnects, restarts, and separate
+    /// processes, and never confuses concurrent operations.
     /// <param name="client">The session client. Must not be null.</param>
     /// <param name="sessionId">The session whose turn to wait on.</param>
     /// <param name="bound">How long to wait for the settle; must be positive. The turn keeps running past it.</param>

@@ -6,12 +6,15 @@ open System.Collections.Concurrent
 open System.Collections.Generic
 open System.Threading.Tasks
 
-// Internal per-session waiter hub for PromptAndWait (issue 85): a FIFO
-// settle queue fed by OnTurnSettled wired at actor spawn (both props
-// sites), mirroring the HarnessSignals precedent in SessionHarness.
-// Waiters queue per PromptAndWait call before the Queue prompt, so
-// sequential turns never steal each other's signal and concurrent waits
-// resolve in Queue settle order; a settle with no waiter still records.
+// Internal per-session waiter hub for the legacy WaitForSettle path plus
+// the issue 383 per-operation live hints: a FIFO settle queue fed by
+// OnTurnSettled wired at actor spawn (both props sites), mirroring the
+// HarnessSignals precedent in SessionHarness. The FIFO queue is the verdict
+// source only for the legacy WaitForSettleAsync companion; receipt-bound
+// waits (PromptAndWaitAsync, WaitForOperationAsync) resolve from the
+// durable execution_settlements row and use the position-keyed hint
+// registry below as a fast-path wake only. A settle with no waiter still
+// records.
 type internal PromptWaitHub() =
 
     let gate = obj ()
@@ -98,3 +101,69 @@ module internal PromptWaitHubs =
     /// Drops every hub. Tests only: isolates static settle state between
     /// facts sharing the process.
     let Clear () : unit = hubs.Clear()
+
+    // ────────────────── Per-operation live hints (issue 383) ──────────────────
+
+    // Position-keyed observers fed by committed settlement. A hint only
+    // wakes the observer so it re-reads the durable row; it never carries a
+    // verdict, so late, reconnected, restarted, and remote observers that
+    // miss it still converge by polling the same store truth. Subscribe
+    // always precedes the durable re-read, and the actor always commits
+    // before notifying, so every outcome is either read directly or wakes
+    // the hint: nothing settles silently.
+    let private positionHints =
+        ConcurrentDictionary<TenantId * SessionId * int64, ResizeArray<TaskCompletionSource<unit>>>()
+
+    /// Subscribes one observer to the live hint for an accepted operation.
+    /// Returns the hint task plus an unsubscribe removing only this
+    /// observer: cancelling abandons only this observation. The hint task
+    /// completes when the owning actor settles that position, or never when
+    /// the hint is missed (a remote or restarted observer): the caller must
+    /// re-read the durable row after subscribing and poll while unsettled.
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="sessionId">The session the operation was accepted into.</param>
+    /// <param name="position">The immutable per-session inbox position.</param>
+    let SubscribePosition (tenant: TenantId) (sessionId: SessionId) (position: int64) : Task * (unit -> unit) =
+        let key = (tenant, sessionId, position)
+
+        let waiter =
+            TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+        let live =
+            positionHints.GetOrAdd(key, fun _ -> ResizeArray<TaskCompletionSource<unit>>())
+
+        lock live (fun () -> live.Add(waiter))
+
+        let unsubscribe () =
+            lock live (fun () ->
+                let mutable found = -1
+
+                for index = 0 to live.Count - 1 do
+                    if found < 0 && Object.ReferenceEquals(live[index], waiter) then
+                        found <- index
+
+                if found >= 0 then
+                    live.RemoveAt(found)
+
+                if live.Count = 0 then
+                    positionHints.TryRemove(key) |> ignore)
+
+        waiter.Task :> Task, unsubscribe
+
+    /// Feeds the live hint for one settled position: wakes every subscribed
+    /// observer so each re-reads the durable row. Best-effort and
+    /// idempotent: observers that miss it converge by polling, and duplicate
+    /// notifies only trigger another re-read of the same committed winner.
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="sessionId">The session the operation was accepted into.</param>
+    /// <param name="position">The immutable per-session inbox position.</param>
+    let NotifyPositionScoped (tenant: TenantId) (sessionId: SessionId) (position: int64) : unit =
+        let key = (tenant, sessionId, position)
+
+        match positionHints.TryRemove(key) with
+        | true, live when not (isNull (box live)) ->
+            lock live (fun () ->
+                for waiter in live do
+                    if not (isNull (box waiter)) then
+                        waiter.TrySetResult(()) |> ignore)
+        | _ -> ()

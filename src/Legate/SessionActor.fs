@@ -4124,6 +4124,20 @@ module internal SessionActor =
                     ()
             | None -> ()
 
+        /// Wakes the per-operation live-hint observers for one settled
+        /// inbox position (issue 383): each observer re-reads the durable
+        /// row, so the hint is never a verdict. Guarded like notifySettled:
+        /// a missed or duplicate hint only costs a re-read, and observers
+        /// that miss it converge by polling. Fires on every settle site with
+        /// an entry in scope, including legacy paths that commit no
+        /// settlement row (their observers keep polling until the bound).
+        /// <param name="position">The immutable per-session inbox position.</param>
+        let notifyPosition (position: int64) : unit =
+            try
+                PromptWaitHubs.NotifyPositionScoped props.Tenant props.SessionId position
+            with _ ->
+                ()
+
         /// Settles a turn whose suspend/resolve journal write never landed
         /// as Failed with the typed reason: parking or resuming would strand
         /// the turn on a missing journal event. Consumes the entry and
@@ -4149,6 +4163,7 @@ module internal SessionActor =
             |> ignore
 
             notifySettled result
+            notifyPosition entry.Position
             dispatchCompletion props result |> ignore
             retireControl entry
 
@@ -4504,6 +4519,7 @@ module internal SessionActor =
 
             let result = authorityRefusalResult failure reason
             notifySettled result
+            notifyPosition entry.Position
             dispatchCompletion props result |> ignore
 
             let positions = [| entry.Position |] :> IReadOnlyList<int64>
@@ -5822,6 +5838,7 @@ module internal SessionActor =
                                 pendingStop <- None
                                 runningTurnId <- None
                                 notifySettled result
+                                notifyPosition entry.Position
 
                                 // Terminal completion event (issue 289):
                                 // verdict-first (the committed settle above
@@ -5905,6 +5922,7 @@ module internal SessionActor =
                                 |> ignore
 
                                 notifySettled result
+                                notifyPosition entry.Position
                                 dispatchCompletion props result |> ignore
 
                                 // Terminal completion event (issue 289):
@@ -6125,6 +6143,7 @@ module internal SessionActor =
                             runningTurnId <- None
                             cancelHeartbeat ()
                             notifySettled selected
+                            notifyPosition entry.Position
 
                             match settling with
                             | Some tid -> journalSettledCompletion tid selected
@@ -6194,6 +6213,7 @@ module internal SessionActor =
                             runningTurnId <- None
                             cancelHeartbeat ()
                             notifySettled selected
+                            notifyPosition entry.Position
                             dispatchCompletion props selected |> ignore
 
                             match settling with
@@ -6447,6 +6467,7 @@ module internal SessionActor =
 
                             journalTimeout parked.TurnId
                             notifySettled result
+                            notifyPosition parked.Entry.Position
                             dispatchCompletion props result |> ignore
                             retireControl parked.Entry
                             cancelHeartbeat ()
