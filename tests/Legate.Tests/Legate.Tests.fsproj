@@ -152,6 +152,7 @@
     <Compile Include="TenantRemotingAcceptanceTests.fs" />
     <Compile Include="TenantRoutingDuplicateTests.fs" />
     <Compile Include="SqliteSessionStoreTests.fs" />
+    <Compile Include="SqliteOperationWaitTests.fs" />
     <Compile Include="ControlActorProtocolTests.fs" />
     <Compile Include="SqliteSessionListTests.fs" />
     <Compile Include="SqliteSessionEventStoreTests.fs" />

@@ -2262,6 +2262,14 @@ module internal SessionClientWiring =
                     (eraReaderOf provider)
                     clock
                     (Some heartbeatOptions)
+                    // Receipt-bound waits (issue 383) resolve from the
+                    // container-registered settlement capability, so the
+                    // suspendable settle must commit through it: split
+                    // compositions (SQLite, Postgres) register it as a
+                    // separate service the store-cast alone never sees, and
+                    // without it their turns settle legacy store-first with
+                    // no execution_settlements row for the wait to read.
+                    (Option.ofObj (provider.GetService<ISessionSettlementStore>()))
 
             spawnContext <-
                 fun address context name ->

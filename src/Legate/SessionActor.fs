@@ -240,6 +240,14 @@ type internal SessionActorProps =
     {
         /// The durable store the inbox and lifecycle state persist through.
         Store: ISessionStore
+        /// The container-registered atomic settlement capability the
+        /// suspendable settle path commits through (issue 383): split
+        /// compositions (SQLite, Postgres) register it as a separate
+        /// service, while unified compositions (InMemory) expose it on the
+        /// store itself. None keeps the store-cast fallback below, so
+        /// direct test constructions over a unified store behave
+        /// unchanged.
+        Settlement: ISessionSettlementStore option
         /// The tenant the session belongs to.
         Tenant: TenantId
         /// The session the actor owns.
@@ -2097,6 +2105,7 @@ module internal SessionActor =
                 let props =
                     {
                         Store = store
+                        Settlement = None
                         Tenant = tenant
                         SessionId = captured
                         RunTurn = runTurn
@@ -5155,16 +5164,26 @@ module internal SessionActor =
 
                 SessionState.Idle
 
-        /// Resolves the atomic terminal settlement capability the store
-        /// exposes (issue 363): the same provider the startup validation
-        /// requires. None only for direct test constructions over a bare
-        /// ISessionStore that never registered the capability; production
-        /// activation always carries it.
+        /// Resolves the atomic terminal settlement capability the suspendable
+        /// settle path commits through (issues 363, 383): the
+        /// container-registered capability the spawn factory threaded into
+        /// the props, else the store itself when the composition unifies
+        /// them (InMemory). Split compositions (SQLite, Postgres) register
+        /// a separate settlement service the store-cast alone never sees:
+        /// without the threaded capability the actor settles legacy
+        /// store-first and commits no execution_settlements row, so
+        /// receipt-bound waits poll until their bound. None only for direct
+        /// test constructions over a bare ISessionStore that never
+        /// registered the capability; production activation always carries
+        /// it.
         /// <returns>The settlement capability, or None when absent.</returns>
         let settlementStore: ISessionSettlementStore option =
-            match props.Store with
-            | :? ISessionSettlementStore as capable -> Some capable
-            | _ -> None
+            match props.Settlement with
+            | Some capable -> Some capable
+            | None ->
+                match props.Store with
+                | :? ISessionSettlementStore as capable -> Some capable
+                | _ -> None
 
         /// Resolves the captured claim authority one suspendable entry
         /// executes under (issue 363): the per-entry bound claim when the
@@ -7224,6 +7243,7 @@ module internal SessionActor =
     /// <param name="compactFor">Builds the on-demand compaction wiring for one session from its primed journal token, or None when the host compacts nothing. Must not be null; return None to answer CompactNotNeeded.</param>
     /// <param name="agentStore">The agent catalog the per-turn authority gate reads, or null when the host runs without one: the gate is skipped then.</param>
     /// <param name="eraMarked">Reads the completion era the entity-start probe consults (issue 289). Never null.</param>
+    /// <param name="settlement">The container-registered atomic settlement capability the suspendable settle commits through, or None when the host registered none: the actor then falls back to the store itself when it implements the capability, else the legacy store-first path. Split compositions (SQLite, Postgres) must pass theirs, or receipt-bound waits never observe a committed winner.</param>
     /// <returns>A factory mapping a session id string to a suspendable child spawn.</returns>
     let spawnSuspendFactoryRouted
         (routes: CompletionDestinations option)
@@ -7240,6 +7260,7 @@ module internal SessionActor =
         (eraMarked: CompletionEra.CompletionEraReader)
         (clock: TimeProvider)
         (heartbeatOptions: ClaimHeartbeat.ClaimHeartbeatOptions option)
+        (settlement: ISessionSettlementStore option)
         : (string -> IActorContext -> string -> IActorRef) =
         ArgumentNullException.ThrowIfNull(store)
         ArgumentNullException.ThrowIfNull(eventStore)
@@ -7482,6 +7503,7 @@ module internal SessionActor =
                 let props: SessionActorProps =
                     {
                         Store = store
+                        Settlement = settlement
                         Tenant = tenant
                         SessionId = captured
                         RunTurn = unusedRunTurn
@@ -7525,6 +7547,7 @@ module internal SessionActor =
         compactFor
         agentStore
         eraMarked
+        settlement
         =
         spawnSuspendFactoryRouted
             None
@@ -7541,3 +7564,4 @@ module internal SessionActor =
             eraMarked
             TimeProvider.System
             None
+            settlement
