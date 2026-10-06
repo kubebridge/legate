@@ -131,8 +131,8 @@ real-entry target/position, and fences the policy-correct recovered attempt. A
 Running slot is already admitted and is not double-counted against new-work
 capacity. Early lease refusal remains retryable on later sweeps.
 
-Run the offline [CSharpWebHost](../samples/CSharpWebHost/README.md) example or its
-[shared-Postgres owner-loss harness](../samples/CSharpWebHost/cluster/README.md).
+Run the offline [CSharpWebHost](https://github.com/kubebridge/legate/tree/main/samples/CSharpWebHost) example or its
+[shared-Postgres owner-loss harness](https://github.com/kubebridge/legate/tree/main/samples/CSharpWebHost/cluster).
 Those assertions describe that sample deployment, not universal provider
 capability certification.
 
