@@ -528,7 +528,7 @@ let ``Prompt queues and settles through the DI runner`` () : Task =
                             CancellationToken.None
                         )
 
-                    entry.Delivery |> should equal DeliveryMode.Queue
+                    entry.Kind |> should equal OperationKind.Queue
                     entry.SessionId |> should equal created.Id
 
                     let! result = awaitWhat waiter.Task "the turn to settle"
@@ -654,7 +654,7 @@ let ``Prompt with Inject folds into the running turn`` () : Task =
                                 CancellationToken.None
                             )
 
-                        injected.Delivery |> should equal DeliveryMode.Inject
+                        injected.Kind |> should equal OperationKind.Inject
 
                         release.TrySetResult("unblocked") |> ignore
                         let! result = awaitWhat waiter.Task "the turn to settle"
@@ -759,7 +759,7 @@ let ``Prompt with Interrupt pre-empts and drains first`` () : Task =
                                 CancellationToken.None
                             )
 
-                        interrupted.Delivery |> should equal DeliveryMode.Interrupt
+                        interrupted.Kind |> should equal OperationKind.Interrupt
 
                         // Queue the second waiter before releasing the blocker:
                         // the hub is FIFO with no replay, so a waiter enqueued

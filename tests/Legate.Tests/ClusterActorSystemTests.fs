@@ -948,7 +948,7 @@ type ClusterRuntimeTests() =
                         CancellationToken.None
                     )
 
-                entry.Delivery |> should equal DeliveryMode.Queue
+                entry.Kind |> should equal OperationKind.Queue
                 entry.SessionId |> should equal created.Id
 
                 let! result = awaitWhat waiter.Task (TimeSpan.FromSeconds(90.0)) "the turn to settle"

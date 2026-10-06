@@ -162,9 +162,56 @@ type SessionClientOperations =
             let! found = client.Store.GetSession(client.Tenant, sessionId, cancellationToken)
 
             match found with
-            | null -> return raise (SessionNotFoundException(sessionId, "The session does not exist."))
+            | null ->
+                let ex = SessionNotFoundException(sessionId, "The session does not exist.")
+                return raise ex
             | session -> return session
         }
+
+    /// Requires the durable settlement capability behind receipt lookup:
+    /// the container-registered ISessionSettlementStore the client carries,
+    /// else the session store itself when it implements the capability
+    /// (the in-memory composition). Stores with neither fail clearly here
+    /// instead of serving an unsafe process-local or unfenced fallback.
+    /// Journal composition stays owned by host startup validation, which
+    /// sees the real container registrations; per-operation reads must not
+    /// reject decorated journals that forward to the composed store.
+    /// <param name="client">The session client. Must not be null.</param>
+    static member private RequireSettlement(client: SessionClient) : ISessionSettlementStore =
+        match client.SettlementStore with
+        | Some capable -> capable
+        | None ->
+            match box client.Store with
+            | :? ISessionSettlementStore as capable -> capable
+            | _ ->
+                let ex =
+                    InvalidOperationException(
+                        "The configured ISessionStore must implement ISessionSettlementStore to accept work requiring durable receipts."
+                    )
+
+                raise ex
+
+    /// Maps an accepted inbox entry to its public durable receipt: the
+    /// immutable position plus the turn identity stamped at accept.
+    /// Reply payloads map to OperationKind.Reply and never promise an
+    /// independent turn; user messages map from their delivery mode.
+    /// <param name="entry">The accepted inbox entry. Must not be null.</param>
+    static member private ToReceipt(entry: InboxEntry | null) : AcceptedOperation =
+        if isNull (box entry) then
+            raise (ArgumentNullException(nameof entry))
+
+        let present = unbox<InboxEntry> (box entry)
+
+        let kind =
+            match box present.Payload with
+            | :? ReplyPayload -> OperationKind.Reply
+            | _ ->
+                match present.Delivery with
+                | DeliveryMode.Inject -> OperationKind.Inject
+                | DeliveryMode.Interrupt -> OperationKind.Interrupt
+                | _ -> OperationKind.Queue
+
+        AcceptedOperation(present.SessionId, present.Position, present.TurnId, kind, present.AppendedAt)
 
     /// Reads the source journal prefix a fork copies: the events with a
     /// stamped sequence through upToSequence (inclusive), in sequence
@@ -484,17 +531,24 @@ type SessionClientOperations =
     /// Prompts a session with a delivery mode: Queue appends and acts on
     /// the message once the running turn (if any) finishes; Inject appends
     /// and folds into the running turn at its next iteration boundary
-    /// without interrupting it; Interrupt appends and pre-empts the running
-    /// turn, settling it as Aborted under ExplicitAbort before starting the
-    /// new turn. While WaitingForInput every mode appends and waits (Reply
-    /// still resumes the suspended turn), and while Idle every mode starts
-    /// a turn normally.
+    /// without interrupting it and never promises an independent turn;
+    /// Interrupt appends and pre-empts the running turn, settling it as
+    /// Aborted under ExplicitAbort before starting the new turn. While
+    /// WaitingForInput every mode appends and waits (Reply still resumes
+    /// the suspended turn), and while Idle every mode starts a turn
+    /// normally. Successful acceptance returns a stable operation-specific
+    /// receipt usable after reconnection, reload, and current-format
+    /// restart; rejection throws and returns nothing claiming acceptance.
+    /// Acceptance promises neither execution start nor success. Concurrent
+    /// accepted inputs carry distinct positions and are distinguishable.
+    /// An interrupt receipt is never confused with the displaced turn or
+    /// following queued work.
     /// <param name="client">The session client. Must not be null.</param>
     /// <param name="sessionId">The session to prompt.</param>
     /// <param name="message">The user message. Must not be null.</param>
     /// <param name="delivery">How the message is delivered to a running turn.</param>
     /// <param name="cancellationToken">Cancels the prompt.</param>
-    /// <returns>The appended inbox entry.</returns>
+    /// <returns>The accepted-operation receipt.</returns>
     /// <exception cref="T:Legate.SessionNotFoundException">The session id does not exist.</exception>
     /// <exception cref="T:Legate.InvalidSessionStateException">The session is closed.</exception>
     [<Extension>]
@@ -505,7 +559,7 @@ type SessionClientOperations =
             message: UserMessage,
             delivery: DeliveryMode,
             cancellationToken: CancellationToken
-        ) : Task<InboxEntry> =
+        ) : Task<AcceptedOperation> =
         ArgumentNullException.ThrowIfNull(client)
 
         if isNull (box message) then
@@ -522,9 +576,9 @@ type SessionClientOperations =
 
             let! actor = client.Resolve(sessionId, cancellationToken)
 
-            match delivery with
-            | DeliveryMode.Queue ->
-                return!
+            let! entry =
+                match delivery with
+                | DeliveryMode.Queue ->
                     SessionActor.promptSuspendableAsync
                         client.Store
                         client.Tenant
@@ -532,8 +586,7 @@ type SessionClientOperations =
                         actor
                         message
                         cancellationToken
-            | DeliveryMode.Inject ->
-                return!
+                | DeliveryMode.Inject ->
                     SessionActor.injectSuspendableAsync
                         client.Store
                         client.Tenant
@@ -541,8 +594,7 @@ type SessionClientOperations =
                         actor
                         message
                         cancellationToken
-            | DeliveryMode.Interrupt ->
-                return!
+                | DeliveryMode.Interrupt ->
                     SessionActor.interruptSuspendableAsync
                         client.Store
                         client.Tenant
@@ -550,32 +602,37 @@ type SessionClientOperations =
                         actor
                         message
                         cancellationToken
-            | unknown ->
-                return
-                    raise (
+                | unknown ->
+                    let ex =
                         ArgumentOutOfRangeException(
                             nameof delivery,
                             sprintf "Unknown delivery mode: %O. Expected Queue, Inject, or Interrupt." unknown
                         )
-                    )
+
+                    raise ex
+
+            return SessionClientOperations.ToReceipt entry
         }
 
     /// Replies to a suspended turn: matches the Reply against the pending
     /// request id and resumes from the cursor with attempt plus 1. An
     /// unknown or already-resolved request id throws the typed
-    /// ReplyMismatchException. Reply never starts a turn.
+    /// ReplyMismatchException. Reply never starts a turn and its receipt
+    /// never promises an independent turn. Successful acceptance returns
+    /// the operation receipt; rejection throws and returns nothing
+    /// claiming acceptance.
     /// <param name="client">The session client. Must not be null.</param>
     /// <param name="sessionId">The session to reply to.</param>
     /// <param name="reply">The host reply. Must not be null.</param>
     /// <param name="cancellationToken">Cancels the reply.</param>
-    /// <returns>The consumed Reply inbox entry.</returns>
+    /// <returns>The accepted-operation receipt.</returns>
     /// <exception cref="T:Legate.SessionNotFoundException">The session id does not exist.</exception>
     /// <exception cref="T:Legate.InvalidSessionStateException">The session is closed.</exception>
     /// <exception cref="T:Legate.ReplyMismatchException">The reply answered nothing pending.</exception>
     [<Extension>]
     static member ReplyAsync
         (client: SessionClient, sessionId: SessionId, reply: Reply, cancellationToken: CancellationToken)
-        : Task<InboxEntry> =
+        : Task<AcceptedOperation> =
         ArgumentNullException.ThrowIfNull(client)
 
         if isNull (box reply) then
@@ -585,7 +642,200 @@ type SessionClientOperations =
             let! current = SessionClientOperations.RequireAsync(client, sessionId, cancellationToken)
             client.ValidateCompletionRoute current
             let! actor = client.Resolve(sessionId, cancellationToken)
-            return! SessionActor.replyAsync client.Store client.Tenant sessionId actor reply cancellationToken
+
+            let! entry = SessionActor.replyAsync client.Store client.Tenant sessionId actor reply cancellationToken
+
+            return SessionClientOperations.ToReceipt entry
+        }
+
+    /// Observes one accepted operation through its receipt: the
+    /// authoritative durable status, the associated real turn when known,
+    /// and the committed winning terminal result when available. Pending,
+    /// Unknown, Unavailable, and Terminal are distinguishable: an unknown
+    /// session throws SessionNotFoundException (other-tenant sessions read
+    /// the same way, so possession grants neither access nor turn
+    /// ownership); an entry missing or mismatched in this tenant reads
+    /// Unknown; a storage failure reads Unavailable and never terminal;
+    /// the winning execution_settlements row reads Terminal; otherwise
+    /// the operation reads Pending with its turn association when known.
+    /// Stale or losing reports never replace the committed winner.
+    /// Sinkless sessions observe the same way. Retention is bounded.
+    /// <param name="client">The session client. Must not be null.</param>
+    /// <param name="receipt">The accepted-operation receipt. Must not be null.</param>
+    /// <param name="cancellationToken">Abandons the lookup.</param>
+    /// <returns>The durable observation of the operation.</returns>
+    /// <exception cref="T:Legate.SessionNotFoundException">The session id does not exist in this tenant.</exception>
+    [<Extension>]
+    static member GetOperationResultAsync
+        (client: SessionClient, receipt: AcceptedOperation, cancellationToken: CancellationToken)
+        : Task<OperationResult> =
+        ArgumentNullException.ThrowIfNull(client)
+
+        if isNull (box receipt) then
+            raise (ArgumentNullException(nameof receipt))
+
+        task {
+            let tenant = client.Tenant
+            let sessionId = receipt.SessionId
+            let position = receipt.Position
+
+            let! current = SessionClientOperations.RequireAsync(client, sessionId, cancellationToken)
+            client.ValidateCompletionRoute current
+            let settlement = SessionClientOperations.RequireSettlement client
+
+            let receiptKind = receipt.Kind
+            let receiptTurn = receipt.OperationId
+
+            let toUnknown () =
+                OperationResult(
+                    sessionId,
+                    position,
+                    receiptKind,
+                    OperationStatus.Unknown,
+                    Nullable(),
+                    Unchecked.defaultof<TurnResult>
+                )
+
+            let toUnavailable () =
+                OperationResult(
+                    sessionId,
+                    position,
+                    receiptKind,
+                    OperationStatus.Unavailable,
+                    Nullable(),
+                    Unchecked.defaultof<TurnResult>
+                )
+
+            let mutable entryFailed = false
+            let mutable committedFailed = false
+
+            let! entry =
+                task {
+                    try
+                        return! settlement.TryReadEntry(tenant, sessionId, position, cancellationToken)
+                    with _ ->
+                        entryFailed <- true
+                        return null
+                }
+
+            let! committed =
+                task {
+                    try
+                        return! settlement.TryReadCommitted(tenant, sessionId, position, cancellationToken)
+                    with _ ->
+                        committedFailed <- true
+                        return null
+                }
+
+            let entryMissing = isNull (box entry)
+
+            let committedPresent = not (isNull (box committed))
+
+            let committedResult: TurnResult | null =
+                if committedPresent then
+                    (unbox<SessionSettlementOutcome> (box committed)).Result
+                else
+                    null
+
+            let hasWinner = committedPresent && not (isNull (box committedResult))
+
+            let winnerResult: TurnResult =
+                if hasWinner then
+                    unbox<TurnResult> (box committedResult)
+                else
+                    Unchecked.defaultof<TurnResult>
+
+            if entryFailed || committedFailed then
+                // Storage failure is never terminal and never fabricated:
+                // a winner already in hand still reads Terminal (it is the
+                // committed truth), otherwise the observation is Unavailable.
+                if hasWinner then
+                    let knownTurn =
+                        if receiptTurn <> Unchecked.defaultof<TurnId> then
+                            Nullable receiptTurn
+                        else
+                            Nullable()
+
+                    return
+                        OperationResult(
+                            sessionId,
+                            position,
+                            receiptKind,
+                            OperationStatus.Terminal,
+                            knownTurn,
+                            winnerResult
+                        )
+                else
+                    return toUnavailable ()
+            elif entryMissing then
+                if hasWinner then
+                    let knownTurn =
+                        if receiptTurn <> Unchecked.defaultof<TurnId> then
+                            Nullable receiptTurn
+                        else
+                            Nullable()
+
+                    return
+                        OperationResult(
+                            sessionId,
+                            position,
+                            receiptKind,
+                            OperationStatus.Terminal,
+                            knownTurn,
+                            winnerResult
+                        )
+                else
+                    return toUnknown ()
+            else
+                let present = unbox<InboxEntry> (box entry)
+
+                if present.SessionId <> sessionId then
+                    return toUnknown ()
+                else
+                    let entryKind = SessionClientOperations.ToReceipt(present).Kind
+
+                    if entryKind <> receiptKind then
+                        return toUnknown ()
+                    else if
+                        present.TurnId <> Unchecked.defaultof<TurnId>
+                        && receiptTurn <> Unchecked.defaultof<TurnId>
+                        && present.TurnId <> receiptTurn
+                    then
+                        return toUnknown ()
+                    else
+                        let knownTurn =
+                            if receiptTurn <> Unchecked.defaultof<TurnId> then
+                                Nullable receiptTurn
+                            elif present.TurnId <> Unchecked.defaultof<TurnId> then
+                                Nullable present.TurnId
+                            else
+                                Nullable()
+
+                        if hasWinner then
+                            return
+                                OperationResult(
+                                    sessionId,
+                                    position,
+                                    receiptKind,
+                                    OperationStatus.Terminal,
+                                    knownTurn,
+                                    winnerResult
+                                )
+                        else
+                            // Accepted but with no committed winner yet:
+                            // a clean null read is Pending (the turn may
+                            // still run, fold, or resume), never
+                            // Unavailable. True storage failure already
+                            // returned above via the failure flags.
+                            return
+                                OperationResult(
+                                    sessionId,
+                                    position,
+                                    receiptKind,
+                                    OperationStatus.Pending,
+                                    knownTurn,
+                                    Unchecked.defaultof<TurnResult>
+                                )
         }
 
     /// Reads the exact current control target without activating an actor or loading its options.
@@ -2115,6 +2365,17 @@ module internal SessionClientWiring =
                  built.AutoTitle <- Some autoTitle
                  built.CompletionEra <- marker
                  built.CompletionDestinations <- Some routes
+
+                 // Durable receipt lookup (issue 381): the
+                 // container-registered settlement capability the client
+                 // reads through, or None when the host never registered
+                 // one. Direct test constructions keep None and fall back
+                 // to the session store itself; genuinely unsupported
+                 // compositions fail fast at lookup time.
+                 let settlement = provider.GetService<ISessionSettlementStore>()
+
+                 if not (isNull (box settlement)) then
+                     built.SettlementStore <- Some(unbox<ISessionSettlementStore> (box settlement))
 
                  built.SubscribeRouter <-
                      Some(

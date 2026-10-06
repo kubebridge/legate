@@ -109,6 +109,17 @@ type SessionClient
     let mutable subscribeRouter: ISubscribeRouter option = None
     let mutable completionEra: CompletionEra.CompletionEraMarker option = None
     let mutable destinations: CompletionDestinations option = None
+    let mutable settlementStore: ISessionSettlementStore option = None
+
+    /// The atomic settlement capability durable receipt lookup reads
+    /// through, or None when the host never registered one: direct test
+    /// constructions and providers without the capability carry None here
+    /// and the lookup fails fast instead of serving an unfenced fallback.
+    /// Set once by the container wiring from the registered
+    /// ISessionSettlementStore; tests set it directly.
+    member internal _.SettlementStore
+        with get (): ISessionSettlementStore option = settlementStore
+        and set (value: ISessionSettlementStore option) = settlementStore <- value
 
     member internal _.CompletionDestinations
         with get () = destinations

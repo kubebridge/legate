@@ -166,3 +166,75 @@ type PostgresSessionSettlementTests() =
             Assert.Equal(SessionSettlementStatus.Rejected, rejected.Status)
         }
         :> Task
+
+    [<Fact>]
+    member _.``postgres try read serves entry then the winning settlement``() =
+        task {
+            let clock, store, _, _ = PostgresTestDatabase.createStores ()
+            let connectionString = PostgresTestDatabase.ensureReady ()
+            let options = PostgresTestDatabase.testOptions connectionString
+
+            let settlement =
+                PostgresSessionSettlementStore(options, clock) :> ISessionSettlementStore
+
+            let session = freshSession ()
+            let! _ = store.CreateSession(tenant, session, CancellationToken.None)
+
+            let! entry =
+                store.AppendInboxMessage(
+                    tenant,
+                    session.Id,
+                    UserMessagePayload(UserMessage.Text "hi"),
+                    DeliveryMode.Queue,
+                    CancellationToken.None
+                )
+
+            let! found = settlement.TryReadEntry(tenant, session.Id, entry.Position, CancellationToken.None)
+            Assert.False(isNull (box found))
+
+            let! before = settlement.TryReadCommitted(tenant, session.Id, entry.Position, CancellationToken.None)
+            Assert.True(isNull (box before))
+
+            let! lease =
+                store.ClaimNextTurn(tenant, session.Id, "owner", TimeSpan.FromMinutes 5.0, CancellationToken.None)
+
+            let claim =
+                match lease with
+                | :? TurnLeaseHeld as held -> held.Claim
+                | :? TurnLeaseRenewed as renewed -> renewed.Claim
+                | _ -> failwith "Expected a held claim."
+
+            Assert.True(
+                (settlement.AdmitExecution(tenant, session.Id, entry.Position, claim, CancellationToken.None).Result)
+            )
+
+            let request =
+                SessionSettlementRequest(
+                    session.Id,
+                    entry.Position,
+                    claim,
+                    Nullable(),
+                    okResult TurnStatus.Completed,
+                    Guid.NewGuid().ToString("N"),
+                    null
+                )
+
+            let! applied = settlement.SettleExecution(tenant, request, CancellationToken.None)
+            Assert.Equal(SessionSettlementStatus.Applied, applied.Status)
+
+            let! winnerRaw = settlement.TryReadCommitted(tenant, session.Id, entry.Position, CancellationToken.None)
+            Assert.False(isNull (box winnerRaw))
+            let winner = unbox<SessionSettlementOutcome> (box winnerRaw)
+            Assert.False(isNull (box winner.Result))
+            let winnerResult = unbox<TurnResult> (box winner.Result)
+            Assert.Equal("done", winnerResult.AssistantText)
+
+            let other = TenantId.Create "pg-settlement-other"
+            let! foreignEntry = settlement.TryReadEntry(other, session.Id, entry.Position, CancellationToken.None)
+            Assert.True(isNull (box foreignEntry))
+
+            let! foreignWinner = settlement.TryReadCommitted(other, session.Id, entry.Position, CancellationToken.None)
+
+            Assert.True(isNull (box foreignWinner))
+        }
+        :> Task
