@@ -54,9 +54,13 @@ endpoint metadata must run after routing.
 
 Omitted cancellation uses `CancellationToken.None`, prompt delivery uses Queue,
 open options are fresh interactive defaults, and subscription cursor is exclusive
-zero. Standalone `WaitForSettleAsync` uses the client default bound (five minutes)
-and must be registered **before** a fast prompt. It is not retrieval of an earlier
-result. `PromptAndWaitAsync` registers its waiter first and uses a session timeout
+zero. `PromptAsync` returns an `AcceptedOperation` receipt. Pass it to
+`WaitForOperationAsync(receipt, bound, cancellationToken)` to observe the committed
+terminal result, including after completion or reconnection within retention.
+Concurrent observers cannot consume each other's results. The legacy standalone
+`WaitForSettleAsync` uses the client default bound (five minutes) and must be
+registered **before** a fast prompt; it is not retrieval of an earlier result.
+`PromptAndWaitAsync` follows its own durable receipt and uses a session timeout
 when present; suspended approval workflows need `Subscribe` and `ReplyAsync`.
 Pass `HttpContext.RequestAborted` to opt into request cancellation. That token can
 prevent admission or abandon the wait/stream, but never implicitly aborts an

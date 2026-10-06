@@ -111,10 +111,11 @@ app.<span class="f">UseLegate</span>();</code></pre>
     if (evt is TurnCompletedEvent or TurnFailedEvent or TurnAbortedEvent)
         break;
 }</code></pre>
-    <p class="body-copy">A standalone settle waiter must be registered before prompting; it is not durable retrieval of an earlier result. Its omitted bound is the configured client default of five minutes. <code>PromptAndWaitAsync</code> registers the waiter first but does not replace explicit suspension handling.</p>
-<pre class="code" tabindex="0" aria-label="Wait before prompting"><code data-snippet="wait">var settled = client.WaitForSettleAsync(session.Id);
-await client.PromptAsync(session.Id, <span class="s">"Continue"</span>);
-var result = await settled;</code></pre>
+    <p class="body-copy"><code>PromptAsync</code> returns an <code>AcceptedOperation</code> receipt, not a completed result. Wait on that receipt to observe the committed outcome, including after a fast completion or reconnection within retention. Concurrent observers do not consume each other's results. <code>PromptAndWaitAsync</code> follows its own receipt but does not replace explicit suspension handling. The legacy <code>WaitForSettleAsync</code> still requires registration before prompting.</p>
+<pre class="code" tabindex="0" aria-label="Wait on the accepted operation"><code data-snippet="wait">var receipt = await client.PromptAsync(session.Id, <span class="s">"Continue"</span>);
+var observation = await client.WaitForOperationAsync(
+    receipt, TimeSpan.FromMinutes(5), CancellationToken.None);
+var result = observation.Result!;</code></pre>
     <p class="body-copy">For explicit request control, pass the request token. Cancellation may prevent admission; after acceptance it abandons the supplied operation, not the turn. Aborting is a separate targeted control operation.</p>
 <pre class="code" tabindex="0" aria-label="Explicit prompt controls"><code data-snippet="controls">await client.PromptAsync(session.Id, <span class="s">"Continue"</span>,
     DeliveryMode.Queue, context.RequestAborted);</code></pre>

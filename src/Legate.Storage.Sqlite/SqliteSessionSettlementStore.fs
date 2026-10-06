@@ -819,3 +819,91 @@ type SqliteSessionSettlementStore(database: SqliteDatabase) =
                 | :? LegateException as ex -> return raise ex
                 | :? SqliteException as sql -> return raise (mapSql sql)
             }
+
+        member _.TryReadCommitted(tenant, sessionId, position, _) =
+            task {
+                try
+                    return
+                        lock database.Gate (fun () ->
+                            use connection = database.OpenConnection()
+
+                            use query = connection.CreateCommand()
+
+                            query.CommandText <-
+                                $"SELECT outcome_json FROM \"%s{settlementsTable ()}\" WHERE tenant = $tenant AND session_id = $session AND position = $pos"
+
+                            query.Parameters.AddWithValue("$tenant", tenant.Value) |> ignore
+                            query.Parameters.AddWithValue("$session", sessionId.Value) |> ignore
+                            query.Parameters.AddWithValue("$pos", position) |> ignore
+
+                            use reader = query.ExecuteReader()
+
+                            if reader.Read() && not (reader.IsDBNull(0)) then
+                                let outcomeJson = reader.GetString(0)
+                                reader.Close()
+
+                                if String.IsNullOrWhiteSpace outcomeJson then
+                                    Unchecked.defaultof<SessionSettlementOutcome>
+                                else
+                                    SqliteJson.deserialize<SessionSettlementOutcome> outcomeJson
+                            else
+                                reader.Close()
+                                Unchecked.defaultof<SessionSettlementOutcome>)
+                with
+                | :? LegateException as ex -> return raise ex
+                | :? SqliteException as sql -> return raise (mapSql sql)
+            }
+
+        member _.TryReadEntry(tenant, sessionId, position, _) =
+            task {
+                try
+                    return
+                        lock database.Gate (fun () ->
+                            use connection = database.OpenConnection()
+
+                            use query = connection.CreateCommand()
+
+                            query.CommandText <-
+                                $"SELECT payload_json, delivery_mode, consumed, appended_at, turn_id FROM \"%s{inboxTable ()}\" WHERE tenant = $tenant AND session_id = $session AND position = $pos"
+
+                            query.Parameters.AddWithValue("$tenant", tenant.Value) |> ignore
+                            query.Parameters.AddWithValue("$session", sessionId.Value) |> ignore
+                            query.Parameters.AddWithValue("$pos", position) |> ignore
+
+                            use reader = query.ExecuteReader()
+
+                            if reader.Read() then
+                                let payload = SqliteJson.deserialize<InboxPayload> (reader.GetString(0))
+                                let delivery = parseDelivery (reader.GetString(1))
+                                let consumed = reader.GetInt64(2) <> 0L
+                                let appendedAt = ofIso (reader.GetString(3))
+
+                                let turnId =
+                                    if reader.FieldCount > 4 && not (reader.IsDBNull(4)) then
+                                        let text = reader.GetString(4)
+
+                                        if String.IsNullOrWhiteSpace(text) then
+                                            Unchecked.defaultof<TurnId>
+                                        else
+                                            TurnId.Parse(text)
+                                    else
+                                        Unchecked.defaultof<TurnId>
+
+                                reader.Close()
+
+                                {
+                                    SessionId = sessionId
+                                    Position = position
+                                    Payload = payload
+                                    Delivery = delivery
+                                    Consumed = consumed
+                                    AppendedAt = appendedAt
+                                    TurnId = turnId
+                                }
+                            else
+                                reader.Close()
+                                Unchecked.defaultof<InboxEntry>)
+                with
+                | :? LegateException as ex -> return raise ex
+                | :? SqliteException as sql -> return raise (mapSql sql)
+            }

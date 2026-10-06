@@ -231,6 +231,7 @@ let private spawnGated
     let baseProps: SessionActorProps =
         {
             Store = store
+            Settlement = None
             Tenant = sessionTenant
             SessionId = sessionId
             RunTurn = (fun _ _ -> Task.FromResult(Unchecked.defaultof<TurnResult>))

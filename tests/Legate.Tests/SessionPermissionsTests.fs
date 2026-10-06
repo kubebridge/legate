@@ -106,6 +106,7 @@ let private startService
                 (fun _ _ -> None)
                 null
                 (fun _ _ _ -> Task.FromResult false)
+                None
         )
 
     (service :> IHostedService).StartAsync(CancellationToken.None).GetAwaiter().GetResult()
@@ -799,6 +800,7 @@ let ``spawnSuspendFactory rejects invalid wiring`` () =
             (fun _ _ -> None)
             null
             eraMarked
+            None
         |> ignore)
     |> should throw typeof<ArgumentNullException>
 
@@ -815,6 +817,7 @@ let ``spawnSuspendFactory rejects invalid wiring`` () =
             (fun _ _ -> None)
             null
             eraMarked
+            None
         |> ignore)
     |> should throw typeof<ArgumentException>
 
@@ -831,6 +834,7 @@ let ``spawnSuspendFactory rejects invalid wiring`` () =
             (fun _ _ -> None)
             null
             eraMarked
+            None
         |> ignore)
     |> should throw typeof<ArgumentOutOfRangeException>
 
@@ -847,6 +851,7 @@ let ``spawnSuspendFactory rejects invalid wiring`` () =
             Unchecked.defaultof<SessionId -> string -> CompactDeps option>
             null
             eraMarked
+            None
         |> ignore)
     |> should throw typeof<ArgumentNullException>
 
@@ -863,6 +868,7 @@ let ``spawnSuspendFactory rejects invalid wiring`` () =
             (fun _ _ -> None)
             null
             Unchecked.defaultof<TenantId -> SessionId -> CancellationToken -> Task<bool>>
+            None
         |> ignore)
     |> should throw typeof<ArgumentNullException>
 

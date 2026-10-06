@@ -268,9 +268,31 @@ type SessionClientOperations =
             let! found = client.Store.GetSession(client.Tenant, sessionId, cancellationToken)
 
             match found with
-            | null -> return raise (SessionNotFoundException(sessionId, "The session does not exist."))
+            | null ->
+                let ex = SessionNotFoundException(sessionId, "The session does not exist.")
+                return raise ex
             | session -> return session
         }
+
+    /// Requires the durable settlement capability behind receipt lookup:
+    /// the container-registered ISessionSettlementStore the client carries,
+    /// else the session store itself when it implements the capability
+    /// (the in-memory composition). Stores with neither fail clearly here
+    /// instead of serving an unsafe process-local or unfenced fallback.
+    /// Journal composition stays owned by host startup validation, which
+    /// sees the real container registrations; per-operation reads must not
+    /// reject decorated journals that forward to the composed store.
+    /// <param name="client">The session client. Must not be null.</param>
+    static member private RequireSettlement(client: SessionClient) : ISessionSettlementStore =
+        client.RequireSettlementStore()
+
+    /// Maps an accepted inbox entry to its public durable receipt: the
+    /// immutable position plus the turn identity stamped at accept.
+    /// Reply payloads map to OperationKind.Reply and never promise an
+    /// independent turn; user messages map from their delivery mode.
+    /// <param name="entry">The accepted inbox entry. Must not be null.</param>
+    static member private ToReceipt(entry: InboxEntry | null) : AcceptedOperation =
+        SessionClientExtensions.ToReceipt(entry)
 
     /// Reads the source journal prefix a fork copies: the events with a
     /// stamped sequence through upToSequence (inclusive), in sequence
@@ -590,17 +612,24 @@ type SessionClientOperations =
     /// Prompts a session with a delivery mode: Queue appends and acts on
     /// the message once the running turn (if any) finishes; Inject appends
     /// and folds into the running turn at its next iteration boundary
-    /// without interrupting it; Interrupt appends and pre-empts the running
-    /// turn, settling it as Aborted under ExplicitAbort before starting the
-    /// new turn. While WaitingForInput every mode appends and waits (Reply
-    /// still resumes the suspended turn), and while Idle every mode starts
-    /// a turn normally.
+    /// without interrupting it and never promises an independent turn;
+    /// Interrupt appends and pre-empts the running turn, settling it as
+    /// Aborted under ExplicitAbort before starting the new turn. While
+    /// WaitingForInput every mode appends and waits (Reply still resumes
+    /// the suspended turn), and while Idle every mode starts a turn
+    /// normally. Successful acceptance returns a stable operation-specific
+    /// receipt usable after reconnection, reload, and current-format
+    /// restart; rejection throws and returns nothing claiming acceptance.
+    /// Acceptance promises neither execution start nor success. Concurrent
+    /// accepted inputs carry distinct positions and are distinguishable.
+    /// An interrupt receipt is never confused with the displaced turn or
+    /// following queued work.
     /// <param name="client">The session client. Must not be null.</param>
     /// <param name="sessionId">The session to prompt.</param>
     /// <param name="message">The user message. Must not be null.</param>
     /// <param name="delivery">How the message is delivered to a running turn.</param>
     /// <param name="cancellationToken">Cancels this operation. Before admission it may prevent the prompt; cancellation after acceptance never aborts the durable turn.</param>
-    /// <returns>The appended inbox entry.</returns>
+    /// <returns>The accepted-operation receipt.</returns>
     /// <exception cref="T:Legate.SessionNotFoundException">The session id does not exist.</exception>
     /// <exception cref="T:Legate.InvalidSessionStateException">The session is closed.</exception>
     [<Extension>]
@@ -611,7 +640,7 @@ type SessionClientOperations =
             message: UserMessage,
             delivery: DeliveryMode,
             cancellationToken: CancellationToken
-        ) : Task<InboxEntry> =
+        ) : Task<AcceptedOperation> =
         ArgumentNullException.ThrowIfNull(client)
 
         if isNull (box message) then
@@ -628,9 +657,9 @@ type SessionClientOperations =
 
             let! actor = client.Resolve(sessionId, cancellationToken)
 
-            match delivery with
-            | DeliveryMode.Queue ->
-                return!
+            let! entry =
+                match delivery with
+                | DeliveryMode.Queue ->
                     SessionActor.promptSuspendableAsync
                         client.Store
                         client.Tenant
@@ -638,8 +667,7 @@ type SessionClientOperations =
                         actor
                         message
                         cancellationToken
-            | DeliveryMode.Inject ->
-                return!
+                | DeliveryMode.Inject ->
                     SessionActor.injectSuspendableAsync
                         client.Store
                         client.Tenant
@@ -647,8 +675,7 @@ type SessionClientOperations =
                         actor
                         message
                         cancellationToken
-            | DeliveryMode.Interrupt ->
-                return!
+                | DeliveryMode.Interrupt ->
                     SessionActor.interruptSuspendableAsync
                         client.Store
                         client.Tenant
@@ -656,32 +683,37 @@ type SessionClientOperations =
                         actor
                         message
                         cancellationToken
-            | unknown ->
-                return
-                    raise (
+                | unknown ->
+                    let ex =
                         ArgumentOutOfRangeException(
                             nameof delivery,
                             sprintf "Unknown delivery mode: %O. Expected Queue, Inject, or Interrupt." unknown
                         )
-                    )
+
+                    raise ex
+
+            return SessionClientOperations.ToReceipt entry
         }
 
     /// Replies to a suspended turn: matches the Reply against the pending
     /// request id and resumes from the cursor with attempt plus 1. An
     /// unknown or already-resolved request id throws the typed
-    /// ReplyMismatchException. Reply never starts a turn.
+    /// ReplyMismatchException. Reply never starts a turn and its receipt
+    /// never promises an independent turn. Successful acceptance returns
+    /// the operation receipt; rejection throws and returns nothing
+    /// claiming acceptance.
     /// <param name="client">The session client. Must not be null.</param>
     /// <param name="sessionId">The session to reply to.</param>
     /// <param name="reply">The host reply. Must not be null.</param>
     /// <param name="cancellationToken">Cancels the reply.</param>
-    /// <returns>The consumed Reply inbox entry.</returns>
+    /// <returns>The accepted-operation receipt.</returns>
     /// <exception cref="T:Legate.SessionNotFoundException">The session id does not exist.</exception>
     /// <exception cref="T:Legate.InvalidSessionStateException">The session is closed.</exception>
     /// <exception cref="T:Legate.ReplyMismatchException">The reply answered nothing pending.</exception>
     [<Extension>]
     static member ReplyAsync
         (client: SessionClient, sessionId: SessionId, reply: Reply, cancellationToken: CancellationToken)
-        : Task<InboxEntry> =
+        : Task<AcceptedOperation> =
         ArgumentNullException.ThrowIfNull(client)
 
         if isNull (box reply) then
@@ -691,7 +723,190 @@ type SessionClientOperations =
             let! current = SessionClientOperations.RequireAsync(client, sessionId, cancellationToken)
             client.ValidateCompletionRoute current
             let! actor = client.Resolve(sessionId, cancellationToken)
-            return! SessionActor.replyAsync client.Store client.Tenant sessionId actor reply cancellationToken
+
+            let! entry = SessionActor.replyAsync client.Store client.Tenant sessionId actor reply cancellationToken
+
+            return SessionClientOperations.ToReceipt entry
+        }
+
+    /// Observes one accepted operation through its receipt: the
+    /// authoritative durable status, the associated real turn when known,
+    /// and the committed winning terminal result when available. Pending,
+    /// Unknown, Unavailable, and Terminal are distinguishable: an unknown
+    /// session throws SessionNotFoundException (other-tenant sessions read
+    /// the same way, so possession grants neither access nor turn
+    /// ownership); an entry missing or mismatched in this tenant reads
+    /// Unknown; a storage failure reads Unavailable and never terminal;
+    /// the winning execution_settlements row reads Terminal; otherwise
+    /// the operation reads Pending with its turn association when known.
+    /// Stale or losing reports never replace the committed winner.
+    /// Sinkless sessions observe the same way. Retention is bounded.
+    /// <param name="client">The session client. Must not be null.</param>
+    /// <param name="receipt">The accepted-operation receipt. Must not be null.</param>
+    /// <param name="cancellationToken">Abandons the lookup.</param>
+    /// <returns>The durable observation of the operation.</returns>
+    /// <exception cref="T:Legate.SessionNotFoundException">The session id does not exist in this tenant.</exception>
+    [<Extension>]
+    static member GetOperationResultAsync
+        (client: SessionClient, receipt: AcceptedOperation, cancellationToken: CancellationToken)
+        : Task<OperationResult> =
+        ArgumentNullException.ThrowIfNull(client)
+
+        if isNull (box receipt) then
+            raise (ArgumentNullException(nameof receipt))
+
+        SessionClientExtensions.ReadOperationAsync(client, receipt, cancellationToken)
+
+    /// Observes one accepted operation through its receipt until it
+    /// settles: returns the committed winning terminal observation. Every
+    /// wait identifies its operation by the receipt's immutable inbox
+    /// position, so concurrent observers cannot steal one another's results
+    /// and multiple observers of the same operation obtain the same
+    /// committed outcome. Completion before subscription resolves on the
+    /// first durable read with no registration required; completion racing
+    /// subscription converges on the live hint plus re-read; late,
+    /// reconnected, restarted, and separate-process observers poll the same
+    /// durable truth within the documented retention window. Cancelling the
+    /// wait or lapsing the bound abandons only this observation: the turn
+    /// keeps running, the result is never consumed, and a later wait for
+    /// the same receipt remains valid. Storage failures never report a
+    /// terminal verdict; unknown sessions (including other-tenant sessions)
+    /// throw, so receipt possession grants neither access nor turn
+    /// ownership. Explicit abort stays on <c>AbortAsync</c>.
+    /// <param name="client">The session client. Must not be null.</param>
+    /// <param name="receipt">The accepted-operation receipt. Must not be null.</param>
+    /// <param name="bound">How long to wait for the settlement; must be positive. The turn keeps running past it.</param>
+    /// <param name="cancellationToken">Abandons the wait, never the turn: the observation ends and a later wait for the same receipt remains valid.</param>
+    /// <returns>The committed winning terminal observation.</returns>
+    /// <exception cref="T:Legate.SessionNotFoundException">The session id does not exist in this tenant.</exception>
+    /// <exception cref="T:Legate.DeadlineExceededException">The wait bound lapsed with the turn left running.</exception>
+    [<Extension>]
+    static member WaitForOperationAsync
+        (client: SessionClient, receipt: AcceptedOperation, bound: TimeSpan, cancellationToken: CancellationToken)
+        : Task<OperationResult> =
+        ArgumentNullException.ThrowIfNull(client)
+
+        if isNull (box receipt) then
+            raise (ArgumentNullException(nameof receipt))
+
+        if bound <= TimeSpan.Zero then
+            raise (ArgumentOutOfRangeException(nameof bound, "The operation wait bound must be positive."))
+
+        task {
+            let tenant = client.Tenant
+            let sessionId = receipt.SessionId
+            let position = receipt.Position
+
+            // Fail fast before waiting: unknown sessions (including
+            // other-tenant sessions), route violations, and unsupported
+            // providers surface now instead of lapsing the bound.
+            let! first = SessionClientExtensions.ReadOperationAsync(client, receipt, CancellationToken.None)
+
+            match first.Status with
+            | OperationStatus.Terminal -> return first
+            | _ ->
+                use boundCts = new CancellationTokenSource()
+                let cancelTcs = TaskCompletionSource<bool>()
+
+                use _registration =
+                    cancellationToken.Register(fun () -> cancelTcs.TrySetResult(true) |> ignore)
+
+                if cancellationToken.IsCancellationRequested then
+                    cancelTcs.TrySetResult(true) |> ignore
+
+                let boundTask = client.WaitDelay.Delay(bound, boundCts.Token)
+                let cancelTask = cancelTcs.Task
+
+                let mutable outcome: OperationResult option = None
+                let mutable failure: exn option = None
+
+                while outcome.IsNone && failure.IsNone do
+                    // Settlement fast-path: a commit before or during the
+                    // subscribe still converges here.
+                    let! fast = SessionClientExtensions.TryTerminalAsync(client, receipt)
+
+                    match fast with
+                    | Some settled -> outcome <- Some settled
+                    | None ->
+                        let hint, unsubscribe = PromptWaitHubs.SubscribePosition tenant sessionId position
+
+                        try
+                            // The commit raced the subscribe: re-read before
+                            // parking on the hint, since the actor always
+                            // commits before notifying.
+                            let! raced = SessionClientExtensions.TryTerminalAsync(client, receipt)
+
+                            match raced with
+                            | Some settled -> outcome <- Some settled
+                            | None ->
+                                let pollTask =
+                                    client.WaitDelay.Delay(
+                                        SessionClientExtensions.WaitPollInterval,
+                                        CancellationToken.None
+                                    )
+
+                                let candidates = ResizeArray<Task>()
+                                candidates.Add(hint)
+                                candidates.Add(boundTask)
+                                candidates.Add(cancelTask)
+                                candidates.Add(pollTask)
+
+                                let! _winner = Task.WhenAny(candidates)
+
+                                // Settlement wins every tie, mirroring
+                                // StopArbitration: re-read before honoring
+                                // any other side.
+                                let! committed = SessionClientExtensions.TryTerminalAsync(client, receipt)
+
+                                match committed with
+                                | Some settled -> outcome <- Some settled
+                                | None ->
+                                    if cancelTask.IsCompleted then
+                                        // Wait-abandonment: never abort the
+                                        // turn from here. Abandon only this
+                                        // observation and throw with the turn
+                                        // left running; a later wait for the
+                                        // same receipt remains valid.
+                                        cancellationToken.ThrowIfCancellationRequested()
+
+                                        failure <- Some(OperationCanceledException(cancellationToken))
+                                    elif boundTask.IsCompletedSuccessfully then
+                                        failure <-
+                                            Some(
+                                                DeadlineExceededException(
+                                                    "WaitForOperation",
+                                                    "The operation wait exceeded its bound while the turn kept running."
+                                                )
+                                                :> exn
+                                            )
+                                    elif boundTask.IsFaulted then
+                                        // The seam faulted: surface it rather
+                                        // than hanging.
+                                        let inner =
+                                            match boundTask.Exception with
+                                            | null -> Exception("The operation-wait delay failed.")
+                                            | aggregate when aggregate.InnerExceptions.Count > 0 ->
+                                                aggregate.InnerExceptions[0]
+                                            | aggregate -> aggregate :> exn
+
+                                        failure <- Some inner
+                                    else
+                                        // A hint or poll fired with nothing
+                                        // committed yet: loop and re-read the
+                                        // durable row.
+                                        ()
+                        finally
+                            unsubscribe ()
+
+                try
+                    boundCts.Cancel()
+                with _ ->
+                    ()
+
+                match outcome, failure with
+                | Some settled, _ -> return settled
+                | None, Some error -> return raise error
+                | None, _ -> return raise (InvalidOperationException("The operation wait resolved with no outcome."))
         }
 
     /// Reads the exact current control target without activating an actor or loading its options.
@@ -962,7 +1177,11 @@ type SessionClientOperations =
     /// observing them on the event stream); settlement, the wait bound, and
     /// the caller's cancellation do. Queue the wait before prompting:
     /// a settle with no waiter only records, so a turn settling first
-    /// would leave a later wait hanging until its bound.
+    /// would leave a later wait hanging until its bound. Legacy companion
+    /// to the receipt-bound <c>WaitForOperationAsync</c>: prefer waiting on
+    /// the accepted operation's receipt, which needs no pre-registration,
+    /// survives late subscription, reconnects, restarts, and separate
+    /// processes, and never confuses concurrent operations.
     /// <param name="client">The session client. Must not be null.</param>
     /// <param name="sessionId">The session whose turn to wait on.</param>
     /// <param name="bound">How long to wait for the settle; must be positive. The turn keeps running past it.</param>
@@ -2181,11 +2400,8 @@ module internal SessionClientWiring =
                         })
 
             let entityFactory =
-                SessionActor.spawnSuspendFactoryRoutedWithSettlement
+                SessionActor.spawnSuspendFactoryRouted
                     (Some routes)
-                    (match provider.GetService(typeof<ISessionSettlementStore>) with
-                     | null -> None
-                     | capability -> Some(capability :?> ISessionSettlementStore))
                     store
                     clientOptions.Tenant
                     eventStore
@@ -2199,6 +2415,14 @@ module internal SessionClientWiring =
                     (eraReaderOf provider)
                     clock
                     (Some heartbeatOptions)
+                    // Receipt-bound waits (issue 383) resolve from the
+                    // container-registered settlement capability, so the
+                    // suspendable settle must commit through it: split
+                    // compositions (SQLite, Postgres) register it as a
+                    // separate service the store-cast alone never sees, and
+                    // without it their turns settle legacy store-first with
+                    // no execution_settlements row for the wait to read.
+                    (Option.ofObj (provider.GetService<ISessionSettlementStore>()))
 
             spawnContext <-
                 fun address context name ->
@@ -2271,6 +2495,17 @@ module internal SessionClientWiring =
                  built.AutoTitle <- Some autoTitle
                  built.CompletionEra <- marker
                  built.CompletionDestinations <- Some routes
+
+                 // Durable receipt lookup (issue 381): the
+                 // container-registered settlement capability the client
+                 // reads through, or None when the host never registered
+                 // one. Direct test constructions keep None and fall back
+                 // to the session store itself; genuinely unsupported
+                 // compositions fail fast at lookup time.
+                 let settlement = provider.GetService<ISessionSettlementStore>()
+
+                 if not (isNull (box settlement)) then
+                     built.SettlementStore <- Some(unbox<ISessionSettlementStore> (box settlement))
 
                  built.SubscribeRouter <-
                      Some(

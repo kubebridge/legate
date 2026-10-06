@@ -113,6 +113,12 @@ let private createServices
 
             member _.SettleExecution(tenant, request, token) =
                 atomic.SettleExecution(tenant, request, token)
+
+            member _.TryReadEntry(tenant, sessionId, position, token) =
+                atomic.TryReadEntry(tenant, sessionId, position, token)
+
+            member _.TryReadCommitted(tenant, sessionId, position, token) =
+                atomic.TryReadCommitted(tenant, sessionId, position, token)
         }
     )
     |> ignore

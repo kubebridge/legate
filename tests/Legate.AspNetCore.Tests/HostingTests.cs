@@ -221,8 +221,17 @@ public sealed class HostingTests
             var wait = client.WaitForSettleAsync(session.Id);
             var receipt = text == "plain" ? await client.PromptAsync(session.Id, text)
                 : await client.PromptAsync(session.Id, UserMessage.Text(text));
-            Assert.Equal(DeliveryMode.Queue, receipt.Delivery);
+            Assert.Equal(OperationKind.Queue, receipt.Kind);
             Assert.Equal(TurnStatus.Completed, (await wait.WaitAsync(TimeSpan.FromSeconds(15))).Status);
+            var observations = await Task.WhenAll(
+                client.WaitForOperationAsync(receipt, TimeSpan.FromSeconds(15), CancellationToken.None),
+                client.WaitForOperationAsync(receipt, TimeSpan.FromSeconds(15), CancellationToken.None));
+            Assert.All(observations, observed =>
+            {
+                Assert.Equal(OperationStatus.Terminal, observed.Status);
+                Assert.Equal(receipt.Position, observed.Position);
+                Assert.Equal(TurnStatus.Completed, observed.Result!.Status);
+            });
             Assert.Equal(text, chat.LastText);
         }
         using var cancelled = new CancellationTokenSource(); cancelled.Cancel();

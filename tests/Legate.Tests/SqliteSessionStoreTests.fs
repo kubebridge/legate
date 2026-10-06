@@ -141,6 +141,7 @@ type SqliteSessionStoreTests private (store, clock, database: SqliteDatabase, pa
                         failwith "Unavailable route")
                     null
                     (fun _ _ _ -> Task.FromResult true)
+                    None
 
             let refusal =
                 Assert.Throws<InvalidSessionStateException>(fun () ->
