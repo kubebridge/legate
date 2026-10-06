@@ -7,6 +7,17 @@ open System.Threading.Tasks
 open Akka.Actor
 
 /// References to host-owned services. This holder never acquires disposal ownership.
+type internal SessionBackgroundInputs =
+    {
+        Sessions: SessionsOptions
+        Dispatcher: DispatcherOptions
+        Clock: TimeProvider
+        Delay: ILlmDelay
+        EraMarked: CompletionEra.CompletionEraReader
+        Agents: IAgentStore | null
+        RecoveryCursor: (string | null) ref
+    }
+
 type internal SessionExecutionContext =
     {
         Tenant: TenantId
@@ -17,6 +28,7 @@ type internal SessionExecutionContext =
         WorkTracker: ExecutionWorkTracker
         Spawn: SessionAddress -> IActorContext -> string -> IActorRef
         Client: Lazy<obj>
+        Background: SessionBackgroundInputs
     }
 
 type internal ISessionHostContexts =

@@ -100,6 +100,23 @@ let private createServices
     |> ignore
 
     services.AddSingleton<ISessionEventStore>(journal) |> ignore
+    // These test journals decorate append/replay over this same database.
+    // Terminal settlement remains the database's atomic session/journal commit.
+    let atomic = InMemorySessionStore(database) :> ISessionSettlementStore
+
+    services.AddSingleton<ISessionSettlementStore>(
+        { new ISessionSettlementStore with
+            member _.SupportsSettlementJournal(actual) = Object.ReferenceEquals(actual, journal)
+
+            member _.AdmitExecution(tenant, sessionId, position, claim, token) =
+                atomic.AdmitExecution(tenant, sessionId, position, claim, token)
+
+            member _.SettleExecution(tenant, request, token) =
+                atomic.SettleExecution(tenant, request, token)
+        }
+    )
+    |> ignore
+
     services.AddSingleton<IChatClient>(chatClient) |> ignore
 
     match tuneTurns with

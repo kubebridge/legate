@@ -37,6 +37,57 @@ Conventions:
 
 ## Tenant session host bindings
 
+### ASP.NET Core profile and finalized defaults
+
+`Legate.AspNetCore` adds `services.AddLegate(configuration)` and
+`services.AddLegate(configuration, Action<LegateBuilder>)`. Configuration is bound
+first, then code overrides; repeated adapter registration is idempotent. Core
+`AddLegate` remains available for Generic Host and CLI composition. Dispatcher,
+Pruning, Schedules and Artifacts sections are retained along with every other
+root section.
+
+| Adapter setting | Default | Meaning |
+|---|---|---|
+| `Legate:Hosting:Tenant` | `default` | Fixed application-authorized tenant; non-default needs a declared binding |
+| `ConfigureAspNetCore(...).ResolveTenant` | unset, code-only | Trusted request resolver selecting an already-declared graph |
+| Session/event stores | one InMemoryDatabase pair | Process-local metadata lost on restart; replace both halves together |
+| `Workspace:RootPath` | content-root `.legate/scratch` | Explicit override must be absolute |
+| Workspace runtime | Process | No sandbox; unsafe for untrusted agents; non-Process mode needs explicit runtime |
+
+StaticSeeds/Kubernetes reject adapter-created implicit stores/workspace, using
+actual node mode for every borrowed graph. An explicitly registered custom pair
+must provide atomic settlement compatibility; it is not certified durable or
+shared. Deployment of genuinely shared durable backends remains the host's duty.
+No allowlist, topology probe or boolean durability assertion is provided.
+
+Default model priority, privately finalized at startup for every graph:
+
+1. Nonblank `SessionClientOptions.DefaultModel`.
+2. Nonblank `Legate:Llm:DefaultModel`.
+3. A usable qualified default from exactly one graph-local `ILlmProvider`.
+4. Existing agent-file fallback for core and explicitly supplied chat clients.
+
+The adapter's generated chat client requires an unambiguous configured/inferred
+choice, while an explicit `IChatClient` retains its identity and existing disposal
+ownership. Custom clients need not expose metadata or an API key. Invalid winning
+references fail; a differing lower-priority value is not a mismatch error. Host
+options are untouched. All context default consumers use the same prepared copy;
+post-start mutation cannot retarget it. Explicit agent, title and compaction model
+overrides retain their existing priorities.
+
+`LegateBuilder.AddExecutionValidation(Action<IServiceProvider, ClusterMode>)`
+registers synchronous, read-only composition checks, once per returned binding
+provider before any context is published. Checks must not build scopes/providers,
+rerun Bind, retain request services, or emit raw exception secrets. The mode is the
+actual node mode, not the borrowed provider's local declaration. It returns no
+durability verdict. A later failing graph leaves all contexts unpublished.
+
+`ISessionClientFactory.GetClient(tenant)` is the background access path. Request
+`SessionClient` resolves only inside `UseLegate`. Runtime background services
+enumerate initialized contexts with frozen graph inputs; root services are not an
+execution fallback. Running recovery discovery sends bounded existing wakes and
+uses provider-minted recovery authority, never a request scope or dispatcher claim.
+
 For a multi-tenant node, construct one independent, long-lived provider graph
 per tenant in the host, then register one immutable `SessionHostBinding` for
 each graph with `AddLegateSessionBinding`. The descriptor contains the trusted

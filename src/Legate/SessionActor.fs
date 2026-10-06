@@ -6600,11 +6600,20 @@ module internal SessionActor =
 
                         match selectDrainableEntries pending with
                         | first :: _ ->
+                            // A settled Idle child has released its prime. Claim
+                            // the pending entry through the existing provider path,
+                            // retaining this original envelope for the start below.
+                            if currentTurnSnapshot().IsNone && suspend.ReprimeJournal.IsSome then
+                                match reprimeNow () with
+                                | Some fresh -> swapJournal fresh
+                                | None -> ()
                             // The per-turn authority gate runs at this Idle
                             // wake boundary too: authorized entries run,
                             // refused ones settle Failed without ever invoking
                             // the runner and the drain moves on.
                             match checkAgentAuthority () with
+                            | None when suspend.ReprimeJournal.IsSome && controlPrime.IsNone ->
+                                return! loop state suspended resolved
                             | None ->
                                 awaitTask (
                                     props.Store.UpdateSessionState(
@@ -7297,11 +7306,21 @@ module internal SessionActor =
                     let bootstrap =
                         UserMessagePayload(UserMessage.Text "legate journal prime") :> InboxPayload
 
-                    store
-                        .AppendInboxMessage(tenant, sessionId, bootstrap, DeliveryMode.Queue, CancellationToken.None)
-                        .GetAwaiter()
-                        .GetResult()
-                    |> ignore
+                    let pending =
+                        store.ReadPendingInbox(tenant, sessionId, CancellationToken.None).GetAwaiter().GetResult()
+
+                    if isNull (box pending) || pending.Count = 0 then
+                        store
+                            .AppendInboxMessage(
+                                tenant,
+                                sessionId,
+                                bootstrap,
+                                DeliveryMode.Queue,
+                                CancellationToken.None
+                            )
+                            .GetAwaiter()
+                            .GetResult()
+                        |> ignore
 
                     match
                         store

@@ -49,6 +49,7 @@
 
   <!-- Test-only packages. -->
   <ItemGroup>
+    <PackageVersion Include="Microsoft.AspNetCore.TestHost" Version="10.0.3" />
     <PackageVersion Include="FsCheck.Xunit" Version="2.16.6" />
     <PackageVersion Include="FsUnit.xUnit" Version="6.0.1" />
     <PackageVersion Include="Microsoft.Extensions.TimeProvider.Testing" Version="10.10.0" />

@@ -510,6 +510,17 @@ type LegateBuilder internal (services: IServiceCollection) as this =
     /// The container the builder registers into.
     member _.Services: IServiceCollection = services
 
+    /// Adds a synchronous, read-only startup composition check for every execution graph.
+    /// Runs before any context is assembled, with the actual node cluster mode.
+    /// Do not construct providers, scopes or resources, rerun binding callbacks, or retain request services.
+    /// Successful validation proves wiring only, not backend sharing or durability.
+    /// <param name="validate">The check; throw a secret-free configuration error on incompatible wiring.</param>
+    /// <returns>This builder.</returns>
+    member _.AddExecutionValidation(validate: Action<IServiceProvider, ClusterMode>) : LegateBuilder =
+        ArgumentNullException.ThrowIfNull(validate)
+        services.AddSingleton(ExecutionValidation(validate)) |> ignore
+        this
+
     /// Configures the LLM providers the coordinator resolves models through.
     /// Registers one exact tenant/destination singleton with DI-owned lifetime.
     /// Participating hosts must preserve the ID's logical receiver; there is no fallback.
@@ -641,7 +652,10 @@ type LegateBuilder internal (services: IServiceCollection) as this =
                 target.Workspace <- bound.Workspace
                 target.Completion <- bound.Completion
                 target.AskUser <- bound.AskUser
-                target.Cluster <- bound.Cluster)
+                target.Cluster <- bound.Cluster
+                target.Dispatcher <- bound.Dispatcher
+                target.Pruning <- bound.Pruning
+                target.Schedules <- bound.Schedules)
         )
         |> ignore
 

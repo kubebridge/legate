@@ -2,6 +2,7 @@
   <Folder Name="/src/">
     <Project Path="src/Legate.Abstractions/Legate.Abstractions.fsproj" />
     <Project Path="src/Legate/Legate.fsproj" />
+    <Project Path="src/Legate.AspNetCore/Legate.AspNetCore.fsproj" />
     <Project Path="src/Legate.Llm.Google/Legate.Llm.Google.fsproj" />
     <Project Path="src/Legate.Llm.Anthropic/Legate.Llm.Anthropic.fsproj" />
     <Project Path="src/Legate.Llm.OpenAI/Legate.Llm.OpenAI.fsproj" />
@@ -22,6 +23,7 @@
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/Legate.Tests/Legate.Tests.fsproj" />
+    <Project Path="tests/Legate.AspNetCore.Tests/Legate.AspNetCore.Tests.csproj" />
     <Project Path="tests/Legate.Llm.Anthropic.Tests/Legate.Llm.Anthropic.Tests.fsproj" />
     <Project Path="tests/Legate.Workspace.Docker.Tests/Legate.Workspace.Docker.Tests.fsproj" />
     <Project Path="tests/Legate.Storage.Postgres.Tests/Legate.Storage.Postgres.Tests.fsproj" />
@@ -35,5 +37,6 @@
     <Project Path="samples/Headless/Headless.fsproj" />
     <Project Path="samples/Dot/Dot.fsproj" />
     <Project Path="samples/CSharpHost/CSharpHost.csproj" />
+    <Project Path="samples/CSharpWebHost/CSharpWebHost.csproj" />
   </Folder>
 </Solution>

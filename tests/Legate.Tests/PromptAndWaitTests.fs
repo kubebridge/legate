@@ -387,7 +387,16 @@ let ``A closed session throws InvalidSessionStateException`` () : Task =
 [<Fact>]
 let ``PromptAndWaitAsync stays BCL-only`` () =
     let method =
-        typeof<SessionClientExtensions>.GetMethod("PromptAndWaitAsync", BindingFlags.Public ||| BindingFlags.Static)
+        typeof<SessionClientExtensions>
+            .GetMethod(
+                "PromptAndWaitAsync",
+                [|
+                    typeof<SessionClient>
+                    typeof<SessionId>
+                    typeof<UserMessage>
+                    typeof<CancellationToken>
+                |]
+            )
         |> Option.ofObj
         |> Option.defaultWith (fun () -> raise (InvalidOperationException("PromptAndWaitAsync is missing.")))
 

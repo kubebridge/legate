@@ -149,6 +149,112 @@ and [<Sealed>] SessionCompactFenced() =
 [<Sealed; AbstractClass; Extension>]
 type SessionClientOperations =
 
+    /// Opens with fresh interactive defaults and CancellationToken.None.
+    [<Extension>]
+    static member OpenSessionAsync(client: SessionClient, agentId: AgentId) =
+        SessionClientOperations.OpenSessionAsync(client, agentId, null, CancellationToken.None)
+
+    /// Opens with the supplied options and CancellationToken.None; null creates fresh interactive defaults.
+    [<Extension>]
+    static member OpenSessionAsync(client: SessionClient, agentId: AgentId, options: SessionOptions | null) =
+        SessionClientOperations.OpenSessionAsync(client, agentId, options, CancellationToken.None)
+
+    /// Opens with fresh interactive defaults; the token cancels only this open operation.
+    [<Extension>]
+    static member OpenSessionAsync(client: SessionClient, agentId: AgentId, cancellationToken: CancellationToken) =
+        SessionClientOperations.OpenSessionAsync(client, agentId, null, cancellationToken)
+
+    /// Prompts with Queue delivery and CancellationToken.None.
+    [<Extension>]
+    static member PromptAsync(client: SessionClient, sessionId: SessionId, message: UserMessage) =
+        SessionClientOperations.PromptAsync(client, sessionId, message, DeliveryMode.Queue, CancellationToken.None)
+
+    /// Prompts with Queue delivery; cancellation can prevent admission but does not abort an accepted turn.
+    [<Extension>]
+    static member PromptAsync
+        (client: SessionClient, sessionId: SessionId, message: UserMessage, cancellationToken: CancellationToken)
+        =
+        SessionClientOperations.PromptAsync(client, sessionId, message, DeliveryMode.Queue, cancellationToken)
+
+    /// Prompts with explicit delivery and CancellationToken.None.
+    [<Extension>]
+    static member PromptAsync
+        (client: SessionClient, sessionId: SessionId, message: UserMessage, delivery: DeliveryMode)
+        =
+        SessionClientOperations.PromptAsync(client, sessionId, message, delivery, CancellationToken.None)
+
+    /// Prompts with non-null plain text, Queue delivery and CancellationToken.None.
+    [<Extension>]
+    static member PromptAsync(client: SessionClient, sessionId: SessionId, text: string) =
+        SessionClientOperations.PromptAsync(client, sessionId, text, DeliveryMode.Queue, CancellationToken.None)
+
+    /// Prompts with non-null plain text and Queue delivery; cancellation never aborts an accepted turn.
+    [<Extension>]
+    static member PromptAsync
+        (client: SessionClient, sessionId: SessionId, text: string, cancellationToken: CancellationToken)
+        =
+        SessionClientOperations.PromptAsync(client, sessionId, text, DeliveryMode.Queue, cancellationToken)
+
+    /// Prompts with non-null plain text, explicit delivery and CancellationToken.None.
+    [<Extension>]
+    static member PromptAsync(client: SessionClient, sessionId: SessionId, text: string, delivery: DeliveryMode) =
+        SessionClientOperations.PromptAsync(client, sessionId, text, delivery, CancellationToken.None)
+
+    /// Prompts with non-null plain text and explicit controls; cancellation never aborts an accepted turn.
+    /// Use typed casts or named arguments for null/default literals ambiguous between text and UserMessage.
+    [<Extension>]
+    static member PromptAsync
+        (
+            client: SessionClient,
+            sessionId: SessionId,
+            text: string,
+            delivery: DeliveryMode,
+            cancellationToken: CancellationToken
+        ) =
+        ArgumentNullException.ThrowIfNull(text)
+        SessionClientOperations.PromptAsync(client, sessionId, UserMessage.Text(text), delivery, cancellationToken)
+
+    /// Replies with CancellationToken.None, preserving the suspended-turn matching semantics.
+    [<Extension>]
+    static member ReplyAsync(client: SessionClient, sessionId: SessionId, reply: Reply) =
+        SessionClientOperations.ReplyAsync(client, sessionId, reply, CancellationToken.None)
+
+    /// Subscribes from exclusive cursor zero with CancellationToken.None.
+    [<Extension>]
+    static member Subscribe(client: SessionClient, sessionId: SessionId) =
+        SessionClientOperations.Subscribe(client, sessionId, 0L, CancellationToken.None)
+
+    /// Subscribes from the explicit exclusive cursor with CancellationToken.None.
+    [<Extension>]
+    static member Subscribe(client: SessionClient, sessionId: SessionId, fromSequence: int64) =
+        SessionClientOperations.Subscribe(client, sessionId, fromSequence, CancellationToken.None)
+
+    /// Subscribes from exclusive cursor zero; cancellation stops this stream, never an accepted turn.
+    [<Extension>]
+    static member Subscribe(client: SessionClient, sessionId: SessionId, cancellationToken: CancellationToken) =
+        SessionClientOperations.Subscribe(client, sessionId, 0L, cancellationToken)
+
+    /// Waits with the configured client default bound and CancellationToken.None.
+    /// Register before prompting; this is not durable retrieval of a previously settled result.
+    [<Extension>]
+    static member WaitForSettleAsync(client: SessionClient, sessionId: SessionId) =
+        ArgumentNullException.ThrowIfNull(client)
+        SessionClientOperations.WaitForSettleAsync(client, sessionId, client.DefaultBound, CancellationToken.None)
+
+    /// Waits with an explicit positive bound and CancellationToken.None. Register before prompting.
+    [<Extension>]
+    static member WaitForSettleAsync(client: SessionClient, sessionId: SessionId, bound: TimeSpan) =
+        SessionClientOperations.WaitForSettleAsync(client, sessionId, bound, CancellationToken.None)
+
+    /// Waits with the configured default bound; cancellation abandons only this wait, never the turn.
+    /// Register before prompting; settlement wins cancellation ties.
+    [<Extension>]
+    static member WaitForSettleAsync
+        (client: SessionClient, sessionId: SessionId, cancellationToken: CancellationToken)
+        =
+        ArgumentNullException.ThrowIfNull(client)
+        SessionClientOperations.WaitForSettleAsync(client, sessionId, client.DefaultBound, cancellationToken)
+
     /// Requires the session row or throws the boundary precondition
     /// failure. Existence only: the per-operation boundaries own the
     /// state checks, so a Close racing the read maps there.
@@ -493,7 +599,7 @@ type SessionClientOperations =
     /// <param name="sessionId">The session to prompt.</param>
     /// <param name="message">The user message. Must not be null.</param>
     /// <param name="delivery">How the message is delivered to a running turn.</param>
-    /// <param name="cancellationToken">Cancels the prompt.</param>
+    /// <param name="cancellationToken">Cancels this operation. Before admission it may prevent the prompt; cancellation after acceptance never aborts the durable turn.</param>
     /// <returns>The appended inbox entry.</returns>
     /// <exception cref="T:Legate.SessionNotFoundException">The session id does not exist.</exception>
     /// <exception cref="T:Legate.InvalidSessionStateException">The session is closed.</exception>
@@ -1520,6 +1626,72 @@ type internal SessionModelClients(resolveClient: Func<ModelReference, IChatClien
 
 module internal SessionClientWiring =
 
+    type PreparedOptions =
+        {
+            Runtime: LegateOptions
+            Client: SessionClientOptions
+        }
+
+    let prepareOptions (provider: IServiceProvider) : PreparedOptions =
+        let runtime =
+            match
+                System.Text.Json.JsonSerializer.Deserialize<LegateOptions>(
+                    System.Text.Json.JsonSerializer.Serialize(
+                        provider.GetRequiredService<IOptions<LegateOptions>>().Value
+                    )
+                )
+            with
+            | null -> invalidOp "LegateOptions snapshot was null."
+            | copy -> copy
+
+        let client =
+            match
+                System.Text.Json.JsonSerializer.Deserialize<SessionClientOptions>(
+                    System.Text.Json.JsonSerializer.Serialize(provider.GetRequiredService<SessionClientOptions>())
+                )
+            with
+            | null -> invalidOp "SessionClientOptions snapshot was null."
+            | copy -> copy
+
+        let providers = ExecutionGraphValidation.providers provider
+
+        let inferred =
+            if providers.Length = 1 then
+                let p = providers[0]
+
+                if String.IsNullOrWhiteSpace p.Id || String.IsNullOrWhiteSpace p.DefaultModel then
+                    None
+                else
+                    try
+                        Some(ModelReference.Parse(p.Id + "/" + p.DefaultModel))
+                    with _ ->
+                        None
+            else
+                None
+
+        let selected =
+            let raw =
+                if not (String.IsNullOrWhiteSpace client.DefaultModel) then
+                    Option.ofObj client.DefaultModel
+                elif
+                    not (isNull (box runtime.Llm))
+                    && not (String.IsNullOrWhiteSpace runtime.Llm.DefaultModel)
+                then
+                    Option.ofObj runtime.Llm.DefaultModel
+                else
+                    None
+
+            match raw with
+            | Some value ->
+                try
+                    ModelReference.Parse(value)
+                with _ ->
+                    invalidOp "The execution default model must be in provider/model form."
+            | None -> inferred |> Option.defaultValue AgentFileParser.defaultModel
+
+        client.DefaultModel <- selected.Value
+        { Runtime = runtime; Client = client }
+
     /// Catalog reads belong to the attempt's cancellation scope, including
     /// stores that do not complete promptly after receiving cancellation.
     let agentsForEntryAsync (agents: IAgentStore | null) tenant (token: CancellationToken) =
@@ -1756,6 +1928,7 @@ module internal SessionClientWiring =
         (nodeMode: ClusterMode)
         (subscriptionLifetime: SessionSubscriptionLifetime)
         (workTracker: ExecutionWorkTracker)
+        (prepared: PreparedOptions)
         : SessionExecutionContext =
         ArgumentNullException.ThrowIfNull(provider)
         ArgumentNullException.ThrowIfNull(subscriptionLifetime)
@@ -1765,28 +1938,8 @@ module internal SessionClientWiring =
         let routes = provider.GetRequiredService<CompletionDestinations>()
         let bus = provider.GetRequiredService<SessionEventBus>()
 
-        let legateOptions =
-            match provider.GetService<IOptions<LegateOptions>>() with
-            | null -> LegateOptions()
-            | options when isNull (box options.Value) -> LegateOptions()
-            | options ->
-                System.Text.Json.JsonSerializer.Deserialize<LegateOptions>(
-                    System.Text.Json.JsonSerializer.Serialize(options.Value)
-                )
-                |> function
-                    | null -> invalidOp "LegateOptions snapshot was null."
-                    | snapshot -> snapshot
-
-        let clientOptions =
-            match provider.GetService<SessionClientOptions>() with
-            | null -> SessionClientOptions()
-            | options ->
-                System.Text.Json.JsonSerializer.Deserialize<SessionClientOptions>(
-                    System.Text.Json.JsonSerializer.Serialize(options)
-                )
-                |> function
-                    | null -> invalidOp "SessionClientOptions snapshot was null."
-                    | snapshot -> snapshot
+        let legateOptions = prepared.Runtime
+        let clientOptions = prepared.Client
 
         match clientOptions.Validate() with
         | null -> ()
@@ -2160,6 +2313,16 @@ module internal SessionClientWiring =
             WorkTracker = workTracker
             Spawn = spawnContext
             Client = client
+            Background =
+                {
+                    Sessions = sessions
+                    Dispatcher = legateOptions.Dispatcher
+                    Clock = clock
+                    Delay = delay
+                    EraMarked = eraReaderOf provider
+                    Agents = provider.GetService<IAgentStore>()
+                    RecoveryCursor = ref null
+                }
         }
 
     let buildClient (provider: IServiceProvider) : SessionClient =
@@ -2206,7 +2369,19 @@ module internal SessionClientRegistration =
         )
         |> ignore
 
-        services.TryAddSingleton<SessionClient>(
-            Func<IServiceProvider, SessionClient>(fun provider -> SessionClientWiring.buildClient provider)
-        )
-        |> ignore
+        if
+            not (
+                services
+                |> Seq.exists (fun d -> not d.IsKeyedService && d.ServiceType = typeof<SessionClient>)
+            )
+        then
+            let descriptor =
+                ServiceDescriptor.Singleton<SessionClient>(
+                    Func<IServiceProvider, SessionClient>(SessionClientWiring.buildClient)
+                )
+
+            services.Add(descriptor)
+            // Registration ownership, not a provider-type heuristic. Adapters can
+            // replace exactly this descriptor without deleting host registrations.
+            services.AddKeyedSingleton<ServiceDescriptor>(typeof<SessionClient>, descriptor)
+            |> ignore

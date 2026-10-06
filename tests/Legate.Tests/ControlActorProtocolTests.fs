@@ -166,6 +166,183 @@ module ControlActorProtocolTests =
         parent.Ask<IActorRef>("activate", bound)
 
     [<Theory>]
+    [<InlineData(false, OnCrashResume.ResumeAttempt, false)>]
+    [<InlineData(false, OnCrashResume.ResumeAttempt, true)>]
+    [<InlineData(false, OnCrashResume.FailAttempt, false)>]
+    [<InlineData(false, OnCrashResume.FailAttempt, true)>]
+    [<InlineData(true, OnCrashResume.ResumeAttempt, false)>]
+    [<InlineData(true, OnCrashResume.ResumeAttempt, true)>]
+    [<InlineData(true, OnCrashResume.FailAttempt, false)>]
+    [<InlineData(true, OnCrashResume.FailAttempt, true)>]
+    let ``issue415 Running sweep recovers genuine original target with InMemory SQLite policy parity``
+        sqlite
+        policy
+        consumed
+        =
+        task {
+            let clock = TestClock()
+            let path = SqliteTestFixture.tempDatabasePath ()
+            let database = InMemoryDatabase(clock)
+
+            let sql =
+                if sqlite then
+                    Some(SqliteDatabase.Open(path, clock))
+                else
+                    None
+
+            try
+                let store, journal =
+                    match sql with
+                    | Some db -> SqliteStoreFactory.sessionStore db, SqliteStoreFactory.eventStore db
+                    | None -> InMemoryStoreFactory.sessionStore database, InMemoryStoreFactory.eventStore database
+
+                let! created = store.CreateSession(tenant, session (SessionOptions(OnCrashResume = policy)), ct)
+                let! oldClaim = prime store created.Id
+
+                let! entry =
+                    store.AppendInboxMessage(
+                        tenant,
+                        created.Id,
+                        UserMessagePayload(UserMessage.Text "original"),
+                        DeliveryMode.Queue,
+                        ct
+                    )
+
+                let control = store :?> ISessionAbortControlStore
+                let! _ = control.BindControlTarget(tenant, created.Id, entry.TurnId, entry.Position, oldClaim, ct)
+                let! _ = store.UpdateSessionState(tenant, created.Id, SessionState.Running, ct)
+
+                if consumed then
+                    let! _ = store.MarkInboxConsumed(tenant, created.Id, [| entry.Position |], ct)
+                    ()
+
+                use system = ActorSystem.Create("sweep-" + Guid.NewGuid().ToString("N"))
+                use bus = new SessionEventBus(journal, SessionSubscriptionOptions(), null)
+                let entered = ConcurrentQueue<InboxEntry * TurnId * int>()
+
+                let finish =
+                    TaskCompletionSource<TurnLoop.TurnLoopCompletion>(
+                        TaskCreationOptions.RunContinuationsAsynchronously
+                    )
+
+                let runner: SessionActor.SuspendableRunner =
+                    fun work attempt _ _ _ _ _ _ _ _ turn ->
+                        entered.Enqueue(work, turn, attempt)
+                        finish.Task
+
+                let factory =
+                    SessionActor.spawnSuspendFactory
+                        store
+                        tenant
+                        journal
+                        delay
+                        (TimeSpan.FromMinutes 1.0)
+                        "survivor"
+                        (TimeSpan.FromMinutes 5.0)
+                        runner
+                        (fun _ _ -> None)
+                        null
+                        (fun _ _ _ -> Task.FromResult(false))
+
+                let resolve id _ =
+                    factoryActor system factory id |> Async.StartAsTask
+
+                let sweep () =
+                    Dispatcher.passOnceRoutedAsync
+                        (fun _ -> true)
+                        store
+                        journal
+                        (fun _ _ _ -> Task.FromResult(false))
+                        tenant
+                        (SessionsOptions(Capacity = 1))
+                        (DispatcherOptions())
+                        resolve
+                        clock
+                        ct
+
+                let! _ = sweep ()
+                Assert.Empty(entered)
+                let! stillHeld = store.VerifyClaim(tenant, oldClaim, ct)
+                Assert.IsType<TurnLeaseHeld>(stillHeld) |> ignore
+                clock.Advance(TimeSpan.FromMinutes 6.0)
+                use timeout = new CancellationTokenSource(bound)
+
+                let stream =
+                    bus.Subscribe(tenant, created.Id, 0L, timeout.Token).GetAsyncEnumerator(timeout.Token)
+
+                let terminal =
+                    task {
+                        let mutable found: SessionEvent option = None
+
+                        while found.IsNone do
+                            let! has = stream.MoveNextAsync().AsTask()
+
+                            if not has then
+                                failwith "No recovered terminal"
+
+                            match stream.Current with
+                            | :? TurnCompletedEvent
+                            | :? TurnFailedEvent
+                            | :? TurnAbortedEvent -> found <- Some stream.Current
+                            | _ -> ()
+
+                        return found.Value
+                    }
+
+                let! _ = Task.WhenAll(sweep (), sweep ())
+
+                if policy = OnCrashResume.ResumeAttempt then
+                    finish.SetResult(
+                        {
+                            Result = completed
+                            TurnId = entry.TurnId
+                            HasPendingInjects = false
+                            Suspension = None
+                        }
+                    )
+
+                let! final = terminal.WaitAsync(bound)
+                do! stream.DisposeAsync().AsTask()
+                Assert.Equal(entry.TurnId, final.TurnId)
+
+                if policy = OnCrashResume.ResumeAttempt then
+                    let original, turn, attempt = Assert.Single(entered)
+                    Assert.Equal(entry.Position, original.Position)
+                    Assert.Equal(consumed, original.Consumed)
+                    Assert.Equal(entry.TurnId, turn)
+                    Assert.Equal(2, attempt)
+                    Assert.IsType<TurnCompletedEvent>(final) |> ignore
+                else
+                    Assert.Empty(entered)
+                    Assert.IsType<TurnFailedEvent>(final) |> ignore
+
+                let! lost = store.VerifyClaim(tenant, oldClaim, ct)
+                Assert.True(lost :? TurnLeaseLost || lost :? TurnLeaseMissing)
+
+                let stale =
+                    TextDeltaEvent(created.Id, entry.TurnId, Nullable(), clock.GetUtcNow(), "loser") :> SessionEvent
+
+                let! rejected = journal.Append(tenant, created.Id, oldClaim.Token, [| stale |], ct)
+                Assert.IsType<EventAppendRejected>(rejected) |> ignore
+                let! page = journal.Replay(tenant, created.Id, 0L, 100, ct)
+                let events = Assert.IsType<EventReplayPage>(page).Events
+
+                Assert.Single(events |> Seq.filter (fun e -> e :? TurnCompletedEvent || e :? TurnFailedEvent))
+                |> ignore
+
+                Assert.Equal<int64 array>(
+                    [| 1L .. int64 events.Count |],
+                    events |> Seq.map (fun e -> e.Sequence.Value) |> Seq.toArray
+                )
+            finally
+                match sql with
+                | Some db ->
+                    (db :> IDisposable).Dispose()
+                    SqliteTestFixture.deleteDatabaseFiles path
+                | None -> ()
+        }
+
+    [<Theory>]
     [<InlineData(OnCrashResume.ResumeAttempt, false)>]
     [<InlineData(OnCrashResume.FailAttempt, false)>]
     [<InlineData(OnCrashResume.ResumeAttempt, true)>]

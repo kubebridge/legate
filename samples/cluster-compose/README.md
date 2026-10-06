@@ -1,5 +1,13 @@
 # Cluster Compose Harness
 
+The configuration-aware ASP.NET Core adapter has a separate executable
+[CSharpWebHost owner-loss harness](../CSharpWebHost/cluster/README.md). It identifies
+and kills the actual active-call owner, requires autonomous later-attempt
+settlement and identical gap-free survivor replay, and uses shared Postgres with
+distributed LLM admission disabled. This existing MinimalHost targeted-stop harness
+is retained; its control-pending outcome is not a substitute for adapter recovery
+proof. Neither sample certifies arbitrary providers as shared or durable.
+
 Sample-only three-node Legate cluster in `StaticSeeds` mode (issue 145).
 No `Legate.Cluster.Docker` package: this is a harness plus an `.fsx`
 smoke, not a runtime. All commands run from the repo root unless noted.
