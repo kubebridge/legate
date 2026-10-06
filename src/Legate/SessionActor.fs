@@ -159,6 +159,20 @@ type internal SessionActorMessage =
     /// arriving after Close are ignored.
     | SessionTurnFaulted of entry: InboxEntry * error: Exception
 
+    /// One piped lifecycle store wait finished (issue 390). The outcome is
+    /// the boxed LifecyclePipe.StoreOpResult the wait produced; only the
+    /// outstanding wait's op id plus the pipe incarnation resumes, so
+    /// delayed, duplicate, reordered, and pre-restart completions are
+    /// discarded with zero effects. Internal to the actor loop, never
+    /// crossing node boundaries.
+    | LifecycleStoreCompleted of opId: int64 * incarnation: Guid * outcome: obj
+
+    /// One piped lifecycle store wait outran its bound (issue 390). The
+    /// resumption fails with DeadlineExceededException; the late real
+    /// completion is discarded by op id with zero effects. Internal to the
+    /// actor loop, never crossing node boundaries.
+    | LifecycleStoreTimeout of opId: int64 * incarnation: Guid
+
 /// The actor's observable state: its in-memory lifecycle state, the store's
 /// pending inbox count, and the running turn's entry position when a turn is
 /// in flight.
@@ -194,6 +208,48 @@ type private RunningTurn =
         /// The source Close cancels to abort it.
         Cts: CancellationTokenSource
     }
+
+/// Whether the base loop finished its store recovery (issue 390): the
+/// recover chain runs piped before the first lifecycle message is handled,
+/// and everything received meanwhile waits bounded behind it in arrival
+/// order.
+type private BehaviorActivation =
+    /// Recovery landed: lifecycle messages handle normally.
+    | Ready
+    /// The recover chain is in flight: non-completion messages defer.
+    | Recovering
+
+/// The base-loop state threaded through every message (issue 390): the
+/// lifecycle state plus the bounded pipe state, the pending inbox count
+/// cache snapshots answer from, and the close senders waiting on the
+/// durable close write.
+type private BehaviorLoopArgs =
+    {
+        /// The actor's current lifecycle state.
+        State: SessionState
+        /// The turn in flight, or None.
+        Running: RunningTurn option
+        /// The stop arbitration cell.
+        Arbitration: StopArbitration.ArbitrationState
+        /// The recorded stop, or None.
+        PendingStop: (StopCause * string) option
+        /// Whether the recover chain landed.
+        Activation: BehaviorActivation
+        /// The store's pending inbox count as of the last inbox read or
+        /// mutation the actor applied: snapshots answer from memory while a
+        /// store wait is outstanding.
+        PendingCount: int
+        /// Close senders waiting on the durable close write: empty when no
+        /// close is outstanding. A requested close behaves Closed for new
+        /// lifecycle work while its write is outstanding.
+        Closing: (IActorRef * CancellationToken) list
+    }
+
+/// The bounded pipe state the base loop threads.
+type private BehaviorPipe = LifecyclePipe.PipeState<SessionActorMessage, BehaviorLoopArgs>
+
+/// A base-loop continuation: the loop state plus the pipe state it resumes with.
+type private BehaviorCont = BehaviorLoopArgs -> BehaviorPipe -> Cont<SessionActorMessage, unit>
 
 /// What an on-demand compact needs outside a turn (issue 46): the same
 /// summariser wiring a per-turn CompactionWiring carries, plus the journal
@@ -275,6 +331,118 @@ type internal SessionActorProps =
         /// to, or null for no logging (the CustomToolSource precedent: a
         /// null logger resolves to the NullLogger). Internal-only wiring.
         Logger: Microsoft.Extensions.Logging.ILogger | null
+        /// How the actor bounds piped lifecycle store waits (issue 390):
+        /// the clock deadline timers register on plus how long one wait may
+        /// stay outstanding before its resumption fails with
+        /// DeadlineExceededException. None selects the system clock with the
+        /// default bound. Internal-only wiring.
+        StorePipe: LifecyclePipe.StorePipeConfig option
+    }
+
+// ────────────────── Piped lifecycle store waits (issue 390) ──────────────────
+
+/// The pared-down pipe context one actor loop builds once and threads into
+/// every piped wait: which actor completions Tell, which clock and bound
+/// they carry, and how completion/timeout messages pack for the loop's
+/// protocol. Lets the shared helpers below stay generic over both loops.
+type private PipeStarter<'M, 'A> =
+    {
+        /// The actor completions Tell.
+        Self: IActorRef
+        /// The clock deadline timers register on.
+        Clock: TimeProvider
+        /// How long one wait may stay outstanding.
+        Timeout: TimeSpan
+        /// Builds the loop protocol's completion message.
+        PackCompleted: int64 * Guid * obj -> 'M
+        /// Builds the loop protocol's timeout message.
+        PackTimeout: int64 * Guid -> 'M
+    }
+
+/// Starts one piped lifecycle store wait through a starter: a completed
+/// wait runs its resumption inline (fast path, today's sequencing),
+/// otherwise the outcome pipes back as a one-way message and the loop
+/// suspends with the wait outstanding. The suspension always re-enters the
+/// loop with the state current at the wait's start; resumptions receive the
+/// state current at the wait's settle, so control recorded meanwhile is
+/// never lost.
+let private startPipedWait<'T, 'M, 'A>
+    (starter: PipeStarter<'M, 'A>)
+    (task: Task<'T>)
+    (label: string)
+    (resume: 'A -> LifecyclePipe.PipeState<'M, 'A> -> Result<'T, exn> -> Cont<'M, unit>)
+    (suspendWith: 'A -> LifecyclePipe.PipeState<'M, 'A> -> Cont<'M, unit>)
+    (args: 'A)
+    (pipe: LifecyclePipe.PipeState<'M, 'A>)
+    : Cont<'M, unit> =
+    LifecyclePipe.start
+        starter.Self
+        starter.Clock
+        starter.Timeout
+        label
+        task
+        resume
+        starter.PackCompleted
+        starter.PackTimeout
+        (suspendWith args)
+        args
+        pipe
+
+/// Starts one non-generic piped lifecycle store wait through a starter.
+/// Same contract as startPipedWait.
+let private startPipedWaitUnit<'M, 'A>
+    (starter: PipeStarter<'M, 'A>)
+    (task: Task)
+    (label: string)
+    (resume: 'A -> LifecyclePipe.PipeState<'M, 'A> -> Result<unit, exn> -> Cont<'M, unit>)
+    (suspendWith: 'A -> LifecyclePipe.PipeState<'M, 'A> -> Cont<'M, unit>)
+    (args: 'A)
+    (pipe: LifecyclePipe.PipeState<'M, 'A>)
+    : Cont<'M, unit> =
+    LifecyclePipe.startUnit
+        starter.Self
+        starter.Clock
+        starter.Timeout
+        label
+        task
+        resume
+        starter.PackCompleted
+        starter.PackTimeout
+        (suspendWith args)
+        args
+        pipe
+
+/// Replies Status.Failure when a lifecycle message arrives past the bounded
+/// deferred queue: the store dependency is delayed and the actor refuses to
+/// grow without bound. Callers pass the Ask sender; one-way senders absorb
+/// it as dead letters.
+let private replyPipeOverflow (sender: IActorRef) : unit =
+    sender
+    <! Status.Failure(
+        DeadlineExceededException(
+            "session-lifecycle-pipe",
+            sprintf
+                "The session actor deferred more than %d lifecycle messages behind a delayed store dependency."
+                LifecyclePipe.MaxDeferredMessages
+        )
+        :> Exception
+    )
+
+/// Builds one base loop's pipe starter: completions Tell the loop's own
+/// actor and pack for the base protocol.
+/// <param name="self">The base loop's own actor.</param>
+/// <param name="config">The resolved pipe configuration.</param>
+/// <returns>The starter the loop's waits run through.</returns>
+let private behaviorStarter
+    (self: IActorRef)
+    (config: LifecyclePipe.StorePipeConfig)
+    : PipeStarter<SessionActorMessage, BehaviorLoopArgs> =
+    {
+        Self = self
+        Clock = config.Clock
+        Timeout = config.Timeout
+        PackCompleted = fun (opId, incarnation, outcome) -> LifecycleStoreCompleted(opId, incarnation, outcome)
+        PackTimeout = fun (opId, incarnation) -> LifecycleStoreTimeout(opId, incarnation)
     }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -782,57 +950,6 @@ module internal SessionActor =
 
             interrupts @ queued
 
-    /// Rebuilds the actor's starting state from the store: the stored
-    /// lifecycle state. A stored Running state means the previous owner
-    /// died mid-turn (this issue has no lease or fencing to decide
-    /// otherwise, those belong to #33), so it is released back to Idle in
-    /// the store and the still-pending entry redelivers on the next drain.
-    /// A missing session row starts as an empty Idle shell: the client
-    /// boundary rejects every mutation for unknown sessions, so the shell
-    /// can never persist phantom work. An out-of-range stored state is
-    /// preserved verbatim and treated as append-only by the loop.
-    /// <param name="props">The session actor dependencies.</param>
-    /// <returns>The recovered lifecycle state.</returns>
-    let private recover (props: SessionActorProps) : SessionState =
-        let found =
-            awaitTask (props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
-
-        match found with
-        | null -> SessionState.Idle
-        | session ->
-            match session.State with
-            | SessionState.Running ->
-                awaitTask (
-                    props.Store.UpdateSessionState(
-                        props.Tenant,
-                        props.SessionId,
-                        SessionState.Idle,
-                        CancellationToken.None
-                    )
-                )
-                |> ignore
-
-                SessionState.Idle
-            | SessionState.Idle -> SessionState.Idle
-            | SessionState.WaitingForInput -> SessionState.WaitingForInput
-            | SessionState.Closed -> SessionState.Closed
-            | unknown -> unknown
-
-    /// Reads the store's pending inbox count for a snapshot. A null read
-    /// result counts as empty, as does a session row that does not exist
-    /// yet (a resolved-but-never-opened session reports an empty Idle
-    /// shell; the client boundary rejects its mutations).
-    /// <param name="props">The session actor dependencies.</param>
-    /// <returns>How many inbox entries are pending.</returns>
-    let private pendingCount (props: SessionActorProps) : int =
-        try
-            let pending =
-                awaitTask (props.Store.ReadPendingInbox(props.Tenant, props.SessionId, CancellationToken.None))
-
-            if isNull (box pending) then 0 else pending.Count
-        with :? SessionNotFoundException ->
-            0
-
     /// Store-backed Inject fold wiring for one session: what the
     /// Inject-aware turn runner closes over to fold Inject entries at
     /// iteration boundaries (issue 34 over issue 41's drain hooks). The
@@ -1335,170 +1452,251 @@ module internal SessionActor =
     /// still fences a takeover loser into TurnLeaseLostException before
     /// anything journals. Truthful idle-operation attribution: the
     /// journaled CompactedEvent carries the default TurnId sentinel and
-    /// zero turn totals, never an executing turn. Runs synchronously on
-    /// the actor thread like the other fast store-first paths; the
-    /// summariser call bounds the block.
+    /// zero turn totals, never an executing turn. Every wait runs piped
+    /// (issue 390): the dispatcher thread never blocks on the replay, the
+    /// stamp read, or the summariser call.
+    /// <param name="starter">The loop's pipe starter.</param>
     /// <param name="props">The session actor dependencies.</param>
     /// <param name="compact">The on-demand compaction wiring. Must be validated.</param>
     /// <param name="cancellationToken">Abandons the replay and the summariser call.</param>
-    /// <returns>How the on-demand compact answered.</returns>
-    let private compactIdleNow
+    /// <param name="cont">Continues with the compact reply.</param>
+    /// <param name="suspendWith">Re-enters the loop with the state current at each wait's start.</param>
+    /// <param name="args">The current loop state.</param>
+    /// <param name="pipe">The current pipe state.</param>
+    /// <returns>The actor computation.</returns>
+    let private compactIdleNowPiped<'M, 'A>
+        (starter: PipeStarter<'M, 'A>)
         (props: SessionActorProps)
         (compact: CompactDeps)
         (cancellationToken: CancellationToken)
-        : SessionCompactReply =
-        try
-            // Resolve the idle history through the shared checkpoint-resumed
-            // compacted base (issue 389): the last successful enriched
-            // CompactedEvent supplies the summary plus the retained
-            // current-format tail, superseded pre-compaction context drops,
-            // and only the post-checkpoint suffix replays with continuity
-            // validation. The one full read after (re)start with an unknown
-            // checkpoint is the documented initial reconstruction; a stale
-            // checkpoint falls back to explicit reconstruction. Lossy
-            // display cells never feed the summariser: required content is
-            // never reconstructed from them. A rejection
-            // (unsupported/incomplete compacted state or unreadable
-            // journal) truthfully no-ops with no success published; the
-            // next production turn rejects explicitly with a clean start.
-            let suffixRead =
-                awaitTask (
-                    BoundedReplay.readSuffixWithBaseAsync
-                        compact.EventStore
-                        props.Tenant
-                        props.SessionId
-                        100
-                        cancellationToken
-                )
+        (cont: SessionCompactReply -> 'A -> LifecyclePipe.PipeState<'M, 'A> -> Cont<'M, unit>)
+        (suspendWith: 'A -> LifecyclePipe.PipeState<'M, 'A> -> Cont<'M, unit>)
+        (args: 'A)
+        (pipe: LifecyclePipe.PipeState<'M, 'A>)
+        : Cont<'M, unit> =
+        let runCore
+            (history: IList<ChatMessage>)
+            (expectedStamp: DateTimeOffset option)
+            (args2: 'A)
+            (pipe2: LifecyclePipe.PipeState<'M, 'A>)
+            : Cont<'M, unit> =
+            let journalAsync =
+                match expectedStamp with
+                | Some stamp ->
+                    fun (event: SessionEvent) ->
+                        let events = ResizeArray<SessionEvent>([| event |]) :> IReadOnlyList<SessionEvent>
 
-            let collected = BoundedReplay.recoveryInputOf suffixRead
+                        JournalWriter.appendHostAsync
+                            compact.EventStore
+                            props.Tenant
+                            props.SessionId
+                            stamp
+                            events
+                            CancellationToken.None
+                | None -> journalSink compact.EventStore props.Tenant props.SessionId compact.JournalToken
 
-            let baseResolution = ConversationRecovery.tryRecoverCompacted collected
+            let request: Compaction.CompactionRequest =
+                {
+                    Client = compact.Client
+                    History = history
+                    SessionModel = compact.SessionModel
+                    CompactionModel = compact.Llm.Compaction
+                    KeepMessages = compact.Llm.CompactionKeepMessages
+                    CatalogEntry = catalogEntryOf compact.Catalog compact.SessionModel
+                    ReservedBufferTokens = compact.ReservedBufferTokens
+                    Observer = compact.Observer
+                    ModelPolicy = compact.Policy
+                    Tenant = props.Tenant
+                    SessionId = props.SessionId
+                    // The host-operation sentinel (issue 373): the idle
+                    // compact is host authority, not execution, so the
+                    // journaled CompactedEvent carries the default TurnId.
+                    TurnId = Unchecked.defaultof<TurnId>
+                    Attempt = 1
+                    InputTokens = 0L
+                    OutputTokens = 0L
+                    JournalAsync = journalAsync
+                    IsLeaseValid = (fun () -> true)
+                    CancellationToken = cancellationToken
+                }
 
-            match baseResolution with
-            | Error _ when collected.Count > 0 ->
-                // Unsupported or incomplete compacted state: truthful
-                // no-op with no success published and no journal write.
-                // The next production turn rejects explicitly with a
-                // clean start before any provider execution.
-                CompactNotNeeded
-            | _ ->
-                let history =
-                    match baseResolution with
-                    | Error _ -> ResizeArray<ChatMessage>() :> IList<ChatMessage>
-                    | Ok resolved -> ResizeArray<ChatMessage>(resolved) :> IList<ChatMessage>
+            // Forced core (issue 387): explicit idle requests compact
+            // eligible context below the automatic threshold, while the
+            // replaceable guard still truthfully no-ops when nothing
+            // can be replaced. No synthetic user turn, no execution
+            // claim, idle-operation attribution via the sentinel above.
+            startPipedWait
+                starter
+                (Compaction.tryCompactCoreAsync true request)
+                "compact-core"
+                (fun args3 pipe3 -> function
+                    | Ok Compaction.NotNeeded -> cont CompactNotNeeded args3 pipe3
+                    | Ok(Compaction.Compacted(beforeEstimate, afterEstimate, _, _)) ->
+                        cont (CompactCompleted(beforeEstimate, afterEstimate)) args3 pipe3
+                    | Ok(Compaction.FailedContinue _) -> cont CompactNotNeeded args3 pipe3
+                    | Error(:? TurnLoop.TurnLeaseLostException) -> cont CompactFenced args3 pipe3
+                    | Error(:? OperationCanceledException) -> cont CompactNotNeeded args3 pipe3
+                    | Error error -> raise error)
+                suspendWith
+                args2
+                pipe2
 
-                // The host fence stamp for the idle compact (issue 373): read
-                // before the summariser call. A concurrent idle writer moves
-                // the stamp and the host append below fences as CompactFenced.
-                // A missing row falls back to the primed token sink, so the
-                // compact stays fenced either way; the prime itself is untouched.
-                let expectedStamp =
+        let readStamp
+            (history: IList<ChatMessage>)
+            (args2: 'A)
+            (pipe2: LifecyclePipe.PipeState<'M, 'A>)
+            : Cont<'M, unit> =
+            // The host fence stamp for the idle compact (issue 373): read
+            // before the summariser call. A concurrent idle writer moves
+            // the stamp and the host append below fences as CompactFenced.
+            // A missing row falls back to the primed token sink, so the
+            // compact stays fenced either way; the prime itself is untouched.
+            // Any read failure reads as no stamp, exactly like before.
+            startPipedWait
+                starter
+                (props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
+                "compact-stamp"
+                (fun args3 pipe3 -> function
+                    | Ok session ->
+                        match session with
+                        | null -> runCore history None args3 pipe3
+                        | s -> runCore history (Some s.UpdatedAt) args3 pipe3
+                    | Error _ -> runCore history None args3 pipe3)
+                suspendWith
+                args2
+                pipe2
+
+        startPipedWait
+            starter
+            (BoundedReplay.readSuffixWithBaseAsync
+                compact.EventStore
+                props.Tenant
+                props.SessionId
+                100
+                cancellationToken)
+            "compact-replay"
+            (fun args2 pipe2 -> function
+                | Error(:? TurnLoop.TurnLeaseLostException) -> cont CompactFenced args2 pipe2
+                | Error(:? OperationCanceledException) -> cont CompactNotNeeded args2 pipe2
+                | Error error -> raise error
+                | Ok suffixRead ->
+                    // Resolve the idle history through the shared
+                    // checkpoint-resumed compacted base (issue 389), exactly
+                    // like before: pure before the next piped wait.
                     try
-                        match
-                            awaitTask (props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
-                        with
-                        | null -> None
-                        | session -> Some session.UpdatedAt
-                    with _ ->
-                        None
+                        let collected = BoundedReplay.recoveryInputOf suffixRead
 
-                let journalAsync =
-                    match expectedStamp with
-                    | Some stamp ->
-                        fun (event: SessionEvent) ->
-                            let events = ResizeArray<SessionEvent>([| event |]) :> IReadOnlyList<SessionEvent>
+                        let baseResolution = ConversationRecovery.tryRecoverCompacted collected
 
-                            JournalWriter.appendHostAsync
-                                compact.EventStore
-                                props.Tenant
-                                props.SessionId
-                                stamp
-                                events
-                                CancellationToken.None
-                    | None -> journalSink compact.EventStore props.Tenant props.SessionId compact.JournalToken
+                        match baseResolution with
+                        | Error _ when collected.Count > 0 ->
+                            // Unsupported or incomplete compacted state:
+                            // truthful no-op with no success published and
+                            // no journal write.
+                            cont CompactNotNeeded args2 pipe2
+                        | _ ->
+                            let history =
+                                match baseResolution with
+                                | Error _ -> ResizeArray<ChatMessage>() :> IList<ChatMessage>
+                                | Ok resolved -> ResizeArray<ChatMessage>(resolved) :> IList<ChatMessage>
 
-                let request: Compaction.CompactionRequest =
-                    {
-                        Client = compact.Client
-                        History = history
-                        SessionModel = compact.SessionModel
-                        CompactionModel = compact.Llm.Compaction
-                        KeepMessages = compact.Llm.CompactionKeepMessages
-                        CatalogEntry = catalogEntryOf compact.Catalog compact.SessionModel
-                        ReservedBufferTokens = compact.ReservedBufferTokens
-                        Observer = compact.Observer
-                        ModelPolicy = compact.Policy
-                        Tenant = props.Tenant
-                        SessionId = props.SessionId
-                        // The host-operation sentinel (issue 373): the idle
-                        // compact is host authority, not execution, so the
-                        // journaled CompactedEvent carries the default TurnId.
-                        TurnId = Unchecked.defaultof<TurnId>
-                        Attempt = 1
-                        InputTokens = 0L
-                        OutputTokens = 0L
-                        JournalAsync = journalAsync
-                        IsLeaseValid = (fun () -> true)
-                        CancellationToken = cancellationToken
-                    }
-
-                // Forced core (issue 387): explicit idle requests compact
-                // eligible context below the automatic threshold, while the
-                // replaceable guard still truthfully no-ops when nothing
-                // can be replaced. No synthetic user turn, no execution
-                // claim, idle-operation attribution via the sentinel above.
-                match awaitTask (Compaction.tryCompactCoreAsync true request) with
-                | Compaction.NotNeeded -> CompactNotNeeded
-                | Compaction.Compacted(beforeEstimate, afterEstimate, _, _) ->
-                    CompactCompleted(beforeEstimate, afterEstimate)
-                | Compaction.FailedContinue _ -> CompactNotNeeded
-        with
-        | :? TurnLoop.TurnLeaseLostException -> CompactFenced
-        | :? OperationCanceledException -> CompactNotNeeded
+                            readStamp history args2 pipe2
+                    with
+                    | :? TurnLoop.TurnLeaseLostException -> cont CompactFenced args2 pipe2
+                    | :? OperationCanceledException -> cont CompactNotNeeded args2 pipe2)
+            suspendWith
+            args
+            pipe
 
     // ────────────────── AutoClose (issue 82) ──────────────────
 
     /// Reads whether the session closes itself after its first completed
     /// turn: the AutoClose snapshot the session was opened with. A missing
     /// row, missing options, or a store read failure reads as false, so the
-    /// close never fires spuriously.
+    /// close never fires spuriously. The read runs piped (issue 390).
+    /// <param name="starter">The loop's pipe starter.</param>
     /// <param name="props">The session actor dependencies.</param>
-    /// <returns>True when the session closes after its first Completed turn.</returns>
-    let private autoCloseEnabled (props: SessionActorProps) : bool =
-        try
-            match awaitTask (props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None)) with
-            | null -> false
-            | session when isNull (box session.Options) -> false
-            | session -> session.Options.AutoClose
-        with :? SessionNotFoundException ->
-            false
+    /// <param name="cont">Continues with whether AutoClose is enabled.</param>
+    /// <param name="suspendWith">Re-enters the loop with the state current at the wait's start.</param>
+    /// <param name="args">The current loop state.</param>
+    /// <param name="pipe">The current pipe state.</param>
+    /// <returns>The actor computation.</returns>
+    let private withAutoCloseEnabled<'M, 'A>
+        (starter: PipeStarter<'M, 'A>)
+        (props: SessionActorProps)
+        (cont: bool -> 'A -> LifecyclePipe.PipeState<'M, 'A> -> Cont<'M, unit>)
+        (suspendWith: 'A -> LifecyclePipe.PipeState<'M, 'A> -> Cont<'M, unit>)
+        (args: 'A)
+        (pipe: LifecyclePipe.PipeState<'M, 'A>)
+        : Cont<'M, unit> =
+        startPipedWait
+            starter
+            (props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
+            "auto-close-read"
+            (fun args2 pipe2 -> function
+                | Ok session ->
+                    match session with
+                    | null -> cont false args2 pipe2
+                    | s when isNull (box s.Options) -> cont false args2 pipe2
+                    | s -> cont s.Options.AutoClose args2 pipe2
+                | Error(:? SessionNotFoundException) -> cont false args2 pipe2
+                | Error error -> raise error)
+            suspendWith
+            args
+            pipe
 
     /// Consumes the settled entry and closes the session store-first for an
     /// AutoClose turn: the entry leaves the pending set before the Closed
     /// write lands, so a restart never redelivers a turn the close already
-    /// answered. CloseSession is idempotent, and the actor's single-threaded
-    /// sequencing keeps a second prompt from slipping between the consume
-    /// and the close.
+    /// answered. CloseSession is idempotent, and the single-flight pipe
+    /// keeps a second prompt from slipping between the consume and the
+    /// close. Both writes run piped (issue 390). The caller adjusts its
+    /// pending-count cache in the continuation: this helper stays generic
+    /// over both loops.
+    /// <param name="starter">The loop's pipe starter.</param>
     /// <param name="props">The session actor dependencies.</param>
     /// <param name="entry">The entry the AutoClose turn executed.</param>
-    let private consumeAndCloseSession (props: SessionActorProps) (entry: InboxEntry) : unit =
+    /// <param name="cont">Continues once the close landed.</param>
+    /// <param name="suspendWith">Re-enters the loop with the state current at each wait's start.</param>
+    /// <param name="args">The current loop state.</param>
+    /// <param name="pipe">The current pipe state.</param>
+    /// <returns>The actor computation.</returns>
+    let private withConsumeAndClose<'M, 'A>
+        (starter: PipeStarter<'M, 'A>)
+        (props: SessionActorProps)
+        (entry: InboxEntry)
+        (cont: unit -> 'A -> LifecyclePipe.PipeState<'M, 'A> -> Cont<'M, unit>)
+        (suspendWith: 'A -> LifecyclePipe.PipeState<'M, 'A> -> Cont<'M, unit>)
+        (args: 'A)
+        (pipe: LifecyclePipe.PipeState<'M, 'A>)
+        : Cont<'M, unit> =
         let positions = [| entry.Position |] :> IReadOnlyList<int64>
 
-        awaitTask (props.Store.MarkInboxConsumed(props.Tenant, props.SessionId, positions, CancellationToken.None))
-        |> ignore
-
-        awaitTask (props.Store.CloseSession(props.Tenant, props.SessionId, CancellationToken.None))
-        |> ignore
-
-        // Bounded transient state (issue 384): the durable close landed,
-        // so the session's hub and live hints release. Transient-only:
-        // execution authority and durable rows are untouched. The
-        // auto-title marker needs no close release: failures clear it and
-        // successes keep it by design (a titled session never refires), and
-        // the table cap plus expiry and client release bound it.
-        PromptWaitHubs.ReleaseSession props.Tenant props.SessionId |> ignore
-
+        startPipedWaitUnit
+            starter
+            (props.Store.MarkInboxConsumed(props.Tenant, props.SessionId, positions, CancellationToken.None))
+            "consume-and-close/consume"
+            (fun args2 pipe2 -> function
+                | Error error -> raise error
+                | Ok () ->
+                    startPipedWaitUnit
+                        starter
+                        (props.Store.CloseSession(props.Tenant, props.SessionId, CancellationToken.None))
+                        "consume-and-close/close"
+                        (fun args3 pipe3 -> function
+                            | Ok () ->
+                                // Bounded transient state (issue 384): the
+                                // durable close landed, so the session's hub
+                                // and live hints release. Transient-only.
+                                PromptWaitHubs.ReleaseSession props.Tenant props.SessionId |> ignore
+                                cont () args3 pipe3
+                            | Error error -> raise error)
+                        suspendWith
+                        args2
+                        pipe2)
+            suspendWith
+            args
+            pipe
     // ────────────────── Completion outbox (issue 84) ──────────────────
 
     /// Mints the stable idempotency key one settlement shares between its
@@ -1508,16 +1706,14 @@ module internal SessionActor =
     /// <returns>A fresh stable key for one settlement.</returns>
     let private mintCompletionKey () : string = Guid.NewGuid().ToString("N")
 
-    /// Enqueues the settlement's immutable route-snapshot completion row and
-    /// returns the stored completion: the durable redriver is the sole
-    /// delivery path, so this step performs no inline notification. Only
-    /// sessions carrying a completion destination id enqueue: sinkless
-    /// sessions store nothing. Best-effort and guarded: a store failure
-    /// stores nothing, and the actor-thread sequencing is the fence.
+    /// Entry-recovery-only synchronous completion enqueue (issue 390 keeps
+    /// entry recovery synchronous): same best-effort guarded semantics as
+    /// the piped path, for crash-recovery fail paths that run on the
+    /// spawning thread before any loop exists.
     /// <param name="props">The session actor dependencies.</param>
     /// <param name="result">The settled turn result to deliver.</param>
     /// <returns>The stored completion, or None when sinkless or best-effort failed.</returns>
-    let private dispatchCompletion (props: SessionActorProps) (result: TurnResult) : SessionCompletion option =
+    let private dispatchCompletionNow (props: SessionActorProps) (result: TurnResult) : SessionCompletion option =
         try
             if isNull (box result) then
                 None
@@ -1557,6 +1753,111 @@ module internal SessionActor =
         with _ ->
             None
 
+    /// Enqueues the settlement's immutable route-snapshot completion row and
+    /// continues with the stored completion: the durable redriver is the sole
+    /// delivery path, so this step performs no inline notification. Only
+    /// sessions carrying a completion destination id enqueue: sinkless
+    /// sessions store nothing. Best-effort and guarded: a store failure
+    /// stores nothing, and the single-flight pipe sequencing is the fence.
+    /// Both reads run piped (issue 390).
+    /// <param name="starter">The loop's pipe starter.</param>
+    /// <param name="props">The session actor dependencies.</param>
+    /// <param name="result">The settled turn result to deliver.</param>
+    /// <param name="cont">Continues with the stored completion, or None when sinkless or best-effort failed.</param>
+    /// <param name="suspendWith">Re-enters the loop with the state current at each wait's start.</param>
+    /// <param name="args">The current loop state.</param>
+    /// <param name="pipe">The current pipe state.</param>
+    /// <returns>The actor computation.</returns>
+    let private withDispatchCompletion<'M, 'A>
+        (starter: PipeStarter<'M, 'A>)
+        (props: SessionActorProps)
+        (result: TurnResult)
+        (cont: SessionCompletion option -> 'A -> LifecyclePipe.PipeState<'M, 'A> -> Cont<'M, unit>)
+        (suspendWith: 'A -> LifecyclePipe.PipeState<'M, 'A> -> Cont<'M, unit>)
+        (args: 'A)
+        (pipe: LifecyclePipe.PipeState<'M, 'A>)
+        : Cont<'M, unit> =
+        if isNull (box result) then
+            cont None args pipe
+        else
+            startPipedWait
+                starter
+                (props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
+                "dispatch-completion/read"
+                (fun args2 pipe2 -> function
+                    | Error _ -> cont None args2 pipe2
+                    | Ok session ->
+                        match session with
+                        | null -> cont None args2 pipe2
+                        | s when isNull (box s.Options) -> cont None args2 pipe2
+                        | s ->
+                            match s.Options.CompletionDestinationId with
+                            | null -> cont None args2 pipe2
+                            | destinationId ->
+                                let completion =
+                                    {
+                                        SessionId = props.SessionId
+                                        TurnResult = result
+                                        Metadata = s.Options.Metadata
+                                        IdempotencyKey = mintCompletionKey ()
+                                    }
+
+                                startPipedWait
+                                    starter
+                                    (props.Store.EnqueueCompletionOutbox(
+                                        props.Tenant,
+                                        destinationId,
+                                        completion,
+                                        CancellationToken.None
+                                    ))
+                                    "dispatch-completion/enqueue"
+                                    (fun args3 pipe3 -> function
+                                        | Ok row when not (isNull (box row)) -> cont (Some row.Completion) args3 pipe3
+                                        | Ok _ -> cont None args3 pipe3
+                                        | Error _ -> cont None args3 pipe3)
+                                    suspendWith
+                                    args2
+                                    pipe2)
+                suspendWith
+                args
+                pipe
+
+    /// Writes the durable close and continues with the stored session,
+    /// piped (issue 390): the hub and live hints release only once the
+    /// write landed.
+    /// <param name="starter">The loop's pipe starter.</param>
+    /// <param name="props">The session actor dependencies.</param>
+    /// <param name="cancellationToken">Abandons the close.</param>
+    /// <param name="cont">Continues with the closed session.</param>
+    /// <param name="suspendWith">Re-enters the loop with the state current at each wait's start.</param>
+    /// <param name="args">The current loop state.</param>
+    /// <param name="pipe">The current pipe state.</param>
+    /// <returns>The actor computation.</returns>
+    let private withCloseWriteSession<'M, 'A>
+        (starter: PipeStarter<'M, 'A>)
+        (props: SessionActorProps)
+        (cancellationToken: CancellationToken)
+        (cont: Session -> 'A -> LifecyclePipe.PipeState<'M, 'A> -> Cont<'M, unit>)
+        (suspendWith: 'A -> LifecyclePipe.PipeState<'M, 'A> -> Cont<'M, unit>)
+        (args: 'A)
+        (pipe: LifecyclePipe.PipeState<'M, 'A>)
+        : Cont<'M, unit> =
+        startPipedWait
+            starter
+            (props.Store.CloseSession(props.Tenant, props.SessionId, cancellationToken))
+            "close-session"
+            (fun args2 pipe2 -> function
+                | Error error -> raise error
+                | Ok closed ->
+                    // Bounded transient state (issue 384): the durable
+                    // close landed, so the session's hub and live hints
+                    // release. Transient-only.
+                    PromptWaitHubs.ReleaseSession props.Tenant props.SessionId |> ignore
+                    cont closed args2 pipe2)
+            suspendWith
+            args
+            pipe
+
     /// The session actor: recovers from the store, then owns the state
     /// machine. The mailbox parameter is injected by the spawn functions;
     /// one message is processed fully before the next is received, so the
@@ -1575,8 +1876,9 @@ module internal SessionActor =
         | Some compact -> requireCompactDeps compact
         | None -> ()
 
-        let initialState = recover props
         let self = mailbox.Self
+        let pipeConfig = LifecyclePipe.resolveConfig props.StorePipe
+        let starter = behaviorStarter self pipeConfig
 
         let log = LoggingScopes.resolveLogger props.Logger
 
@@ -1593,26 +1895,62 @@ module internal SessionActor =
             use _scope = LoggingScopes.beginScope log scope
             log.LogInformation("{Message}", LoggingScopes.redactForLog message)
 
-        /// Starts a turn for an inbox entry: guards the runner call itself
-        /// (a synchronously throwing or null-returning runner faults the
-        /// turn, never the actor), then pipes the outcome back as a
-        /// one-way message without blocking the actor thread.
-        /// <param name="entry">The inbox entry the turn executes.</param>
-        /// <returns>The in-flight turn handle.</returns>
-        let startTurn (entry: InboxEntry) : RunningTurn =
-            let cts = new CancellationTokenSource()
+        /// Builds the observable snapshot from the loop state: the
+        /// lifecycle state, the cached pending inbox count, and the running
+        /// entry position. Pure memory, so Abort and GetSnapshot answer
+        /// while a store wait is outstanding.
+        /// <param name="args">The current loop state.</param>
+        /// <returns>The actor's current snapshot.</returns>
+        let takeSnapshot (args: BehaviorLoopArgs) : SessionSnapshot =
+            {
+                SessionId = props.SessionId
+                State = args.State
+                PendingCount = args.PendingCount
+                RunningPosition = args.Running |> Option.map (fun inFlight -> inFlight.Entry.Position)
+                PendingRequestId = null
+            }
 
-            // Snapshot the live turn (issue 289): the claimed turn id the
-            // settle choke points journal under. A missing row or an empty
-            // snapshot mints fresh, preserving the pre-plumbing shape.
-            let turnId =
-                try
-                    match awaitTask (props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None)) with
-                    | null -> TurnId.New()
-                    | session when session.CurrentTurnId.HasValue -> session.CurrentTurnId.Value
-                    | _ -> TurnId.New()
-                with _ ->
-                    TurnId.New()
+        /// Reads the live turn one turn runs as (issue 289): the claimed
+        /// turn id the settle choke points journal under. A missing row or
+        /// an empty snapshot mints fresh, preserving the pre-plumbing
+        /// shape. Any read failure mints fresh, exactly like before. The
+        /// read runs piped.
+        /// <param name="cont">Continues with the turn id.</param>
+        /// <param name="suspendWith">Re-enters the loop with the state current at the wait's start.</param>
+        /// <param name="args">The current loop state.</param>
+        /// <param name="pipe">The current pipe state.</param>
+        /// <returns>The actor computation.</returns>
+        let withTurnIdSnapshot
+            (cont: TurnId -> BehaviorCont)
+            (suspendWith: BehaviorCont)
+            (args: BehaviorLoopArgs)
+            (pipe: BehaviorPipe)
+            : Cont<SessionActorMessage, unit> =
+            startPipedWait
+                starter
+                (props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
+                "start-turn-snapshot"
+                (fun args2 pipe2 -> function
+                    | Ok session ->
+                        match session with
+                        | null -> cont (TurnId.New()) args2 pipe2
+                        | s when s.CurrentTurnId.HasValue -> cont s.CurrentTurnId.Value args2 pipe2
+                        | _ -> cont (TurnId.New()) args2 pipe2
+                    | Error _ -> cont (TurnId.New()) args2 pipe2)
+                suspendWith
+                args
+                pipe
+
+        /// Starts a turn for an inbox entry under an already-resolved turn
+        /// id: guards the runner call itself (a synchronously throwing or
+        /// null-returning runner faults the turn, never the actor), then
+        /// pipes the outcome back as a one-way message without blocking the
+        /// actor thread. Runs on the actor thread, like before.
+        /// <param name="entry">The inbox entry the turn executes.</param>
+        /// <param name="turnId">The turn the attempt runs as.</param>
+        /// <returns>The in-flight turn handle.</returns>
+        let startTurnNow (entry: InboxEntry) (turnId: TurnId) : RunningTurn =
+            let cts = new CancellationTokenSource()
 
             let runTask =
                 try
@@ -1655,46 +1993,81 @@ module internal SessionActor =
         /// messages in position order; Reply payloads never start a turn.
         /// A final-iteration Inject the loop left pending (its
         /// would-complete signal is discarded across the runner boundary)
-        /// starts its new turn here, implicitly.
+        /// starts its new turn here, implicitly. Every wait runs piped.
         /// <param name="entry">The entry the finished attempt executed.</param>
         /// <param name="cancellationToken">Abandons the settle reads.</param>
-        /// <returns>The next loop state and in-flight turn.</returns>
-        let settle (entry: InboxEntry) (cancellationToken: CancellationToken) : SessionState * RunningTurn option =
+        /// <param name="cont">Continues with the next loop state and in-flight turn.</param>
+        /// <param name="suspendWith">Re-enters the loop with the state current at each wait's start.</param>
+        /// <param name="args">The current loop state.</param>
+        /// <param name="pipe">The current pipe state.</param>
+        /// <returns>The actor computation.</returns>
+        let withSettle
+            (entry: InboxEntry)
+            (cancellationToken: CancellationToken)
+            (cont: (SessionState * RunningTurn option) -> BehaviorCont)
+            (suspendWith: BehaviorCont)
+            (args: BehaviorLoopArgs)
+            (pipe: BehaviorPipe)
+            : Cont<SessionActorMessage, unit> =
             let positions = [| entry.Position |] :> IReadOnlyList<int64>
 
-            awaitTask (props.Store.MarkInboxConsumed(props.Tenant, props.SessionId, positions, cancellationToken))
-            |> ignore
+            startPipedWaitUnit
+                starter
+                (props.Store.MarkInboxConsumed(props.Tenant, props.SessionId, positions, cancellationToken))
+                "settle-consume"
+                (fun args2 pipe2 -> function
+                    | Error error -> raise error
+                    | Ok () ->
+                        Telemetry.addQueueDepth -1
 
-            Telemetry.addQueueDepth -1
+                        let args2c =
+                            { args2 with PendingCount = max 0 (args2.PendingCount - 1) }
 
-            let pending =
-                awaitTask (props.Store.ReadPendingInbox(props.Tenant, props.SessionId, cancellationToken))
+                        startPipedWait
+                            starter
+                            (props.Store.ReadPendingInbox(props.Tenant, props.SessionId, cancellationToken))
+                            "settle-drain"
+                            (fun args3 pipe3 -> function
+                                | Error error -> raise error
+                                | Ok pending ->
+                                    let args4 =
+                                        {
+                                            args3 with
+                                                PendingCount =
+                                                    if isNull (box pending) then 0 else pending.Count
+                                        }
 
-            match selectDrainableEntries pending with
-            | next :: _ ->
-                let running = startTurn next
-                (SessionState.Running, Some running)
-            | [] ->
-                awaitTask (
-                    props.Store.UpdateSessionState(props.Tenant, props.SessionId, SessionState.Idle, cancellationToken)
-                )
-                |> ignore
-
-                (SessionState.Idle, None)
-
-        /// Builds the observable snapshot for a state: the lifecycle state,
-        /// the store's pending inbox count, and the running entry position.
-        /// <param name="state">The actor's current lifecycle state.</param>
-        /// <param name="running">The turn in flight, or None.</param>
-        /// <returns>The actor's current snapshot.</returns>
-        let takeSnapshot (state: SessionState) (running: RunningTurn option) : SessionSnapshot =
-            {
-                SessionId = props.SessionId
-                State = state
-                PendingCount = pendingCount props
-                RunningPosition = running |> Option.map (fun inFlight -> inFlight.Entry.Position)
-                PendingRequestId = null
-            }
+                                    match selectDrainableEntries pending with
+                                    | next :: _ ->
+                                        withTurnIdSnapshot
+                                            (fun turnId args5 pipe5 ->
+                                                let running = startTurnNow next turnId
+                                                cont (SessionState.Running, Some running) args5 pipe5)
+                                            suspendWith
+                                            args4
+                                            pipe3
+                                    | [] ->
+                                        startPipedWaitUnit
+                                            starter
+                                            (props.Store.UpdateSessionState(
+                                                props.Tenant,
+                                                props.SessionId,
+                                                SessionState.Idle,
+                                                cancellationToken
+                                            ))
+                                            "settle-idle"
+                                            (fun args5 pipe5 -> function
+                                                | Ok () -> cont (SessionState.Idle, None) args5 pipe5
+                                                | Error error -> raise error)
+                                            suspendWith
+                                            args4
+                                            pipe3)
+                            suspendWith
+                            args2c
+                            pipe2)
+                suspendWith
+                args
+                pipe
 
         /// Observes a settled turn result through the props hook. Guarded: a
         /// throwing observer never kills the actor.
@@ -1757,124 +2130,482 @@ module internal SessionActor =
         /// Appends a prompt entry without starting a turn: the entry waits
         /// for the settle drain (Running), for the Reply resume
         /// (WaitingForInput), or stays durable with nothing new starting
-        /// (an out-of-range stored state).
+        /// (an out-of-range stored state). The append runs piped.
         /// <param name="payload">What the entry carries: a user message.</param>
         /// <param name="delivery">How the message was delivered.</param>
         /// <param name="cancellationToken">Abandons the append.</param>
-        /// <returns>The appended inbox entry.</returns>
-        let appendWaiting
+        /// <param name="cont">Continues with the appended inbox entry.</param>
+        /// <param name="suspendWith">Re-enters the loop with the state current at the wait's start.</param>
+        /// <param name="args">The current loop state.</param>
+        /// <param name="pipe">The current pipe state.</param>
+        /// <returns>The actor computation.</returns>
+        let withAppend
             (payload: InboxPayload)
             (delivery: DeliveryMode)
             (cancellationToken: CancellationToken)
-            : InboxEntry =
-            let appended =
-                awaitTask (
-                    props.Store.AppendInboxMessage(props.Tenant, props.SessionId, payload, delivery, cancellationToken)
-                )
-
-            Telemetry.addQueueDepth 1
-            appended
+            (cont: InboxEntry -> BehaviorCont)
+            (suspendWith: BehaviorCont)
+            (args: BehaviorLoopArgs)
+            (pipe: BehaviorPipe)
+            : Cont<SessionActorMessage, unit> =
+            startPipedWait
+                starter
+                (props.Store.AppendInboxMessage(props.Tenant, props.SessionId, payload, delivery, cancellationToken))
+                "append-inbox"
+                (fun args2 pipe2 -> function
+                    | Error error -> raise error
+                    | Ok appended ->
+                        Telemetry.addQueueDepth 1
+                        cont appended { args2 with PendingCount = args2.PendingCount + 1 } pipe2)
+                suspendWith
+                args
+                pipe
 
         /// Appends a prompt entry while Idle and starts its turn: persists
         /// Running store-first, then drains tier-first (Interrupt first,
         /// then Queue-plus-Inject in position order), so an older entry
         /// orphaned by a restart wins over the just-appended one. The
         /// appended entry is the fallback when nothing else is drainable.
+        /// Every wait runs piped.
         /// <param name="payload">What the entry carries: a user message.</param>
         /// <param name="delivery">How the message was delivered.</param>
         /// <param name="cancellationToken">Abandons the append.</param>
-        /// <returns>The appended entry and the in-flight turn.</returns>
-        let startIdleTurn
+        /// <param name="cont">Continues with the appended entry and the in-flight turn.</param>
+        /// <param name="suspendWith">Re-enters the loop with the state current at each wait's start.</param>
+        /// <param name="args">The current loop state.</param>
+        /// <param name="pipe">The current pipe state.</param>
+        /// <returns>The actor computation.</returns>
+        let withStartIdleTurn
             (payload: InboxPayload)
             (delivery: DeliveryMode)
             (cancellationToken: CancellationToken)
-            : InboxEntry * RunningTurn =
-            let appended = appendWaiting payload delivery cancellationToken
+            (cont: (InboxEntry * RunningTurn) -> BehaviorCont)
+            (suspendWith: BehaviorCont)
+            (args: BehaviorLoopArgs)
+            (pipe: BehaviorPipe)
+            : Cont<SessionActorMessage, unit> =
+            withAppend payload delivery cancellationToken (fun appended args2 pipe2 ->
+                startPipedWaitUnit
+                    starter
+                    (props.Store.UpdateSessionState(
+                        props.Tenant,
+                        props.SessionId,
+                        SessionState.Running,
+                        cancellationToken
+                    ))
+                    "start-idle-turn/running"
+                    (fun args3 pipe3 -> function
+                        | Error error -> raise error
+                        | Ok () ->
+                            startPipedWait
+                                starter
+                                (props.Store.ReadPendingInbox(props.Tenant, props.SessionId, cancellationToken))
+                                "start-idle-turn/drain"
+                                (fun args4 pipe4 -> function
+                                    | Error error -> raise error
+                                    | Ok pending ->
+                                        let args5 =
+                                            {
+                                                args4 with
+                                                    PendingCount =
+                                                        if isNull (box pending) then 0 else pending.Count
+                                            }
 
-            awaitTask (
-                props.Store.UpdateSessionState(props.Tenant, props.SessionId, SessionState.Running, cancellationToken)
-            )
-            |> ignore
+                                        let first =
+                                            selectDrainableEntries pending
+                                            |> List.tryHead
+                                            |> Option.defaultValue appended
 
-            let pending =
-                awaitTask (props.Store.ReadPendingInbox(props.Tenant, props.SessionId, cancellationToken))
+                                        withTurnIdSnapshot
+                                            (fun turnId args6 pipe6 ->
+                                                let next = startTurnNow first turnId
+                                                cont (appended, next) args6 pipe6)
+                                            suspendWith
+                                            args5
+                                            pipe4)
+                                suspendWith
+                                args3
+                                pipe3)
+                    suspendWith
+                    args2
+                    pipe2) suspendWith args pipe
 
-            let first =
-                selectDrainableEntries pending |> List.tryHead |> Option.defaultValue appended
+        /// Writes the durable close and continues with the stored session:
+        /// the hub and live hints release only once the write landed.
+        /// <param name="cancellationToken">Abandons the close.</param>
+        /// <param name="cont">Continues with the closed session.</param>
+        /// <param name="suspendWith">Re-enters the loop with the state current at the wait's start.</param>
+        /// <param name="args">The current loop state.</param>
+        /// <param name="pipe">The current pipe state.</param>
+        /// <returns>The actor computation.</returns>
+        let withCloseWrite
+            (cancellationToken: CancellationToken)
+            (cont: Session -> BehaviorCont)
+            (suspendWith: BehaviorCont)
+            (args: BehaviorLoopArgs)
+            (pipe: BehaviorPipe)
+            : Cont<SessionActorMessage, unit> =
+            withCloseWriteSession starter props cancellationToken cont suspendWith args pipe
 
-            let next = startTurn first
-            (appended, next)
+        /// Starts the recover chain: the stored lifecycle state plus the
+        /// pending inbox count, releasing a stored Running back to Idle so
+        /// the still-pending entry redelivers on the next drain. A missing
+        /// session row starts as an empty Idle shell. Every wait runs
+        /// piped; the loop enters Ready only once the chain lands.
+        /// <param name="suspendWith">Re-enters the loop with the state current at the wait's start.</param>
+        /// <param name="args">The current loop state.</param>
+        /// <param name="pipe">The current pipe state.</param>
+        /// <returns>The actor computation.</returns>
+        let startRecover
+            (suspendWith: BehaviorCont)
+            (args: BehaviorLoopArgs)
+            (pipe: BehaviorPipe)
+            : Cont<SessionActorMessage, unit> =
+            let readInbox
+                (state: SessionState)
+                (args2: BehaviorLoopArgs)
+                (pipe2: BehaviorPipe)
+                : Cont<SessionActorMessage, unit> =
+                startPipedWait
+                    starter
+                    (props.Store.ReadPendingInbox(props.Tenant, props.SessionId, CancellationToken.None))
+                    "recover-inbox"
+                    (fun args3 pipe3 -> function
+                        | Ok pending ->
+                            suspendWith
+                                {
+                                    args3 with
+                                        State = state
+                                        Activation = Ready
+                                        PendingCount =
+                                            if isNull (box pending) then 0 else pending.Count
+                                }
+                                pipe3
+                        | Error(:? SessionNotFoundException) ->
+                            suspendWith
+                                {
+                                    args3 with
+                                        State = state
+                                        Activation = Ready
+                                        PendingCount = 0
+                                }
+                                pipe3
+                        | Error error -> raise error)
+                    suspendWith
+                    args2
+                    pipe2
 
-        let rec loop
-            (state: SessionState)
-            (running: RunningTurn option)
-            (arbitration: StopArbitration.ArbitrationState)
-            (pendingStop: (StopCause * string) option)
-            =
+            startPipedWait
+                starter
+                (props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
+                "recover-session"
+                (fun args2 pipe2 -> function
+                    | Error error -> raise error
+                    | Ok found ->
+                        match found with
+                        | null -> readInbox SessionState.Idle args2 pipe2
+                        | session ->
+                            match session.State with
+                            | SessionState.Running ->
+                                startPipedWaitUnit
+                                    starter
+                                    (props.Store.UpdateSessionState(
+                                        props.Tenant,
+                                        props.SessionId,
+                                        SessionState.Idle,
+                                        CancellationToken.None
+                                    ))
+                                    "recover-release-running"
+                                    (fun args3 pipe3 -> function
+                                        | Ok () -> readInbox SessionState.Idle args3 pipe3
+                                        | Error error -> raise error)
+                                    suspendWith
+                                    args2
+                                    pipe2
+                            | SessionState.Idle -> readInbox SessionState.Idle args2 pipe2
+                            | SessionState.WaitingForInput -> readInbox SessionState.WaitingForInput args2 pipe2
+                            | SessionState.Closed -> readInbox SessionState.Closed args2 pipe2
+                            | unknown -> readInbox unknown args2 pipe2)
+                suspendWith
+                args
+                pipe
+
+        let rec loop (args: BehaviorLoopArgs) (pipe: BehaviorPipe) : Cont<SessionActorMessage, unit> =
+            match args.Closing with
+            | (_, token) :: _ when not (LifecyclePipe.isBusy pipe) ->
+                // A requested close owns the durable write now that the
+                // pipe drains: every recorded sender shares the one write
+                // and observes the same stored session.
+                withCloseWrite token (fun closed args2 pipe2 -> actor {
+                    for sender, _ in args2.Closing do
+                        sender <! closed
+
+                    return!
+                        loop
+                            {
+                                args2 with
+                                    State = SessionState.Closed
+                                    Running = None
+                                    Arbitration = StopArbitration.Undecided
+                                    PendingStop = None
+                                    Closing = []
+                            }
+                            pipe2
+                }) suspendWith args pipe
+            | _ ->
+                match LifecyclePipe.tryTakeDeferred pipe with
+                | Some((message, sender), pipe') -> handleMessage message sender args pipe'
+                | None ->
+                    actor {
+                        let! message = mailbox.Receive()
+                        return! handleMessage message (mailbox.Sender()) args pipe
+                    }
+
+        and handleMessage
+            (message: SessionActorMessage)
+            (sender: IActorRef)
+            (args: BehaviorLoopArgs)
+            (pipe: BehaviorPipe)
+            : Cont<SessionActorMessage, unit> =
             actor {
-                let! message = mailbox.Receive()
-
                 match message with
+                | LifecycleStoreCompleted(opId, incarnation, outcome) ->
+                    match LifecyclePipe.tryComplete pipe opId incarnation with
+                    | Some(outstanding, pipe') -> return! outstanding.Resume args pipe' outcome
+                    | None -> return! loop args pipe
+                | LifecycleStoreTimeout(opId, incarnation) ->
+                    match LifecyclePipe.tryComplete pipe opId incarnation with
+                    | Some(outstanding, pipe') ->
+                        return! outstanding.Resume args pipe' outstanding.TimeoutOutcome
+                    | None -> return! loop args pipe
+                | _ when args.Activation = Recovering ->
+                    // The recover chain is in flight: everything waits
+                    // bounded behind it in arrival order.
+                    match LifecyclePipe.defer pipe message sender with
+                    | pipe', true -> return! loop args pipe'
+                    | _, false ->
+                        replyPipeOverflow sender
+                        return! loop args pipe
+                | AbortSession(cause, reason, _) ->
+                    match args.Closing with
+                    | _ :: _ ->
+                        // A requested close owns the turn's cancellation
+                        // already: the abort no-ops returning the current
+                        // snapshot, like post-close.
+                        sender <! takeSnapshot args
+                        return! loop args pipe
+                    | [] ->
+                        match args.State, args.Running with
+                        | SessionState.Running, Some inFlight when
+                            cause = StopCause.ExplicitAbort || cause = StopCause.HostShutdown
+                            ->
+                            let nextArbitration, won = StopArbitration.applyStop args.Arbitration cause
+
+                            let nextStop =
+                                if won then Some(cause, reason) else args.PendingStop
+
+                            if won then
+                                inFlight.Cts.Cancel()
+
+                            let args2 =
+                                {
+                                    args with
+                                        Arbitration = nextArbitration
+                                        PendingStop = nextStop
+                                }
+
+                            sender <! takeSnapshot args2
+                            return! loop args2 pipe
+                        | _ ->
+                            // Idle, WaitingForInput (suspended turns belong to
+                            // issue 36: nothing runs to abort), Closed, unknown
+                            // states, and non-abort-family causes: a no-op
+                            // returning the current state.
+                            sender <! takeSnapshot args
+                            return! loop args pipe
+                | CloseSession cancellationToken ->
+                    match args.Running with
+                    | Some inFlight -> inFlight.Cts.Cancel()
+                    | None -> ()
+
+                    // The turn cancellation applies now; the durable write
+                    // lands through the loop entry once the pipe drains, so
+                    // shutdown stays responsive behind a delayed dependency.
+                    return! loop { args with Closing = args.Closing @ [ sender, cancellationToken ] } pipe
+                | GetSnapshot ->
+                    sender <! takeSnapshot args
+                    return! loop args pipe
+                | _ when args.Closing <> [] ->
+                    // A requested close behaves Closed for new lifecycle
+                    // work: it waits bounded behind the close write and is
+                    // then answered as Closed, in order.
+                    match LifecyclePipe.defer pipe message sender with
+                    | pipe', true -> return! loop args pipe'
+                    | _, false ->
+                        replyPipeOverflow sender
+                        return! loop args pipe
+                | _ when LifecyclePipe.isBusy pipe ->
+                    // A store wait is outstanding: Abort, Close, and
+                    // GetSnapshot answered from memory above; everything
+                    // else waits its turn behind the wait.
+                    match LifecyclePipe.defer pipe message sender with
+                    | pipe', true -> return! loop args pipe'
+                    | _, false ->
+                        replyPipeOverflow sender
+                        return! loop args pipe
                 | QueuePrompt(payload, cancellationToken) ->
-                    match state with
+                    match args.State with
                     | SessionState.Closed ->
                         logScoped null "The session rejected a prompt: the session is closed."
-                        mailbox.Sender() <! PromptRejected SessionState.Closed
-                        return! loop state running arbitration pendingStop
+                        sender <! PromptRejected SessionState.Closed
+                        return! loop args pipe
                     | SessionState.Idle ->
-                        let appended, next = startIdleTurn payload DeliveryMode.Queue cancellationToken
-                        mailbox.Sender() <! PromptAccepted appended
-                        logScoped null "The session accepted a prompt and started a turn."
-                        return! loop SessionState.Running (Some next) StopArbitration.Undecided None
+                        return!
+                            withStartIdleTurn
+                                payload
+                                DeliveryMode.Queue
+                                cancellationToken
+                                (fun (appended, next) args2 pipe2 -> actor {
+                                    sender <! PromptAccepted appended
+                                    logScoped null "The session accepted a prompt and started a turn."
+
+                                    return!
+                                        loop
+                                            {
+                                                args2 with
+                                                    State = SessionState.Running
+                                                    Running = Some next
+                                                    Arbitration = StopArbitration.Undecided
+                                                    PendingStop = None
+                                            }
+                                            pipe2
+                                })
+                                suspendWith
+                                args
+                                pipe
                     | SessionState.Running
                     | SessionState.WaitingForInput ->
-                        let appended = appendWaiting payload DeliveryMode.Queue cancellationToken
-                        mailbox.Sender() <! PromptAccepted appended
-                        logScoped null "The session accepted a prompt while busy."
-                        return! loop state running arbitration pendingStop
+                        return!
+                            withAppend
+                                payload
+                                DeliveryMode.Queue
+                                cancellationToken
+                                (fun appended args2 pipe2 -> actor {
+                                    sender <! PromptAccepted appended
+                                    logScoped null "The session accepted a prompt while busy."
+                                    return! loop args2 pipe2
+                                })
+                                suspendWith
+                                args
+                                pipe
                     | _ ->
                         // Out-of-range stored state: stay durable but start
                         // nothing new.
-                        let appended = appendWaiting payload DeliveryMode.Queue cancellationToken
-                        mailbox.Sender() <! PromptAccepted appended
-                        logScoped null "The session accepted a prompt while out of range."
-                        return! loop state running arbitration pendingStop
+                        return!
+                            withAppend
+                                payload
+                                DeliveryMode.Queue
+                                cancellationToken
+                                (fun appended args2 pipe2 -> actor {
+                                    sender <! PromptAccepted appended
+                                    logScoped null "The session accepted a prompt while out of range."
+                                    return! loop args2 pipe2
+                                })
+                                suspendWith
+                                args
+                                pipe
                 | InjectPrompt(payload, cancellationToken) ->
-                    match state with
+                    match args.State with
                     | SessionState.Closed ->
                         logScoped null "The session rejected an injected prompt: the session is closed."
-                        mailbox.Sender() <! PromptRejected SessionState.Closed
-                        return! loop state running arbitration pendingStop
+                        sender <! PromptRejected SessionState.Closed
+                        return! loop args pipe
                     | SessionState.Idle ->
-                        let appended, next = startIdleTurn payload DeliveryMode.Inject cancellationToken
-                        mailbox.Sender() <! PromptAccepted appended
-                        logScoped null "The session accepted an injected prompt and started a turn."
-                        return! loop SessionState.Running (Some next) StopArbitration.Undecided None
+                        return!
+                            withStartIdleTurn
+                                payload
+                                DeliveryMode.Inject
+                                cancellationToken
+                                (fun (appended, next) args2 pipe2 -> actor {
+                                    sender <! PromptAccepted appended
+                                    logScoped null "The session accepted an injected prompt and started a turn."
+
+                                    return!
+                                        loop
+                                            {
+                                                args2 with
+                                                    State = SessionState.Running
+                                                    Running = Some next
+                                                    Arbitration = StopArbitration.Undecided
+                                                    PendingStop = None
+                                            }
+                                            pipe2
+                                })
+                                suspendWith
+                                args
+                                pipe
                     | SessionState.Running
                     | SessionState.WaitingForInput ->
                         // Append-and-wait: the running turn folds the entry
                         // at its next iteration boundary, and a suspended
                         // turn leaves it for the settle drain. Never aborts.
-                        let appended = appendWaiting payload DeliveryMode.Inject cancellationToken
-                        mailbox.Sender() <! PromptAccepted appended
-                        logScoped null "The session accepted an injected prompt while busy."
-                        return! loop state running arbitration pendingStop
+                        return!
+                            withAppend
+                                payload
+                                DeliveryMode.Inject
+                                cancellationToken
+                                (fun appended args2 pipe2 -> actor {
+                                    sender <! PromptAccepted appended
+                                    logScoped null "The session accepted an injected prompt while busy."
+                                    return! loop args2 pipe2
+                                })
+                                suspendWith
+                                args
+                                pipe
                     | _ ->
-                        let appended = appendWaiting payload DeliveryMode.Inject cancellationToken
-                        mailbox.Sender() <! PromptAccepted appended
-                        logScoped null "The session accepted an injected prompt while out of range."
-                        return! loop state running arbitration pendingStop
+                        return!
+                            withAppend
+                                payload
+                                DeliveryMode.Inject
+                                cancellationToken
+                                (fun appended args2 pipe2 -> actor {
+                                    sender <! PromptAccepted appended
+                                    logScoped null "The session accepted an injected prompt while out of range."
+                                    return! loop args2 pipe2
+                                })
+                                suspendWith
+                                args
+                                pipe
                 | InterruptPrompt(payload, cancellationToken) ->
-                    match state with
+                    match args.State with
                     | SessionState.Closed ->
                         logScoped null "The session rejected an interrupt prompt: the session is closed."
-                        mailbox.Sender() <! PromptRejected SessionState.Closed
-                        return! loop state running arbitration pendingStop
+                        sender <! PromptRejected SessionState.Closed
+                        return! loop args pipe
                     | SessionState.Idle ->
-                        let appended, next = startIdleTurn payload DeliveryMode.Interrupt cancellationToken
-                        mailbox.Sender() <! PromptAccepted appended
-                        logScoped null "The session accepted an interrupt prompt and started a turn."
-                        return! loop SessionState.Running (Some next) StopArbitration.Undecided None
+                        return!
+                            withStartIdleTurn
+                                payload
+                                DeliveryMode.Interrupt
+                                cancellationToken
+                                (fun (appended, next) args2 pipe2 -> actor {
+                                    sender <! PromptAccepted appended
+                                    logScoped null "The session accepted an interrupt prompt and started a turn."
+
+                                    return!
+                                        loop
+                                            {
+                                                args2 with
+                                                    State = SessionState.Running
+                                                    Running = Some next
+                                                    Arbitration = StopArbitration.Undecided
+                                                    PendingStop = None
+                                            }
+                                            pipe2
+                                })
+                                suspendWith
+                                args
+                                pipe
                     | SessionState.Running ->
                         // Pre-empt through the abort verb: the entry joins
                         // the inbox first so the settle drain finds it, then
@@ -1885,213 +2616,399 @@ module internal SessionActor =
                         // intact. A stop that already won keeps the first
                         // cause; the new entry still drains after the
                         // settle.
-                        let appended = appendWaiting payload DeliveryMode.Interrupt cancellationToken
+                        return!
+                            withAppend
+                                payload
+                                DeliveryMode.Interrupt
+                                cancellationToken
+                                (fun appended args2 pipe2 -> actor {
+                                    match args2.Running with
+                                    | Some inFlight ->
+                                        let nextArbitration, won =
+                                            StopArbitration.applyStop args2.Arbitration StopCause.ExplicitAbort
 
-                        match running with
-                        | Some inFlight ->
-                            let nextArbitration, won =
-                                StopArbitration.applyStop arbitration StopCause.ExplicitAbort
+                                        let nextStop =
+                                            if won then
+                                                Some(StopCause.ExplicitAbort, InterruptReason)
+                                            else
+                                                args2.PendingStop
 
-                            let nextStop =
-                                if won then
-                                    Some(StopCause.ExplicitAbort, InterruptReason)
-                                else
-                                    pendingStop
+                                        if won then
+                                            inFlight.Cts.Cancel()
 
-                            if won then
-                                inFlight.Cts.Cancel()
+                                        sender <! PromptAccepted appended
+                                        logScoped
+                                            null
+                                            "The session accepted an interrupt prompt and pre-empted the running turn."
 
-                            mailbox.Sender() <! PromptAccepted appended
-                            logScoped null "The session accepted an interrupt prompt and pre-empted the running turn."
-                            return! loop state running nextArbitration nextStop
-                        | None ->
-                            mailbox.Sender() <! PromptAccepted appended
-                            logScoped null "The session accepted an interrupt prompt with no turn in flight."
-                            return! loop state running arbitration pendingStop
+                                        return!
+                                            loop
+                                                {
+                                                    args2 with
+                                                        Arbitration = nextArbitration
+                                                        PendingStop = nextStop
+                                                }
+                                                pipe2
+                                    | None ->
+                                        sender <! PromptAccepted appended
+                                        logScoped
+                                            null
+                                            "The session accepted an interrupt prompt with no turn in flight."
+                                        return! loop args2 pipe2
+                                })
+                                suspendWith
+                                args
+                                pipe
                     | SessionState.WaitingForInput ->
                         // Append-and-wait: suspended turns belong to issue
                         // 36, so nothing runs to abort and Reply still
                         // resumes the suspended turn.
-                        let appended = appendWaiting payload DeliveryMode.Interrupt cancellationToken
-                        mailbox.Sender() <! PromptAccepted appended
-                        logScoped null "The session accepted an interrupt prompt while suspended."
-                        return! loop state running arbitration pendingStop
+                        return!
+                            withAppend
+                                payload
+                                DeliveryMode.Interrupt
+                                cancellationToken
+                                (fun appended args2 pipe2 -> actor {
+                                    sender <! PromptAccepted appended
+                                    logScoped null "The session accepted an interrupt prompt while suspended."
+                                    return! loop args2 pipe2
+                                })
+                                suspendWith
+                                args
+                                pipe
                     | _ ->
-                        let appended = appendWaiting payload DeliveryMode.Interrupt cancellationToken
-                        mailbox.Sender() <! PromptAccepted appended
-                        return! loop state running arbitration pendingStop
-                | CloseSession cancellationToken ->
-                    match running with
-                    | Some inFlight -> inFlight.Cts.Cancel()
-                    | None -> ()
-
-                    let closed =
-                        awaitTask (props.Store.CloseSession(props.Tenant, props.SessionId, cancellationToken))
-
-                    // Bounded transient state (issue 384): the durable close
-                    // landed, so the session's hub and live hints release.
-                    // Transient-only (the auto-title marker is
-                    // self-maintaining: failures clear it, successes keep it
-                    // by design).
-                    PromptWaitHubs.ReleaseSession props.Tenant props.SessionId |> ignore
-
-                    mailbox.Sender() <! closed
-                    return! loop SessionState.Closed None StopArbitration.Undecided None
+                        return!
+                            withAppend
+                                payload
+                                DeliveryMode.Interrupt
+                                cancellationToken
+                                (fun appended args2 pipe2 -> actor {
+                                    sender <! PromptAccepted appended
+                                    return! loop args2 pipe2
+                                })
+                                suspendWith
+                                args
+                                pipe
                 | ObserveHostAbort(tenant, sessionId, targetTurnId) ->
-                    match state, running, props.Store with
+                    match args.State, args.Running, props.Store with
                     | SessionState.Running, Some inFlight, (:? ISessionAbortControlStore as control) when
                         tenant = props.Tenant
                         && sessionId = props.SessionId
                         && inFlight.TurnId = targetTurnId
                         ->
-                        match awaitTask (control.ReadAbortTarget(tenant, sessionId, CancellationToken.None)) with
-                        | null -> return! loop state running arbitration pendingStop
-                        | target when target.TurnId = targetTurnId ->
-                            match target.Stop with
-                            | null -> return! loop state running arbitration pendingStop
-                            | stop ->
-                                let next, won = StopArbitration.applyStop arbitration stop.Cause.Value
+                        return!
+                            startPipedWait
+                                starter
+                                (control.ReadAbortTarget(tenant, sessionId, CancellationToken.None))
+                                "observe-host-abort"
+                                (fun args2 pipe2 -> function
+                                    | Error error -> raise error
+                                    | Ok target ->
+                                        match target with
+                                        | null -> loop args2 pipe2
+                                        | t when t.TurnId = targetTurnId ->
+                                            match t.Stop with
+                                            | null -> loop args2 pipe2
+                                            | stop ->
+                                                let next, won =
+                                                    StopArbitration.applyStop args2.Arbitration stop.Cause.Value
 
-                                if won then
-                                    inFlight.Cts.Cancel()
+                                                if won then
+                                                    inFlight.Cts.Cancel()
 
-                                let selected =
-                                    if won then
-                                        Some(stop.Cause.Value, stop.Reason |> Option.ofObj |> Option.defaultValue "")
-                                    else
-                                        pendingStop
+                                                let selected =
+                                                    if won then
+                                                        Some(
+                                                            stop.Cause.Value,
+                                                            stop.Reason |> Option.ofObj |> Option.defaultValue ""
+                                                        )
+                                                    else
+                                                        args2.PendingStop
 
-                                return! loop state running next selected
-                        | _ -> return! loop state running arbitration pendingStop
-                    | _ -> return! loop state running arbitration pendingStop
-                | AbortSession(cause, reason, _) ->
-                    match state, running with
-                    | SessionState.Running, Some inFlight when
-                        cause = StopCause.ExplicitAbort || cause = StopCause.HostShutdown
-                        ->
-                        let nextArbitration, won = StopArbitration.applyStop arbitration cause
-
-                        let nextStop = if won then Some(cause, reason) else pendingStop
-
-                        if won then
-                            inFlight.Cts.Cancel()
-
-                        mailbox.Sender() <! takeSnapshot state running
-                        return! loop state running nextArbitration nextStop
-                    | _ ->
-                        // Idle, WaitingForInput (suspended turns belong to
-                        // issue 36: nothing runs to abort), Closed, unknown
-                        // states, and non-abort-family causes: a no-op
-                        // returning the current state.
-                        mailbox.Sender() <! takeSnapshot state running
-                        return! loop state running arbitration pendingStop
+                                                loop
+                                                    {
+                                                        args2 with
+                                                            Arbitration = next
+                                                            PendingStop = selected
+                                                    }
+                                                    pipe2
+                                        | _ -> loop args2 pipe2)
+                                suspendWith
+                                args
+                                pipe
+                    | _ -> return! loop args pipe
                 | CompactSession cancellationToken ->
-                    match state with
+                    match args.State with
                     | SessionState.Closed ->
-                        mailbox.Sender() <! CompactRejected SessionState.Closed
-                        return! loop state running arbitration pendingStop
+                        sender <! CompactRejected SessionState.Closed
+                        return! loop args pipe
                     | SessionState.Idle ->
                         match props.Compact with
                         | None ->
-                            mailbox.Sender() <! CompactNotNeeded
-                            return! loop state running arbitration pendingStop
+                            sender <! CompactNotNeeded
+                            return! loop args pipe
                         | Some compact ->
-                            let reply = compactIdleNow props compact cancellationToken
-                            mailbox.Sender() <! reply
-                            return! loop state running arbitration pendingStop
+                            return!
+                                compactIdleNowPiped
+                                    starter
+                                    props
+                                    compact
+                                    cancellationToken
+                                    (fun reply args2 pipe2 -> actor {
+                                        sender <! reply
+                                        return! loop args2 pipe2
+                                    })
+                                    suspendWith
+                                    args
+                                    pipe
                     | SessionState.Running ->
                         match props.Compact with
                         | Some compact when not (isNull (box compact.Force)) ->
                             compact.Force.Request()
-                            mailbox.Sender() <! CompactDeferred
-                            return! loop state running arbitration pendingStop
+                            sender <! CompactDeferred
+                            return! loop args pipe
                         | _ ->
                             // Unconfigured: no boundary hook shares the
                             // one-shot cell, so nothing can fire later.
-                            mailbox.Sender() <! CompactNotNeeded
-                            return! loop state running arbitration pendingStop
+                            sender <! CompactNotNeeded
+                            return! loop args pipe
                     | SessionState.WaitingForInput ->
                         // Suspended turns belong to issue 36: their history
                         // is parked, so an on-demand compact no-ops.
-                        mailbox.Sender() <! CompactNotNeeded
-                        return! loop state running arbitration pendingStop
+                        sender <! CompactNotNeeded
+                        return! loop args pipe
                     | _ ->
                         // Out-of-range stored state: stay durable but
                         // compact nothing.
-                        mailbox.Sender() <! CompactNotNeeded
-                        return! loop state running arbitration pendingStop
-                | GetSnapshot ->
-                    mailbox.Sender() <! takeSnapshot state running
-                    return! loop state running arbitration pendingStop
+                        sender <! CompactNotNeeded
+                        return! loop args pipe
                 | SessionTurnSettled(entry, result) ->
-                    match state, running with
+                    match args.State, args.Running with
                     | SessionState.Running, Some inFlight when inFlight.Entry.Position = entry.Position ->
-                        match arbitration with
+                        match args.Arbitration with
                         | StopArbitration.Undecided ->
                             // Settlement wins: the carried result stands.
                             inFlight.Cts.Dispose()
                             notifySettled result
-                            dispatchCompletion props result |> ignore
                             logScoped null "The session settled a turn."
 
-                            if result.Status = TurnStatus.Completed && autoCloseEnabled props then
-                                // AutoClose (issue 82): the first Completed
-                                // turn closes the session store-first instead
-                                // of draining. Aborted and Failed results
-                                // never take this path, so failed runs stay
-                                // open for inspection.
-                                consumeAndCloseSession props entry
-                                return! loop SessionState.Closed None StopArbitration.Undecided None
-                            else
-                                let nextState, nextRunning = settle entry CancellationToken.None
-                                return! loop nextState nextRunning StopArbitration.Undecided None
+                            return!
+                                withDispatchCompletion
+                                    starter
+                                    props
+                                    result
+                                    (fun _ args2 pipe2 -> actor {
+                                        if result.Status = TurnStatus.Completed then
+                                            return!
+                                                withAutoCloseEnabled
+                                                    starter
+                                                    props
+                                                    (fun enabled args3 pipe3 -> actor {
+                                                        if enabled then
+                                                            // AutoClose (issue 82): the first Completed
+                                                            // turn closes the session store-first instead
+                                                            // of draining. Aborted and Failed results
+                                                            // never take this path, so failed runs stay
+                                                            // open for inspection.
+                                                            return!
+                                                                withConsumeAndClose
+                                                                    starter
+                                                                    props
+                                                                    entry
+                                                                    (fun () args4 pipe4 -> actor {
+                                                                        return!
+                                                                            loop
+                                                                                {
+                                                                                    args4 with
+                                                                                        State = SessionState.Closed
+                                                                                        Running = None
+                                                                                        Arbitration =
+                                                                                            StopArbitration.Undecided
+                                                                                        PendingStop = None
+                                                                                        PendingCount =
+                                                                                            max
+                                                                                                0
+                                                                                                (args4.PendingCount
+                                                                                                - 1)
+                                                                                }
+                                                                                pipe4
+                                                                    })
+                                                                    suspendWith
+                                                                    args3
+                                                                    pipe3
+                                                        else
+                                                            return!
+                                                                withSettle
+                                                                    entry
+                                                                    CancellationToken.None
+                                                                    (fun (nextState, nextRunning) args4 pipe4 ->
+                                                                        actor {
+                                                                            return!
+                                                                                loop
+                                                                                    {
+                                                                                        args4 with
+                                                                                            State = nextState
+                                                                                            Running = nextRunning
+                                                                                            Arbitration =
+                                                                                                StopArbitration.Undecided
+                                                                                            PendingStop = None
+                                                                                    }
+                                                                                    pipe4
+                                                                        })
+                                                                    suspendWith
+                                                                    args3
+                                                                    pipe3
+                                                    })
+                                                    suspendWith
+                                                    args2
+                                                    pipe2
+                                        else
+                                            return!
+                                                withSettle
+                                                    entry
+                                                    CancellationToken.None
+                                                    (fun (nextState, nextRunning) args3 pipe3 -> actor {
+                                                        return!
+                                                            loop
+                                                                {
+                                                                    args3 with
+                                                                        State = nextState
+                                                                        Running = nextRunning
+                                                                        Arbitration = StopArbitration.Undecided
+                                                                        PendingStop = None
+                                                                }
+                                                                pipe3
+                                                    })
+                                                    suspendWith
+                                                    args2
+                                                    pipe2
+                                    })
+                                    suspendWith
+                                    args
+                                    pipe
                         | StopArbitration.Decided(StopArbitration.StopWins cause) ->
                             // The stop landed first, so it wins even over a
                             // success: map to Aborted under the winning
                             // cause, then run the settle bookkeeping once.
                             inFlight.Cts.Dispose()
 
-                            let reason = pendingStop |> Option.map snd |> Option.defaultValue ""
+                            let reason = args.PendingStop |> Option.map snd |> Option.defaultValue ""
 
                             let settled = mapAborted cause reason result
                             notifySettled settled
-                            dispatchCompletion props settled |> ignore
                             logScoped null "The session settled a turn under a stop cause."
-                            let nextState, nextRunning = settle entry CancellationToken.None
-                            return! loop nextState nextRunning StopArbitration.Undecided None
+
+                            return!
+                                withDispatchCompletion
+                                    starter
+                                    props
+                                    settled
+                                    (fun _ args2 pipe2 -> actor {
+                                        return!
+                                            withSettle
+                                                entry
+                                                CancellationToken.None
+                                                (fun (nextState, nextRunning) args3 pipe3 -> actor {
+                                                    return!
+                                                        loop
+                                                            {
+                                                                args3 with
+                                                                    State = nextState
+                                                                    Running = nextRunning
+                                                                    Arbitration = StopArbitration.Undecided
+                                                                    PendingStop = None
+                                                            }
+                                                            pipe3
+                                                })
+                                                suspendWith
+                                                args2
+                                                pipe2
+                                    })
+                                    suspendWith
+                                    args
+                                    pipe
                         | StopArbitration.Decided StopArbitration.SettlementWins ->
                             // Stale: the turn already settled, so this
                             // completion produces zero effects.
-                            return! loop state running arbitration pendingStop
-                    | _ -> return! loop state running arbitration pendingStop
+                            return! loop args pipe
+                    | _ -> return! loop args pipe
                 | SessionTurnFaulted(entry, _) ->
-                    match state, running with
+                    match args.State, args.Running with
                     | SessionState.Running, Some inFlight when inFlight.Entry.Position = entry.Position ->
-                        match arbitration with
+                        match args.Arbitration with
                         | StopArbitration.Undecided ->
                             inFlight.Cts.Dispose()
                             logScoped null "The session turn faulted and its entry was consumed."
-                            let nextState, nextRunning = settle entry CancellationToken.None
-                            return! loop nextState nextRunning StopArbitration.Undecided None
+
+                            return!
+                                withSettle
+                                    entry
+                                    CancellationToken.None
+                                    (fun (nextState, nextRunning) args2 pipe2 -> actor {
+                                        return!
+                                            loop
+                                                {
+                                                    args2 with
+                                                        State = nextState
+                                                        Running = nextRunning
+                                                        Arbitration = StopArbitration.Undecided
+                                                        PendingStop = None
+                                                }
+                                                pipe2
+                                    })
+                                    suspendWith
+                                    args
+                                    pipe
                         | StopArbitration.Decided(StopArbitration.StopWins cause) ->
                             // The stop arrived first, so it wins even over
                             // a real fault: settle Aborted under the cause.
                             inFlight.Cts.Dispose()
 
-                            let reason = pendingStop |> Option.map snd |> Option.defaultValue ""
+                            let reason = args.PendingStop |> Option.map snd |> Option.defaultValue ""
 
                             notifySettled (abortedResult cause reason)
                             logScoped null "The session turn faulted under a stop cause."
-                            let nextState, nextRunning = settle entry CancellationToken.None
-                            return! loop nextState nextRunning StopArbitration.Undecided None
+
+                            return!
+                                withSettle
+                                    entry
+                                    CancellationToken.None
+                                    (fun (nextState, nextRunning) args2 pipe2 -> actor {
+                                        return!
+                                            loop
+                                                {
+                                                    args2 with
+                                                        State = nextState
+                                                        Running = nextRunning
+                                                        Arbitration = StopArbitration.Undecided
+                                                        PendingStop = None
+                                                }
+                                                pipe2
+                                    })
+                                    suspendWith
+                                    args
+                                    pipe
                         | StopArbitration.Decided StopArbitration.SettlementWins ->
                             // Stale: the turn already settled, so this fault
                             // produces zero effects.
-                            return! loop state running arbitration pendingStop
-                    | _ -> return! loop state running arbitration pendingStop
+                            return! loop args pipe
+                    | _ -> return! loop args pipe
             }
 
-        loop initialState None StopArbitration.Undecided None
+        and suspendWith (args: BehaviorLoopArgs) (pipe: BehaviorPipe) : Cont<SessionActorMessage, unit> = loop args pipe
+
+        let initialArgs =
+            {
+                State = SessionState.Idle
+                Running = None
+                Arbitration = StopArbitration.Undecided
+                PendingStop = None
+                Activation = Recovering
+                PendingCount = 0
+                Closing = []
+            }
+
+        startRecover suspendWith initialArgs (LifecyclePipe.empty ())
 
     /// Builds the child-spawn factory the session router uses: parses the
     /// router's string id into a SessionId and spawns the session actor,
@@ -2497,13 +3414,15 @@ module internal SessionActor =
             /// Re-primes the journal after the actor settles its primed
             /// claim: appends a bootstrap entry and claims it, returning the
             /// live claim, or None when no turn is claimable (a live claim
-            /// is held) or the prime failed. The SetAgent swap calls it
-            /// after settling the old prime and again to restore the live
-            /// prime; a quiescent boundary that finds a recorded rebind
-            /// retries through it until it succeeds. None when the host
-            /// never re-primes (direct test constructions): a recorded
-            /// rebind then stays pending.
-            ReprimeJournal: (unit -> TurnClaim option) option
+            /// is held) or the prime failed. The task starts without
+            /// blocking the caller (issue 390): the loop pipes the wait
+            /// instead of awaiting it. The SetAgent swap calls it after
+            /// settling the old prime and again to restore the live prime;
+            /// a quiescent boundary that finds a recorded rebind retries
+            /// through it until it succeeds. None when the host never
+            /// re-primes (direct test constructions): a recorded rebind
+            /// then stays pending.
+            ReprimeJournal: (unit -> Task<TurnClaim option>) option
             /// Rebuilds the on-demand compaction wiring for a fresh journal
             /// token after a SetAgent swap, or None when the host drives
             /// Compact directly. The factory supplies the spawn-time
@@ -2704,6 +3623,72 @@ module internal SessionActor =
         /// Idle handler before draining. Answered with
         /// <see cref="T:Legate.SessionSetAgentReply" />.
         | SuspendableSetAgent of agentId: AgentId * cancellationToken: CancellationToken
+
+    /// The suspendable-loop state threaded through every message (issue
+    /// 390): the lifecycle state plus the bounded pipe state, the pending
+    /// inbox count cache snapshots answer from, the close senders waiting
+    /// on the durable close write, and the one-shot inbox-count seeding
+    /// after entry recovery.
+    type private SuspendLoopArgs =
+        {
+            /// The actor's current lifecycle state.
+            State: SessionState
+            /// The parked turn, or None.
+            Suspended: SuspendedTurn option
+            /// Request ids already resolved.
+            Resolved: HashSet<string>
+            /// The store's pending inbox count as of the last inbox read or
+            /// mutation the actor applied: snapshots answer from memory
+            /// while a store wait is outstanding.
+            PendingCount: int
+            /// Close senders waiting on the durable close write: empty when
+            /// no close is outstanding. A requested close behaves Closed for
+            /// new lifecycle work while its write is outstanding.
+            Closing: (IActorRef * CancellationToken) list
+            /// True until the entry inbox-count seeding wait lands: received
+            /// lifecycle work waits bounded behind it in arrival order.
+            Seeding: bool
+            /// A crash-resume turn start deferred to the loop: the entry,
+            /// attempt, grants, and crash seed the interrupted turn
+            /// restarts with once the seeding read landed. None afterwards.
+            PendingResume: (InboxEntry * int * HashSet<string> * IList<ChatMessage> option) option
+        }
+
+    /// The bounded pipe state the suspendable loop threads.
+    type private SuspendPipe = LifecyclePipe.PipeState<SuspendableActorMessage, SuspendLoopArgs>
+
+    /// A suspendable-loop continuation: the loop state plus the pipe state it resumes with.
+    type private SuspendCont = SuspendLoopArgs -> SuspendPipe -> Cont<SuspendableActorMessage, unit>
+
+    /// Builds one suspendable loop's pipe starter: completions Tell the
+    /// loop's own actor and pack for the suspendable protocol.
+    /// <param name="self">The suspendable loop's own actor.</param>
+    /// <param name="config">The resolved pipe configuration.</param>
+    /// <returns>The starter the loop's waits run through.</returns>
+    let private suspendableStarter
+        (self: IActorRef)
+        (config: LifecyclePipe.StorePipeConfig)
+        : PipeStarter<SuspendableActorMessage, SuspendLoopArgs> =
+        {
+            Self = self
+            Clock = config.Clock
+            Timeout = config.Timeout
+            PackCompleted =
+                fun (opId, incarnation, outcome) -> SuspendableStoreCompleted(opId, incarnation, outcome)
+            PackTimeout = fun (opId, incarnation) -> SuspendableStoreTimeout(opId, incarnation)
+        }
+
+        /// One piped lifecycle store wait finished (issue 390). Same
+        /// contract as the base protocol's LifecycleStoreCompleted:
+        /// only the outstanding wait's op id plus the pipe incarnation
+        /// resumes, everything else is discarded with zero effects.
+        /// Internal to the actor loop, never crossing node boundaries.
+        | SuspendableStoreCompleted of opId: int64 * incarnation: Guid * outcome: obj
+
+        /// One piped lifecycle store wait outran its bound (issue 390).
+        /// Same contract as the base protocol's LifecycleStoreTimeout.
+        /// Internal to the actor loop, never crossing node boundaries.
+        | SuspendableStoreTimeout of opId: int64 * incarnation: Guid
 
     /// Reason carried by TurnFailed when AskTimeout fires while suspended.
     /// Never contains secrets or tool arguments.
@@ -3464,13 +4449,15 @@ module internal SessionActor =
         /// prime fails, or a live claim is held (takeover, or a restart
         /// inside the old prime's lease). Total: a throwing prime reads as
         /// None and the recorded rebind retries at the next boundary.
+        /// Entry-recovery only: the loop pipes ReprimeJournal through
+        /// withReprime instead of blocking on it.
         /// <returns>The live claim, or None.</returns>
         let reprimeNow () : TurnClaim option =
             match suspend.ReprimeJournal with
             | None -> None
             | Some reprime ->
                 try
-                    reprime ()
+                    awaitTask (reprime ())
                 with _ ->
                     None
 

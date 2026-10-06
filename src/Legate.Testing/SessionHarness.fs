@@ -436,38 +436,38 @@ type SessionHarness
                 // still drain first; a held live claim (or any prime
                 // failure) reads as None and the recorded rebind retries at
                 // the next quiescent boundary.
-                let reprime () : TurnClaim option =
-                    try
-                        let fresh = UserMessagePayload(UserMessage.Text "harness bootstrap") :> InboxPayload
+                let reprime () : Task<TurnClaim option> =
+                    task {
+                        try
+                            let fresh = UserMessagePayload(UserMessage.Text "harness bootstrap") :> InboxPayload
 
-                        store
-                            .AppendInboxMessage(
-                                resolved.Tenant,
-                                created.Id,
-                                fresh,
-                                DeliveryMode.Queue,
-                                CancellationToken.None
-                            )
-                            .GetAwaiter()
-                            .GetResult()
-                        |> ignore
+                            do!
+                                store.AppendInboxMessage(
+                                    resolved.Tenant,
+                                    created.Id,
+                                    fresh,
+                                    DeliveryMode.Queue,
+                                    CancellationToken.None
+                                )
 
-                        match
-                            store.ClaimNextTurn(
-                                resolved.Tenant,
-                                created.Id,
-                                "harness",
-                                TimeSpan.FromHours 1.0,
-                                CancellationToken.None
-                            )
-                            |> fun task -> task.GetAwaiter().GetResult()
-                        with
-                        | :? TurnLeaseRenewed as renewed when not (isNull (box renewed)) -> Some renewed.Claim
-                        | :? TurnLeaseHeld as held when not (isNull (box held)) -> Some held.Claim
-                        | :? TurnLeaseExpiring as expiring when not (isNull (box expiring)) -> Some expiring.Claim
-                        | _ -> None
-                    with _ ->
-                        None
+                            match!
+                                store.ClaimNextTurn(
+                                    resolved.Tenant,
+                                    created.Id,
+                                    "harness",
+                                    TimeSpan.FromHours 1.0,
+                                    CancellationToken.None
+                                )
+                            with
+                            | :? TurnLeaseRenewed as renewed when not (isNull (box renewed)) ->
+                                return Some renewed.Claim
+                            | :? TurnLeaseHeld as held when not (isNull (box held)) -> return Some held.Claim
+                            | :? TurnLeaseExpiring as expiring when not (isNull (box expiring)) ->
+                                return Some expiring.Claim
+                            | _ -> return None
+                        with _ ->
+                            return None
+                    }
 
                 let noDrain () : IReadOnlyList<InboxEntry> =
                     ResizeArray<InboxEntry>() :> IReadOnlyList<InboxEntry>
@@ -587,6 +587,7 @@ type SessionHarness
                         OnInjectJournaled = None
                         Logger = null
                         Compact = None
+                        StorePipe = None
                     }
 
                 let deps: SessionActor.SuspendDeps =

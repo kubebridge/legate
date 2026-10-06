@@ -953,6 +953,18 @@ module internal WireDtos =
                     dto.Entry <- requireEntry entry
                     dto.Reason <- reasonOf error)
                 :> obj
+            | LifecycleStoreCompleted _ ->
+                raise (
+                    InvalidOperationException(
+                        "Piped lifecycle store completions are actor-local; they never cross node boundaries."
+                    )
+                )
+            | LifecycleStoreTimeout _ ->
+                raise (
+                    InvalidOperationException(
+                        "Piped lifecycle store timeouts are actor-local; they never cross node boundaries."
+                    )
+                )
         elif message :? SessionActor.SuspendableActorMessage then
             match message :?> SessionActor.SuspendableActorMessage with
             | SessionActor.SuspendableQueuePrompt(payload, _) ->
@@ -1011,6 +1023,18 @@ module internal WireDtos =
             | SessionActor.SuspendableCheckInbox -> SuspendableCheckInboxDto() :> obj
             | SessionActor.SuspendableSetAgent(agentId, _) ->
                 buildDto (fun (dto: SuspendableSetAgentDto) -> dto.AgentId <- requireAgentId agentId) :> obj
+            | SessionActor.SuspendableStoreCompleted _ ->
+                raise (
+                    InvalidOperationException(
+                        "Piped lifecycle store completions are actor-local; they never cross node boundaries."
+                    )
+                )
+            | SessionActor.SuspendableStoreTimeout _ ->
+                raise (
+                    InvalidOperationException(
+                        "Piped lifecycle store timeouts are actor-local; they never cross node boundaries."
+                    )
+                )
         elif message :? SessionPromptReply then
             match message :?> SessionPromptReply with
             | PromptAccepted entry -> buildDto (fun (dto: PromptAcceptedDto) -> dto.Entry <- requireEntry entry) :> obj
