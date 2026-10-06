@@ -734,10 +734,7 @@ type SessionClientOperations =
                             | Some settled -> outcome <- Some settled
                             | None ->
                                 let pollTask =
-                                    client.WaitDelay.Delay(
-                                        SessionClientExtensions.WaitPollInterval,
-                                        CancellationToken.None
-                                    )
+                                    client.WaitDelay.Delay(client.WaitPollInterval, CancellationToken.None)
 
                                 let candidates = ResizeArray<Task>()
                                 candidates.Add(hint)
@@ -2342,6 +2339,15 @@ module internal SessionClientWiring =
                  built.AutoTitle <- Some autoTitle
                  built.CompletionEra <- marker
                  built.CompletionDestinations <- Some routes
+
+                 // Bounded transient state (issue 384): the per-client
+                 // sync bound and wait poll interval ride the configured
+                 // Sessions options, and the process-wide wait-hub plus
+                 // auto-title tables take the same options as their caps.
+                 built.MaxSyncSessions <- sessions.MaxSyncSessionsPerClient
+                 built.WaitPollInterval <- sessions.WaitPollInterval
+                 PromptWaitHubs.ConfigureFromSessions sessions
+                 SessionAutoTitle.Configure sessions.MaxAutoTitleSessions
 
                  // Durable receipt lookup (issue 381): the
                  // container-registered settlement capability the client

@@ -144,6 +144,50 @@ let ``Non-positive dispatcher poll interval fails validation with the section pa
     |> should equal true
 
 [<Fact>]
+let ``Binds the transient wait bounds and the wait poll interval`` () =
+    let section =
+        buildSection
+            [
+                "Legate:Sessions:MaxWaitHubs", "16"
+                "Legate:Sessions:MaxSettledResultsPerHub", "4"
+                "Legate:Sessions:MaxSettleWaitersPerHub", "8"
+                "Legate:Sessions:MaxPositionHints", "32"
+                "Legate:Sessions:MaxPositionHintObservers", "3"
+                "Legate:Sessions:MaxSyncSessionsPerClient", "7"
+                "Legate:Sessions:MaxAutoTitleSessions", "9"
+                "Legate:Sessions:WaitPollInterval", "100ms"
+            ]
+
+    let options = LegateOptionsBinding.bind section
+
+    options.Sessions.MaxWaitHubs |> should equal 16
+    options.Sessions.MaxSettledResultsPerHub |> should equal 4
+    options.Sessions.MaxSettleWaitersPerHub |> should equal 8
+    options.Sessions.MaxPositionHints |> should equal 32
+    options.Sessions.MaxPositionHintObservers |> should equal 3
+    options.Sessions.MaxSyncSessionsPerClient |> should equal 7
+    options.Sessions.MaxAutoTitleSessions |> should equal 9
+
+    options.Sessions.WaitPollInterval
+    |> should equal (TimeSpan.FromMilliseconds 100.0)
+
+    options.Validate() |> should equal null
+
+[<Fact>]
+let ``Non-positive wait poll interval fails validation with the section path`` () =
+    let section =
+        buildSection
+            [
+                "Legate:Sessions:WaitPollInterval", "0s"
+            ]
+
+    let ex =
+        Assert.Throws<InvalidOperationException>(fun () -> LegateOptionsBinding.bind section |> ignore)
+
+    ex.Message.Contains("Sessions: WaitPollInterval must be positive.")
+    |> should equal true
+
+[<Fact>]
 let ``Binds the compaction model override and keep count`` () =
     let section =
         buildSection

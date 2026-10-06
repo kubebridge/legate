@@ -942,3 +942,137 @@ let ``WaitForOperationAsync stays BCL-only`` () =
             exposed.Assembly.Equals(fsharpCore),
             sprintf "The public surface leaks the F# core type %s." exposed.FullName
         )
+
+// ──────────────────────────────────────────────────────────────
+// Transient cleanup convergence (issue 384)
+// ──────────────────────────────────────────────────────────────
+
+[<Fact>]
+let ``late observer after transient cleanup reads the durable receipt`` () : Task =
+    task {
+        use provider =
+            (createServices (scripted [ ScriptStep.Text "kept" ]) (sourced [])).BuildServiceProvider()
+
+        return!
+            withClient provider (fun client ->
+                task {
+                    let! created = openSession client
+                    let! receipt = awaitWhat (prompt client created.Id "hi" DeliveryMode.Queue) "the prompt to land"
+                    let! winner = awaitTerminal client receipt
+                    Assert.Equal("kept", (presentResult winner.Result).AssistantText)
+
+                    // Drop every transient entry for the session: the hub
+                    // (true: the settle created one) plus the client sync
+                    // state (false: PromptAsync never takes the gate).
+                    Assert.True(PromptWaitHubs.ReleaseSession client.Tenant created.Id)
+                    Assert.False(client.ReleaseSession(created.Id))
+
+                    // A late observer that never registered still reads the
+                    // same committed winner from the durable row.
+                    let! late = awaitWhat (waitOp client receipt waitBound CancellationToken.None) "the late wait"
+
+                    Assert.Equal(OperationStatus.Terminal, late.Status)
+                    Assert.Equal("kept", (presentResult late.Result).AssistantText)
+
+                    let! read =
+                        SessionClientOperations.GetOperationResultAsync(client, receipt, CancellationToken.None)
+
+                    Assert.Equal(OperationStatus.Terminal, read.Status)
+                    Assert.Equal("kept", (presentResult read.Result).AssistantText)
+                })
+    }
+
+[<Fact>]
+let ``simultaneous live observers during cleanup each get the committed winner`` () : Task =
+    task {
+        let entered = new ManualResetEventSlim(false)
+        let release = new TaskCompletionSource<string>()
+
+        use provider =
+            (createServices
+                (scripted
+                    [
+                        ScriptStep.ToolCall("c1", "blocker")
+                        ScriptStep.Text "shared"
+                    ])
+                (sourced
+                    [
+                        blockingTool "blocker" entered release
+                    ]))
+                .BuildServiceProvider()
+
+        try
+            return!
+                withClient provider (fun client ->
+                    task {
+                        let! created = openSession client
+
+                        let! receipt =
+                            awaitWhat (prompt client created.Id "go" DeliveryMode.Queue) "the prompt to land"
+
+                        Assert.True(entered.Wait(TimeSpan.FromSeconds 10.0))
+
+                        let first = waitOp client receipt waitBound CancellationToken.None
+                        let second = waitOp client receipt waitBound CancellationToken.None
+
+                        // Best-effort barrier: both waits subscribe within
+                        // milliseconds, so the release below races live
+                        // observers. Either way both must converge.
+                        let deadline = DateTimeOffset.UtcNow.AddSeconds(5.0)
+
+                        while PromptWaitHubs.HintObserverCount() < 2 && DateTimeOffset.UtcNow < deadline do
+                            do! Task.Yield()
+
+                        PromptWaitHubs.ReleaseSession client.Tenant created.Id |> ignore
+
+                        release.TrySetResult("unblocked") |> ignore
+
+                        let! both = awaitWhat (Task.WhenAll(first, second)) "both survivor waits"
+
+                        Assert.Equal(OperationStatus.Terminal, both[0].Status)
+                        Assert.Equal(OperationStatus.Terminal, both[1].Status)
+                        Assert.Equal("shared", (presentResult both[0].Result).AssistantText)
+                        Assert.Equal("shared", (presentResult both[1].Result).AssistantText)
+                    })
+        finally
+            release.TrySetResult("unblocked") |> ignore
+    }
+
+[<Fact>]
+let ``session synchronization reuse after release is safe`` () : Task =
+    task {
+        use provider =
+            (createServices
+                (scripted
+                    [
+                        ScriptStep.Text "one"
+                        ScriptStep.Text "two"
+                    ])
+                (sourced []))
+                .BuildServiceProvider()
+
+        return!
+            withClient provider (fun client ->
+                task {
+                    let! created = openSession client
+
+                    let! first =
+                        awaitWhat
+                            (client.PromptAndWaitAsync(created.Id, UserMessage.Text "hi", CancellationToken.None))
+                            "the first wait"
+
+                    Assert.Equal("one", first.AssistantText)
+                    Assert.Equal(1, client.TrackedSyncCount)
+
+                    Assert.True(client.ReleaseSession(created.Id))
+                    Assert.Equal(0, client.TrackedSyncCount)
+
+                    let! second =
+                        awaitWhat
+                            (client.PromptAndWaitAsync(created.Id, UserMessage.Text "again", CancellationToken.None))
+                            "the second wait"
+
+                    Assert.Equal("two", second.AssistantText)
+                    Assert.Equal(1, client.TrackedSyncCount)
+                })
+    }

@@ -1491,6 +1491,14 @@ module internal SessionActor =
         awaitTask (props.Store.CloseSession(props.Tenant, props.SessionId, CancellationToken.None))
         |> ignore
 
+        // Bounded transient state (issue 384): the durable close landed,
+        // so the session's hub and live hints release. Transient-only:
+        // execution authority and durable rows are untouched. The
+        // auto-title marker needs no close release: failures clear it and
+        // successes keep it by design (a titled session never refires), and
+        // the table cap plus expiry and client release bound it.
+        PromptWaitHubs.ReleaseSession props.Tenant props.SessionId |> ignore
+
     // ────────────────── Completion outbox (issue 84) ──────────────────
 
     /// Mints the stable idempotency key one settlement shares between its
@@ -1919,6 +1927,13 @@ module internal SessionActor =
 
                     let closed =
                         awaitTask (props.Store.CloseSession(props.Tenant, props.SessionId, cancellationToken))
+
+                    // Bounded transient state (issue 384): the durable close
+                    // landed, so the session's hub and live hints release.
+                    // Transient-only (the auto-title marker is
+                    // self-maintaining: failures clear it, successes keep it
+                    // by design).
+                    PromptWaitHubs.ReleaseSession props.Tenant props.SessionId |> ignore
 
                     mailbox.Sender() <! closed
                     return! loop SessionState.Closed None StopArbitration.Undecided None
@@ -6614,6 +6629,13 @@ module internal SessionActor =
 
                     let closed =
                         awaitTask (props.Store.CloseSession(props.Tenant, props.SessionId, cancellationToken))
+
+                    // Bounded transient state (issue 384): the durable close
+                    // landed, so the session's hub and live hints release.
+                    // Transient-only (the auto-title marker is
+                    // self-maintaining: failures clear it, successes keep it
+                    // by design).
+                    PromptWaitHubs.ReleaseSession props.Tenant props.SessionId |> ignore
 
                     mailbox.Sender() <! closed
                     return! loop SessionState.Closed None resolved

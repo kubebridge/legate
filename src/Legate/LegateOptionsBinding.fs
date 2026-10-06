@@ -23,6 +23,7 @@ module internal LegateOptionsBinding =
             "Sessions:LeaseRenewalInterval"
             "Sessions:Expiry"
             "Sessions:SubAgents:Timeout"
+            "Sessions:WaitPollInterval"
             "Dispatcher:PollInterval"
             "Turns:DefaultTimeout"
             "Permissions:AskTimeout"

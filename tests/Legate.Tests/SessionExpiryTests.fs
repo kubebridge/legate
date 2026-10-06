@@ -360,3 +360,25 @@ let ``Startup passes with expiry disabled and no blob store`` () =
 
         do! startValidation provider
     }
+
+[<Fact>]
+let ``Expiry close releases the transient wait hub`` () =
+    task {
+        let store, _, clock = createStore ()
+        let sessions = SessionsOptions(Expiry = Nullable(TimeSpan.FromMinutes 30.0))
+
+        let! idle = store.CreateSession(tenant, sampleSession (), CancellationToken.None)
+
+        // The session holds transient wait state before the sweep.
+        let before = PromptWaitHubs.GetOrAddScoped tenant idle.Id
+
+        clock.Advance(TimeSpan.FromMinutes 35.0)
+
+        let! closed = SessionExpiry.passOnceAsync store tenant sessions clock CancellationToken.None
+        closed |> should equal 1
+
+        // The sweep released the hub: the next waiter resolves through a
+        // fresh hub plus the durable row, never through retained history.
+        let after = PromptWaitHubs.GetOrAddScoped tenant idle.Id
+        Assert.False(Object.ReferenceEquals(before, after))
+    }

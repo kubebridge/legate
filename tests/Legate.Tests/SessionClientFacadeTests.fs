@@ -3210,3 +3210,173 @@ let ``Subscribe overlaps append with replay keeping order and identity`` () : Ta
                     (received[received.Length - 1] :? SessionClosedEvent) |> should equal true
                 })
     }
+
+// ──────────────────────────────────────────────────────────────
+// Bounded per-session synchronization (issue 384)
+// ──────────────────────────────────────────────────────────────
+
+[<Fact>]
+let ``Sync entries carry the documented finite defaults`` () =
+    let client, _, _ = directTitleSetup ()
+
+    try
+        client.WaitPollInterval |> should equal (TimeSpan.FromMilliseconds 50.0)
+        client.MaxSyncSessions |> should equal 2048
+        client.TrackedSyncCount |> should equal 0
+
+        SessionsOptions().WaitPollInterval
+        |> should equal (TimeSpan.FromMilliseconds 50.0)
+    finally
+        (client :> IDisposable).Dispose()
+
+[<Fact>]
+let ``Sync bounds reject invalid values`` () =
+    let client, _, _ = directTitleSetup ()
+
+    try
+        Assert.Throws<ArgumentOutOfRangeException>(fun () -> client.MaxSyncSessions <- 0)
+        |> ignore
+
+        Assert.Throws<ArgumentOutOfRangeException>(fun () -> client.WaitPollInterval <- TimeSpan.Zero)
+        |> ignore
+    finally
+        (client :> IDisposable).Dispose()
+
+[<Fact>]
+let ``Many sessions track and release their sync entries`` () =
+    let client, _, _ = directTitleSetup ()
+
+    try
+        let ids = [ for _ in 1..25 -> SessionId.New() ]
+
+        for sessionId in ids do
+            client.SemaphoreFor(sessionId) |> ignore
+            client.ReleaseSlot(sessionId)
+
+        client.TrackedSyncCount |> should equal 25
+
+        for sessionId in ids do
+            client.ReleaseSession(sessionId) |> should equal true
+
+        client.TrackedSyncCount |> should equal 0
+        client.ReleaseSession(SessionId.New()) |> should equal false
+    finally
+        (client :> IDisposable).Dispose()
+
+[<Fact>]
+let ``Sync admission rejects past the cap unless an unheld entry evicts`` () =
+    let client, _, _ = directTitleSetup ()
+
+    try
+        client.MaxSyncSessions <- 2
+
+        let first = SessionId.New()
+        let second = SessionId.New()
+        let third = SessionId.New()
+
+        // Both slots stay held: nothing may evict them.
+        let firstSem = client.SemaphoreFor(first)
+        let secondSem = client.SemaphoreFor(second)
+
+        let rejected =
+            Assert.Throws<AdmissionRejectedException>(fun () -> client.SemaphoreFor(third) |> ignore)
+
+        rejected.Reason |> should equal "sessionSyncAtCapacity"
+        client.TrackedSyncCount |> should equal 2
+
+        // Releasing the first slot lets the third session evict it; held
+        // entries are never evicted, so the second gate is untouched.
+        client.ReleaseSlot(first)
+        let thirdSem = client.SemaphoreFor(third)
+        thirdSem.Wait(CancellationToken.None)
+        thirdSem.Release() |> ignore
+        client.ReleaseSlot(third)
+
+        Object.ReferenceEquals(secondSem, client.SemaphoreFor(second))
+        |> should equal true
+
+        client.ReleaseSlot(second)
+        client.ReleaseSlot(second)
+
+        client.ReleaseSession(first) |> should equal false
+        client.ReleaseSession(second) |> should equal true
+        client.ReleaseSession(third) |> should equal true
+
+        // The evicted entry stays gone: re-acquiring starts a fresh gate.
+        let revived = client.SemaphoreFor(first)
+        Object.ReferenceEquals(firstSem, revived) |> should equal false
+        client.ReleaseSlot(first)
+        client.ReleaseSession(first) |> should equal true
+    finally
+        (client :> IDisposable).Dispose()
+
+[<Fact>]
+let ``Sync reuse after release is safe`` () : Task =
+    task {
+        let client, _, _ = directTitleSetup ()
+
+        try
+            let sessionId = SessionId.New()
+            let first = client.SemaphoreFor(sessionId)
+            do! first.WaitAsync(CancellationToken.None)
+            first.Release() |> ignore
+            client.ReleaseSlot(sessionId)
+
+            client.ReleaseSession(sessionId) |> should equal true
+
+            let second = client.SemaphoreFor(sessionId)
+            Object.ReferenceEquals(first, second) |> should equal false
+            do! second.WaitAsync(CancellationToken.None)
+            second.Release() |> ignore
+            client.ReleaseSlot(sessionId)
+
+            client.ReleaseSession(sessionId) |> should equal true
+        finally
+            (client :> IDisposable).Dispose()
+    }
+
+[<Fact>]
+let ``Client disposal releases unheld entries and keeps held ones`` () =
+    let client, _, _ = directTitleSetup ()
+
+    let held = SessionId.New()
+    let idle = SessionId.New()
+
+    client.SemaphoreFor(held) |> ignore
+    client.SemaphoreFor(idle) |> ignore
+    client.ReleaseSlot(idle)
+
+    (client :> IDisposable).Dispose() |> ignore
+
+    // The held entry survives disposal; releasing its slot then
+    // disposing again drops it.
+    client.TrackedSyncCount |> should equal 1
+    client.ReleaseSlot(held)
+    (client :> IDisposable).Dispose() |> ignore
+    client.TrackedSyncCount |> should equal 0
+
+[<Fact>]
+let ``Auto-title tracker bounds markers and admits after release`` () =
+    let tracker = SessionAutoTitle.AutoTitleTracker(2)
+    let tenant = TenantId.Create "sync-bounds"
+    let first = SessionId.New()
+    let second = SessionId.New()
+    let third = SessionId.New()
+
+    tracker.TryMark(tenant, first) |> should equal true
+    tracker.TryMark(tenant, first) |> should equal false
+    tracker.TryMark(tenant, second) |> should equal true
+    tracker.TrackedCount |> should equal 2
+
+    // Past the cap new sessions skip titling until entries release.
+    tracker.TryMark(tenant, third) |> should equal false
+
+    tracker.Release(tenant, first)
+    tracker.TrackedCount |> should equal 1
+    tracker.TryMark(tenant, third) |> should equal true
+
+    Assert.Throws<ArgumentOutOfRangeException>(fun () -> tracker.MaxEntries <- 0)
+    |> ignore
+
+    tracker.MaxEntries <- 3
+    tracker.MaxEntries |> should equal 3
