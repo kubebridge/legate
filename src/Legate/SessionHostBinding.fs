@@ -44,8 +44,8 @@ type SessionHostBinding(tenant: TenantId, provider: Func<IServiceProvider, IServ
         let borrowed =
             try
                 provider.Invoke root
-            with error ->
-                reraise ()
+            with _ ->
+                invalidOp ($"SessionHostBinding '{tenant}' callback failed to return its execution provider.")
 
         if isNull (box borrowed) then
             invalidOp "A SessionHostBinding callback returned no provider."
@@ -120,37 +120,13 @@ type internal SessionHostContextRegistry(root: IServiceProvider) as this =
         let temporary = Dictionary<TenantId, SessionExecutionContext>()
         let temporaryLifetimes = ResizeArray<SessionSubscriptionLifetime>()
         let temporaryTrackers = ResizeArray<ExecutionWorkTracker>()
-        let validatedProviders = ResizeArray<TenantId * IServiceProvider>()
+
+        let validatedProviders =
+            ResizeArray<TenantId * IServiceProvider * SessionClientWiring.PreparedOptions>()
+
         let mutable published = false
 
-        let validateExecutionProvider (provider: IServiceProvider) : unit =
-            let missing = ResizeArray<string>()
-            let store = provider.GetService<ISessionStore>()
-
-            if isNull (box store) then
-                missing.Add("ISessionStore")
-            elif not (store :? ISessionAbortControlStore) then
-                missing.Add("ISessionAbortControlStore")
-
-            if isNull (box (provider.GetService<ISessionEventStore>())) then
-                missing.Add("ISessionEventStore")
-
-            if isNull (box (provider.GetService<IChatClient>())) then
-                missing.Add("IChatClient")
-
-            if isNull (box (provider.GetService<IWorkspaceRuntime>())) then
-                missing.Add("IWorkspaceRuntime")
-
-            if Seq.isEmpty (provider.GetServices<ILlmProvider>()) then
-                missing.Add("ILlmProvider")
-
-            if missing.Count > 0 then
-                raise (
-                    InvalidOperationException(
-                        "Legate execution binding is missing required registrations: "
-                        + String.Join(", ", missing)
-                    )
-                )
+        let validators = root.GetServices<ExecutionValidation>() |> Seq.toArray
 
         try
             // Resolve and validate every callback first.  No provider-owned
@@ -159,23 +135,28 @@ type internal SessionHostContextRegistry(root: IServiceProvider) as this =
             // a partial journal hook or execution context behind.
             for binding in bindings do
                 let provider = binding.Bind(this, root)
-                let options = provider.GetRequiredService<SessionClientOptions>()
+                let prepared = SessionClientWiring.prepareOptions provider
+                let options = prepared.Client
 
                 if options.Tenant <> binding.Tenant then
                     invalidOp "A SessionHostBinding tenant must match its provider's SessionClientOptions.Tenant."
 
+                match options.Validate() with
+                | null -> ()
+                | _ -> invalidOp "A SessionHostBinding has invalid SessionClientOptions."
+
                 // Every binding, including the deferred root self-binding,
                 // is a complete execution boundary.  Never fall back to the
                 // node root for a missing dependency.
-                validateExecutionProvider provider
+                ExecutionGraphValidation.require provider ($"execution binding '{binding.Tenant}'")
 
-                let options = provider.GetRequiredService<IOptions<LegateOptions>>().Value
+                let options = prepared.Runtime
 
                 match options.Validate() with
                 | null -> ()
                 | _ -> invalidOp "A bound execution provider has invalid LegateOptions."
 
-                SessionExpiryStartup.requireDurableBlobStore provider
+                SessionExpiryStartup.requireForSnapshot provider options.Sessions
 
                 let sessions =
                     if isNull (box options.Sessions) then
@@ -189,16 +170,19 @@ type internal SessionHostContextRegistry(root: IServiceProvider) as this =
                 | null -> ()
                 | violation -> invalidArg "Sessions" violation
 
-                validatedProviders.Add(binding.Tenant, provider)
+                for validator in validators do
+                    validator.Validate(provider, nodeMode)
 
-            for tenant, provider in validatedProviders do
+                validatedProviders.Add(binding.Tenant, provider, prepared)
+
+            for tenant, provider, prepared in validatedProviders do
                 let lifetime = new SessionSubscriptionLifetime()
                 let tracker = new ExecutionWorkTracker()
                 temporaryLifetimes.Add(lifetime)
                 temporaryTrackers.Add(tracker)
 
                 let context =
-                    SessionClientWiring.assembleContext provider resolver nodeMode lifetime tracker
+                    SessionClientWiring.assembleContext provider resolver nodeMode lifetime tracker prepared
 
                 temporary.Add(tenant, context)
 
@@ -312,3 +296,17 @@ type internal SessionHostContextRegistry(root: IServiceProvider) as this =
             let all = Task.WhenAll drains
 
             NodeBoundedWait.awaitTask "SessionNodeDrain" all bound timeProvider cancellationToken
+
+/// Read-only access to initialized tenant clients for host and background code.
+/// Lookup never constructs a graph or grants tenant authority; the application authorizes the tenant.
+type ISessionClientFactory =
+    /// Gets an existing declared tenant's client after successful startup.
+    /// Fails before startup, for undeclared tenants, and once node admission closes.
+    /// <param name="tenant">The application-authorized tenant.</param>
+    /// <returns>The immutable tenant-bound client.</returns>
+    abstract GetClient: tenant: TenantId -> SessionClient
+
+type internal SessionClientFactory(contexts: ISessionHostContexts) =
+    interface ISessionClientFactory with
+        member _.GetClient(tenant) =
+            contexts.Get(tenant).Client.Value :?> SessionClient

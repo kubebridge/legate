@@ -104,6 +104,9 @@ type LegateServiceCollectionExtensions =
         services.TryAddSingleton<ISessionHostContexts, SessionHostContextRegistry>()
         |> ignore
 
+        services.TryAddSingleton<ISessionClientFactory, SessionClientFactory>()
+        |> ignore
+
         LegateStartupChecks.register services
         CompletionEraRegistration.register services
         SessionArtifactRegistration.register services

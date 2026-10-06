@@ -706,6 +706,28 @@ module internal SessionAutoTitle =
 [<Sealed; AbstractClass; Extension>]
 type SessionClientExtensions =
 
+    /// Prompts with Queue delivery and waits using CancellationToken.None.
+    /// Uses the session timeout or client default bound and observes the accepted operation's durable receipt.
+    [<Extension>]
+    static member PromptAndWaitAsync(client: SessionClient, sessionId: SessionId, message: UserMessage) =
+        SessionClientExtensions.PromptAndWaitAsync(client, sessionId, message, CancellationToken.None)
+
+    /// Prompts with non-null plain text, Queue delivery and CancellationToken.None.
+    /// Uses the session timeout or client default bound; suspended permission workflows require explicit handling.
+    [<Extension>]
+    static member PromptAndWaitAsync(client: SessionClient, sessionId: SessionId, text: string) =
+        SessionClientExtensions.PromptAndWaitAsync(client, sessionId, text, CancellationToken.None)
+
+    /// Prompts with non-null plain text and Queue delivery, observing the accepted operation's durable receipt.
+    /// Cancellation abandons the operation but never aborts an accepted turn; settlement wins ties.
+    /// Uses the session timeout or client default bound. Cast ambiguous null/default literals or use named arguments.
+    [<Extension>]
+    static member PromptAndWaitAsync
+        (client: SessionClient, sessionId: SessionId, text: string, cancellationToken: CancellationToken)
+        =
+        ArgumentNullException.ThrowIfNull(text)
+        SessionClientExtensions.PromptAndWaitAsync(client, sessionId, UserMessage.Text(text), cancellationToken)
+
     /// Prompts the session with one user message over Queue delivery and
     /// waits until the accepted operation settles, returning the committed
     /// winning <see cref="T:Legate.TurnResult" />. The wait follows this

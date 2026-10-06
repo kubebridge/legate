@@ -84,6 +84,7 @@ type private CombinedSessionStore =
     interface
         inherit ISessionStore
         inherit ISessionAbortControlStore
+        inherit ISessionSettlementStore
     end
 
 type private OnDemandStoreProxy() =
@@ -100,6 +101,8 @@ type private OnDemandStoreProxy() =
         path <- Path.GetFullPath databasePath
         kind <- proxyKind
         counters <- observed
+
+    member _.DatabasePath = path
 
     static member private Finish(pending: Task, database: SqliteDatabase, gate: SemaphoreSlim) : Task =
         task {
@@ -133,6 +136,11 @@ type private OnDemandStoreProxy() =
         | methodInfo, _ when methodInfo.Name = "ToString" -> box $"OnDemandStoreProxy({path})"
         | methodInfo, _ when methodInfo.Name = "GetHashCode" -> box (RuntimeHelpers.GetHashCode(this))
         | methodInfo, args when methodInfo.Name = "Equals" -> box (obj.ReferenceEquals(this, args[0]))
+        | methodInfo, args when methodInfo.Name = "SupportsSettlementJournal" ->
+            match args[0] with
+            | :? OnDemandStoreProxy as journal ->
+                box (String.Equals(path, journal.DatabasePath, StringComparison.OrdinalIgnoreCase))
+            | _ -> box false
         | methodInfo, args ->
             counters.Record methodInfo.Name
 
@@ -1633,8 +1641,9 @@ let ``issue395 production two-node tenant routing keeps scope and placement`` ()
             do! awaitMembers node1.Cluster 2
             do! awaitMembers node2.Cluster 2
 
-            let senderA = node1.BindingA.Client
-            let senderB = node1.BindingB.Client
+            let clients = node1.Provider.GetRequiredService<ISessionClientFactory>()
+            let senderA = clients.GetClient(node1.BindingA.Tenant)
+            let senderB = clients.GetClient(node1.BindingB.Tenant)
 
             let addressA = SessionAddress(tenantA, sessionId)
             let resolver1 = node1.Cluster :> ISessionResolver
@@ -2012,8 +2021,9 @@ let ``issue395 routed operations fence replies, effects, subscriptions, and rest
                 do! awaitMembers freshNode1.Cluster 2
                 do! awaitMembers freshNode2.Cluster 2
 
-                let freshSenderA = freshNode2.BindingA.Client
-                let freshSenderB = freshNode2.BindingB.Client
+                let clients = freshNode2.Provider.GetRequiredService<ISessionClientFactory>()
+                let freshSenderA = clients.GetClient(freshNode2.BindingA.Tenant)
+                let freshSenderB = clients.GetClient(freshNode2.BindingB.Tenant)
                 let! resolved = (freshNode2.Cluster :> ISessionResolver).ResolveSessionAsync(addressB, cancellation)
                 let! probe = resolved.Ask<obj>(SessionRouteProbe, cancellation)
                 Assert.IsType<SessionRouteAccepted>(probe) |> ignore

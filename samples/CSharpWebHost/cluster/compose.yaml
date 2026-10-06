@@ -1,0 +1,65 @@
+# SPDX-License-Identifier: Apache-2.0
+name: legate-web-415
+x-host: &host
+  build:
+    context: ../../..
+    dockerfile: samples/CSharpWebHost/cluster/Dockerfile
+  healthcheck:
+    test: ["CMD", "curl", "-f", "http://127.0.0.1:8080/ready"]
+    interval: 3s
+    timeout: 5s
+    retries: 80
+    start_period: 60s
+x-environment: &environment
+  ASPNETCORE_URLS: http://+:8080
+  Legate__Cluster__Mode: StaticSeeds
+  Legate__Cluster__SeedNodes__0: web-1:4053
+  Legate__Cluster__Roles__0: session
+  Legate__Cluster__RemotingPort: "4053"
+  Legate__Cluster__JoinTimeout: 60s
+  Legate__Storage__Postgres__ConnectionString: Host=postgres;Database=legate;Username=legate;Password=legate
+  Sample__ReplyDelayMilliseconds: "30000"
+  Logging__LogLevel__Default: Warning
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: legate
+      POSTGRES_PASSWORD: legate
+      POSTGRES_DB: legate
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U legate -d legate"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+  web-1:
+    <<: *host
+    ports: ["8181:8080"]
+    environment:
+      <<: *environment
+      Legate__Cluster__RemotingHostname: web-1
+      Legate__Cluster__MinimumMembers: "1"
+    depends_on:
+      postgres: {condition: service_healthy}
+  web-2:
+    <<: *host
+    ports: ["8182:8080"]
+    environment:
+      <<: *environment
+      Legate__Cluster__RemotingHostname: web-2
+      Legate__Cluster__MinimumMembers: "3"
+      Legate__Cluster__SeedNodes__1: web-2:4053
+      Legate__Cluster__SeedNodes__2: web-3:4053
+    depends_on:
+      web-1: {condition: service_healthy}
+  web-3:
+    <<: *host
+    ports: ["8183:8080"]
+    environment:
+      <<: *environment
+      Legate__Cluster__RemotingHostname: web-3
+      Legate__Cluster__MinimumMembers: "3"
+      Legate__Cluster__SeedNodes__1: web-2:4053
+      Legate__Cluster__SeedNodes__2: web-3:4053
+    depends_on:
+      web-1: {condition: service_healthy}

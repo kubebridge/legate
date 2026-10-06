@@ -187,7 +187,7 @@ module internal Dispatcher =
     /// <param name="clock">The clock dispatch latency reads.</param>
     /// <param name="cancellationToken">Abandons the pass.</param>
     /// <returns>What the pass woke and what stayed queued behind each limit.</returns>
-    let passOnceRoutedAsync
+    let passOnceRoutedWithCursorAndLogAsync
         (validateRoute: Session -> bool)
         (store: ISessionStore)
         (eventStore: ISessionEventStore)
@@ -198,6 +198,8 @@ module internal Dispatcher =
         (resolve: SessionId -> CancellationToken -> Task<IActorRef>)
         (clock: TimeProvider)
         (cancellationToken: CancellationToken)
+        (recoveryCursor: (string | null) ref)
+        (log: ILogger)
         : Task<DispatchPassResult> =
         task {
             ArgumentNullException.ThrowIfNull(store)
@@ -214,7 +216,7 @@ module internal Dispatcher =
 
             let maxBatch =
                 if dispatcher.MaxBatchSize > 0 then
-                    dispatcher.MaxBatchSize
+                    min 1000 dispatcher.MaxBatchSize
                 else
                     50
 
@@ -224,6 +226,7 @@ module internal Dispatcher =
             let agentSnapshots = Dictionary<AgentId, int>()
             let agentLocal = Dictionary<AgentId, int>()
             let visited = HashSet<SessionId>()
+            let woken = HashSet<SessionId>()
 
             let mutable runningLocal = 0
             let mutable tenantLocal = 0
@@ -340,6 +343,7 @@ module internal Dispatcher =
 
                                         let! actor = resolve sessionId cancellationToken
                                         do! SessionActor.checkInboxAsync store tenant sessionId actor cancellationToken
+                                        woken.Add(sessionId) |> ignore
 
                                         runningLocal <- runningLocal + 1
                                         tenantLocal <- tenantLocal + 1
@@ -581,6 +585,86 @@ module internal Dispatcher =
                     orphanContinuation <- page.Continuation
                     orphanPaging <- not (isNull (box page.Continuation))
 
+            // A Running slot is already admitted. Discovery sends only a wake;
+            // the existing execution factory/provider decides lease authority.
+            // Keep the upper-fenced keyset between bounded passes so live owners
+            // at the front cannot starve eligible sessions further down the set.
+            let mutable recoveryBudget = maxBatch
+            let mutable recoveryPaging = true
+            let mutable reports = min 8 maxBatch
+
+            let report category sessionId =
+                if reports > 0 then
+                    reports <- reports - 1
+                    log.LogDebug("Running recovery {Category} for {SessionId}.", category, sessionId)
+
+            while recoveryPaging && recoveryBudget > 0 do
+                cancellationToken.ThrowIfCancellationRequested()
+
+                let! page =
+                    store.ListRecoveryCandidates(
+                        tenant,
+                        SessionState.Running,
+                        recoveryBudget,
+                        recoveryCursor.Value,
+                        cancellationToken
+                    )
+
+                if isNull (box page) || isNull (box page.Items) then
+                    recoveryCursor.Value <- null
+                    recoveryPaging <- false
+                else
+                    for candidateId in page.Items do
+                        cancellationToken.ThrowIfCancellationRequested()
+
+                        try
+                            let! current = store.GetSession(tenant, candidateId, cancellationToken)
+
+                            match current with
+                            | null -> ()
+                            | current when
+                                woken.Contains(candidateId)
+                                || current.Id <> candidateId
+                                || current.Tenant <> tenant
+                                || current.State <> SessionState.Running
+                                || not current.CurrentTurnId.HasValue
+                                ->
+                                report "lifecycleRefused" candidateId
+                            | current when not (validateRoute current) -> report "routeRefused" candidateId
+                            | _ ->
+                                match store with
+                                | :? ISessionAbortControlStore as control ->
+                                    let! target = control.ReadAbortTarget(tenant, candidateId, cancellationToken)
+
+                                    match target with
+                                    | null -> ()
+                                    | target when
+                                        target.State = ControlTargetState.Active
+                                        && isNull (box target.Stop)
+                                        && target.SessionId = candidateId
+                                        ->
+                                        recoveryBudget <- recoveryBudget - 1
+                                        let! actor = resolve candidateId cancellationToken
+
+                                        do!
+                                            SessionActor.checkInboxAsync
+                                                store
+                                                tenant
+                                                candidateId
+                                                actor
+                                                cancellationToken
+
+                                        report "wakeSent" candidateId
+                                    | _ -> report "controlRefused" candidateId
+                                | _ -> ()
+                        with
+                        | :? OperationCanceledException as cancelled -> raise cancelled
+                        | _ -> report "activationRefused" candidateId
+
+                    let previous = recoveryCursor.Value
+                    recoveryCursor.Value <- page.Continuation
+                    recoveryPaging <- not (isNull page.Continuation) && page.Continuation <> previous
+
             return
                 {
                     Started = started
@@ -589,6 +673,47 @@ module internal Dispatcher =
                     QueuedAgent = queuedAgent
                 }
         }
+
+    let passOnceRoutedWithCursorAsync
+        validateRoute
+        store
+        eventStore
+        eraMarked
+        tenant
+        sessions
+        dispatcher
+        resolve
+        clock
+        ct
+        cursor
+        =
+        passOnceRoutedWithCursorAndLogAsync
+            validateRoute
+            store
+            eventStore
+            eraMarked
+            tenant
+            sessions
+            dispatcher
+            resolve
+            clock
+            ct
+            cursor
+            NullLogger.Instance
+
+    let passOnceRoutedAsync validateRoute store eventStore eraMarked tenant sessions dispatcher resolve clock ct =
+        passOnceRoutedWithCursorAsync
+            validateRoute
+            store
+            eventStore
+            eraMarked
+            tenant
+            sessions
+            dispatcher
+            resolve
+            clock
+            ct
+            (ref null)
 
     let passOnceAsync store eventStore eraMarked tenant sessions dispatcher resolve clock ct =
         passOnceRoutedAsync
@@ -636,19 +761,13 @@ type internal DispatcherService
         ArgumentNullException.ThrowIfNull(timeProvider)
         ArgumentNullException.ThrowIfNull(delay)
 
-    let log: ILogger = NullLogger.Instance :> ILogger
+    let log: ILogger =
+        match serviceProvider.GetService<ILogger<DispatcherService>>() with
+        | null -> NullLogger.Instance :> ILogger
+        | logger -> logger
+
     let lifetime = new CancellationTokenSource()
     let mutable loop: Task | null = null
-
-    /// Resolves the locally scoped sweep tenant: the facade client's tenant
-    /// when one is registered, else the default single-tenant id. The sweep
-    /// stays tenant-scoped with no new store API by covering exactly the
-    /// tenant this node serves.
-    /// <returns>The tenant whose sessions to sweep.</returns>
-    member private _.SweepTenant() : TenantId =
-        match serviceProvider.GetService<SessionClientOptions>() with
-        | null -> TenantId.Default
-        | clientOptions -> clientOptions.Tenant
 
     /// The dispatcher knobs, falling back to the defaults when the options
     /// root or section is missing.
@@ -661,59 +780,65 @@ type internal DispatcherService
         else
             legateOptions.Dispatcher
 
-    /// The session knobs, falling back to the defaults when the options
-    /// root or section is missing.
-    /// <returns>The session knobs the gate enforces.</returns>
-    member private _.SessionKnobs() : SessionsOptions =
-        let legateOptions = options.Value
-
-        if isNull (box legateOptions) || isNull (box legateOptions.Sessions) then
-            SessionsOptions()
-        else
-            legateOptions.Sessions
-
     /// Runs one full cycle: drains the coalesced wakes (the sweep that
     /// follows covers them authoritatively) and runs the poll pass.
     /// <param name="cancellationToken">Abandons the cycle.</param>
     /// <returns>What the pass woke and what stayed queued.</returns>
-    member internal this.RunOnceAsync(cancellationToken: CancellationToken) : Task<Dispatcher.DispatchPassResult> =
+    member internal _.RunOnceAsync(cancellationToken: CancellationToken) : Task<Dispatcher.DispatchPassResult> =
         task {
-            let store = serviceProvider.GetRequiredService<ISessionStore>()
-            let eventStore = serviceProvider.GetRequiredService<ISessionEventStore>()
-            let client = serviceProvider.GetRequiredService<SessionClient>()
             let sink = serviceProvider.GetRequiredService<DispatcherWakeSink>()
-            let tenant = this.SweepTenant()
-
-            // Completion era (issue 289): the gate the orphan sweep reads;
-            // an absent (or reader-less) registration reads pre-era quiet.
-            let eraMarked: CompletionEra.CompletionEraReader =
-                match serviceProvider.GetService<CompletionEra.CompletionEraGate>() with
-                | null -> CompletionEra.preEraGate.Reader
-                | gate when isNull (box gate.Reader) -> CompletionEra.preEraGate.Reader
-                | gate -> gate.Reader
-
             sink.TakePending() |> ignore
+            let contexts = serviceProvider.GetRequiredService<ISessionHostContexts>()
+            let mutable total = Dispatcher.emptyResult
 
-            let resolve (sessionId: SessionId) (candidateToken: CancellationToken) : Task<IActorRef> =
-                client.Resolve(sessionId, candidateToken)
+            for context in contexts.All do
+                cancellationToken.ThrowIfCancellationRequested()
 
-            return!
-                Dispatcher.passOnceRoutedAsync
-                    (fun session ->
-                        try
-                            client.ValidateCompletionRoute session
-                            true
-                        with :? CompletionRoutingException ->
-                            false)
-                    store
-                    eventStore
-                    eraMarked
-                    tenant
-                    (this.SessionKnobs())
-                    (this.DispatcherKnobs())
-                    resolve
-                    timeProvider
-                    cancellationToken
+                try
+                    contexts.Get(context.Tenant) |> ignore
+
+                    let! result =
+                        context.WorkTracker.Track(fun () ->
+                            let client = context.Client.Value :?> SessionClient
+                            let inputs = context.Background
+
+                            Dispatcher.passOnceRoutedWithCursorAndLogAsync
+                                (fun session ->
+                                    try
+                                        client.ValidateCompletionRoute session
+                                        true
+                                    with :? CompletionRoutingException ->
+                                        false)
+                                context.Store
+                                context.EventStore
+                                inputs.EraMarked
+                                context.Tenant
+                                inputs.Sessions
+                                inputs.Dispatcher
+                                (fun id token -> client.Resolve(id, token))
+                                inputs.Clock
+                                cancellationToken
+                                inputs.RecoveryCursor
+                                log)
+
+                    total <-
+                        {
+                            Started = total.Started + result.Started
+                            QueuedProcess = total.QueuedProcess + result.QueuedProcess
+                            QueuedTenant = total.QueuedTenant + result.QueuedTenant
+                            QueuedAgent = total.QueuedAgent + result.QueuedAgent
+                        }
+
+                    log.LogDebug("Dispatch graph sweep completed for {Tenant}.", context.Tenant)
+                with
+                | :? OperationCanceledException as cancelled -> raise cancelled
+                | _ ->
+                    log.LogWarning(
+                        "Dispatch graph sweep refused or failed for {Tenant}; retry next cycle.",
+                        context.Tenant
+                    )
+
+            return total
         }
 
     /// The tick interval for the loop: the configured poll interval when it
@@ -743,8 +868,7 @@ type internal DispatcherService
                     ()
                 with
                 | :? OperationCanceledException -> running <- false
-                | failed ->
-                    log.LogWarning("Dispatch pass failed and will retry next interval: {Reason}", failed.Message)
+                | _ -> log.LogWarning("Dispatch pass failed and will retry next interval.")
 
                 if running && not lifetime.Token.IsCancellationRequested then
                     try

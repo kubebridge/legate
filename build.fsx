@@ -413,6 +413,16 @@ Target.create "SmokeSamples" (fun _ ->
     dotTuiFallbackSmoke ()
     dotTuiHeadlessSmoke ())
 
+// Owns its loopback HTTP process and proves approval/settlement plus graceful stop.
+Target.create "SmokeWebHost" (fun _ ->
+    let python =
+        if System.OperatingSystem.IsWindows() then
+            "python"
+        else
+            "python3"
+
+    run (createProcess python) [ "samples/CSharpWebHost/smoke.py" ] rootPath)
+
 // Produces Release NuGet packages for every packable project into ./artifacts.
 // Builds in Release itself, so it does not depend on the Debug Build target.
 Target.create "Pack" (fun _ ->
@@ -452,6 +462,8 @@ open Fake.Core.TargetOperators
 "Clean" ==> "Restore" ==> "Build" ==> "Test"
 
 "Build" ==> "SmokeSamples"
+
+"Build" ==> "SmokeWebHost"
 
 "Restore" ==> "Pack"
 

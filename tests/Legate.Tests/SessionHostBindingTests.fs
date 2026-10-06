@@ -12,9 +12,10 @@ open Legate.Testing
 open Microsoft.Extensions.AI
 open Microsoft.Extensions.DependencyInjection
 open Microsoft.Extensions.Hosting
+open Microsoft.Extensions.Options
 open Xunit
 
-let private executionProvider tenant =
+let private executionServices tenant =
     let services = ServiceCollection()
     services.AddLegate() |> ignore
     let database = InMemoryDatabase()
@@ -69,13 +70,85 @@ let private executionProvider tenant =
     )
     |> ignore
 
-    services.BuildServiceProvider(ServiceProviderOptions(ValidateScopes = true))
+    services
+
+let private executionProvider tenant =
+    (executionServices tenant).BuildServiceProvider(ServiceProviderOptions(ValidateScopes = true))
 
 let private localService (provider: IServiceProvider) =
     provider.GetServices<IHostedService>()
     |> Seq.pick (function
         | :? LocalActorSystemService as local -> Some local
         | _ -> None)
+
+[<Fact>]
+let ``issue415 background passes never resolve request scoped facade`` () =
+    task {
+        let services = executionServices TenantId.Default
+
+        services.AddScoped<SessionClient>(
+            Func<IServiceProvider, SessionClient>(fun _ -> invalidOp "No request context")
+        )
+        |> ignore
+
+        use provider =
+            services.BuildServiceProvider(ServiceProviderOptions(ValidateScopes = true))
+
+        do! provider.GetRequiredService<ISessionHostContexts>().InitializeAsync(CancellationToken.None)
+        let options = provider.GetRequiredService<IOptions<LegateOptions>>()
+        let delay = provider.GetRequiredService<ILlmDelay>()
+        let dispatcher = DispatcherService(provider, options, TimeProvider.System, delay)
+        let! pass = dispatcher.RunOnceAsync(CancellationToken.None)
+        Assert.Equal(0, pass.Started)
+
+        let schedules =
+            ScheduleEvaluatorService(provider, options, TimeProvider.System, delay)
+
+        let! fired = schedules.RunOnceAsync(CancellationToken.None)
+        Assert.Equal(0, fired)
+    }
+
+[<Fact>]
+let ``issue415 receiving only root sweeps all initialized borrowed graphs without root execution defaults`` () =
+    task {
+        let a, b = TenantId.Create "background-a", TenantId.Create "background-b"
+        use graphA = executionProvider a
+        use graphB = executionProvider b
+        let services = ServiceCollection()
+        services.AddLegate() |> ignore
+
+        services.AddLegateSessionBinding(
+            SessionHostBinding(a, Func<IServiceProvider, IServiceProvider>(fun _ -> graphA))
+        )
+        |> ignore
+
+        services.AddLegateSessionBinding(
+            SessionHostBinding(b, Func<IServiceProvider, IServiceProvider>(fun _ -> graphB))
+        )
+        |> ignore
+
+        use node =
+            services.BuildServiceProvider(ServiceProviderOptions(ValidateScopes = true))
+
+        let contexts = node.GetRequiredService<ISessionHostContexts>()
+        do! contexts.InitializeAsync(CancellationToken.None)
+        Assert.Null(node.GetService<ISessionStore>())
+
+        let dispatcher =
+            DispatcherService(
+                node,
+                node.GetRequiredService<IOptions<LegateOptions>>(),
+                TimeProvider.System,
+                node.GetRequiredService<ILlmDelay>()
+            )
+
+        let! result = dispatcher.RunOnceAsync(CancellationToken.None)
+        Assert.Equal(0, result.Started)
+        Assert.Equal(2, contexts.All.Length)
+        contexts.CloseAdmission()
+        let! stopped = dispatcher.RunOnceAsync(CancellationToken.None)
+        Assert.Equal(0, stopped.Started)
+    }
 
 [<Fact>]
 let ``issue395 initialization is single flight and client access is read only`` () =
@@ -121,6 +194,175 @@ let ``issue395 initialization is single flight and client access is read only`` 
         execution.GetRequiredService<SessionClientOptions>().Tenant <- TenantId.Create "retarget"
         Assert.Equal(tenant, binding.Client.Tenant)
         Assert.Equal(tenant, contexts.Get(tenant).Tenant)
+    }
+
+[<Theory>]
+[<InlineData("test/facade", "test/config", "test/facade")>]
+[<InlineData(null, "test/config", "test/config")>]
+[<InlineData(null, null, "test/test")>]
+let ``issue415 model preparation finalizes private copies with exact priority``
+    (facade: string)
+    (configured: string)
+    expected
+    =
+    let services = executionServices TenantId.Default
+    let hostOptions = SessionClientOptions(DefaultModel = facade)
+    services.AddSingleton(hostOptions) |> ignore
+
+    services.Configure<LegateOptions>(Action<LegateOptions>(fun o -> o.Llm.DefaultModel <- configured))
+    |> ignore
+
+    use provider = services.BuildServiceProvider()
+    let prepared = SessionClientWiring.prepareOptions provider
+    Assert.Equal(expected, prepared.Client.DefaultModel)
+    Assert.Equal(facade, hostOptions.DefaultModel)
+    Assert.Equal(configured, provider.GetRequiredService<IOptions<LegateOptions>>().Value.Llm.DefaultModel)
+    hostOptions.DefaultModel <- "test/retarget"
+    Assert.Equal(expected, prepared.Client.DefaultModel)
+
+[<Fact>]
+let ``issue415 invalid winning default fails without modifying host options`` () =
+    let services = executionServices TenantId.Default
+    let options = SessionClientOptions(DefaultModel = "not-qualified")
+    services.AddSingleton(options) |> ignore
+    use provider = services.BuildServiceProvider()
+
+    Assert.Throws<InvalidOperationException>(fun () -> SessionClientWiring.prepareOptions provider |> ignore)
+    |> ignore
+
+    Assert.Equal("not-qualified", options.DefaultModel)
+
+[<Fact>]
+let ``issue415 explicit client with multiple providers keeps legacy fallback`` () =
+    let services = executionServices TenantId.Default
+
+    services.AddSingleton<ILlmProvider>(
+        { new ILlmProvider with
+            member _.Id = "other"
+            member _.DefaultModel = "other"
+
+            member _.Capabilities =
+                {
+                    Streaming = false
+                    Reasoning = false
+                    ToolCalling = false
+                }
+
+            member _.CreateChatClient(_, _) =
+                failwith "Must preserve explicit client."
+        }
+    )
+    |> ignore
+
+    use provider = services.BuildServiceProvider()
+    let prepared = SessionClientWiring.prepareOptions provider
+    Assert.Equal(Agents.AgentFileParser.defaultModel.Value, prepared.Client.DefaultModel)
+
+[<Fact>]
+let ``issue415 factory lookup never rebinds validates or disposes graphs and closes on stop`` () =
+    task {
+        let a, b = TenantId.Create "a", TenantId.Create "b"
+        use graphA = executionProvider a
+        use graphB = executionProvider b
+        let mutable binds = 0
+        let mutable checks = 0
+        let services = ServiceCollection()
+
+        services.AddLegate(
+            Action<LegateBuilder>(fun builder ->
+                builder.AddExecutionValidation(
+                    Action<IServiceProvider, ClusterMode>(fun graph mode ->
+                        Assert.Equal(ClusterMode.Local, mode)
+                        Assert.True(Object.ReferenceEquals(graph, graphA) || Object.ReferenceEquals(graph, graphB))
+                        Interlocked.Increment(&checks) |> ignore)
+                )
+                |> ignore)
+        )
+        |> ignore
+
+        for tenant, graph in [ a, graphA; b, graphB ] do
+            services.AddLegateSessionBinding(
+                SessionHostBinding(
+                    tenant,
+                    Func<IServiceProvider, IServiceProvider>(fun _ ->
+                        Interlocked.Increment(&binds) |> ignore
+                        graph)
+                )
+            )
+            |> ignore
+
+        use node = services.BuildServiceProvider()
+        let factory = node.GetRequiredService<ISessionClientFactory>()
+
+        Assert.Throws<InvalidOperationException>(fun () -> factory.GetClient(a) |> ignore)
+        |> ignore
+
+        let contexts = node.GetRequiredService<ISessionHostContexts>()
+        do! contexts.InitializeAsync(CancellationToken.None)
+        Assert.Equal(2, binds)
+        Assert.Equal(2, checks)
+        Assert.NotSame(factory.GetClient(a), factory.GetClient(b))
+        Assert.Same(factory.GetClient(a), factory.GetClient(a))
+        Assert.Equal("test/test", factory.GetClient(a).AutoTitle.Value.FacadeDefaultModel)
+        Assert.Null(graphA.GetRequiredService<SessionClientOptions>().DefaultModel)
+        contexts.CloseAdmission()
+
+        let error =
+            Assert.Throws<SessionScopeRejectedException>(fun () -> factory.GetClient(a) |> ignore)
+
+        Assert.Equal(SessionScopeRejectionReason.NodeStopping, error.Reason)
+        Assert.Equal(2, binds)
+        Assert.Equal(2, checks)
+    }
+
+[<Fact>]
+let ``issue415 incompatible later graph publishes none and never assembles event buses`` () =
+    task {
+        let a, b = TenantId.Create "a", TenantId.Create "b"
+        let servicesA = executionServices a
+        let servicesB = executionServices b
+
+        servicesB.AddSingleton<ISessionEventStore>(InMemorySessionEventStore(InMemoryDatabase()))
+        |> ignore
+
+        let mutable buses = 0
+
+        for services in [ servicesA; servicesB ] do
+            services.AddSingleton<SessionEventBus>(
+                Func<IServiceProvider, SessionEventBus>(fun _ ->
+                    Interlocked.Increment(&buses) |> ignore
+                    failwith "Must not assemble a bus.")
+            )
+            |> ignore
+
+        use graphA = servicesA.BuildServiceProvider()
+        use graphB = servicesB.BuildServiceProvider()
+
+        let first =
+            SessionHostBinding(a, Func<IServiceProvider, IServiceProvider>(fun _ -> graphA))
+
+        let second =
+            SessionHostBinding(b, Func<IServiceProvider, IServiceProvider>(fun _ -> graphB))
+
+        let services = ServiceCollection()
+
+        services.AddLegate().AddLegateSessionBinding(first).AddLegateSessionBinding(second)
+        |> ignore
+
+        use node = services.BuildServiceProvider()
+        let contexts = node.GetRequiredService<ISessionHostContexts>()
+
+        let! error =
+            Assert.ThrowsAsync<InvalidOperationException>(fun () -> contexts.InitializeAsync(CancellationToken.None))
+
+        Assert.Contains("incompatible", error.Message)
+        Assert.Empty(contexts.All)
+        Assert.Equal(0, buses)
+
+        Assert.Throws<InvalidOperationException>(fun () -> first.Client |> ignore)
+        |> ignore
+
+        Assert.Null(graphA.GetRequiredService<SessionClientOptions>().DefaultModel)
     }
 
 [<Fact>]

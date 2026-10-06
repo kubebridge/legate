@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <IsPackable>false</IsPackable><IsTestProject>true</IsTestProject><ImplicitUsings>enable</ImplicitUsings>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+  </PropertyGroup>
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <ProjectReference Include="../../src/Legate.AspNetCore/Legate.AspNetCore.fsproj" />
+    <ProjectReference Include="../../src/Legate.Llm.OpenAI/Legate.Llm.OpenAI.fsproj" />
+    <ProjectReference Include="../../src/Legate.Storage.Postgres/Legate.Storage.Postgres.fsproj" />
+    <PackageReference Include="Microsoft.AspNetCore.TestHost" />
+    <PackageReference Include="Microsoft.Extensions.TimeProvider.Testing" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="xunit" /><PackageReference Include="xunit.runner.visualstudio"><PrivateAssets>all</PrivateAssets></PackageReference>
+  </ItemGroup>
+  <Target Name="ExtractBuildPage" BeforeTargets="CoreCompile">
+    <Exec Command="dotnet fsi &quot;../../.build/ExtractBuildPage.fsx&quot; &quot;../../site/build.html&quot; &quot;$(IntermediateOutputPath)BuildPageFixture.g.cs&quot;" />
+    <ItemGroup><Compile Include="$(IntermediateOutputPath)BuildPageFixture.g.cs" /></ItemGroup>
+  </Target>
+</Project>

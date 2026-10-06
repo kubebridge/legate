@@ -69,7 +69,8 @@ lazy access that throws. Binding and facade assembly perform no lazy writes.
 
 Each binding provider must register `SessionClientOptions` with the same
 tenant, `ILlmProvider`, `IChatClient`, `ISessionStore` implementing
-`ISessionAbortControlStore`, `ISessionEventStore`, `IWorkspaceRuntime`, and
+`ISessionAbortControlStore`, compatible `ISessionSettlementStore` (explicit or
+implemented by that store), `ISessionEventStore`, `IWorkspaceRuntime`, and
 the tenant's tools, permission policy, model policy, and other execution
 dependencies. Explicit bindings suppress the default binding. The default
 self-binding is used only when there are no explicit bindings and the host
@@ -87,6 +88,31 @@ cannot retarget a descriptor, add or remove bindings, replace providers, or
 reuse a descriptor on another node lifetime. A restarted node gets fresh
 binding descriptors. `SessionHostBinding` is ordinary ownership for the root
 self-binding, so shutdown must not double-dispose it.
+
+`ISessionClientFactory.GetClient(tenant)` reads the initialized registry without
+building providers or scopes. It fails before startup, for undeclared tenants and
+once admission closes. ASP.NET Core middleware uses this factory to install an
+immutable request feature for scoped `SessionClient`. Runtime dispatcher/schedule
+workers use initialized graph-local context clients and private frozen inputs,
+not request services or a receiving-only node's root execution defaults.
+
+Preparation copies runtime/client options before validation, finalizing default
+model priority as facade, Llm, usable sole-provider default, then legacy fallback.
+Host-owned options are never normalized in place. Composition validators registered
+with `AddExecutionValidation` run read-only once per graph with actual node mode,
+before any assembly/publication. Compatibility is atomic wiring, not evidence of
+backend sharing or durability. The ASP.NET adapter refuses its implicit ephemeral
+pair/workspace in cluster mode but accepts explicitly chosen compatible providers.
+
+The authoritative dispatcher independently discovers Running/current-turn keys
+with finite keyset continuation, retaining progress between bounded wake passes so
+front-of-list live owners cannot starve later candidates. Existing Running slots
+do not consume new-work admission twice. Discovery validates tenant/lifecycle/
+control/completion routing and sends the existing check-inbox command. Only the
+execution factory and `TryRecoverControlTarget` mint fresh authority for the exact
+unstopped target after expiry. No recovery reset, bootstrap takeover, protocol or
+schema change grants authority; losing owners remain fenced. Stops and
+terminal-pending barriers remain refused and early lease refusals retry later.
 
 This is the intended C# composition shape. The host constructs the independent
 providers before registering the node bindings, and keeps ownership of them:
@@ -410,7 +436,9 @@ protected and must never be logged.
 Legate.Abstractions         contracts: domain types, store/tool/workspace/policy interfaces
                             deps: FSharp.Core, Microsoft.Extensions.AI.Abstractions (no Akka)
 Legate                      runtime: actors, sharding, dispatcher, ReAct loop, built-in tools,
-                            local LLM coordinator, hosted services, AddLegate()
+                             local LLM coordinator, hosted services, AddLegate()
+Legate.AspNetCore           configuration-aware registration, local profile, tenant request binding
+                            deps: Legate, Storage.InMemory, Workspace.Process, ASP.NET Core
 Legate.Llm.OpenAI           OpenAI, Anthropic (OpenAI-compatible), Ollama Cloud, any compatible base URL
 Legate.Llm.Google           Gemini via Google.GenAI
 Legate.Storage.Postgres     ISessionStore, ISessionEventStore, IAgentStore (migrations shared, see below)
@@ -428,8 +456,7 @@ Legate.Mcp                  IToolSource over the ModelContextProtocol SDK
 Legate.Testing              fakes, clock/delay/random seams, scripted IChatClient
 ```
 
-Only `Legate.Abstractions`, `Legate`, and `Legate.Tests` exist today. New
-packages are added under `src/<PackageName>/` with a matching test module in
+Packages are added under `src/<PackageName>/` with a matching test module in
 `tests/Legate.Tests` (or their own `tests/<PackageName>.Tests` when they need
 external services), registered in `Legate.slnx`, and versioned through
 `Directory.Packages.props`.

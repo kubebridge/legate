@@ -589,7 +589,7 @@ module internal JournalWriter =
     /// <param name="tenant">The tenant the session belongs to.</param>
     /// <param name="sessionId">The session whose journal appended.</param>
     /// <param name="stamped">The stamped events, in append order.</param>
-    let private notifyPublished
+    let internal notifyPublished
         (tenant: TenantId)
         (sessionId: SessionId)
         (stamped: IReadOnlyList<SessionEvent>)

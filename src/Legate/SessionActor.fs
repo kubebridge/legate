@@ -3556,6 +3556,261 @@ module internal SessionActor =
             with _ ->
                 ()
 
+        /// Explicit graph settlement takes priority over the unified-store fallback.
+        let settlementStore: ISessionSettlementStore option =
+            match props.Settlement with
+            | Some capable -> Some capable
+            | None ->
+                match props.Store with
+                | :? ISessionSettlementStore as capable -> Some capable
+                | _ -> None
+
+        let notifySettled (result: TurnResult) : unit =
+            match props.OnTurnSettled with
+            | Some observe ->
+                try
+                    observe result
+                with _ ->
+                    ()
+            | None -> ()
+
+        let notifyPosition (position: int64) : unit =
+            try
+                PromptWaitHubs.NotifyPositionScoped props.Tenant props.SessionId position
+            with _ ->
+                ()
+
+        /// Startup failure uses the same original association and renewed prime
+        /// as resume. No fault or refusal permits the legacy cleanup path.
+        let failRecoveredTurn (entry: InboxEntry) : SessionSettlementOutcome =
+            let refuse () =
+                raise (
+                    InvalidSessionStateException(
+                        props.SessionId,
+                        "recoverySettlementUnavailable",
+                        "Crash settlement refused authority or committed disposition."
+                    )
+                )
+
+            let safe operation =
+                try
+                    operation ()
+                with _ ->
+                    refuse ()
+
+            match suspend.Recovery, settlementStore, controlStore with
+            | null, _, _
+            | _, None, _
+            | _, _, None -> refuse ()
+            | recovery, Some capable, Some control ->
+                let claim = recovery.Claim
+                let target = recovery.Target
+
+                if isNull (box claim) || isNull (box target) || isNull (box recovery.Entry) then
+                    refuse ()
+
+                let claim = unbox<TurnClaim> (box claim)
+                let target = unbox<AbortTarget> (box target)
+                let original = unbox<InboxEntry> (box recovery.Entry)
+
+                if
+                    recovery.Outcome <> ControlOperationOutcome.Applied
+                    || original.SessionId <> props.SessionId
+                    || target.SessionId <> props.SessionId
+                    || original.Position <> entry.Position
+                    || target.InboxPosition <> entry.Position
+                    || target.TurnId <> entry.TurnId
+                then
+                    refuse ()
+
+                if
+                    not (
+                        safe (fun () ->
+                            awaitTask (
+                                capable.AdmitExecution(
+                                    props.Tenant,
+                                    props.SessionId,
+                                    entry.Position,
+                                    claim,
+                                    CancellationToken.None
+                                )
+                            ))
+                    )
+                then
+                    refuse ()
+
+                let candidate =
+                    {
+                        AssistantText = ""
+                        Status = TurnStatus.Failed
+                        Iterations = 0
+                        Usage = { InputTokens = 0L; OutputTokens = 0L }
+                        Outcome = TurnFailed(CrashFailReason) :> TurnOutcome
+                    }
+
+                let _, _, decisionId = controlReports[entry.Position]
+
+                let holdsAuthority () =
+                    try
+                        match awaitTask (props.Store.VerifyClaim(props.Tenant, claim, CancellationToken.None)) with
+                        | :? TurnLeaseHeld
+                        | :? TurnLeaseRenewed -> true
+                        | _ -> false
+                    with _ ->
+                        false
+
+                let decide () =
+                    awaitTask (
+                        control.TryDecideControlTarget(
+                            props.Tenant,
+                            props.SessionId,
+                            target.TurnId,
+                            entry.Position,
+                            claim,
+                            decisionId,
+                            candidate.Status,
+                            Nullable(),
+                            null,
+                            CancellationToken.None
+                        )
+                    )
+
+                let decided =
+                    try
+                        decide ()
+                    with _ ->
+                        if holdsAuthority () then safe decide else refuse ()
+
+                let selected =
+                    match decided.Outcome, decided.Decision with
+                    | (ControlOperationOutcome.Applied | ControlOperationOutcome.AlreadyDecided), evidence when
+                        not (isNull (box evidence))
+                        ->
+                        let evidence = unbox<ControlTargetDecision> (box evidence)
+
+                        if
+                            evidence.SessionId <> props.SessionId
+                            || evidence.TurnId <> target.TurnId
+                            || evidence.InboxPosition <> entry.Position
+                            || evidence.DecisionId <> decisionId
+                            || evidence.ProposedStatus <> candidate.Status
+                            || evidence.ProposedCause.HasValue
+                            || not (isNull evidence.ProposedReason)
+                            || evidence.Retired
+                        then
+                            refuse ()
+
+                        if evidence.Status = TurnStatus.Aborted && evidence.Cause.HasValue then
+                            { candidate with
+                                Status = TurnStatus.Aborted
+                                Outcome =
+                                    TurnAborted(
+                                        evidence.Cause.Value,
+                                        evidence.Reason |> Option.ofObj |> Option.defaultValue ""
+                                    )
+                                    :> TurnOutcome
+                            }
+                        elif evidence.Status = TurnStatus.Failed then
+                            candidate
+                        else
+                            refuse ()
+                    | _ -> refuse ()
+
+                let terminal: SessionEvent =
+                    match selected.Outcome with
+                    | :? TurnAborted as stop ->
+                        TurnAbortedEvent(
+                            props.SessionId,
+                            target.TurnId,
+                            Nullable(),
+                            clock.GetUtcNow(),
+                            stop.Cause,
+                            stop.Reason
+                        )
+                    | _ ->
+                        TurnFailedEvent(props.SessionId, target.TurnId, Nullable(), clock.GetUtcNow(), CrashFailReason)
+
+                let request =
+                    SessionSettlementRequest(
+                        props.SessionId,
+                        entry.Position,
+                        claim,
+                        Nullable target.TurnId,
+                        selected,
+                        mintCompletionKey (),
+                        terminal
+                    )
+
+                // A lost response may conceal a commit. Retry only this exact
+                // request, once, while the captured prime still holds authority.
+                let outcome =
+                    try
+                        awaitTask (capable.SettleExecution(props.Tenant, request, CancellationToken.None))
+                    with _ ->
+                        if holdsAuthority () then
+                            safe (fun () ->
+                                awaitTask (capable.SettleExecution(props.Tenant, request, CancellationToken.None)))
+                        else
+                            refuse ()
+
+                if
+                    (outcome.Status <> SessionSettlementStatus.Applied
+                     && outcome.Status <> SessionSettlementStatus.AlreadyApplied)
+                    || isNull (box outcome.Result)
+                then
+                    refuse ()
+
+                let winner = unbox<TurnResult> (box outcome.Result)
+
+                if outcome.Status = SessionSettlementStatus.Applied then
+                    JournalWriter.notifyPublished props.Tenant props.SessionId outcome.Events
+                    notifySettled winner
+                    notifyPosition entry.Position
+
+                    match outcome.JournalReason, props.Logger with
+                    | null, _
+                    | _, null -> ()
+                    | _, logger -> logger.LogWarning("Crash settlement committed without its optional journal event.")
+
+                // Settlement keeps the decided prime until retirement. A read
+                // of a receipt alone never authorizes this cleanup.
+                let retired =
+                    safe (fun () ->
+                        awaitTask (
+                            control.RetireControlTarget(
+                                props.Tenant,
+                                props.SessionId,
+                                target.TurnId,
+                                entry.Position,
+                                claim,
+                                decisionId,
+                                CancellationToken.None
+                            )
+                        ))
+
+                if retired.Outcome <> ControlOperationOutcome.Applied then
+                    refuse ()
+
+                completedControlReports.Add decisionId |> ignore
+
+                if isNull (box outcome.Following) then
+                    match
+                        safe (fun () ->
+                            awaitTask (
+                                props.Store.SettleTurn(
+                                    props.Tenant,
+                                    claim,
+                                    winner.Status,
+                                    winner.Outcome,
+                                    CancellationToken.None
+                                )
+                            ))
+                    with
+                    | :? TurnSettled -> controlPrime <- None
+                    | _ -> refuse ()
+
+                outcome
+
         let failInterruptedTurn (liveId: TurnId option) (entryOpt: InboxEntry option) : unit =
             let candidate =
                 {
@@ -3896,6 +4151,17 @@ module internal SessionActor =
                     match crashKnobOf session with
                     | OnCrashResume.FailAttempt ->
                         match drainable with
+                        | Some entry when not (isNull (box suspend.Recovery)) ->
+                            let committed = failRecoveredTurn entry
+                            committed.State, None, (committed.Following |> Option.ofObj)
+                        | _ when suspend.PrimeClaim.IsSome ->
+                            raise (
+                                InvalidSessionStateException(
+                                    props.SessionId,
+                                    "recoveryAssociationUnavailable",
+                                    "Crash settlement requires its original provider association."
+                                )
+                            )
                         | Some _ ->
                             failInterruptedTurn liveId drainable
                             SessionState.Idle, None, None
@@ -4138,29 +4404,6 @@ module internal SessionActor =
                     Usage = { InputTokens = 0L; OutputTokens = 0L }
                     Outcome = TurnFailed(reason) :> TurnOutcome
                 }
-
-        let notifySettled (result: TurnResult) : unit =
-            match props.OnTurnSettled with
-            | Some observe ->
-                try
-                    observe result
-                with _ ->
-                    ()
-            | None -> ()
-
-        /// Wakes the per-operation live-hint observers for one settled
-        /// inbox position (issue 383): each observer re-reads the durable
-        /// row, so the hint is never a verdict. Guarded like notifySettled:
-        /// a missed or duplicate hint only costs a re-read, and observers
-        /// that miss it converge by polling. Fires on every settle site with
-        /// an entry in scope, including legacy paths that commit no
-        /// settlement row (their observers keep polling until the bound).
-        /// <param name="position">The immutable per-session inbox position.</param>
-        let notifyPosition (position: int64) : unit =
-            try
-                PromptWaitHubs.NotifyPositionScoped props.Tenant props.SessionId position
-            with _ ->
-                ()
 
         /// Settles a turn whose suspend/resolve journal write never landed
         /// as Failed with the typed reason: parking or resuming would strand
@@ -5178,27 +5421,6 @@ module internal SessionActor =
                 |> ignore
 
                 SessionState.Idle
-
-        /// Resolves the atomic terminal settlement capability the suspendable
-        /// settle path commits through (issues 363, 383): the
-        /// container-registered capability the spawn factory threaded into
-        /// the props, else the store itself when the composition unifies
-        /// them (InMemory). Split compositions (SQLite, Postgres) register
-        /// a separate settlement service the store-cast alone never sees:
-        /// without the threaded capability the actor settles legacy
-        /// store-first and commits no execution_settlements row, so
-        /// receipt-bound waits poll until their bound. None only for direct
-        /// test constructions over a bare ISessionStore that never
-        /// registered the capability; production activation always carries
-        /// it.
-        /// <returns>The settlement capability, or None when absent.</returns>
-        let settlementStore: ISessionSettlementStore option =
-            match props.Settlement with
-            | Some capable -> Some capable
-            | None ->
-                match props.Store with
-                | :? ISessionSettlementStore as capable -> Some capable
-                | _ -> None
 
         /// Resolves the captured claim authority one suspendable entry
         /// executes under (issue 363): the per-entry bound claim when the
@@ -6662,11 +6884,20 @@ module internal SessionActor =
 
                         match selectDrainableEntries pending with
                         | first :: _ ->
+                            // A settled Idle child has released its prime. Claim
+                            // the pending entry through the existing provider path,
+                            // retaining this original envelope for the start below.
+                            if currentTurnSnapshot().IsNone && suspend.ReprimeJournal.IsSome then
+                                match reprimeNow () with
+                                | Some fresh -> swapJournal fresh
+                                | None -> ()
                             // The per-turn authority gate runs at this Idle
                             // wake boundary too: authorized entries run,
                             // refused ones settle Failed without ever invoking
                             // the runner and the drain moves on.
                             match checkAgentAuthority () with
+                            | None when suspend.ReprimeJournal.IsSome && controlPrime.IsNone ->
+                                return! loop state suspended resolved
                             | None ->
                                 awaitTask (
                                     props.Store.UpdateSessionState(
@@ -6689,6 +6920,15 @@ module internal SessionActor =
             }
 
         match initialState, initialResumeEntry with
+        | SessionState.Running, Some entry when
+            not (isNull (box suspend.Recovery))
+            && entry.Position
+               <> (unbox<InboxEntry> (box (unbox<ControlTargetRecovery> (box suspend.Recovery)).Entry)).Position
+            ->
+            // Atomic crash failure chose fresh following work, not a replay
+            // of the failed entry. Existing admission owns its real turn.
+            startSuspendable entry 1 (readGrantsNow ()) None
+            loop SessionState.Running None (HashSet<string>())
         | SessionState.Running, Some entry ->
             // Crash resume: the interrupted turn restarts as a new attempt
             // under the fresh spawn-primed journal token (old-attempt events
@@ -7361,11 +7601,21 @@ module internal SessionActor =
                     let bootstrap =
                         UserMessagePayload(UserMessage.Text "legate journal prime") :> InboxPayload
 
-                    store
-                        .AppendInboxMessage(tenant, sessionId, bootstrap, DeliveryMode.Queue, CancellationToken.None)
-                        .GetAwaiter()
-                        .GetResult()
-                    |> ignore
+                    let pending =
+                        store.ReadPendingInbox(tenant, sessionId, CancellationToken.None).GetAwaiter().GetResult()
+
+                    if isNull (box pending) || pending.Count = 0 then
+                        store
+                            .AppendInboxMessage(
+                                tenant,
+                                sessionId,
+                                bootstrap,
+                                DeliveryMode.Queue,
+                                CancellationToken.None
+                            )
+                            .GetAwaiter()
+                            .GetResult()
+                        |> ignore
 
                     match
                         store

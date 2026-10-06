@@ -1110,6 +1110,16 @@ type private TestSessionContexts
             WorkTracker = new ExecutionWorkTracker()
             Spawn = fun _ _ _ -> Unchecked.defaultof<IActorRef>
             Client = lazy (Unchecked.defaultof<obj>)
+            Background =
+                {
+                    Sessions = SessionsOptions()
+                    Dispatcher = DispatcherOptions()
+                    Clock = TimeProvider.System
+                    Delay = SystemLlmDelay() :> ILlmDelay
+                    EraMarked = CompletionEra.preEraGate.Reader
+                    Agents = null
+                    RecoveryCursor = ref null
+                }
         }
 
     interface ISessionHostContexts with

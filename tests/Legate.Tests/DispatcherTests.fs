@@ -105,6 +105,121 @@ type private RecordingResolve() =
             lock gate (fun () -> resolved.Add(sessionId))
             Task.FromResult(ActorRefs.Nobody :> IActorRef)
 
+[<Fact>]
+let ``issue415 Running consumed target discovery wakes without replacing authority at full capacity`` () =
+    task {
+        let clock = TestClock()
+        let database = InMemoryDatabase(clock)
+        let store = InMemoryStoreFactory.sessionStore database
+        let journal = InMemoryStoreFactory.eventStore database
+        let session = createSession store (AgentId.New())
+        let entry = appendStored store session.Id "original"
+
+        let! lease =
+            store.ClaimNextTurn(tenant, session.Id, "victim", TimeSpan.FromSeconds(60.0), CancellationToken.None)
+
+        let claim = Assert.IsType<TurnLeaseRenewed>(lease).Claim
+        let control = store :?> ISessionAbortControlStore
+
+        let! bound =
+            control.BindControlTarget(tenant, session.Id, entry.TurnId, entry.Position, claim, CancellationToken.None)
+
+        Assert.Equal(ControlOperationOutcome.Applied, bound.Outcome)
+        let! _ = store.UpdateSessionState(tenant, session.Id, SessionState.Running, CancellationToken.None)
+        let! _ = store.MarkInboxConsumed(tenant, session.Id, [| entry.Position |], CancellationToken.None)
+        clock.Advance(TimeSpan.FromSeconds(61.0))
+        let resolve = RecordingResolve()
+        let sessions = SessionsOptions(Capacity = 1)
+
+        let! _ =
+            Dispatcher.passOnceRoutedAsync
+                (fun _ -> true)
+                store
+                journal
+                (fun _ _ _ -> Task.FromResult(false))
+                tenant
+                sessions
+                (DispatcherOptions())
+                resolve.Func
+                clock
+                CancellationToken.None
+
+        Assert.Contains(session.Id, resolve.Resolved)
+        let! target = control.ReadAbortTarget(tenant, session.Id, CancellationToken.None)
+
+        match target with
+        | null -> failwith "Lost original target"
+        | target ->
+            Assert.Equal(entry.TurnId, target.TurnId)
+            Assert.Equal(entry.Position, target.InboxPosition)
+
+        let! pending = store.ReadPendingInbox(tenant, session.Id, CancellationToken.None)
+        Assert.Empty(pending)
+        Assert.Equal(claim.TurnId, (storedOf store session.Id).CurrentTurnId.Value)
+    }
+
+[<Fact>]
+let ``issue415 Running keyset advances past refused pages and retries finite sweeps`` () =
+    task {
+        let clock = TestClock()
+        let database = InMemoryDatabase(clock)
+
+        let store, journal =
+            InMemoryStoreFactory.sessionStore database, InMemoryStoreFactory.eventStore database
+
+        let ids = ResizeArray<SessionId>()
+
+        for _ in 1..7 do
+            let session = createSession store (AgentId.New())
+            let entry = appendStored store session.Id "original"
+
+            let! lease =
+                store.ClaimNextTurn(tenant, session.Id, "owner", TimeSpan.FromMinutes(5.0), CancellationToken.None)
+
+            let claim = Assert.IsType<TurnLeaseRenewed>(lease).Claim
+
+            let! _ =
+                (store :?> ISessionAbortControlStore)
+                    .BindControlTarget(tenant, session.Id, entry.TurnId, entry.Position, claim, CancellationToken.None)
+
+            let! _ = store.UpdateSessionState(tenant, session.Id, SessionState.Running, CancellationToken.None)
+            let! _ = store.MarkInboxConsumed(tenant, session.Id, [| entry.Position |], CancellationToken.None)
+            ids.Add(session.Id)
+
+        let ordered = ids |> Seq.sortBy (fun id -> id.Value) |> Seq.toArray
+        let refused = HashSet<SessionId>(ordered |> Seq.take 3)
+        let resolve = RecordingResolve()
+        let cursor = ref null
+
+        let run () =
+            Dispatcher.passOnceRoutedWithCursorAsync
+                (fun session -> not (refused.Contains session.Id))
+                store
+                journal
+                (fun _ _ _ -> Task.FromResult false)
+                tenant
+                (SessionsOptions(Capacity = 1))
+                (DispatcherOptions(MaxBatchSize = 2))
+                resolve.Func
+                clock
+                CancellationToken.None
+                cursor
+
+        let! _ = run ()
+        Assert.Equal(2, resolve.Resolved.Count)
+        let! _ = run ()
+        Assert.Equal(4, resolve.Resolved.Count)
+        Assert.Null(cursor.Value)
+        let! _ = run ()
+        Assert.Equal(6, resolve.Resolved.Count)
+
+        for id in ordered |> Seq.skip 3 do
+            Assert.Contains(id, resolve.Resolved)
+
+        for id in refused do
+            Assert.DoesNotContain(id, resolve.Resolved)
+    }
+
 /// Runs emit under a MeterListener scoped to Meter("Legate") and returns
 /// every double measurement the listener observed.
 let private collectDoubles (emit: unit -> unit) : (string * float) list =
@@ -1356,6 +1471,43 @@ let private buildServiceProvider
     |> ignore
 
     services.AddSingleton<SessionClient>(client) |> ignore
+
+    let context =
+        {
+            Tenant = tenant
+            Store = store
+            EventStore = journal
+            SubscriptionOptions = SessionSubscriptionOptions()
+            SubscriptionLifetime = new SessionSubscriptionLifetime()
+            WorkTracker = new ExecutionWorkTracker()
+            Spawn = fun _ _ _ -> ActorRefs.Nobody :> IActorRef
+            Client = lazy (client :> obj)
+            Background =
+                {
+                    Sessions = SessionsOptions()
+                    Dispatcher = DispatcherOptions()
+                    Clock = clock
+                    Delay = RecordingDelay() :> ILlmDelay
+                    EraMarked = preEra
+                    Agents = null
+                    RecoveryCursor = ref null
+                }
+        }
+
+    services.AddSingleton<ISessionHostContexts>(
+        { new ISessionHostContexts with
+            member _.InitializeAsync(_) = Task.CompletedTask
+            member _.HasDeclaredBindings = false
+            member _.DefaultTenant = tenant
+            member _.All = [| context |]
+            member _.Get(_) = context
+            member _.OpenAdmission() = ()
+            member _.CloseAdmission() = ()
+            member _.DrainAsync(_, _, _) = Task.CompletedTask
+        }
+    )
+    |> ignore
+
     services.AddSingleton<DispatcherWakeSink>(DispatcherWakeSink()) |> ignore
 
     services.AddSingleton<SessionClientOptions>(SessionClientOptions(Tenant = tenant))
