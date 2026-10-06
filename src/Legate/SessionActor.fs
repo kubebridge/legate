@@ -10696,6 +10696,21 @@ module internal SessionActor =
     /// An activation-loop continuation.
     type private ActivationCont = ActivationArgs -> ActivationPipe -> Cont<SuspendableActorMessage, unit>
 
+    /// What one suspendable activation decides, once (issue 390): the
+    /// chain runs once as an async task; a synchronously completed chain
+    /// interprets inline (the historical synchronous factory behavior,
+    /// including throws), otherwise an activating actor pipes the same
+    /// task without blocking the spawning thread.
+    type private ActivationOutcome =
+        /// The session validated, recovered, and primed: the routed
+        /// behavior's dependencies plus its row checker.
+        | Activated of props: SessionActorProps * suspend: SuspendDeps * checkRoute: (Session -> unit)
+        /// The route refused: the session answers the refusal.
+        | Refused of error: CompletionRoutingRefused
+        /// Activation proved impossible: the spawn fails (sync) or the
+        /// actor fails its Asks (async) with this error.
+        | Failed of error: exn
+
     let spawnSuspendFactoryRouted
         (routes: CompletionDestinations option)
         (store: ISessionStore)
@@ -10942,16 +10957,180 @@ module internal SessionActor =
 
             loopB () (LifecyclePipe.empty ())
 
-        /// Activates one session without blocking the spawning thread
-        /// (issue 390): validates the route, recovers the control target,
-        /// and primes the journal through piped waits, then becomes the
-        /// routed behavior, the refusing behavior, or the failing
-        /// behavior. Everything received meanwhile waits bounded behind
-        /// the chain in arrival order.
+        /// Runs the validate/recover/prime activation chain once, without
+        /// blocking the caller (issue 390): every wait is an async task
+        /// the caller pipes instead of awaiting. A synchronously completed
+        /// chain interprets inline through the historical synchronous
+        /// factory behavior.
         /// <param name="captured">The session to activate.</param>
+        /// <returns>The activation outcome.</returns>
+        let runActivationChainAsync (captured: SessionId) : Task<ActivationOutcome> =
+            let primeBranch (recovery: ControlTargetRecovery | null) : Task<ActivationOutcome> =
+                task {
+                    try
+                        let! primedOpt = primeClaimTask captured
+
+                        let primed =
+                            match recovery with
+                            | null -> primedOpt
+                            | r -> r.Claim |> Option.ofObj
+
+                        if primed.IsNone then
+                            return
+                                Failed(
+                                    InvalidSessionStateException(
+                                        captured,
+                                        "executionAuthorityUnavailable",
+                                        "Activation acquired no genuine prime authority; no runner may start."
+                                    )
+                                )
+                        else
+                            let token =
+                                match primed with
+                                | Some claim -> claim.Token
+                                | None -> Guid.NewGuid().ToString("N")
+
+                            let props: SessionActorProps =
+                                {
+                                    Store = store
+                                    Settlement = settlement
+                                    Tenant = tenant
+                                    SessionId = captured
+                                    RunTurn = unusedRunTurn
+                                    OnTurnSettled =
+                                        Some(fun result -> PromptWaitHubs.ObserveSettledScoped tenant captured result)
+                                    OnInjectJournaled = None
+                                    Compact = compactFor captured token
+                                    Logger = null
+                                    StorePipe = None
+                                }
+
+                            let suspend: SuspendDeps =
+                                {
+                                    EventStore = eventStore
+                                    Delay = delay
+                                    AskTimeout = askTimeout
+                                    JournalToken = token
+                                    PrimeClaim = primed
+                                    Recovery = recovery
+                                    RunSuspendable = runSuspendable
+                                    ReprimeJournal = Some(fun () -> primeClaimTask captured)
+                                    RefreshCompact = Some(compactFor captured)
+                                    AgentStore = agentStore
+                                    EraMarked = eraMarked
+                                }
+
+                            return Activated(props, suspend, checkRoute captured)
+                    with ex ->
+                        return Failed ex
+                }
+
+            task {
+                try
+                    let! session = store.GetSession(tenant, captured, CancellationToken.None)
+
+                    match session with
+                    | null ->
+                        return Failed(SessionNotFoundException(captured, "The session does not exist."))
+                    | s ->
+                        let routeOutcome =
+                            try
+                                checkRoute captured s
+                                Ok()
+                            with
+                            | :? CompletionRoutingException as error -> Error(Choice1Of2 error)
+                            | failure -> Error(Choice2Of2 failure)
+
+                        match routeOutcome with
+                        | Error(Choice1Of2 error) ->
+                            return
+                                Refused
+                                    {
+                                        Tenant = tenant
+                                        SessionId = captured
+                                        DestinationId = error.DestinationId
+                                        Reason = error.Reason
+                                    }
+                        | Error(Choice2Of2 failure) -> return Failed failure
+                        | Ok() ->
+
+                            match store with
+                            | :? ISessionAbortControlStore as control ->
+                                try
+                                    let! target = control.ReadAbortTarget(tenant, captured, CancellationToken.None)
+
+                                    match target with
+                                    | null ->
+                                        let! rejected = primeBranch null
+                                        return rejected
+                                    | t when t.State = ControlTargetState.Active && isNull (box t.Stop) ->
+                                        try
+                                            let! result =
+                                                control.TryRecoverControlTarget(
+                                                    tenant,
+                                                    captured,
+                                                    t.TurnId,
+                                                    claimOwner,
+                                                    leaseDuration,
+                                                    CancellationToken.None
+                                                )
+
+                                            if result.Outcome <> ControlOperationOutcome.Applied then
+                                                let category =
+                                                    if result.Outcome = ControlOperationOutcome.Stopped then
+                                                        "controlPending"
+                                                    else
+                                                        "executionAuthorityUnavailable"
+
+                                                return
+                                                    Failed(
+                                                        InvalidSessionStateException(
+                                                            captured,
+                                                            category,
+                                                            "Recovery cannot acquire genuine authority for this exact unstopped target."
+                                                        )
+                                                    )
+                                            else
+                                                let! recovered = primeBranch result
+                                                return recovered
+                                        with ex ->
+                                            return Failed ex
+                                    | _ ->
+                                        return
+                                            Failed(
+                                                InvalidSessionStateException(
+                                                    captured,
+                                                    "controlPending",
+                                                    "Accepted stop or pending control decision forbids activation."
+                                                )
+                                            )
+                                with ex ->
+                                    return Failed ex
+                            | _ ->
+                                return
+                                    Failed(
+                                        InvalidOperationException(
+                                            "ISessionAbortControlStore is required before session activation."
+                                        )
+                                    )
+                with ex ->
+                    return Failed ex
+            }
+
+        /// Pipes one already-started activation chain without blocking the
+        /// spawning thread (issue 390): becomes the routed behavior, the
+        /// refusing behavior, or the failing behavior once the chain
+        /// settles. Everything received meanwhile waits bounded behind it
+        /// in arrival order.
+        /// <param name="captured">The session to activate.</param>
+        /// <param name="chainTask">The started activation chain.</param>
         /// <param name="mailbox">The actor mailbox, injected by spawn.</param>
         /// <returns>The Akka.FSharp actor computation to spawn.</returns>
-        let activating (captured: SessionId) (mailbox: Actor<SuspendableActorMessage>) =
+        let activatingWithTask
+            (captured: SessionId)
+            (chainTask: Task<ActivationOutcome>)
+            (mailbox: Actor<SuspendableActorMessage>)
+            =
             let self = mailbox.Self
 
             let starter: PipeStarter<SuspendableActorMessage, ActivationArgs> =
@@ -10997,44 +11176,15 @@ module internal SessionActor =
 
             and suspendA (args: ActivationArgs) (pipe: ActivationPipe) = loopA args pipe
 
-            let becomeRouted (primed: TurnClaim option) (recovery: ControlTargetRecovery | null) (pipe: ActivationPipe) =
-                let token =
-                    match primed with
-                    | Some claim -> claim.Token
-                    | None -> Guid.NewGuid().ToString("N")
-
-                let props: SessionActorProps =
-                    {
-                        Store = store
-                        Settlement = settlement
-                        Tenant = tenant
-                        SessionId = captured
-                        RunTurn = unusedRunTurn
-                        OnTurnSettled = Some(fun result -> PromptWaitHubs.ObserveSettledScoped tenant captured result)
-                        OnInjectJournaled = None
-                        Compact = compactFor captured token
-                        Logger = null
-                        StorePipe = None
-                    }
-
-                let suspend: SuspendDeps =
-                    {
-                        EventStore = eventStore
-                        Delay = delay
-                        AskTimeout = askTimeout
-                        JournalToken = token
-                        PrimeClaim = primed
-                        Recovery = recovery
-                        RunSuspendable = runSuspendable
-                        ReprimeJournal = Some(fun () -> primeClaimTask captured)
-                        RefreshCompact = Some(compactFor captured)
-                        AgentStore = agentStore
-                        EraMarked = eraMarked
-                    }
-
+            let becomeRouted
+                (props: SessionActorProps)
+                (suspend: SuspendDeps)
+                (check: Session -> unit)
+                (pipe: ActivationPipe)
+                =
                 behaviorWithSuspendRouted
                     (fun () -> ())
-                    (checkRoute captured)
+                    check
                     props
                     suspend
                     clock
@@ -11060,123 +11210,17 @@ module internal SessionActor =
 
                 failedActivation failure mailbox
 
-            let primeAfter (recovery: ControlTargetRecovery | null) : ActivationCont =
-                fun args2 pipe2 ->
-                    startPipedWait
-                        starter
-                        (fun () -> primeClaimTask captured)
-                        "activate/prime"
-                        (fun _ pipe3 -> function
-                            | Error failure -> becomeFailed failure pipe3
-                            | Ok primedOpt ->
-                                let primed =
-                                    match recovery with
-                                    | null -> primedOpt
-                                    | r -> r.Claim |> Option.ofObj
-
-                                if primed.IsNone then
-                                    becomeFailed
-                                        (InvalidSessionStateException(
-                                            captured,
-                                            "executionAuthorityUnavailable",
-                                            "Activation acquired no genuine prime authority; no runner may start."
-                                        ))
-                                        pipe3
-                                else
-                                    becomeRouted primed recovery pipe3)
-                        suspendA
-                        args2
-                        pipe2
-
-            let recoverAfter () : ActivationCont =
-                fun args2 pipe2 ->
-                    match store with
-                    | :? ISessionAbortControlStore as control ->
-                        startPipedWait
-                            starter
-                            (fun () -> control.ReadAbortTarget(tenant, captured, CancellationToken.None))
-                            "activate/recover-target"
-                            (fun args3 pipe3 -> function
-                                | Error failure -> becomeFailed failure pipe3
-                                | Ok target ->
-                                    match target with
-                                    | null -> primeAfter null args3 pipe3
-                                    | t when t.State = ControlTargetState.Active && isNull (box t.Stop) ->
-                                        startPipedWait
-                                            starter
-                                            (fun () ->
-                                                    control.TryRecoverControlTarget(
-                                                        tenant,
-                                                        captured,
-                                                        t.TurnId,
-                                                        claimOwner,
-                                                        leaseDuration,
-                                                        CancellationToken.None
-                                                    ))
-                                            "activate/recover"
-                                            (fun args4 pipe4 -> function
-                                                | Error failure -> becomeFailed failure pipe4
-                                                | Ok result ->
-                                                    if result.Outcome <> ControlOperationOutcome.Applied then
-                                                        let category =
-                                                            if result.Outcome = ControlOperationOutcome.Stopped then
-                                                                "controlPending"
-                                                            else
-                                                                "executionAuthorityUnavailable"
-
-                                                        becomeFailed
-                                                            (InvalidSessionStateException(
-                                                                captured,
-                                                                category,
-                                                                "Recovery cannot acquire genuine authority for this exact unstopped target."
-                                                            ))
-                                                            pipe4
-                                                    else
-                                                        primeAfter result args4 pipe4)
-                                            suspendA
-                                            args3
-                                            pipe3
-                                    | _ ->
-                                        becomeFailed
-                                            (InvalidSessionStateException(
-                                                captured,
-                                                "controlPending",
-                                                "Accepted stop or pending control decision forbids activation."
-                                            ))
-                                            pipe3)
-                            suspendA
-                            args2
-                            pipe2
-                    | _ ->
-                        becomeFailed
-                            (InvalidOperationException("ISessionAbortControlStore is required before session activation."))
-                            pipe2
-
             startPipedWait
                 starter
-                (fun () -> store.GetSession(tenant, captured, CancellationToken.None))
-                "activate/validate"
+                (fun () -> chainTask)
+                "activate/chain"
                 (fun _ pipe2 -> function
                     | Error failure -> becomeFailed failure pipe2
-                    | Ok session ->
-                        match session with
-                        | null ->
-                            becomeFailed (SessionNotFoundException(captured, "The session does not exist.")) pipe2
-                        | s ->
-                            try
-                                checkRoute captured s
-                                recoverAfter () { Step = RecoverTargetStep } pipe2
-                            with
-                            | :? CompletionRoutingException as error ->
-                                becomeBlocked
-                                    {
-                                        Tenant = tenant
-                                        SessionId = captured
-                                        DestinationId = error.DestinationId
-                                        Reason = error.Reason
-                                    }
-                                    pipe2
-                            | failure -> becomeFailed failure pipe2)
+                    | Ok outcome ->
+                        match outcome with
+                        | Activated(props, suspend, check) -> becomeRouted props suspend check pipe2
+                        | Refused error -> becomeBlocked error pipe2
+                        | Failed failure -> becomeFailed failure pipe2)
                 suspendA
                 { Step = ValidateRouteStep }
                 (LifecyclePipe.empty ())
@@ -11185,7 +11229,31 @@ module internal SessionActor =
             let mutable parsed = Unchecked.defaultof<SessionId>
 
             if SessionId.TryParse(sessionId, &parsed) then
-                spawn context name (activating parsed)
+                let captured = parsed
+                let chainTask = runActivationChainAsync captured
+
+                if chainTask.IsCompletedSuccessfully then
+                    // Synchronous stores interpret inline: the historical
+                    // factory behavior, including synchronous throws and
+                    // the refusing child, with no dispatcher wait.
+                    match chainTask.Result with
+                    | Activated(props, suspend, check) ->
+                        spawn
+                            context
+                            name
+                            (behaviorWithSuspendRouted
+                                (fun () -> ())
+                                check
+                                props
+                                suspend
+                                clock
+                                heartbeatOptions
+                                []
+                                )
+                    | Refused error -> spawn context name (blockedPiped error captured)
+                    | Failed failure -> raise failure
+                else
+                    spawn context name (activatingWithTask captured chainTask)
             else
                 spawn context name (actorOf (fun (_: obj) -> ()))
     let spawnSuspendFactory
