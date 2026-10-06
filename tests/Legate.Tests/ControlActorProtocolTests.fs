@@ -13,7 +13,9 @@ open Legate.Storage.InMemory
 open Legate.Storage.Sqlite
 open Legate.Testing
 open Legate.Tests.TurnLoopTests
+open Microsoft.Extensions.AI
 open Microsoft.Extensions.DependencyInjection
+open Microsoft.Extensions.Hosting
 open Microsoft.Extensions.Logging
 open Microsoft.Extensions.Logging.Abstractions
 open Xunit
@@ -164,6 +166,74 @@ module ControlActorProtocolTests =
                 })
 
         parent.Ask<IActorRef>("activate", bound)
+
+    [<Fact>]
+    let ``issue415 explicitly registered settlement capability is used by production execution`` () =
+        task {
+            let database = InMemoryDatabase()
+            let actual = InMemoryStoreFactory.sessionStore database
+            let journal = InMemoryStoreFactory.eventStore database
+            let proxy = DispatchProxy.Create<ISessionStore, ControlFaultStore>()
+            (proxy :?> ControlFaultStore).Inner <- actual
+            Assert.False(proxy :? ISessionSettlementStore)
+            let atomic = actual :?> ISessionSettlementStore
+            let mutable admits, settlements = 0, 0
+
+            let selected =
+                { new ISessionSettlementStore with
+                    member _.SupportsSettlementJournal(events) =
+                        atomic.SupportsSettlementJournal(events)
+
+                    member _.AdmitExecution(t, s, p, claim, token) =
+                        Interlocked.Increment(&admits) |> ignore
+                        atomic.AdmitExecution(t, s, p, claim, token)
+
+                    member _.SettleExecution(t, request, token) =
+                        Interlocked.Increment(&settlements) |> ignore
+                        atomic.SettleExecution(t, request, token)
+                }
+
+            let services = ServiceCollection()
+
+            services.AddLegate(
+                Action<LegateBuilder>(fun b ->
+                    b.Llm.AddProvider(BuilderTests.StubLlmProvider()) |> ignore
+                    b.Workspace.UseRuntime(BuilderTests.StubWorkspaceRuntime()) |> ignore
+                    b.Storage.UseSessionStore(proxy) |> ignore)
+            )
+            |> ignore
+
+            services.AddSingleton<ISessionSettlementStore>(selected) |> ignore
+            services.AddSingleton<ISessionEventStore>(journal) |> ignore
+
+            use chat =
+                new ScriptedChatClient(
+                    [|
+                        ScriptStep.Text "explicit capability"
+                    |]
+                )
+
+            services.AddSingleton<IChatClient>(chat) |> ignore
+            use provider = services.BuildServiceProvider()
+
+            let local =
+                provider.GetServices<IHostedService>()
+                |> Seq.pick (function
+                    | :? LocalActorSystemService as local -> Some local
+                    | _ -> None)
+
+            do! (local :> IHostedService).StartAsync(ct)
+
+            let client =
+                provider.GetRequiredService<ISessionClientFactory>().GetClient(TenantId.Default)
+
+            let! opened = client.OpenSessionAsync(AgentId.New())
+            let! result = client.PromptAndWaitAsync(opened.Id, "hello")
+            Assert.Equal(TurnStatus.Completed, result.Status)
+            Assert.True(admits > 0)
+            Assert.Equal(1, settlements)
+            do! (local :> IHostedService).StopAsync(ct)
+        }
 
     [<Theory>]
     [<InlineData(false, OnCrashResume.ResumeAttempt, false)>]

@@ -2181,8 +2181,11 @@ module internal SessionClientWiring =
                         })
 
             let entityFactory =
-                SessionActor.spawnSuspendFactoryRouted
+                SessionActor.spawnSuspendFactoryRoutedWithSettlement
                     (Some routes)
+                    (match provider.GetService(typeof<ISessionSettlementStore>) with
+                     | null -> None
+                     | capability -> Some(capability :?> ISessionSettlementStore))
                     store
                     clientOptions.Tenant
                     eventStore

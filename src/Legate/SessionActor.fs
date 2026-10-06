@@ -3089,7 +3089,8 @@ module internal SessionActor =
     /// <param name="suspend">The suspend dependencies.</param>
     /// <param name="mailbox">The actor mailbox, injected by spawn.</param>
     /// <returns>The Akka.FSharp actor computation to spawn.</returns>
-    let behaviorWithSuspendRouted
+    let behaviorWithSuspendRoutedWithSettlement
+        (selectedSettlement: ISessionSettlementStore option)
         (validateRoute: unit -> unit)
         (props: SessionActorProps)
         (suspend: SuspendDeps)
@@ -5146,9 +5147,11 @@ module internal SessionActor =
         /// activation always carries it.
         /// <returns>The settlement capability, or None when absent.</returns>
         let settlementStore: ISessionSettlementStore option =
-            match props.Store with
-            | :? ISessionSettlementStore as capable -> Some capable
-            | _ -> None
+            selectedSettlement
+            |> Option.orElseWith (fun () ->
+                match props.Store with
+                | :? ISessionSettlementStore as capable -> Some capable
+                | _ -> None)
 
         /// Resolves the captured claim authority one suspendable entry
         /// executes under (issue 363): the per-entry bound claim when the
@@ -6672,6 +6675,9 @@ module internal SessionActor =
             loop SessionState.Running None (HashSet<string>())
         | _ -> loop initialState initialSuspended (HashSet<string>())
 
+    let behaviorWithSuspendRouted validateRoute props suspend clock heartbeatOptions mailbox =
+        behaviorWithSuspendRoutedWithSettlement None validateRoute props suspend clock heartbeatOptions mailbox
+
     let behaviorWithSuspend props suspend mailbox =
         behaviorWithSuspendRouted (fun () -> ()) props suspend TimeProvider.System None mailbox
 
@@ -7213,8 +7219,9 @@ module internal SessionActor =
     /// <param name="agentStore">The agent catalog the per-turn authority gate reads, or null when the host runs without one: the gate is skipped then.</param>
     /// <param name="eraMarked">Reads the completion era the entity-start probe consults (issue 289). Never null.</param>
     /// <returns>A factory mapping a session id string to a suspendable child spawn.</returns>
-    let spawnSuspendFactoryRouted
+    let spawnSuspendFactoryRoutedWithSettlement
         (routes: CompletionDestinations option)
+        (selectedSettlement: ISessionSettlementStore option)
         (store: ISessionStore)
         (tenant: TenantId)
         (eventStore: ISessionEventStore)
@@ -7507,9 +7514,51 @@ module internal SessionActor =
                 match refusal with
                 | Some error -> spawn context name (blocked error)
                 | None ->
-                    spawn context name (behaviorWithSuspendRouted validateRoute props suspend clock heartbeatOptions)
+                    spawn
+                        context
+                        name
+                        (behaviorWithSuspendRoutedWithSettlement
+                            selectedSettlement
+                            validateRoute
+                            props
+                            suspend
+                            clock
+                            heartbeatOptions)
             else
                 spawn context name (actorOf (fun (_: obj) -> ()))
+
+    let spawnSuspendFactoryRouted
+        routes
+        store
+        tenant
+        eventStore
+        delay
+        askTimeout
+        claimOwner
+        leaseDuration
+        runSuspendable
+        compactFor
+        agentStore
+        eraMarked
+        clock
+        heartbeatOptions
+        =
+        spawnSuspendFactoryRoutedWithSettlement
+            routes
+            None
+            store
+            tenant
+            eventStore
+            delay
+            askTimeout
+            claimOwner
+            leaseDuration
+            runSuspendable
+            compactFor
+            agentStore
+            eraMarked
+            clock
+            heartbeatOptions
 
     let spawnSuspendFactory
         store
