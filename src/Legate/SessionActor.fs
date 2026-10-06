@@ -1355,22 +1355,35 @@ module internal SessionActor =
         ArgumentNullException.ThrowIfNull(compact.JournalToken)
         ArgumentNullException.ThrowIfNull(compact.Force)
 
-    /// Starts one piped lifecycle store wait through a starter: a completed
-    /// wait runs its resumption inline (fast path, today's sequencing),
-    /// otherwise the outcome pipes back as a one-way message and the loop
-    /// suspends with the wait outstanding. The suspension always re-enters the
-    /// loop with the state current at the wait's start; resumptions receive the
-    /// state current at the wait's settle, so control recorded meanwhile is
-    /// never lost.
+    /// Starts one piped lifecycle store wait through a starter: the task
+    /// factory runs on the actor thread without blocking it (a synchronously
+    /// throwing factory reads as a faulted wait, exactly like an awaited
+    /// throw); a completed wait runs its resumption inline (fast path,
+    /// today's sequencing), otherwise the outcome pipes back as a one-way
+    /// message and the loop suspends with the wait outstanding. The suspension
+    /// always re-enters the loop with the state current at the wait's start;
+    /// resumptions receive the state current at the wait's settle, so control
+    /// recorded meanwhile is never lost.
     let private startPipedWait<'T, 'M, 'A>
         (starter: PipeStarter<'M, 'A>)
-        (task: Task<'T>)
+        (taskFactory: unit -> Task<'T>)
         (label: string)
         (resume: 'A -> LifecyclePipe.PipeState<'M, 'A> -> Result<'T, exn> -> Cont<'M, unit>)
         (suspendWith: 'A -> LifecyclePipe.PipeState<'M, 'A> -> Cont<'M, unit>)
         (args: 'A)
         (pipe: LifecyclePipe.PipeState<'M, 'A>)
         : Cont<'M, unit> =
+        let task =
+            try
+                let started = taskFactory ()
+
+                if isNull (box started) then
+                    Task.FromException<'T>(ArgumentNullException("taskFactory") :> exn)
+                else
+                    started
+            with ex ->
+                Task.FromException<'T>(ex)
+
         LifecyclePipe.start
             starter.Self
             starter.Clock
@@ -1388,13 +1401,24 @@ module internal SessionActor =
     /// Same contract as startPipedWait.
     let private startPipedWaitUnit<'M, 'A>
         (starter: PipeStarter<'M, 'A>)
-        (task: Task)
+        (taskFactory: unit -> Task)
         (label: string)
         (resume: 'A -> LifecyclePipe.PipeState<'M, 'A> -> Result<unit, exn> -> Cont<'M, unit>)
         (suspendWith: 'A -> LifecyclePipe.PipeState<'M, 'A> -> Cont<'M, unit>)
         (args: 'A)
         (pipe: LifecyclePipe.PipeState<'M, 'A>)
         : Cont<'M, unit> =
+        let task =
+            try
+                let started = taskFactory ()
+
+                if isNull (box started) then
+                    Task.FromException(ArgumentNullException("taskFactory") :> exn)
+                else
+                    started
+            with ex ->
+                Task.FromException(ex)
+
         LifecyclePipe.startUnit
             starter.Self
             starter.Clock
@@ -1528,7 +1552,7 @@ module internal SessionActor =
             // claim, idle-operation attribution via the sentinel above.
             startPipedWait
                 starter
-                (Compaction.tryCompactCoreAsync true request)
+                (fun () -> Compaction.tryCompactCoreAsync true request)
                 "compact-core"
                 (fun args3 pipe3 -> function
                     | Ok Compaction.NotNeeded -> cont CompactNotNeeded args3 pipe3
@@ -1555,7 +1579,7 @@ module internal SessionActor =
             // Any read failure reads as no stamp, exactly like before.
             startPipedWait
                 starter
-                (props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
+                (fun () -> props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
                 "compact-stamp"
                 (fun args3 pipe3 -> function
                     | Ok session ->
@@ -1569,12 +1593,13 @@ module internal SessionActor =
 
         startPipedWait
             starter
-            (BoundedReplay.readSuffixWithBaseAsync
-                compact.EventStore
-                props.Tenant
-                props.SessionId
-                100
-                cancellationToken)
+            (fun () ->
+                BoundedReplay.readSuffixWithBaseAsync
+                        compact.EventStore
+                        props.Tenant
+                        props.SessionId
+                        100
+                        cancellationToken)
             "compact-replay"
             (fun args2 pipe2 -> function
                 | Error(:? TurnLoop.TurnLeaseLostException) -> cont CompactFenced args2 pipe2
@@ -1632,7 +1657,7 @@ module internal SessionActor =
         : Cont<'M, unit> =
         startPipedWait
             starter
-            (props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
+            (fun () -> props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
             "auto-close-read"
             (fun args2 pipe2 -> function
                 | Ok session ->
@@ -1675,14 +1700,14 @@ module internal SessionActor =
 
         startPipedWaitUnit
             starter
-            (props.Store.MarkInboxConsumed(props.Tenant, props.SessionId, positions, CancellationToken.None))
+            (fun () -> props.Store.MarkInboxConsumed(props.Tenant, props.SessionId, positions, CancellationToken.None))
             "consume-and-close/consume"
             (fun args2 pipe2 -> function
                 | Error error -> raise error
                 | Ok () ->
                     startPipedWaitUnit
                         starter
-                        (props.Store.CloseSession(props.Tenant, props.SessionId, CancellationToken.None))
+                        (fun () -> props.Store.CloseSession(props.Tenant, props.SessionId, CancellationToken.None))
                         "consume-and-close/close"
                         (fun args3 pipe3 -> function
                             | Ok () ->
@@ -1783,7 +1808,7 @@ module internal SessionActor =
         else
             startPipedWait
                 starter
-                (props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
+                (fun () -> props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
                 "dispatch-completion/read"
                 (fun args2 pipe2 -> function
                     | Error _ -> cont None args2 pipe2
@@ -1805,12 +1830,13 @@ module internal SessionActor =
 
                                 startPipedWait
                                     starter
-                                    (props.Store.EnqueueCompletionOutbox(
-                                        props.Tenant,
-                                        destinationId,
-                                        completion,
-                                        CancellationToken.None
-                                    ))
+                                    (fun () ->
+                                            props.Store.EnqueueCompletionOutbox(
+                                                props.Tenant,
+                                                destinationId,
+                                                completion,
+                                                CancellationToken.None
+                                            ))
                                     "dispatch-completion/enqueue"
                                     (fun args3 pipe3 -> function
                                         | Ok row when not (isNull (box row)) -> cont (Some row.Completion) args3 pipe3
@@ -1845,7 +1871,7 @@ module internal SessionActor =
         : Cont<'M, unit> =
         startPipedWait
             starter
-            (props.Store.CloseSession(props.Tenant, props.SessionId, cancellationToken))
+            (fun () -> props.Store.CloseSession(props.Tenant, props.SessionId, cancellationToken))
             "close-session"
             (fun args2 pipe2 -> function
                 | Error error -> raise error
@@ -1929,7 +1955,7 @@ module internal SessionActor =
             : Cont<SessionActorMessage, unit> =
             startPipedWait
                 starter
-                (props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
+                (fun () -> props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
                 "start-turn-snapshot"
                 (fun args2 pipe2 -> function
                     | Ok session ->
@@ -2014,7 +2040,7 @@ module internal SessionActor =
 
             startPipedWaitUnit
                 starter
-                (props.Store.MarkInboxConsumed(props.Tenant, props.SessionId, positions, cancellationToken))
+                (fun () -> props.Store.MarkInboxConsumed(props.Tenant, props.SessionId, positions, cancellationToken))
                 "settle-consume"
                 (fun args2 pipe2 -> function
                     | Error error -> raise error
@@ -2026,7 +2052,7 @@ module internal SessionActor =
 
                         startPipedWait
                             starter
-                            (props.Store.ReadPendingInbox(props.Tenant, props.SessionId, cancellationToken))
+                            (fun () -> props.Store.ReadPendingInbox(props.Tenant, props.SessionId, cancellationToken))
                             "settle-drain"
                             (fun args3 pipe3 -> function
                                 | Error error -> raise error
@@ -2050,12 +2076,13 @@ module internal SessionActor =
                                     | [] ->
                                         startPipedWaitUnit
                                             starter
-                                            (props.Store.UpdateSessionState(
-                                                props.Tenant,
-                                                props.SessionId,
-                                                SessionState.Idle,
-                                                cancellationToken
-                                            ))
+                                            (fun () ->
+                                                    props.Store.UpdateSessionState(
+                                                        props.Tenant,
+                                                        props.SessionId,
+                                                        SessionState.Idle,
+                                                        cancellationToken
+                                                    ))
                                             "settle-idle"
                                             (fun args5 pipe5 -> function
                                                 | Ok () -> cont (SessionState.Idle, None) args5 pipe5
@@ -2151,7 +2178,7 @@ module internal SessionActor =
             : Cont<SessionActorMessage, unit> =
             startPipedWait
                 starter
-                (props.Store.AppendInboxMessage(props.Tenant, props.SessionId, payload, delivery, cancellationToken))
+                (fun () -> props.Store.AppendInboxMessage(props.Tenant, props.SessionId, payload, delivery, cancellationToken))
                 "append-inbox"
                 (fun args2 pipe2 -> function
                     | Error error -> raise error
@@ -2188,19 +2215,20 @@ module internal SessionActor =
             withAppend payload delivery cancellationToken (fun appended args2 pipe2 ->
                 startPipedWaitUnit
                     starter
-                    (props.Store.UpdateSessionState(
-                        props.Tenant,
-                        props.SessionId,
-                        SessionState.Running,
-                        cancellationToken
-                    ))
+                    (fun () ->
+                            props.Store.UpdateSessionState(
+                                props.Tenant,
+                                props.SessionId,
+                                SessionState.Running,
+                                cancellationToken
+                            ))
                     "start-idle-turn/running"
                     (fun args3 pipe3 -> function
                         | Error error -> raise error
                         | Ok () ->
                             startPipedWait
                                 starter
-                                (props.Store.ReadPendingInbox(props.Tenant, props.SessionId, cancellationToken))
+                                (fun () -> props.Store.ReadPendingInbox(props.Tenant, props.SessionId, cancellationToken))
                                 "start-idle-turn/drain"
                                 (fun args4 pipe4 -> function
                                     | Error error -> raise error
@@ -2269,7 +2297,7 @@ module internal SessionActor =
                 : Cont<SessionActorMessage, unit> =
                 startPipedWait
                     starter
-                    (props.Store.ReadPendingInbox(props.Tenant, props.SessionId, CancellationToken.None))
+                    (fun () -> props.Store.ReadPendingInbox(props.Tenant, props.SessionId, CancellationToken.None))
                     "recover-inbox"
                     (fun args3 pipe3 -> function
                         | Ok pending ->
@@ -2298,7 +2326,7 @@ module internal SessionActor =
 
             startPipedWait
                 starter
-                (props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
+                (fun () -> props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
                 "recover-session"
                 (fun args2 pipe2 -> function
                     | Error error -> raise error
@@ -2310,12 +2338,13 @@ module internal SessionActor =
                             | SessionState.Running ->
                                 startPipedWaitUnit
                                     starter
-                                    (props.Store.UpdateSessionState(
-                                        props.Tenant,
-                                        props.SessionId,
-                                        SessionState.Idle,
-                                        CancellationToken.None
-                                    ))
+                                    (fun () ->
+                                            props.Store.UpdateSessionState(
+                                                props.Tenant,
+                                                props.SessionId,
+                                                SessionState.Idle,
+                                                CancellationToken.None
+                                            ))
                                     "recover-release-running"
                                     (fun args3 pipe3 -> function
                                         | Ok () -> readInbox SessionState.Idle args3 pipe3
@@ -2700,7 +2729,7 @@ module internal SessionActor =
                         return!
                             startPipedWait
                                 starter
-                                (control.ReadAbortTarget(tenant, sessionId, CancellationToken.None))
+                                (fun () -> control.ReadAbortTarget(tenant, sessionId, CancellationToken.None))
                                 "observe-host-abort"
                                 (fun args2 pipe2 -> function
                                     | Error error -> raise error
@@ -5458,7 +5487,7 @@ module internal SessionActor =
             : Cont<SuspendableActorMessage, unit> =
             startPipedWait
                 starter
-                (props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
+                (fun () -> props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
                 "validate-route"
                 (fun args2 pipe2 -> function
                     | Error error -> raise error
@@ -5493,7 +5522,7 @@ module internal SessionActor =
             | Some control, Some _ ->
                 startPipedWait
                     starter
-                    (control.ReadAbortTarget(props.Tenant, props.SessionId, CancellationToken.None))
+                    (fun () -> control.ReadAbortTarget(props.Tenant, props.SessionId, CancellationToken.None))
                     "durable-stop"
                     (fun args2 pipe2 -> function
                         | Error error -> raise error
@@ -5531,7 +5560,7 @@ module internal SessionActor =
             : Cont<SuspendableActorMessage, unit> =
             startPipedWait
                 starter
-                (props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
+                (fun () -> props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
                 "current-turn-snapshot"
                 (fun args2 pipe2 -> function
                     | Ok session ->
@@ -5564,7 +5593,7 @@ module internal SessionActor =
             | _ ->
                 startPipedWait
                     starter
-                    (props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
+                    (fun () -> props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
                     "read-grants"
                     (fun args2 pipe2 -> function
                         | Ok session ->
@@ -5595,7 +5624,7 @@ module internal SessionActor =
             : Cont<SuspendableActorMessage, unit> =
             startPipedWait
                 starter
-                (props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
+                (fun () -> props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
                 "previous-agent"
                 (fun args2 pipe2 -> function
                     | Ok session ->
@@ -5628,7 +5657,7 @@ module internal SessionActor =
             | agentStore ->
                 startPipedWait
                     starter
-                    (props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
+                    (fun () -> props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
                     "check-agent-authority/session"
                     (fun args2 pipe2 -> function
                         | Error _ -> cont None args2 pipe2
@@ -5640,7 +5669,7 @@ module internal SessionActor =
 
                                 startPipedWait
                                     starter
-                                    (agentStore.GetAgent(props.Tenant, agentId, CancellationToken.None))
+                                    (fun () -> agentStore.GetAgent(props.Tenant, agentId, CancellationToken.None))
                                     "check-agent-authority/agent"
                                     (fun args3 pipe3 -> function
                                         | Error _ -> cont None args3 pipe3
@@ -5713,17 +5742,18 @@ module internal SessionActor =
                 (fun _ args2 pipe2 ->
                     startPipedWaitUnit
                         starter
-                        (props.Store.MarkInboxConsumed(props.Tenant, props.SessionId, positions, CancellationToken.None))
+                        (fun () -> props.Store.MarkInboxConsumed(props.Tenant, props.SessionId, positions, CancellationToken.None))
                         "settle-authority-refusal/consume"
                         (fun args3 pipe3 _ ->
                             startPipedWaitUnit
                                 starter
-                                (props.Store.UpdateSessionState(
-                                    props.Tenant,
-                                    props.SessionId,
-                                    SessionState.Idle,
-                                    CancellationToken.None
-                                ))
+                                (fun () ->
+                                        props.Store.UpdateSessionState(
+                                            props.Tenant,
+                                            props.SessionId,
+                                            SessionState.Idle,
+                                            CancellationToken.None
+                                        ))
                                 "settle-authority-refusal/idle"
                                 (fun args4 pipe4 _ -> cont () args4 pipe4)
                                 suspendWith
@@ -5753,7 +5783,7 @@ module internal SessionActor =
             : Cont<SuspendableActorMessage, unit> =
             startPipedWait
                 starter
-                (props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
+                (fun () -> props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
                 "settle-primed/read"
                 (fun args2 pipe2 -> function
                     | Ok session ->
@@ -5772,13 +5802,14 @@ module internal SessionActor =
 
                             startPipedWait
                                 starter
-                                (props.Store.SettleTurn(
-                                    props.Tenant,
-                                    claim,
-                                    TurnStatus.Completed,
-                                    null,
-                                    CancellationToken.None
-                                ))
+                                (fun () ->
+                                        props.Store.SettleTurn(
+                                            props.Tenant,
+                                            claim,
+                                            TurnStatus.Completed,
+                                            null,
+                                            CancellationToken.None
+                                        ))
                                 "settle-primed/settle"
                                 (fun args3 pipe3 _ -> cont () args3 pipe3)
                                 suspendWith
@@ -5808,7 +5839,7 @@ module internal SessionActor =
             : Cont<SuspendableActorMessage, unit> =
             startPipedWait
                 starter
-                (props.Store.SettleTurn(props.Tenant, claim, TurnStatus.Completed, null, CancellationToken.None))
+                (fun () -> props.Store.SettleTurn(props.Tenant, claim, TurnStatus.Completed, null, CancellationToken.None))
                 "settle-turn-quiet"
                 (fun args2 pipe2 -> function
                     | Ok(:? TurnSettled) -> cont true args2 pipe2
@@ -5840,14 +5871,14 @@ module internal SessionActor =
             | Some reprime ->
                 startPipedWait
                     starter
-                    (reprime ())
+                    (fun () -> reprime ())
                     "reprime-journal"
                     (fun args2 pipe2 -> function
                         | Error _ -> cont None None args2 pipe2
                         | Ok fresh ->
                             startPipedWait
                                 starter
-                                (props.Store.ReadPendingInbox(props.Tenant, props.SessionId, CancellationToken.None))
+                                (fun () -> props.Store.ReadPendingInbox(props.Tenant, props.SessionId, CancellationToken.None))
                                 "reprime-refresh"
                                 (fun args3 pipe3 -> function
                                     | Ok pending when not (isNull (box pending)) ->
@@ -5878,7 +5909,7 @@ module internal SessionActor =
             : Cont<SuspendableActorMessage, unit> =
             startPipedWait
                 starter
-                (props.Store.ReadPendingInbox(props.Tenant, props.SessionId, CancellationToken.None))
+                (fun () -> props.Store.ReadPendingInbox(props.Tenant, props.SessionId, CancellationToken.None))
                 "inbox-empty"
                 (fun args2 pipe2 -> function
                     | Ok pending when not (isNull (box pending)) -> cont (pending.Count = 0) args2 pipe2
@@ -5909,7 +5940,7 @@ module internal SessionActor =
             // equality compares against the current row.
             startPipedWait
                 starter
-                (props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
+                (fun () -> props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
                 "apply-agent/stamp"
                 (fun args2 pipe2 -> function
                     | Ok session ->
@@ -5918,13 +5949,14 @@ module internal SessionActor =
                         | s ->
                             startPipedWait
                                 starter
-                                (JournalWriter.appendHostAsync
-                                    suspend.EventStore
-                                    props.Tenant
-                                    props.SessionId
-                                    s.UpdatedAt
-                                    batch
-                                    CancellationToken.None)
+                                (fun () ->
+                                        JournalWriter.appendHostAsync
+                                            suspend.EventStore
+                                            props.Tenant
+                                            props.SessionId
+                                            s.UpdatedAt
+                                            batch
+                                            CancellationToken.None)
                                 "apply-agent/journal"
                                 (fun args3 pipe3 -> function
                                     | Ok outcome -> cont (Some outcome) args3 pipe3
@@ -6000,12 +6032,13 @@ module internal SessionActor =
                                                             else
                                                                 startPipedWaitUnit
                                                                     starter
-                                                                    (props.Store.SetSessionAgent(
-                                                                        props.Tenant,
-                                                                        props.SessionId,
-                                                                        target,
-                                                                        CancellationToken.None
-                                                                    ))
+                                                                    (fun () ->
+                                                                            props.Store.SetSessionAgent(
+                                                                                props.Tenant,
+                                                                                props.SessionId,
+                                                                                target,
+                                                                                CancellationToken.None
+                                                                            ))
                                                                     "apply-agent/rebind"
                                                                     (fun args7 pipe7 -> function
                                                                         | Ok () ->
@@ -6197,14 +6230,15 @@ module internal SessionActor =
 
                 startPipedWait
                     starter
-                    (control.BindControlTarget(
-                        props.Tenant,
-                        props.SessionId,
-                        turn,
-                        entry.Position,
-                        claim,
-                        CancellationToken.None
-                    ))
+                    (fun () ->
+                            control.BindControlTarget(
+                                props.Tenant,
+                                props.SessionId,
+                                turn,
+                                entry.Position,
+                                claim,
+                                CancellationToken.None
+                            ))
                     "bind-control"
                     (fun args2 pipe2 -> function
                         | Error error -> onError error args2 pipe2
@@ -6254,14 +6288,15 @@ module internal SessionActor =
             | Some control ->
                 startPipedWait
                     starter
-                    (control.CheckControlTarget(
-                        props.Tenant,
-                        props.SessionId,
-                        turn,
-                        position,
-                        claim,
-                        CancellationToken.None
-                    ))
+                    (fun () ->
+                            control.CheckControlTarget(
+                                props.Tenant,
+                                props.SessionId,
+                                turn,
+                                position,
+                                claim,
+                                CancellationToken.None
+                            ))
                     "control-admission"
                     (fun args2 pipe2 -> function
                         | Ok verified when verified.Outcome = ControlOperationOutcome.Applied ->
@@ -6483,13 +6518,14 @@ module internal SessionActor =
                 | Some claim ->
                     startPipedWait
                         starter
-                        (ClaimFence.updateSessionStateAsync
-                            props.Store
-                            props.Tenant
-                            claim
-                            props.SessionId
-                            SessionState.Running
-                            CancellationToken.None)
+                        (fun () ->
+                                ClaimFence.updateSessionStateAsync
+                                    props.Store
+                                    props.Tenant
+                                    claim
+                                    props.SessionId
+                                    SessionState.Running
+                                    CancellationToken.None)
                         "start-running-fenced"
                         (fun args3 pipe3 -> function
                             | Ok true -> proceed args3 pipe3
@@ -6501,12 +6537,13 @@ module internal SessionActor =
                 | None ->
                     startPipedWaitUnit
                         starter
-                        (props.Store.UpdateSessionState(
-                            props.Tenant,
-                            props.SessionId,
-                            SessionState.Running,
-                            CancellationToken.None
-                        ))
+                        (fun () ->
+                                props.Store.UpdateSessionState(
+                                    props.Tenant,
+                                    props.SessionId,
+                                    SessionState.Running,
+                                    CancellationToken.None
+                                ))
                         "start-running"
                         (fun args3 pipe3 -> function
                             | Ok () -> proceed args3 pipe3
@@ -6688,14 +6725,15 @@ module internal SessionActor =
             | (true, (turn, claim, _)), Some control ->
                 startPipedWait
                     starter
-                    (control.CheckControlTarget(
-                        props.Tenant,
-                        props.SessionId,
-                        turn,
-                        parked.Entry.Position,
-                        claim,
-                        CancellationToken.None
-                    ))
+                    (fun () ->
+                            control.CheckControlTarget(
+                                props.Tenant,
+                                props.SessionId,
+                                turn,
+                                parked.Entry.Position,
+                                claim,
+                                CancellationToken.None
+                            ))
                     "resume-admission"
                     (fun args2 pipe2 -> function
                         | Ok verified when verified.Outcome = ControlOperationOutcome.Applied ->
@@ -6739,11 +6777,12 @@ module internal SessionActor =
                             (fun () args3 pipe3 ->
                                 startPipedWait
                                     starter
-                                    (props.Store.ReadPendingInbox(
-                                        props.Tenant,
-                                        props.SessionId,
-                                        CancellationToken.None
-                                    ))
+                                    (fun () ->
+                                            props.Store.ReadPendingInbox(
+                                                props.Tenant,
+                                                props.SessionId,
+                                                CancellationToken.None
+                                            ))
                                     "drain-after-refusal/read"
                                     (fun args4 pipe4 -> function
                                         | Error error -> raise error
@@ -6768,12 +6807,13 @@ module internal SessionActor =
                                                         | None ->
                                                             startPipedWaitUnit
                                                                 starter
-                                                                (props.Store.UpdateSessionState(
-                                                                    props.Tenant,
-                                                                    props.SessionId,
-                                                                    SessionState.Running,
-                                                                    CancellationToken.None
-                                                                ))
+                                                                (fun () ->
+                                                                        props.Store.UpdateSessionState(
+                                                                            props.Tenant,
+                                                                            props.SessionId,
+                                                                            SessionState.Running,
+                                                                            CancellationToken.None
+                                                                        ))
                                                                 "drain-after-refusal/running"
                                                                 (fun args6 pipe6 -> function
                                                                     | Error error -> raise error
@@ -6820,12 +6860,13 @@ module internal SessionActor =
                                             | [] ->
                                                 startPipedWaitUnit
                                                     starter
-                                                    (props.Store.UpdateSessionState(
-                                                        props.Tenant,
-                                                        props.SessionId,
-                                                        SessionState.Idle,
-                                                        CancellationToken.None
-                                                    ))
+                                                    (fun () ->
+                                                            props.Store.UpdateSessionState(
+                                                                props.Tenant,
+                                                                props.SessionId,
+                                                                SessionState.Idle,
+                                                                CancellationToken.None
+                                                            ))
                                                     "drain-after-refusal/idle"
                                                     (fun args5 pipe5 -> function
                                                         | Ok () -> cont SessionState.Idle args5 pipe5
@@ -6895,13 +6936,14 @@ module internal SessionActor =
                     // Failed with the typed reason instead.
                     startPipedWait
                         starter
-                        (JournalWriter.appendWithTokenAsync
-                            suspend.EventStore
-                            props.Tenant
-                            props.SessionId
-                            journalToken
-                            events
-                            CancellationToken.None)
+                        (fun () ->
+                                JournalWriter.appendWithTokenAsync
+                                    suspend.EventStore
+                                    props.Tenant
+                                    props.SessionId
+                                    journalToken
+                                    events
+                                    CancellationToken.None)
                         "journal-suspend"
                         (fun args2 pipe2 -> function
                             | Ok outcome -> cont outcome args2 pipe2
@@ -6914,7 +6956,7 @@ module internal SessionActor =
             | Some control, Some _ ->
                 startPipedWait
                     starter
-                    (control.ReadAbortTarget(props.Tenant, props.SessionId, CancellationToken.None))
+                    (fun () -> control.ReadAbortTarget(props.Tenant, props.SessionId, CancellationToken.None))
                     "journal-suspend/target"
                     (fun args2 pipe2 -> function
                         | Error error -> raise error
@@ -6995,13 +7037,14 @@ module internal SessionActor =
 
                         startPipedWait
                             starter
-                            (JournalWriter.appendWithTokenAsync
-                                suspend.EventStore
-                                props.Tenant
-                                props.SessionId
-                                journalToken
-                                events
-                                CancellationToken.None)
+                            (fun () ->
+                                    JournalWriter.appendWithTokenAsync
+                                        suspend.EventStore
+                                        props.Tenant
+                                        props.SessionId
+                                        journalToken
+                                        events
+                                        CancellationToken.None)
                             "journal-resolve"
                             (fun args2 pipe2 -> function
                                 | Ok outcome -> cont outcome args2 pipe2
@@ -7014,7 +7057,7 @@ module internal SessionActor =
             | Some control, Some _ ->
                 startPipedWait
                     starter
-                    (control.ReadAbortTarget(props.Tenant, props.SessionId, CancellationToken.None))
+                    (fun () -> control.ReadAbortTarget(props.Tenant, props.SessionId, CancellationToken.None))
                     "journal-resolve/target"
                     (fun args2 pipe2 -> function
                         | Error error -> raise error
@@ -7097,13 +7140,14 @@ module internal SessionActor =
 
                 startPipedWait
                     starter
-                    (JournalWriter.appendWithTokenAsync
-                        suspend.EventStore
-                        props.Tenant
-                        props.SessionId
-                        journalToken
-                        events
-                        CancellationToken.None)
+                    (fun () ->
+                            JournalWriter.appendWithTokenAsync
+                                suspend.EventStore
+                                props.Tenant
+                                props.SessionId
+                                journalToken
+                                events
+                                CancellationToken.None)
                     "journal-settled-completion"
                     (fun args2 pipe2 _ -> cont () args2 pipe2)
                     suspendWith
@@ -7143,13 +7187,14 @@ module internal SessionActor =
 
                 startPipedWait
                     starter
-                    (JournalWriter.appendWithTokenAsync
-                        suspend.EventStore
-                        props.Tenant
-                        props.SessionId
-                        journalToken
-                        events
-                        CancellationToken.None)
+                    (fun () ->
+                            JournalWriter.appendWithTokenAsync
+                                suspend.EventStore
+                                props.Tenant
+                                props.SessionId
+                                journalToken
+                                events
+                                CancellationToken.None)
                     "journal-timeout"
                     (fun args2 pipe2 -> function
                         | Ok _ -> cont () args2 pipe2
@@ -7197,18 +7242,19 @@ module internal SessionActor =
 
                 startPipedWait
                     starter
-                    (control.TryDecideControlTarget(
-                        props.Tenant,
-                        props.SessionId,
-                        turn,
-                        entry.Position,
-                        claim,
-                        id,
-                        candidate.Status,
-                        cause,
-                        reason,
-                        CancellationToken.None
-                    ))
+                    (fun () ->
+                            control.TryDecideControlTarget(
+                                props.Tenant,
+                                props.SessionId,
+                                turn,
+                                entry.Position,
+                                claim,
+                                id,
+                                candidate.Status,
+                                cause,
+                                reason,
+                                CancellationToken.None
+                            ))
                     "decide-control"
                     (fun args2 pipe2 -> function
                         | Error error -> raise error
@@ -7272,15 +7318,16 @@ module internal SessionActor =
             | Some control, (true, (turn, claim, id)) ->
                 startPipedWait
                     starter
-                    (control.RetireControlTarget(
-                        props.Tenant,
-                        props.SessionId,
-                        turn,
-                        entry.Position,
-                        claim,
-                        id,
-                        CancellationToken.None
-                    ))
+                    (fun () ->
+                            control.RetireControlTarget(
+                                props.Tenant,
+                                props.SessionId,
+                                turn,
+                                entry.Position,
+                                claim,
+                                id,
+                                CancellationToken.None
+                            ))
                     "retire-control"
                     (fun args2 pipe2 -> function
                         | Error error -> raise error
@@ -7338,12 +7385,13 @@ module internal SessionActor =
                 (fun decided args2 pipe2 ->
                     startPipedWaitUnit
                         starter
-                        (props.Store.MarkInboxConsumed(
-                            props.Tenant,
-                            props.SessionId,
-                            positions,
-                            CancellationToken.None
-                        ))
+                        (fun () ->
+                                props.Store.MarkInboxConsumed(
+                                    props.Tenant,
+                                    props.SessionId,
+                                    positions,
+                                    CancellationToken.None
+                                ))
                         "settle-journal-failure/consume"
                         (fun args3 pipe3 -> function
                             | Ok () ->
@@ -7363,12 +7411,13 @@ module internal SessionActor =
                                             (fun () args5 pipe5 ->
                                                 startPipedWaitUnit
                                                     starter
-                                                    (props.Store.UpdateSessionState(
-                                                        props.Tenant,
-                                                        props.SessionId,
-                                                        SessionState.Idle,
-                                                        CancellationToken.None
-                                                    ))
+                                                    (fun () ->
+                                                            props.Store.UpdateSessionState(
+                                                                props.Tenant,
+                                                                props.SessionId,
+                                                                SessionState.Idle,
+                                                                CancellationToken.None
+                                                            ))
                                                     "settle-journal-failure/idle"
                                                     (fun args6 pipe6 -> function
                                                         | Ok () -> cont () args6 pipe6
@@ -7420,13 +7469,14 @@ module internal SessionActor =
 
                         startPipedWait
                             starter
-                            (ClaimFence.settleTurnAsync
-                                props.Store
-                                props.Tenant
-                                claim
-                                TurnStatus.Completed
-                                null
-                                CancellationToken.None)
+                            (fun () ->
+                                    ClaimFence.settleTurnAsync
+                                        props.Store
+                                        props.Tenant
+                                        claim
+                                        TurnStatus.Completed
+                                        null
+                                        CancellationToken.None)
                             "settle-completed-prime"
                             (fun args3 pipe3 _ -> cont () args3 pipe3)
                             suspendWith
@@ -7548,13 +7598,14 @@ module internal SessionActor =
             | Some capable, Some claim ->
                 startPipedWaitUnit
                     starter
-                    (capable.AdmitExecution(
-                        props.Tenant,
-                        props.SessionId,
-                        entry.Position,
-                        claim,
-                        CancellationToken.None
-                    ))
+                    (fun () ->
+                            capable.AdmitExecution(
+                                props.Tenant,
+                                props.SessionId,
+                                entry.Position,
+                                claim,
+                                CancellationToken.None
+                            ))
                     "settle/admit"
                     (fun args2 pipe2 _ ->
                         let execution =
@@ -7575,7 +7626,7 @@ module internal SessionActor =
 
                         startPipedWait
                             starter
-                            (capable.SettleExecution(props.Tenant, request, CancellationToken.None))
+                            (fun () -> capable.SettleExecution(props.Tenant, request, CancellationToken.None))
                             "settle/execution"
                             (fun args3 pipe3 -> function
                                 | Ok outcome -> cont (Some outcome) args3 pipe3
@@ -7611,13 +7662,14 @@ module internal SessionActor =
             | Some claim ->
                 startPipedWait
                     starter
-                    (ClaimFence.consumeInboxAsync
-                        props.Store
-                        props.Tenant
-                        claim
-                        props.SessionId
-                        positions
-                        CancellationToken.None)
+                    (fun () ->
+                            ClaimFence.consumeInboxAsync
+                                props.Store
+                                props.Tenant
+                                claim
+                                props.SessionId
+                                positions
+                                CancellationToken.None)
                     "consume-under-claim"
                     (fun args2 pipe2 -> function
                         | Ok landed -> cont landed args2 pipe2
@@ -7628,7 +7680,7 @@ module internal SessionActor =
             | None ->
                 startPipedWaitUnit
                     starter
-                    (props.Store.MarkInboxConsumed(props.Tenant, props.SessionId, positions, CancellationToken.None))
+                    (fun () -> props.Store.MarkInboxConsumed(props.Tenant, props.SessionId, positions, CancellationToken.None))
                     "consume-legacy"
                     (fun args2 pipe2 -> function
                         | Ok () -> cont true args2 pipe2
@@ -7660,13 +7712,14 @@ module internal SessionActor =
             | Some claim ->
                 startPipedWait
                     starter
-                    (ClaimFence.updateSessionStateAsync
-                        props.Store
-                        props.Tenant
-                        claim
-                        props.SessionId
-                        state
-                        CancellationToken.None)
+                    (fun () ->
+                            ClaimFence.updateSessionStateAsync
+                                props.Store
+                                props.Tenant
+                                claim
+                                props.SessionId
+                                state
+                                CancellationToken.None)
                     "update-state-under-claim"
                     (fun args2 pipe2 -> function
                         | Ok landed -> cont landed args2 pipe2
@@ -7677,7 +7730,7 @@ module internal SessionActor =
             | None ->
                 startPipedWaitUnit
                     starter
-                    (props.Store.UpdateSessionState(props.Tenant, props.SessionId, state, CancellationToken.None))
+                    (fun () -> props.Store.UpdateSessionState(props.Tenant, props.SessionId, state, CancellationToken.None))
                     "update-state-legacy"
                     (fun args2 pipe2 -> function
                         | Ok () -> cont true args2 pipe2
@@ -7741,13 +7794,14 @@ module internal SessionActor =
                                 | Some claim ->
                                     startPipedWait
                                         starter
-                                        (ClaimFence.grantSessionToolAsync
-                                            props.Store
-                                            props.Tenant
-                                            claim
-                                            props.SessionId
-                                            toolName
-                                            CancellationToken.None)
+                                        (fun () ->
+                                                ClaimFence.grantSessionToolAsync
+                                                    props.Store
+                                                    props.Tenant
+                                                    claim
+                                                    props.SessionId
+                                                    toolName
+                                                    CancellationToken.None)
                                         "grant-under-claim"
                                         (fun args3 pipe3 -> function
                                             | Ok granted -> cont granted args3 pipe3
@@ -7758,12 +7812,13 @@ module internal SessionActor =
                                 | None ->
                                     startPipedWaitUnit
                                         starter
-                                        (props.Store.GrantSessionTool(
-                                            props.Tenant,
-                                            props.SessionId,
-                                            toolName,
-                                            CancellationToken.None
-                                        ))
+                                        (fun () ->
+                                                props.Store.GrantSessionTool(
+                                                    props.Tenant,
+                                                    props.SessionId,
+                                                    toolName,
+                                                    CancellationToken.None
+                                                ))
                                         "grant-legacy"
                                         (fun args3 pipe3 -> function
                                             | Ok () -> cont true args3 pipe3
@@ -7812,7 +7867,7 @@ module internal SessionActor =
             : Cont<SuspendableActorMessage, unit> =
             startPipedWait
                 starter
-                (props.Store.AppendInboxMessage(props.Tenant, props.SessionId, payload, delivery, cancellationToken))
+                (fun () -> props.Store.AppendInboxMessage(props.Tenant, props.SessionId, payload, delivery, cancellationToken))
                 "prompt-append"
                 (fun args2 pipe2 -> function
                     | Error error -> raise error
@@ -7839,7 +7894,7 @@ module internal SessionActor =
             : Cont<SuspendableActorMessage, unit> =
             startPipedWait
                 starter
-                (props.Store.ReadPendingInbox(props.Tenant, props.SessionId, cancellationToken))
+                (fun () -> props.Store.ReadPendingInbox(props.Tenant, props.SessionId, cancellationToken))
                 "prompt-drain"
                 (fun args2 pipe2 -> function
                     | Error error -> raise error
@@ -8140,12 +8195,13 @@ module internal SessionActor =
 
                                 startPipedWaitUnit
                                     starter
-                                    (props.Store.MarkInboxConsumed(
-                                        props.Tenant,
-                                        props.SessionId,
-                                        positions,
-                                        CancellationToken.None
-                                    ))
+                                    (fun () ->
+                                            props.Store.MarkInboxConsumed(
+                                                props.Tenant,
+                                                props.SessionId,
+                                                positions,
+                                                CancellationToken.None
+                                            ))
                                     "settle-entry/consume"
                                     (fun args4 pipe4 -> function
                                         | Error error -> raise error
@@ -8182,11 +8238,12 @@ module internal SessionActor =
                                                                                 // the session: Closed rejects it.
                                                                                 startPipedWaitUnit
                                                                                     starter
-                                                                                    (props.Store.CloseSession(
-                                                                                        props.Tenant,
-                                                                                        props.SessionId,
-                                                                                        CancellationToken.None
-                                                                                    ))
+                                                                                    (fun () ->
+                                                                                            props.Store.CloseSession(
+                                                                                                props.Tenant,
+                                                                                                props.SessionId,
+                                                                                                CancellationToken.None
+                                                                                            ))
                                                                                     "settle-entry/autoclose"
                                                                                     (fun args9 pipe9 -> function
                                                                                         | Error error -> raise error
@@ -8317,12 +8374,13 @@ module internal SessionActor =
                                                     and idleWrite args8 pipe8 =
                                                         startPipedWaitUnit
                                                             starter
-                                                            (props.Store.UpdateSessionState(
-                                                                props.Tenant,
-                                                                props.SessionId,
-                                                                SessionState.Idle,
-                                                                CancellationToken.None
-                                                            ))
+                                                            (fun () ->
+                                                                    props.Store.UpdateSessionState(
+                                                                        props.Tenant,
+                                                                        props.SessionId,
+                                                                        SessionState.Idle,
+                                                                        CancellationToken.None
+                                                                    ))
                                                             "settle-entry/idle"
                                                             (fun args9 pipe9 -> function
                                                                 | Ok () -> cont SessionState.Idle args9 pipe9
@@ -8563,13 +8621,14 @@ module internal SessionActor =
                                                     // snapshot-before-append check.
                                                     startPipedWait
                                                         starter
-                                                        (props.Store.AppendInboxMessage(
-                                                            props.Tenant,
-                                                            props.SessionId,
-                                                            ReplyPayload(reply),
-                                                            DeliveryMode.Queue,
-                                                            CancellationToken.None
-                                                        ))
+                                                        (fun () ->
+                                                                props.Store.AppendInboxMessage(
+                                                                    props.Tenant,
+                                                                    props.SessionId,
+                                                                    ReplyPayload(reply),
+                                                                    DeliveryMode.Queue,
+                                                                    CancellationToken.None
+                                                                ))
                                                         "reply-append"
                                                         (fun args4 pipe4 -> function
                                                             | Error error -> raise error
@@ -9151,12 +9210,13 @@ module internal SessionActor =
                                                             // store-first path below.
                                                             startPipedWaitUnit
                                                                 starter
-                                                                (props.Store.MarkInboxConsumed(
-                                                                    props.Tenant,
-                                                                    props.SessionId,
-                                                                    positions,
-                                                                    CancellationToken.None
-                                                                ))
+                                                                (fun () ->
+                                                                        props.Store.MarkInboxConsumed(
+                                                                            props.Tenant,
+                                                                            props.SessionId,
+                                                                            positions,
+                                                                            CancellationToken.None
+                                                                        ))
                                                                 "faulted/consume"
                                                                 (fun args6 pipe6 -> function
                                                                     | Error error -> raise error
@@ -9187,12 +9247,13 @@ module internal SessionActor =
                                                                                         (fun () args9 pipe9 ->
                                                                                             startPipedWaitUnit
                                                                                                 starter
-                                                                                                (props.Store.UpdateSessionState(
-                                                                                                    props.Tenant,
-                                                                                                    props.SessionId,
-                                                                                                    SessionState.Idle,
-                                                                                                    CancellationToken.None
-                                                                                                ))
+                                                                                                (fun () ->
+                                                                                                        props.Store.UpdateSessionState(
+                                                                                                            props.Tenant,
+                                                                                                            props.SessionId,
+                                                                                                            SessionState.Idle,
+                                                                                                            CancellationToken.None
+                                                                                                        ))
                                                                                                 "faulted/idle"
                                                                                                 (fun args10 pipe10 ->
                                                                                                     function
@@ -9647,12 +9708,13 @@ module internal SessionActor =
 
                                     startPipedWaitUnit
                                         starter
-                                        (props.Store.MarkInboxConsumed(
-                                            props.Tenant,
-                                            props.SessionId,
-                                            positions,
-                                            CancellationToken.None
-                                        ))
+                                        (fun () ->
+                                                props.Store.MarkInboxConsumed(
+                                                    props.Tenant,
+                                                    props.SessionId,
+                                                    positions,
+                                                    CancellationToken.None
+                                                ))
                                         "suspend-timeout/consume"
                                         (fun args3 pipe3 -> function
                                             | Error error -> raise error
@@ -9681,12 +9743,13 @@ module internal SessionActor =
 
                                                                         startPipedWaitUnit
                                                                             starter
-                                                                            (props.Store.UpdateSessionState(
-                                                                                props.Tenant,
-                                                                                props.SessionId,
-                                                                                SessionState.Idle,
-                                                                                CancellationToken.None
-                                                                            ))
+                                                                            (fun () ->
+                                                                                    props.Store.UpdateSessionState(
+                                                                                        props.Tenant,
+                                                                                        props.SessionId,
+                                                                                        SessionState.Idle,
+                                                                                        CancellationToken.None
+                                                                                    ))
                                                                             "suspend-timeout/idle"
                                                                             (fun args7 pipe7 -> function
                                                                                 | Ok () ->
@@ -9791,7 +9854,7 @@ module internal SessionActor =
                         let afterApply args2 pipe2 =
                             startPipedWait
                                 starter
-                                (requireSessionAsync props.Store props.Tenant props.SessionId cancellationToken)
+                                (fun () -> requireSessionAsync props.Store props.Tenant props.SessionId cancellationToken)
                                 "set-agent/read"
                                 (fun args3 pipe3 -> function
                                     | Error error -> raise error
@@ -9840,11 +9903,12 @@ module internal SessionActor =
                                     // start path the Idle prompt arms use.
                                     startPipedWait
                                         starter
-                                        (props.Store.ReadPendingInbox(
-                                            props.Tenant,
-                                            props.SessionId,
-                                            CancellationToken.None
-                                        ))
+                                        (fun () ->
+                                                props.Store.ReadPendingInbox(
+                                                    props.Tenant,
+                                                    props.SessionId,
+                                                    CancellationToken.None
+                                                ))
                                         "check-inbox/read"
                                         (fun args3 pipe3 -> function
                                             | Error(:? SessionNotFoundException) -> loop args3 pipe3
@@ -9877,12 +9941,13 @@ module internal SessionActor =
                                                                 | None ->
                                                                     startPipedWaitUnit
                                                                         starter
-                                                                        (props.Store.UpdateSessionState(
-                                                                            props.Tenant,
-                                                                            props.SessionId,
-                                                                            SessionState.Running,
-                                                                            CancellationToken.None
-                                                                        ))
+                                                                        (fun () ->
+                                                                                props.Store.UpdateSessionState(
+                                                                                    props.Tenant,
+                                                                                    props.SessionId,
+                                                                                    SessionState.Running,
+                                                                                    CancellationToken.None
+                                                                                ))
                                                                         "check-inbox/running"
                                                                         (fun args6 pipe6 -> function
                                                                             | Error error -> raise error
@@ -10047,7 +10112,7 @@ module internal SessionActor =
 
         startPipedWait
             starter
-            (props.Store.ReadPendingInbox(props.Tenant, props.SessionId, CancellationToken.None))
+            (fun () -> props.Store.ReadPendingInbox(props.Tenant, props.SessionId, CancellationToken.None))
             "seed-inbox-count"
             (fun args2 pipe2 -> function
                 | Ok pending ->
@@ -10836,14 +10901,14 @@ module internal SessionActor =
                         return!
                             startPipedWait
                                 starter
-                                (requireSessionAsync store tenant captured CancellationToken.None)
+                                (fun () -> requireSessionAsync store tenant captured CancellationToken.None)
                                 "blocked/snapshot-session"
                                 (fun () pipe2 -> function
                                     | Error e -> raise e
                                     | Ok session ->
                                         startPipedWait
                                             starter
-                                            (store.ReadPendingInbox(tenant, captured, CancellationToken.None))
+                                            (fun () -> store.ReadPendingInbox(tenant, captured, CancellationToken.None))
                                             "blocked/snapshot-inbox"
                                             (fun () pipe3 -> function
                                                 | Error e -> raise e
@@ -10999,7 +11064,7 @@ module internal SessionActor =
                 fun args2 pipe2 ->
                     startPipedWait
                         starter
-                        (primeClaimTask captured)
+                        (fun () -> primeClaimTask captured)
                         "activate/prime"
                         (fun _ pipe3 -> function
                             | Error failure -> becomeFailed failure pipe3
@@ -11029,7 +11094,7 @@ module internal SessionActor =
                     | :? ISessionAbortControlStore as control ->
                         startPipedWait
                             starter
-                            (control.ReadAbortTarget(tenant, captured, CancellationToken.None))
+                            (fun () -> control.ReadAbortTarget(tenant, captured, CancellationToken.None))
                             "activate/recover-target"
                             (fun args3 pipe3 -> function
                                 | Error failure -> becomeFailed failure pipe3
@@ -11039,14 +11104,15 @@ module internal SessionActor =
                                     | t when t.State = ControlTargetState.Active && isNull (box t.Stop) ->
                                         startPipedWait
                                             starter
-                                            (control.TryRecoverControlTarget(
-                                                tenant,
-                                                captured,
-                                                t.TurnId,
-                                                claimOwner,
-                                                leaseDuration,
-                                                CancellationToken.None
-                                            ))
+                                            (fun () ->
+                                                    control.TryRecoverControlTarget(
+                                                        tenant,
+                                                        captured,
+                                                        t.TurnId,
+                                                        claimOwner,
+                                                        leaseDuration,
+                                                        CancellationToken.None
+                                                    ))
                                             "activate/recover"
                                             (fun args4 pipe4 -> function
                                                 | Error failure -> becomeFailed failure pipe4
@@ -11088,7 +11154,7 @@ module internal SessionActor =
 
             startPipedWait
                 starter
-                (store.GetSession(tenant, captured, CancellationToken.None))
+                (fun () -> store.GetSession(tenant, captured, CancellationToken.None))
                 "activate/validate"
                 (fun _ pipe2 -> function
                     | Error failure -> becomeFailed failure pipe2
