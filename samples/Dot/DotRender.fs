@@ -599,11 +599,17 @@ let applyAll (state: RendererState) (events: SessionEvent seq) : RendererState =
     else
         (state, events) ||> Seq.fold (fun current evt -> apply current evt)
 
-/// Adds one engine diagnostic line (RESULT, ERROR, DEADLINE, SESSION,
-/// COMPACT, ABORTED, SESSIONS, TREE, FORKED, RESUMED, MODEL, TEMPLATE,
-/// EXPORTED, PERMISSION, QUESTION, and the rest of the REPL line contract)
-/// to the viewport: the parity path for output the journal never carries.
-/// Null lines are ignored; the tail window caps growth.
+/// Adds one engine diagnostic line (RESULT, ERROR, DEADLINE, STATE,
+/// ACCEPTED, ATTACHED, OBSERVE-FAILED, UNSUPPORTED-CONTRACT,
+/// REPLY-REJECTED, IGNORED-STALE-EVENT, SESSION, COMPACT, ABORTED,
+/// SESSIONS, TREE, FORKED, RESUMED, MODEL, TEMPLATE, EXPORTED,
+/// PERMISSION, QUESTION, and the rest of the REPL line contract) to the
+/// viewport: the parity path for output the journal never carries.
+/// Session- and turn-bound permission/question widgets themselves stay
+/// owned by the Subscribe fold (rendering rules unchanged); the
+/// REPLY-REJECTED and STATE lines make stale/invalid replies and
+/// authoritative operation observations visible. Null lines are ignored;
+/// the tail window caps growth.
 /// <param name="state">The current renderer state.</param>
 /// <param name="line">The engine line to retain.</param>
 /// <returns>The next renderer state.</returns>

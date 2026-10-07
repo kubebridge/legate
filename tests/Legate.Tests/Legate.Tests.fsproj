@@ -147,6 +147,12 @@
     <Compile Include="DotTuiModeTests.fs" />
     <Compile Include="../../samples/Dot/DotTuiRouting.fs" Link="DotTuiRoutingUnderTest.fs" />
     <Compile Include="DotTuiRoutingTests.fs" />
+    <Compile Include="../../samples/Dot/DotContext.fs" Link="DotContextUnderTest.fs" />
+    <Compile Include="../../samples/Dot/DotSkills.fs" Link="DotSkillsUnderTest.fs" />
+    <Compile Include="../../samples/Dot/DotTemplates.fs" Link="DotTemplatesUnderTest.fs" />
+    <Compile Include="../../samples/Dot/DotExport.fs" Link="DotExportUnderTest.fs" />
+    <Compile Include="../../samples/Dot/ReplEngine.fs" Link="ReplEngineUnderTest.fs" />
+    <Compile Include="DotAttachmentTests.fs" />
     <Compile Include="MigrationTests.fs" />
     <Compile Include="SqliteTestFixture.fs" />
     <Compile Include="TenantRemotingAcceptanceTests.fs" />

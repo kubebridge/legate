@@ -7,36 +7,69 @@ open System.Threading
 open System.Threading.Tasks
 open Legate
 
-// REPL engine over the session client facade for the dot host: foreground
-// prompt loop with one turn in flight, Subscribe streaming to the writer,
-// permission/question console replies, and the /new, /sessions, /resume,
-// /model, /steer, /follow, /abort, /compact, /tree, /fork, /clone,
-// /session, /export, /<template>, and /quit commands over the SQLite
-// session store. Modeled on
-// samples/LegateCli/CliEngine.fs: the settle waiter is queued before the
-// prompt lands (a settle with no waiter only records), each event renders
-// as a stable single line, and permission/question suspensions are
-// answered inline through ReplyAsync. Divergences from CliEngine, all
-// required by the SQLite host or this issue: the engine provisions one
-// enabled scripted agent per opened session (the SQLite authority check
-// rejects turns for missing agents, while CliEngine's InMemory catalog
-// authorizes); opened sessions carry a title but no timeout, so the
-// settle-wait bound reports a deadline without killing the turn; there is
-// no /agent stub; /model switches the session through SetAgentAsync
-// against a model-carrying agent row, so the journal transcript and
-// workspace binding survive; /steer interrupts (Interrupt), /follow folds
-// in (Inject, waiter-free while a turn runs so the folded turn settles
-// once), and plain input queues (Queue); /tree pages ReadEventsAsync and
-// /fork branches the prefix through ForkAsync (plus a free /clone at the
-// tail); unknown commands reprint the command usage; and a settle wait
-// that outruns its bound reports DEADLINE while the turn keeps running.
+// REPL engine over the session client facade for the dot host: one
+// continuous logical attachment observation per selected session plus
+// receipt-bound authoritative observation, permission/question console
+// replies, and the /new, /sessions, /resume, /model, /steer, /follow,
+// /abort, /compact, /tree, /fork, /clone, /session, /export,
+// /<template>, /help, and /quit commands over the SQLite session store.
+// Modeled on
+// samples/LegateCli/CliEngine.fs: each event renders as a stable single
+// line, and permission/question suspensions are answered inline through
+// ReplyAsync. Divergences from CliEngine, all required by the SQLite host
+// or this issue: the engine provisions one enabled scripted agent per
+// opened session (the SQLite authority check rejects turns for missing
+// agents, while CliEngine's InMemory catalog authorizes); opened sessions
+// carry a title but no timeout, so the operation-wait bound reports a
+// deadline without killing the turn; there is no /agent stub; /model
+// switches the session through SetAgentAsync against a model-carrying
+// agent row, so the journal transcript and workspace binding survive;
+// /steer interrupts (Interrupt), /follow folds in (Inject) and plain input
+// queues (Queue); /tree pages ReadEventsAsync and /fork branches the
+// prefix through ForkAsync (plus a free /clone at the tail); unknown
+// commands reprint the command usage; and an operation wait that outruns
+// its bound reports DEADLINE naming the accepted operation while the turn
+// keeps running and the attachment keeps observing. Selecting, opening,
+// or attaching a session establishes the attachment (including to
+// already-running or suspended work with no prompt); individual waits,
+// deadline expiry, and terminal results never end it; transport recovery
+// replaces the subscription with no overlapping consumers and no loss of
+// session identity. Replies bind to the request's original session plus
+// continued validity and turn association; stale, resolved, switched, or
+// replayed requests are rejected visibly with no cross-session send.
 // Transport-agnostic: the host wires the chat client, tools, and policy.
 // Reads and writes through the given reader/writer so scripted transports
 // drive it without a console.
 
 /// The command usage reprinted on startup and for unknown commands.
 let private commandsUsage =
-    "Commands: /new [title], /sessions, /resume <id-or-index>, /model [provider[/model]], /agents, /steer <text>, /follow <text>, /abort, /compact, /tree, /fork <sequence>, /clone, /session, /export <file>, /<template>, /quit."
+    "Commands: /new [title], /sessions, /resume <id-or-index>, /model [provider[/model]], /agents, /steer <text>, /follow <text>, /abort, /compact, /tree, /fork <sequence>, /clone, /session, /export <file>, /<template>, /help, /quit."
+
+/// How client waiting, queued time, turn execution, and suspension
+/// relate: the completion-wait budget starts on confirmed input
+/// acceptance and includes time queued behind earlier work; queued-time
+/// expiry cancels nothing and charges nothing against the runtime turn
+/// execution budget; suspension waits for host input through ReplyAsync
+/// and never resolves a completion wait; execution-budget exhaustion is
+/// reported from the authoritative runtime outcome, never from a client
+/// deadline. Stopping a wait, detaching, or cancelling observation never
+/// aborts; only /abort (explicit execution control) affects execution.
+let waitSemanticsHelp =
+    "Waiting: PromptAsync acceptance returns an AcceptedOperation receipt (Queue/Inject/Interrupt/Reply distinguishable); "
+    + "WaitForOperationAsync bounds only client completion waiting from acceptance (queued time included; queued-time expiry cancels nothing and charges nothing against the runtime turn execution budget); "
+    + "GetOperationResultAsync reports Pending/Terminal/Unknown/Unavailable explicitly (unknown stays unknown, never running/success/idle); "
+    + "suspension waits for host input through ReplyAsync and never resolves a completion wait; execution-budget exhaustion is reported from the authoritative runtime outcome, never from a client deadline; "
+    + "a wait that outruns its bound prints DEADLINE naming the operation and stating only that client waiting stopped (no abort, no result consumption, no disconnect); "
+    + "stopping a wait, detaching, or cancelling observation never aborts execution; only explicit execution control affects execution; "
+    + "steer (/steer Interrupt), follow (/follow Inject), abort (/abort), and replies stay usable after deadlines and while input queues."
+
+/// When an old persistence, wait, or event contract is no longer
+/// supported: fail clearly and require an explicit host/user clean start
+/// (new database path), never fabricate resumed state, historical
+/// results, or conversation, and never rewrite landed migrations.
+let cleanStartHelp =
+    "Clean start: unsupported old persistence/wait/event contracts fail with UNSUPPORTED-CONTRACT and require an explicit clean start (a fresh database path); "
+    + "Dot never invents history, terminal outcomes, or request validity to keep an old integration appearing functional."
 
 // ──────────────────────────────────────────────────────────────────────────
 // Provider and model selection (issue 307)
@@ -244,21 +277,42 @@ type private ReplSession =
         mutable Cursor: int64
     }
 
-/// One queued turn: the session it runs in, the settle waiter queued
-/// before its prompt landed, and the waiter CTS the drain disposes. The
-/// streamed prefix accumulates this turn's TextDelta fragments while its
-/// stream drains (claimed by the first TurnStarted the stream observes, so
-/// queued turns never share a prefix); the settled prefix snapshots that
-/// text when the turn's terminal event lands, so settlement rendering stays
-/// scoped to this turn even when the next turn already streams.
+/// One queued turn: the session it runs in, the accepted-operation
+/// receipt captured on confirmed PromptAsync acceptance (Queue, Inject,
+/// or Interrupt distinguishable by receipt kind), the receipt-bound
+/// WaitForOperationAsync waiter started at acceptance (bound includes
+/// queued time), and the waiter CTS the drain disposes. The streamed
+/// prefix accumulates this turn's TextDelta fragments while the
+/// attachment observes (claimed by the first TurnStarted the attachment
+/// sees, so queued turns never share a prefix); the settled prefix
+/// snapshots that text when the turn's terminal event lands, so
+/// settlement rendering stays scoped to this turn even when the next
+/// turn already streams. Acceptance failures never create a turn: they
+/// report not-accepted and cancel nothing.
 type private PendingTurn =
     {
         Session: ReplSession
-        WaitTask: Task<TurnResult>
+        Receipt: AcceptedOperation
+        AcceptedAt: DateTimeOffset
+        WaitTask: Task<OperationResult>
         WaitCts: CancellationTokenSource
         mutable TurnKey: string
         mutable StreamedPrefix: string
         mutable SettledPrefix: string
+    }
+
+/// One session-bound pending host-input request: the original session
+/// identity plus the request and turn association needed to validate a
+/// reply at submit. Switching sessions, resolving or aborting the turn,
+/// disconnecting, or invalidating the request rejects stale input
+/// visibly with no work and no disclosure; replayed already-resolved
+/// requests never become actionable again.
+type private PendingRequest =
+    {
+        SessionId: SessionId
+        RequestId: string
+        TurnId: TurnId
+        IsPermission: bool
     }
 
 /// Ensures the model-carrying agent exists in the agent store: the
@@ -433,6 +487,34 @@ let renderEvent (evt: SessionEvent) : string = renderWith "EVENT" evt
 /// <returns>The rendered line.</returns>
 let renderTree (evt: SessionEvent) : string = renderWith "TREE" evt
 
+/// Maps one authoritative operation observation to visible text without
+/// an engine instance: accepted-queued, committed success/failure/abort,
+/// or explicit unknown/unavailable. Null reads unknown. Local task
+/// lifetime is never presented as runtime state.
+/// <param name="observed">The operation observation. Null reads unknown.</param>
+/// <returns>The visible state text.</returns>
+let describeOperationState (observed: OperationResult) : string =
+    if isNull (box observed) then
+        "unknown (insufficient evidence)"
+    else
+        match observed.Status with
+        | OperationStatus.Pending ->
+            $"accepted-queued op={observed.Position} kind={observed.Kind} (no committed result yet)"
+        | OperationStatus.Terminal ->
+            match box observed.Result with
+            | null -> $"committed op={observed.Position} kind={observed.Kind} (terminal, result unavailable)"
+            | boxed ->
+                let result = unbox<TurnResult> boxed
+
+                match result.Status with
+                | TurnStatus.Completed -> $"committed-success op={observed.Position} kind={observed.Kind}"
+                | TurnStatus.Aborted -> $"committed-abort op={observed.Position} kind={observed.Kind}"
+                | TurnStatus.Failed -> $"committed-failure op={observed.Position} kind={observed.Kind}"
+                | other -> $"committed op={observed.Position} kind={observed.Kind} status={other}"
+        | OperationStatus.Unknown -> $"unknown op={observed.Position} (stale, missing, or mismatched evidence)"
+        | OperationStatus.Unavailable -> $"unavailable op={observed.Position} (storage failed; never terminal)"
+        | _ -> $"unknown op={observed.Position} (unrecognized status)"
+
 /// The REPL engine: drives one current session through prompt, stream,
 /// reply, and settle over the given reader/writer.
 type Engine
@@ -472,6 +554,45 @@ type Engine
     let pendingGate = obj ()
     let pendingQueue = Queue<PendingTurn>()
     let mutable drainTask: Task option = None
+    // Continuous logical attachment (issue 365): one active consumer per
+    // selected session. The attachment starts on select/open/attach
+    // (including to already-running or suspended work with no prompt) and
+    // survives individual waits, deadline expiry, and terminal results.
+    // Transport recovery replaces the subscription without overlapping
+    // active consumers or losing session identity; the session's own last
+    // actually observed durable cursor is the only resume position, never
+    // another session's cursor. Detach/switch releases the obsolete
+    // observer promptly without aborting detached work.
+    let attachmentGate = obj ()
+    let mutable attachmentCts: CancellationTokenSource option = None
+    let mutable attachmentTask: Task option = None
+    let mutable attachmentSession: SessionId option = None
+    let mutable activeConsumers = 0
+    // The turn the drain loop currently waits on (dequeued, not queued):
+    // the attachment routes prefix tracking to it as well as to queued
+    // turns so settlement rendering stays per-turn scoped.
+    let mutable drainCurrent: PendingTurn option = None
+    // Authoritative operation observations by inbox position: Pending means
+    // accepted with no committed winner yet; Terminal carries the winning
+    // TurnResult; Unknown/Unavailable are shown explicitly as unknown,
+    // never as running, success, or idle. An idle session may retain its
+    // failed last operation.
+    let operationGate = obj ()
+    let operationStates = Dictionary<int64, OperationResult>()
+    let mutable lastOperation: OperationResult option = None
+    let mutable authoritativeRunning = false
+    // Session-bound pending host-input requests by request id: the reply
+    // path validates original session identity plus continued validity
+    // and turn association at submit.
+    let requestGate = obj ()
+    let pendingRequests = Dictionary<string, PendingRequest>()
+    // In-flight acceptances (prompt sent, receipt not yet observed): the
+    // receipt-bound waiter is created on confirmed acceptance, but the
+    // foreground loop and /quit drain must treat acceptance-in-flight as
+    // live work so steering lands mid-turn and quits wait for the
+    // acceptance plus its operation. Stopping observation never aborts.
+    let inflightGate = obj ()
+    let mutable inflightAcceptances = 0
     // Consumer dedup (issue 385): durable (session, sequence) identities
     // already printed on the stream. Duplicate transport delivery repeats
     // the identical pair, so the second sighting prints nothing; distinct
@@ -507,14 +628,6 @@ type Engine
             writer.WriteLine(text)
             writer.Flush())
 
-    /// True while the drain loop owns a live turn.
-    let isDrainRunning () : bool =
-        lock pendingGate (fun () ->
-            match drainTask with
-            | Some running when not running.IsCompleted -> true
-            | Some _
-            | None -> false)
-
     /// Marks one inline approval wait as pending.
     let markApproval () : unit =
         lock approvalGate (fun () -> approvalCount <- approvalCount + 1)
@@ -527,10 +640,139 @@ type Engine
     let isApprovalPending () : bool =
         lock approvalGate (fun () -> approvalCount > 0)
 
+    /// True while the drain loop owns a live client wait or an acceptance
+    /// is in flight (prompt sent, receipt not yet observed). Local wait or
+    /// acceptance ownership is never presented as runtime execution state;
+    /// use IsTurnRunning (authoritative) for status display. The
+    /// foreground loop treats acceptance-in-flight as live so steering
+    /// lands mid-turn and /quit drains the acceptance plus its operation.
+    let isDrainRunning () : bool =
+        let drainLive =
+            lock pendingGate (fun () ->
+                match drainTask with
+                | Some running when not running.IsCompleted -> true
+                | Some _
+                | None -> false)
+
+        if drainLive then
+            true
+        else
+            lock pendingGate (fun () -> pendingQueue.Count > 0)
+            || lock inflightGate (fun () -> inflightAcceptances > 0)
+
+    /// Marks one acceptance as in flight (prompt sent, receipt pending).
+    let markInflight () : unit =
+        lock inflightGate (fun () -> inflightAcceptances <- inflightAcceptances + 1)
+
+    /// Clears one in-flight acceptance when its receipt (or failure)
+    /// lands: the receipt-bound waiter takes over from here.
+    let clearInflight () : unit =
+        lock inflightGate (fun () -> inflightAcceptances <- max 0 (inflightAcceptances - 1))
+
+    /// Records one authoritative operation observation: Pending marks the
+    /// operation accepted with no committed winner (execution may be
+    /// queued, running, or suspended for input); Terminal carries the
+    /// committed winning TurnResult; Unknown/Unavailable are retained
+    /// explicitly and never rendered as running, success, or idle.
+    let recordOperation (observed: OperationResult) : unit =
+        if not (isNull (box observed)) then
+            lock operationGate (fun () ->
+                operationStates[observed.Position] <- observed
+                lastOperation <- Some observed
+
+                match observed.Status with
+                | OperationStatus.Pending -> authoritativeRunning <- true
+                | OperationStatus.Terminal -> authoritativeRunning <- false
+                | OperationStatus.Unknown
+                | OperationStatus.Unavailable -> ()
+                | _ -> ())
+
+    /// Marks authoritative execution from the attachment's durable event
+    /// observation: started/permission/question means work is live,
+    /// terminal settlement means it committed. Local task lifetime never
+    /// drives this flag.
+    let markAuthoritativeEvent (evt: SessionEvent) : unit =
+        if not (isNull (box evt)) then
+            lock operationGate (fun () ->
+                match evt with
+                | :? TurnStartedEvent -> authoritativeRunning <- true
+                | :? PermissionRequestedEvent -> authoritativeRunning <- true
+                | :? QuestionAskedEvent -> authoritativeRunning <- true
+                | :? TurnCompletedEvent
+                | :? TurnAbortedEvent
+                | :? TurnFailedEvent -> authoritativeRunning <- false
+                | _ -> ())
+
+    /// Tracks one session-bound host-input request as pending for its
+    /// original session, request id, and turn. Replayed or duplicate asks
+    /// keep the first registration; resolution removes it so replays never
+    /// become actionable again.
+    let trackRequest (sessionId: SessionId) (requestId: string) (turnId: TurnId) (isPermission: bool) : unit =
+        if not (String.IsNullOrWhiteSpace requestId) then
+            lock requestGate (fun () ->
+                if not (pendingRequests.ContainsKey requestId) then
+                    pendingRequests[requestId] <-
+                        {
+                            SessionId = sessionId
+                            RequestId = requestId
+                            TurnId = turnId
+                            IsPermission = isPermission
+                        })
+
+    /// Clears one host-input request when it resolves, aborts, or is
+    /// otherwise invalidated: later replays are rejected visibly.
+    let resolveRequest (requestId: string) : unit =
+        if not (String.IsNullOrWhiteSpace requestId) then
+            lock requestGate (fun () -> pendingRequests.Remove requestId |> ignore)
+
+    /// Validates a reply at submit: the request must still be pending for
+    /// its original session with continued validity, and the engine must
+    /// still be attached to that session. Switching sessions, resolving
+    /// or aborting the turn, disconnecting, or invalidating the request
+    /// rejects stale input visibly with no work and no disclosure, and
+    /// never sends it to the newly selected session.
+    let validateReply (requestId: string) (currentId: SessionId) : PendingRequest =
+        let found =
+            lock requestGate (fun () ->
+                match pendingRequests.TryGetValue requestId with
+                | true, pending -> Some pending
+                | false, _ -> None)
+
+        match found with
+        | None ->
+            line
+                $"REPLY-REJECTED id={requestId} reason=stale-or-resolved (no pending request; switching, resolve/abort, disconnect, or replay never reuses it)"
+
+            raise (
+                InvalidOperationException(
+                    $"The request '{requestId}' is not pending: it resolved, aborted, switched sessions, or was never asked."
+                )
+            )
+        | Some pending ->
+            let attached = lock attachmentGate (fun () -> attachmentSession)
+
+            let attachedOk =
+                match attached with
+                | Some attachedId -> attachedId.Equals(pending.SessionId)
+                | None -> false
+
+            if not (pending.SessionId.Equals(currentId)) || not attachedOk then
+                line
+                    $"REPLY-REJECTED id={requestId} reason=session-mismatch (request belongs to {pending.SessionId}, selected is {currentId}; stale input is never sent cross-session)"
+
+                raise (
+                    InvalidOperationException(
+                        $"The request '{requestId}' belongs to session {pending.SessionId}, not the selected {currentId}."
+                    )
+                )
+            else
+                pending
+
     /// Adds one settled turn's token usage to the session's running total:
     /// the journal carries no UsageEvents on this path, so the REPL
-    /// accumulates what WaitForSettleAsync reports per turn instead. Only
-    /// this process's settles accumulate; the journal sums stay durable.
+    /// accumulates what the authoritative terminal observation reports
+    /// per operation instead. Only this process's settles accumulate;
+    /// the journal sums stay durable.
     /// <param name="sessionId">The session the turn settled in.</param>
     /// <param name="usage">The settled turn's usage.</param>
     let recordUsage (sessionId: SessionId) (usage: UsageSummary) : unit =
@@ -542,6 +784,19 @@ type Engine
                     | false, _ -> 0L, 0L
 
                 usageTotals[sessionId] <- (input + usage.InputTokens, output + usage.OutputTokens))
+
+    /// Records usage from an authoritative terminal operation observation
+    /// (the committed winning TurnResult), when it carries usage.
+    /// <param name="observed">The terminal operation observation.</param>
+    let recordOperationUsage (observed: OperationResult) : unit =
+        if not (isNull (box observed)) && observed.Status = OperationStatus.Terminal then
+            match box observed.Result with
+            | null -> ()
+            | boxed ->
+                let result = unbox<TurnResult> boxed
+
+                if not (isNull (box result.Usage)) then
+                    recordUsage observed.SessionId result.Usage
 
     /// Reads the session's accumulated token usage in this process.
     /// <param name="sessionId">The session to read.</param>
@@ -574,7 +829,11 @@ type Engine
             else
                 -1
 
-    /// Answers one permission request from the console.
+    /// Answers one permission request from the console. Binds to the
+    /// request's original session identity: the reply goes to the session
+    /// that asked, and only while the request is still pending for its
+    /// turn. Switching sessions or resolving/aborting the turn rejects
+    /// the answer visibly with no send.
     /// <param name="asked">The pending permission request.</param>
     /// <param name="cancellationToken">Abandons the reply.</param>
     let answerPermission (asked: PermissionRequestedEvent) (cancellationToken: CancellationToken) : Task =
@@ -582,37 +841,58 @@ type Engine
             markApproval ()
 
             try
-                line $"PERMISSION tool={asked.ToolName} id={asked.RequestId} [a]llow once, allow for [s]ession, [d]eny:"
+                // Plain-input ownership: an obsolete approval reader never
+                // consumes unrelated command input as permission. The
+                // console prompt owns the reader only while this request
+                // is still pending for the attached session.
+                let stillPending =
+                    lock requestGate (fun () -> pendingRequests.ContainsKey asked.RequestId)
 
-                let! rawChoice = reader.ReadLineAsync()
+                if not stillPending then
+                    line
+                        $"REPLY-REJECTED id={asked.RequestId} reason=stale-or-resolved (permission no longer pending; unrelated input is never granted)"
+                else
+                    line
+                        $"PERMISSION tool={asked.ToolName} id={asked.RequestId} [a]llow once, allow for [s]ession, [d]eny:"
 
-                let choiceText =
-                    match rawChoice with
-                    | null -> ""
-                    | text -> text.Trim().ToLowerInvariant()
+                    let! rawChoice = reader.ReadLineAsync()
 
-                let decision =
-                    match choiceText with
-                    | "s"
-                    | "session" -> PermissionDecisionKind.AllowForSession
-                    | "d"
-                    | "deny" -> PermissionDecisionKind.Deny
-                    | _ -> PermissionDecisionKind.AllowOnce
+                    let choiceText =
+                        match rawChoice with
+                        | null -> ""
+                        | text -> text.Trim().ToLowerInvariant()
 
-                let! _ =
-                    SessionClientOperations.ReplyAsync(
-                        client,
-                        asked.SessionId,
-                        PermissionDecision(asked.RequestId, decision),
-                        cancellationToken
-                    )
+                    let decision =
+                        match choiceText with
+                        | "s"
+                        | "session" -> PermissionDecisionKind.AllowForSession
+                        | "d"
+                        | "deny" -> PermissionDecisionKind.Deny
+                        | _ -> PermissionDecisionKind.AllowOnce
 
-                ()
+                    try
+                        let! _ =
+                            SessionClientOperations.ReplyAsync(
+                                client,
+                                asked.SessionId,
+                                PermissionDecision(asked.RequestId, decision),
+                                cancellationToken
+                            )
+
+                        resolveRequest asked.RequestId
+                        ()
+                    with
+                    | :? ReplyMismatchException as mismatch ->
+                        resolveRequest asked.RequestId
+                        line $"REPLY-REJECTED id={asked.RequestId} reason=invalid ({mismatch.Message})"
+                    | error -> line $"REPLY-REJECTED id={asked.RequestId} reason=invalid ({error.Message})"
             finally
                 clearApproval ()
         }
 
-    /// Answers one agent question from the console.
+    /// Answers one agent question from the console. Binds to the
+    /// request's original session identity with the same stale/replay
+    /// rejection as permission replies.
     /// <param name="asked">The pending question.</param>
     /// <param name="cancellationToken">Abandons the reply.</param>
     let answerQuestion (asked: QuestionAskedEvent) (cancellationToken: CancellationToken) : Task =
@@ -620,25 +900,38 @@ type Engine
             markApproval ()
 
             try
-                line $"QUESTION id={asked.QuestionId}: {asked.Question}"
-                line "ANSWER:"
+                let stillPending =
+                    lock requestGate (fun () -> pendingRequests.ContainsKey asked.QuestionId)
 
-                let! rawAnswer = reader.ReadLineAsync()
+                if not stillPending then
+                    line $"REPLY-REJECTED id={asked.QuestionId} reason=stale-or-resolved (question no longer pending)"
+                else
+                    line $"QUESTION id={asked.QuestionId}: {asked.Question}"
+                    line "ANSWER:"
 
-                let answer =
-                    match rawAnswer with
-                    | null -> ""
-                    | text -> text
+                    let! rawAnswer = reader.ReadLineAsync()
 
-                let! _ =
-                    SessionClientOperations.ReplyAsync(
-                        client,
-                        asked.SessionId,
-                        QuestionAnswer(asked.QuestionId, answer),
-                        cancellationToken
-                    )
+                    let answer =
+                        match rawAnswer with
+                        | null -> ""
+                        | text -> text
 
-                ()
+                    try
+                        let! _ =
+                            SessionClientOperations.ReplyAsync(
+                                client,
+                                asked.SessionId,
+                                QuestionAnswer(asked.QuestionId, answer),
+                                cancellationToken
+                            )
+
+                        resolveRequest asked.QuestionId
+                        ()
+                    with
+                    | :? ReplyMismatchException as mismatch ->
+                        resolveRequest asked.QuestionId
+                        line $"REPLY-REJECTED id={asked.QuestionId} reason=invalid ({mismatch.Message})"
+                    | error -> line $"REPLY-REJECTED id={asked.QuestionId} reason=invalid ({error.Message})"
             finally
                 clearApproval ()
         }
@@ -673,7 +966,11 @@ type Engine
 
     /// Answers one permission request without console I/O: the TUI inline
     /// approval path over the same ReplyAsync PermissionDecision the REPL
-    /// console reader uses.
+    /// console reader uses. Binds to the request's original session plus
+    /// continued validity and turn association: switching sessions,
+    /// resolving/aborting the turn, disconnecting, or replaying an
+    /// already-resolved request rejects stale input visibly with no work,
+    /// no disclosure, and never sends it to the newly selected session.
     /// <param name="requestId">The permission request id.</param>
     /// <param name="decision">What the host decided.</param>
     /// <param name="cancellationToken">Abandons the reply.</param>
@@ -688,21 +985,33 @@ type Engine
                 | null -> ""
                 | _ -> requestId
 
-            let! _ =
-                SessionClientOperations.ReplyAsync(
-                    client,
-                    session.Id,
-                    PermissionDecision(safeRequest, decision),
-                    cancellationToken
-                )
+            let pending = validateReply safeRequest session.Id
 
-            ()
+            try
+                let! _ =
+                    SessionClientOperations.ReplyAsync(
+                        client,
+                        pending.SessionId,
+                        PermissionDecision(safeRequest, decision),
+                        cancellationToken
+                    )
+
+                resolveRequest safeRequest
+                ()
+            with
+            | :? ReplyMismatchException as mismatch ->
+                resolveRequest safeRequest
+                line $"REPLY-REJECTED id={safeRequest} reason=invalid ({mismatch.Message})"
+                raise (InvalidOperationException(mismatch.Message, mismatch :> exn))
+            | error ->
+                line $"REPLY-REJECTED id={safeRequest} reason=invalid ({error.Message})"
+                raise error
         }
 
     /// Answers one agent question without console I/O: the TUI inline
     /// answer-field path over the same ReplyAsync QuestionAnswer the REPL
     /// console reader uses (null becomes empty, every other buffer resumes
-    /// verbatim).
+    /// verbatim). Session- and turn-bound exactly like permission replies.
     /// <param name="questionId">The question id.</param>
     /// <param name="answer">The submitted answer buffer.</param>
     /// <param name="cancellationToken">Abandons the reply.</param>
@@ -720,15 +1029,27 @@ type Engine
                 | null -> ""
                 | _ -> answer
 
-            let! _ =
-                SessionClientOperations.ReplyAsync(
-                    client,
-                    session.Id,
-                    QuestionAnswer(safeQuestion, safeAnswer),
-                    cancellationToken
-                )
+            let pending = validateReply safeQuestion session.Id
 
-            ()
+            try
+                let! _ =
+                    SessionClientOperations.ReplyAsync(
+                        client,
+                        pending.SessionId,
+                        QuestionAnswer(safeQuestion, safeAnswer),
+                        cancellationToken
+                    )
+
+                resolveRequest safeQuestion
+                ()
+            with
+            | :? ReplyMismatchException as mismatch ->
+                resolveRequest safeQuestion
+                line $"REPLY-REJECTED id={safeQuestion} reason=invalid ({mismatch.Message})"
+                raise (InvalidOperationException(mismatch.Message, mismatch :> exn))
+            | error ->
+                line $"REPLY-REJECTED id={safeQuestion} reason=invalid ({error.Message})"
+                raise error
         }
 
     /// The current session id for fullscreen status display.
@@ -738,183 +1059,481 @@ type Engine
     /// The currently selected model, including interactive model switches.
     member _.CurrentModel: ModelReference = currentModel
 
-    /// True while the drain loop owns a live turn.
-    /// <returns>True while a turn is in flight.</returns>
-    member _.IsTurnRunning: bool = isDrainRunning ()
+    /// Authoritative execution state for status display: true while the
+    /// last authoritative observation (receipt Pending or durable
+    /// TurnStarted/permission/question) says work is live, false after a
+    /// committed terminal settlement. Local drain-task lifetime never
+    /// drives this flag: an idle session can retain a failed last
+    /// operation, and unavailable/stale evidence reads as unknown, never
+    /// as running, success, or idle.
+    /// <returns>True while authoritative evidence says work is live.</returns>
+    member _.IsTurnRunning: bool = lock operationGate (fun () -> authoritativeRunning)
+
+    /// True while the drain loop owns a live client wait (local wait
+    /// ownership, never execution evidence). Public for tests proving
+    /// that stopping a wait never aborts execution.
+    /// <returns>True while a client wait is owned.</returns>
+    member _.IsWaitOwned: bool = isDrainRunning ()
+
+    /// The session the continuous attachment currently observes, or None
+    /// when detached. Public for tests proving one active consumer and
+    /// session-identity retention across recovery.
+    /// <returns>The attached session id, or None.</returns>
+    member _.AttachmentSessionId: SessionId option =
+        lock attachmentGate (fun () -> attachmentSession)
+
+    /// How many live attachment consumers exist (0 or 1). Repeated
+    /// waits, turns, and switches keep one active consumer with bounded
+    /// cleanup rather than accumulating obsolete readers/subscriptions.
+    /// <returns>0 or 1.</returns>
+    member _.ActiveConsumerCount: int = lock attachmentGate (fun () -> activeConsumers)
+
+    /// The last authoritative operation observation text for diagnostics:
+    /// explicit Pending/Terminal/Unknown/Unavailable with position, kind,
+    /// turn association, and the mapped visible state (accepted-queued,
+    /// committed-success/failure/abort, unknown, unavailable), or unknown
+    /// when no operation was observed. An idle session retains its failed
+    /// last operation visibly instead of reading idle or running.
+    /// <returns>The diagnostic text.</returns>
+    member _.LastOperationText: string =
+        lock operationGate (fun () ->
+            match lastOperation with
+            | None -> "unknown (no accepted operation observed)"
+            | Some observed ->
+                let turn =
+                    if observed.TurnId.HasValue then
+                        observed.TurnId.Value.ToString()
+                    else
+                        "none"
+
+                let visible = describeOperationState observed
+
+                $"op={observed.Position} kind={observed.Kind} status={observed.Status} turn={turn} ({visible})")
+
+    /// Maps one authoritative operation observation to the visible
+    /// session plus accepted-operation state: accepted-queued, executing,
+    /// awaiting permission/question input, committed
+    /// success/failure/abort, or explicit unknown/unavailable. Local task
+    /// running or ending is never presented as runtime state.
+    /// <param name="observed">The operation observation. Null reads unknown.</param>
+    /// <returns>The visible state text.</returns>
+    member _.DescribeOperationState(observed: OperationResult) : string = describeOperationState observed
+
+    /// Folds one fresh event into one queued turn's streamed prefix: the
+    /// first TurnStarted claims the turn, deltas accumulate only for the
+    /// claimed turn, and the terminal event snapshots the prefix so
+    /// settlement stays scoped when the next turn already streams.
+    /// <param name="pending">The queued turn to track.</param>
+    /// <param name="evt">The event just observed.</param>
+    /// <param name="hasHook">True when the fullscreen hook renders deltas progressively.</param>
+    member private _.TrackPrefixFor(pending: PendingTurn, evt: SessionEvent, hasHook: bool) : unit =
+        match evt with
+        | :? TurnStartedEvent ->
+            let turnKey = DotDedup.turnKeyOf evt
+
+            if pending.TurnKey = "" then
+                pending.TurnKey <- turnKey
+
+            if turnKey = pending.TurnKey then
+                pending.StreamedPrefix <- ""
+                pending.SettledPrefix <- ""
+        | :? TextDeltaEvent as delta when not (isNull (box delta)) ->
+            let raw: string | null = delta.Text
+
+            // Visible scope (issue 412): the plain EVENT line never
+            // carries delta text, so only the hooked fullscreen fold
+            // (which renders delta text progressively) contributes to
+            // the streamed prefix. Fallback deltas on an unhooked
+            // stream leave the prefix empty, so the settlement carrying
+            // the sole visible copy renders fully instead of being
+            // mistaken for already-rendered output.
+            let fragment = DotDedup.visibleFragment hasHook raw
+
+            if fragment <> "" then
+                let turnKey = DotDedup.turnKeyOf evt
+
+                if pending.TurnKey = "" then
+                    pending.TurnKey <- turnKey
+
+                if turnKey = pending.TurnKey then
+                    // Uncapped: the prefix must stay an exact prefix
+                    // of the settlement for suffix matching; one
+                    // turn's deltas are bounded by the model.
+                    pending.StreamedPrefix <- pending.StreamedPrefix + fragment
+        | :? TurnCompletedEvent
+        | :? TurnAbortedEvent
+        | :? TurnFailedEvent ->
+            let turnKey = DotDedup.turnKeyOf evt
+
+            if pending.TurnKey = "" then
+                pending.TurnKey <- turnKey
+
+            if turnKey = pending.TurnKey then
+                pending.SettledPrefix <- pending.StreamedPrefix
+        | _ -> ()
+
+    /// Observes one attachment event for the attached session: advances
+    /// the session's own durable cursor, tracks streamed prefixes for
+    /// queued and draining turns, renders the stable line, folds the TUI
+    /// hook, tracks session-bound permission/question validity, marks
+    /// authoritative execution, and answers console prompts inline.
+    /// Late events from an old attachment never reach here: Detach cancels
+    /// the obsolete subscription before a new session attaches.
+    /// <param name="session">The attached session.</param>
+    /// <param name="evt">The event just observed.</param>
+    /// <param name="cancellationToken">Stops inline replies.</param>
+    member private this.ObserveEventAsync
+        (session: ReplSession, evt: SessionEvent, cancellationToken: CancellationToken)
+        : Task =
+        task {
+            if not (isNull (box evt)) && not (isDuplicate evt) then
+                if evt.SessionId.Equals(session.Id) then
+                    if evt.Sequence.HasValue && evt.Sequence.Value > session.Cursor then
+                        session.Cursor <- evt.Sequence.Value
+
+                    let hasHook = onEvent.IsSome
+
+                    // Prefix tracking across queued and draining turns:
+                    // every pending for this session sees the event so
+                    // settlement rendering stays scoped per turn.
+                    lock pendingGate (fun () ->
+                        for queued in pendingQueue do
+                            if queued.Session.Id.Equals(session.Id) then
+                                this.TrackPrefixFor(queued, evt, hasHook)
+
+                        match drainCurrent with
+                        | Some active when active.Session.Id.Equals(session.Id) ->
+                            this.TrackPrefixFor(active, evt, hasHook)
+                        | Some _
+                        | None -> ())
+
+                    markAuthoritativeEvent evt
+
+                    match evt with
+                    | :? PermissionRequestedEvent as asked when not (isNull (box asked)) ->
+                        trackRequest session.Id asked.RequestId asked.TurnId true
+                    | :? QuestionAskedEvent as asked when not (isNull (box asked)) ->
+                        trackRequest session.Id asked.QuestionId asked.TurnId false
+                    | :? PermissionResolvedEvent as resolved when not (isNull (box resolved)) ->
+                        resolveRequest resolved.RequestId
+                    | :? QuestionAnsweredEvent as answered when not (isNull (box answered)) ->
+                        resolveRequest answered.QuestionId
+                    | :? TurnCompletedEvent
+                    | :? TurnAbortedEvent
+                    | :? TurnFailedEvent -> ()
+                    | _ -> ()
+
+                    line (renderEvent evt)
+
+                    match onEvent with
+                    | Some hook ->
+                        try
+                            hook evt
+                        with _ ->
+                            ()
+                    | None -> ()
+
+                    match evt with
+                    | :? PermissionRequestedEvent as asked when not (isNull (box asked)) ->
+                        if not tuiOwnsApprovals then
+                            do! answerPermission asked cancellationToken
+                    | :? QuestionAskedEvent as asked when not (isNull (box asked)) ->
+                        if not tuiOwnsApprovals then
+                            do! answerQuestion asked cancellationToken
+                    | _ -> ()
+                else
+                    // Late old-session event after a switch: never updates
+                    // the new session's transcript, state, or controls.
+                    line $"IGNORED-STALE-EVENT session={evt.SessionId} selected={session.Id} type={evt.GetType().Name}"
+            else
+                ()
+        }
+
+    /// Runs the continuous logical attachment observation for one session:
+    /// Subscribe from the session's own last actually observed durable
+    /// cursor, then yield live publishes gap-free. Individual waits,
+    /// deadline expiry, and terminal results never end this loop; only
+    /// detach, switch, or reconnect replaces it. Transport recovery
+    /// re-subscribes from the same cursor with no overlapping consumers
+    /// and no loss of session identity. Expired ranges, unsupported
+    /// versions, denied access, and observation failures surface explicit
+    /// diagnostics and keep the attachment identity for reattach.
+    /// <param name="session">The attached session.</param>
+    /// <param name="cancellationToken">Detaches the attachment.</param>
+    member private this.AttachmentLoopAsync(session: ReplSession, cancellationToken: CancellationToken) : Task =
+        task {
+            let mutable alive = true
+
+            while alive && not cancellationToken.IsCancellationRequested do
+                let stream =
+                    try
+                        Some(SessionClientOperations.Subscribe(client, session.Id, session.Cursor, cancellationToken))
+                    with error ->
+                        line
+                            $"OBSERVE-FAILED session={session.Id} reason={error.Message} (attachment kept; reattach recovers retained events)"
+
+                        line cleanStartHelp
+                        None
+
+                match stream with
+                | None ->
+                    try
+                        do! Task.Delay(TimeSpan.FromSeconds 1.0, cancellationToken)
+                    with :? OperationCanceledException ->
+                        alive <- false
+                | Some events ->
+                    let enumerator = events.GetAsyncEnumerator(cancellationToken)
+
+                    try
+                        let mutable go = true
+
+                        while go && not cancellationToken.IsCancellationRequested do
+                            try
+                                let! has = enumerator.MoveNextAsync().AsTask()
+
+                                if not has then
+                                    go <- false
+                                else
+                                    do! this.ObserveEventAsync(session, enumerator.Current, cancellationToken)
+                            with
+                            | :? OperationCanceledException -> go <- false
+                            | :? SessionNotFoundException as missing ->
+                                line
+                                    $"OBSERVE-FAILED session={session.Id} reason={missing.Message} (unknown session; reattach or clean start)"
+
+                                go <- false
+                                alive <- false
+                            | :? InvalidOperationException as invalid ->
+                                // Unsupported old persistence/wait/event
+                                // contracts fail clearly with a documented
+                                // clean-start requirement; never fabricate
+                                // resumed state, results, or conversation.
+                                line $"UNSUPPORTED-CONTRACT session={session.Id} reason={invalid.Message}"
+                                line cleanStartHelp
+                                go <- false
+                                alive <- false
+                            | error ->
+                                line
+                                    $"OBSERVE-FAILED session={session.Id} cursor={session.Cursor} reason={error.Message} (recovering from retained cursor; never borrows another session)"
+
+                                go <- false
+                    finally
+                        try
+                            enumerator.DisposeAsync().AsTask() |> ignore
+                        with _ ->
+                            ()
+
+                    // Transport ended without detach (reconnect path):
+                    // replace the subscription from the same cursor after
+                    // a brief pause, keeping session identity and never
+                    // overlapping consumers (this loop is the only one).
+                    if alive && not cancellationToken.IsCancellationRequested then
+                        try
+                            do! Task.Delay(TimeSpan.FromMilliseconds 250.0, cancellationToken)
+                        with :? OperationCanceledException ->
+                            alive <- false
+        }
+
+    /// Ensures the continuous attachment observes the given session: a
+    /// matching live attachment is kept; any obsolete observer is
+    /// released promptly (bounded join, never abort) before the new
+    /// subscription starts, so repeated waits, turns, and switches keep
+    /// exactly one active consumer with bounded cleanup.
+    /// <param name="session">The session to attach.</param>
+    /// <param name="cancellationToken">Abandons the attach.</param>
+    member private this.EnsureAttachment(session: ReplSession, cancellationToken: CancellationToken) : unit =
+        lock attachmentGate (fun () ->
+            let live =
+                match attachmentTask, attachmentSession with
+                | Some running, Some attachedId when attachedId.Equals(session.Id) && not running.IsCompleted -> true
+                | Some _, _
+                | None, _ -> false
+
+            if not live then
+                // Release the obsolete observer promptly without aborting
+                // detached work: cancellation ends observation only.
+                match attachmentCts with
+                | Some obsolete ->
+                    try
+                        obsolete.Cancel()
+                    with _ ->
+                        ()
+                | None -> ()
+
+                match attachmentTask with
+                | Some obsoleteTask ->
+                    try
+                        obsoleteTask.Wait(TimeSpan.FromSeconds 5.0) |> ignore
+                    with _ ->
+                        ()
+                | None -> ()
+
+                match attachmentCts with
+                | Some obsolete ->
+                    try
+                        obsolete.Dispose()
+                    with _ ->
+                        ()
+                | None -> ()
+
+                let linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
+                attachmentCts <- Some linked
+                attachmentSession <- Some session.Id
+                activeConsumers <- 1
+                attachmentTask <- Some(this.AttachmentLoopAsync(session, linked.Token))
+            else
+                ())
+
+    /// Detaches the continuous attachment without aborting detached work:
+    /// stopping observation never affects execution. The session's own
+    /// cursor is retained, so reattach recovers retained events, results,
+    /// and actual state.
+    member private _.DetachAttachment() : unit =
+        lock attachmentGate (fun () ->
+            match attachmentCts with
+            | Some obsolete ->
+                try
+                    obsolete.Cancel()
+                with _ ->
+                    ()
+            | None -> ()
+
+            match attachmentTask with
+            | Some running ->
+                try
+                    running.Wait(TimeSpan.FromSeconds 5.0) |> ignore
+                with _ ->
+                    ()
+            | None -> ()
+
+            match attachmentCts with
+            | Some obsolete ->
+                try
+                    obsolete.Dispose()
+                with _ ->
+                    ()
+            | None -> ()
+
+            attachmentCts <- None
+            attachmentTask <- None
+            attachmentSession <- None
+            activeConsumers <- 0)
 
     /// Opens a session and makes it current without entering the prompt
     /// loop: the fullscreen TUI route hook (issue 332). The prompt,
-    /// stream, reply, and settle behavior stays identical: the TUI feeds
+    /// attachment, reply, and settle behavior stays identical: the TUI feeds
     /// HandleLineAsync, which routes exactly as the plain REPL.
     /// <param name="title">The session title.</param>
     /// <param name="cancellationToken">Abandons the open.</param>
     member this.OpenSessionAsync(title: string, cancellationToken: CancellationToken) : Task =
         this.OpenAsync(title, cancellationToken)
 
-    /// Streams one turn's events until the subscriber is cancelled,
-    /// answering permission requests and questions inline. Already-printed
-    /// durable identities print nothing (duplicate delivery, replay-to-live
-    /// overlap, reconnect), while the turn's streamed assistant prefix
-    /// accumulates for prefix-aware settlement rendering.
-    /// <param name="pending">The queued turn streaming.</param>
-    /// <param name="cancellationToken">Stops the stream.</param>
-    member private _.StreamAsync(pending: PendingTurn, cancellationToken: CancellationToken) : Task =
+    /// Reports the authoritative observation for one receipt without
+    /// consuming it: Pending, Terminal, Unknown, or Unavailable. Unknown
+    /// and Unavailable never carry a terminal result and are shown
+    /// explicitly, never as running, success, or idle.
+    /// <param name="receipt">The accepted-operation receipt.</param>
+    /// <param name="cancellationToken">Abandons the lookup.</param>
+    /// <returns>The diagnostic state text.</returns>
+    member this.QueryOperationStateAsync
+        (receipt: AcceptedOperation, cancellationToken: CancellationToken)
+        : Task<string> =
         task {
-            let session = pending.Session
-
-            let stream =
-                SessionClientOperations.Subscribe(client, session.Id, session.Cursor, cancellationToken)
-
-            let enumerator = stream.GetAsyncEnumerator(cancellationToken)
-
-            // Folds one fresh event into the turn's streamed prefix: the
-            // first TurnStarted claims the turn, deltas accumulate only for
-            // the claimed turn, and the terminal event snapshots the prefix
-            // so settlement stays scoped when the next turn already streams.
-            let trackPrefix (evt: SessionEvent) : unit =
-                match evt with
-                | :? TurnStartedEvent ->
-                    let turnKey = DotDedup.turnKeyOf evt
-
-                    if pending.TurnKey = "" then
-                        pending.TurnKey <- turnKey
-
-                    if turnKey = pending.TurnKey then
-                        pending.StreamedPrefix <- ""
-                        pending.SettledPrefix <- ""
-                | :? TextDeltaEvent as delta when not (isNull (box delta)) ->
-                    let raw: string | null = delta.Text
-
-                    // Visible scope (issue 412): the plain EVENT line never
-                    // carries delta text, so only the hooked fullscreen fold
-                    // (which renders delta text progressively) contributes to
-                    // the streamed prefix. Fallback deltas on an unhooked
-                    // stream leave the prefix empty, so the settlement carrying
-                    // the sole visible copy renders fully instead of being
-                    // mistaken for already-rendered output.
-                    let fragment = DotDedup.visibleFragment onEvent.IsSome raw
-
-                    if fragment <> "" then
-                        let turnKey = DotDedup.turnKeyOf evt
-
-                        if pending.TurnKey = "" then
-                            pending.TurnKey <- turnKey
-
-                        if turnKey = pending.TurnKey then
-                            // Uncapped: the prefix must stay an exact prefix
-                            // of the settlement for suffix matching; one
-                            // turn's deltas are bounded by the model.
-                            pending.StreamedPrefix <- pending.StreamedPrefix + fragment
-                | :? TurnCompletedEvent
-                | :? TurnAbortedEvent
-                | :? TurnFailedEvent ->
-                    let turnKey = DotDedup.turnKeyOf evt
-
-                    if pending.TurnKey = "" then
-                        pending.TurnKey <- turnKey
-
-                    if turnKey = pending.TurnKey then
-                        pending.SettledPrefix <- pending.StreamedPrefix
-                | _ -> ()
-
             try
-                let mutable go = true
+                let! observed = SessionClientOperations.GetOperationResultAsync(client, receipt, cancellationToken)
 
-                while go do
-                    try
-                        let! has = enumerator.MoveNextAsync().AsTask()
-
-                        if not has then
-                            go <- false
-                        else
-                            let evt = enumerator.Current
-
-                            if not (isNull (box evt)) && not (isDuplicate evt) then
-                                if evt.Sequence.HasValue && evt.Sequence.Value > session.Cursor then
-                                    session.Cursor <- evt.Sequence.Value
-
-                                trackPrefix evt
-                                line (renderEvent evt)
-
-                                match onEvent with
-                                | Some hook ->
-                                    try
-                                        hook evt
-                                    with _ ->
-                                        ()
-                                | None -> ()
-
-                                match evt with
-                                | :? PermissionRequestedEvent as asked when not (isNull (box asked)) ->
-                                    if not tuiOwnsApprovals then
-                                        do! answerPermission asked cancellationToken
-                                | :? QuestionAskedEvent as asked when not (isNull (box asked)) ->
-                                    if not tuiOwnsApprovals then
-                                        do! answerQuestion asked cancellationToken
-                                | _ -> ()
-                    with :? OperationCanceledException ->
-                        go <- false
-            finally
-                try
-                    enumerator.DisposeAsync().AsTask() |> ignore
-                with _ ->
-                    ()
+                recordOperation observed
+                return this.DescribeOperationState observed
+            with
+            | :? SessionNotFoundException as missing -> return $"unknown (session missing: {missing.Message})"
+            | error -> return $"unavailable ({error.Message}; never terminal)"
         }
 
-    /// Runs one queued turn: streams its events from the cursor, awaits
-    /// its waiter, and prints the settle. Settlement rendering is
+    /// Runs one queued turn: awaits its receipt-bound operation wait and
+    /// prints the authoritative settle. Settlement rendering is
     /// prefix-aware per turn (issue 385): streamed-then-success prints only
     /// the genuinely unrendered suffix, partial-then-failure/abort keeps the
     /// streamed partial once with the truthful terminal outcome and no
     /// invented success text, and settlement-only/nonstreaming output prints
-    /// fully. A settle wait that outruns its bound reports DEADLINE while
-    /// the turn keeps running. The stream is cancelled on settle and joined
-    /// best-effort, so a stuck stream never blocks the drain.
+    /// fully. A wait that outruns its bound reports DEADLINE naming the
+    /// accepted operation and stating only that client waiting stopped (no
+    /// abort, no result consumption, no disconnect, no continued-execution
+    /// assertion); the attachment keeps observing so committed events and
+    /// the terminal outcome remain visible across subsequent turns and
+    /// reconnect. Committed completion or failure is never mislabeled as
+    /// ongoing work. Stopping the wait never aborts execution.
     /// <param name="pending">The queued turn.</param>
-    /// <param name="cancellationToken">Abandons the drain.</param>
-    member private this.RunPendingAsync(pending: PendingTurn, cancellationToken: CancellationToken) : Task =
+    /// <param name="_cancellationToken">Abandons the drain (observation is receipt-bound; kept for signature).</param>
+    member private this.RunPendingAsync(pending: PendingTurn, _cancellationToken: CancellationToken) : Task =
         task {
-            use streamCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
-            let stream = this.StreamAsync(pending, streamCts.Token)
+            lock pendingGate (fun () -> drainCurrent <- Some pending)
 
             try
                 try
-                    let! result = pending.WaitTask
-                    recordUsage pending.Session.Id result.Usage
-                    line $"RESULT {result.Status}"
+                    let! observed = pending.WaitTask
+                    recordOperation observed
+                    recordOperationUsage observed
 
-                    if
-                        result.Status = TurnStatus.Completed
-                        && not (String.IsNullOrEmpty result.AssistantText)
-                    then
-                        let prefix =
-                            if not (String.IsNullOrEmpty pending.SettledPrefix) then
-                                pending.SettledPrefix
-                            else
-                                pending.StreamedPrefix
+                    match observed.Status with
+                    | OperationStatus.Terminal ->
+                        match box observed.Result with
+                        | null -> line $"RESULT unknown (terminal op={observed.Position} with no result)"
+                        | boxed ->
+                            let result = unbox<TurnResult> boxed
+                            line $"RESULT {result.Status}"
 
-                        let suffix = DotDedup.settlementSuffix prefix result.AssistantText
+                            if
+                                result.Status = TurnStatus.Completed
+                                && not (String.IsNullOrEmpty result.AssistantText)
+                            then
+                                let prefix =
+                                    if not (String.IsNullOrEmpty pending.SettledPrefix) then
+                                        pending.SettledPrefix
+                                    else
+                                        pending.StreamedPrefix
 
-                        if suffix <> "" then
-                            line suffix
+                                let suffix = DotDedup.settlementSuffix prefix result.AssistantText
 
-                    line "END-RESULT"
+                                if suffix <> "" then
+                                    line suffix
+
+                        line "END-RESULT"
+                        line $"STATE {this.DescribeOperationState observed}"
+                    | OperationStatus.Pending ->
+                        line
+                            $"STATE {this.DescribeOperationState observed} (wait resolved pending; continuing observation)"
+                    | OperationStatus.Unknown
+                    | OperationStatus.Unavailable -> line $"STATE {this.DescribeOperationState observed}"
+                    | _ -> line $"STATE {this.DescribeOperationState observed}"
                 with
-                | :? DeadlineExceededException as exceeded -> line $"DEADLINE {exceeded.Message}"
+                | :? DeadlineExceededException ->
+                    // The Dot bound lapsed: client completion waiting
+                    // stopped for this operation. Execution continues,
+                    // the result is not consumed, the attachment stays
+                    // connected, and no continued execution is asserted
+                    // without evidence. Steer, follow, abort, and replies
+                    // remain usable afterwards.
+                    line
+                        $"DEADLINE op={pending.Receipt.Position} kind={pending.Receipt.Kind} client waiting stopped after {waitBound} (work continues; attachment still observing; STATE follows)"
+
+                    try
+                        let! observed =
+                            SessionClientOperations.GetOperationResultAsync(
+                                client,
+                                pending.Receipt,
+                                CancellationToken.None
+                            )
+
+                        recordOperation observed
+                        line $"STATE {this.DescribeOperationState observed}"
+                    with error ->
+                        line $"STATE unavailable op={pending.Receipt.Position} ({error.Message}; never terminal)"
                 | :? OperationCanceledException -> ()
             finally
+                lock pendingGate (fun () -> drainCurrent <- None)
+
                 try
                     pending.WaitCts.Dispose()
-                with _ ->
-                    ()
-
-                try
-                    streamCts.Cancel()
-                with _ ->
-                    ()
-
-                try
-                    stream.Wait(TimeSpan.FromSeconds 5.0) |> ignore
                 with _ ->
                     ()
         }
@@ -958,25 +1577,61 @@ type Engine
             if not running then
                 drainTask <- Some(this.DrainLoopAsync(cancellationToken)))
 
-    /// Waits for the in-flight drain to empty: /quit and end-of-input exit
-    /// only after every queued turn settles visibly.
+    /// Waits for in-flight acceptances plus the drain to empty: /quit and
+    /// end-of-input exit only after every accepted turn settles visibly.
+    /// Acceptance-in-flight (prompt sent, receipt pending) is awaited
+    /// first, then queued waits, then the active drain; new acceptances
+    /// landing mid-drain are picked up in the same pass. Stopping the wait
+    /// never aborts execution.
     /// <param name="cancellationToken">Abandons the wait.</param>
-    member private _.DrainAsync(_cancellationToken: CancellationToken) : Task =
+    member private _.DrainAsync(cancellationToken: CancellationToken) : Task =
         task {
-            let running: Task option = lock pendingGate (fun () -> drainTask)
+            let deadline = DateTimeOffset.UtcNow.AddMinutes(5.0)
+            let mutable go = true
 
-            match running with
-            | None -> ()
-            | Some active ->
-                try
-                    do! active
-                with _ ->
-                    ()
+            while go
+                  && DateTimeOffset.UtcNow < deadline
+                  && not cancellationToken.IsCancellationRequested do
+                let inflight = lock inflightGate (fun () -> inflightAcceptances)
+                let queued = lock pendingGate (fun () -> pendingQueue.Count)
+                let running: Task option = lock pendingGate (fun () -> drainTask)
+
+                let live =
+                    match running with
+                    | Some active when not active.IsCompleted -> Some active
+                    | Some _
+                    | None -> None
+
+                if inflight = 0 && queued = 0 then
+                    match live with
+                    | None -> go <- false
+                    | Some active ->
+                        try
+                            do! active.WaitAsync(cancellationToken)
+                        with _ ->
+                            ()
+                else
+                    match live with
+                    | Some active ->
+                        try
+                            do! (Task.WhenAny(active, Task.Delay(50, cancellationToken)) :> Task)
+                        with _ ->
+                            ()
+                    | None ->
+                        try
+                            do! Task.Delay(50, cancellationToken)
+                        with :? OperationCanceledException ->
+                            go <- false
         }
 
-    /// Prompts with its own waiter: queues the settle waiter before the
-    /// prompt lands (a settle with no waiter only records), appends the
-    /// turn to the drain, and returns to the foreground loop at once.
+    /// Prompts with a receipt-bound waiter: PromptAsync acceptance
+    /// returns the AcceptedOperation receipt first (confirmed acceptance),
+    /// then WaitForOperationAsync bounds only client completion waiting
+    /// from acceptance (queued time included). Acceptance or request
+    /// failures report not-accepted and never as accepted execution;
+    /// queued-time expiry cancels nothing and charges nothing against the
+    /// runtime execution budget. The accepted control (ACCEPTED line) stays
+    /// distinguishable from its eventual effect (RESULT/STATE lines).
     /// <param name="session">The session to prompt.</param>
     /// <param name="text">The user text.</param>
     /// <param name="delivery">How the message is delivered to a running turn.</param>
@@ -985,46 +1640,32 @@ type Engine
         (session: ReplSession, text: string, delivery: DeliveryMode, cancellationToken: CancellationToken)
         : Task =
         task {
-            // Queue the waiter and the drain entry synchronously, then send
-            // the prompt without awaiting it: PromptAsync only answers once
-            // the actor accepts, which rides behind a running turn, so an
-            // await here would block the foreground loop until the turn
-            // settles and mid-turn steering could never land in time. The
-            // waiter is already queued before the prompt is sent, so the
-            // pre-empted turn still settles visibly.
-            let waitCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
-
-            let waitTask =
-                SessionClientOperations.WaitForSettleAsync(client, session.Id, waitBound, waitCts.Token)
-
-            lock pendingGate (fun () ->
-                pendingQueue.Enqueue(
-                    {
-                        Session = session
-                        WaitTask = waitTask
-                        WaitCts = waitCts
-                        TurnKey = ""
-                        StreamedPrefix = ""
-                        SettledPrefix = ""
-                    }
-                ))
-
-            this.EnsureDrain(cancellationToken)
+            // Attachment first: selecting/prompting establishes the
+            // continuous observation (including to already-running work)
+            // before the new input lands.
+            this.EnsureAttachment(session, cancellationToken)
 
             let message: UserMessage option =
                 try
                     Some(UserMessage.Text text)
                 with error ->
-                    line $"ERROR {error.Message}"
+                    line $"ERROR not-accepted ({error.Message})"
                     None
 
             match message with
-            | None ->
-                try
-                    waitCts.Cancel()
-                with _ ->
-                    ()
+            | None -> ()
             | Some userMessage ->
+                // Fire-and-forget acceptance: PromptAsync answers once the
+                // actor accepts, which may ride behind a running turn, so
+                // awaiting here would block the foreground loop until the
+                // turn settles and mid-turn steering could never land in
+                // time. The receipt-bound waiter is created on confirmed
+                // acceptance (bound starts at acceptance, queued time
+                // included), so no pre-registration can steal results.
+                // The acceptance is marked in flight synchronously so the
+                // foreground loop and /quit drain treat it as live work.
+                markInflight ()
+
                 try
                     let promptTask =
                         SessionClientOperations.PromptAsync(
@@ -1036,48 +1677,87 @@ type Engine
                         )
 
                     promptTask.ContinueWith(fun (completed: Task<AcceptedOperation>) ->
-                        if not completed.IsCompletedSuccessfully then
-                            let error =
-                                match completed.Exception with
-                                | null -> Exception("The prompt failed.")
-                                | aggregate when aggregate.InnerExceptions.Count > 0 -> aggregate.InnerExceptions[0]
-                                | aggregate -> aggregate :> exn
+                        try
+                            if completed.IsCompletedSuccessfully then
+                                let accepted = completed.Result
+                                let acceptedAt = DateTimeOffset.UtcNow
+                                lock operationGate (fun () -> authoritativeRunning <- true)
 
-                            try
-                                waitCts.Cancel()
-                            with _ ->
-                                ()
+                                line
+                                    $"ACCEPTED op={accepted.Position} kind={accepted.Kind} session={accepted.SessionId}"
 
-                            line $"ERROR {error.Message}")
+                                let waitCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
+
+                                let waitTask =
+                                    SessionClientOperations.WaitForOperationAsync(
+                                        client,
+                                        accepted,
+                                        waitBound,
+                                        waitCts.Token
+                                    )
+
+                                lock pendingGate (fun () ->
+                                    pendingQueue.Enqueue(
+                                        {
+                                            Session = session
+                                            Receipt = accepted
+                                            AcceptedAt = acceptedAt
+                                            WaitTask = waitTask
+                                            WaitCts = waitCts
+                                            TurnKey = ""
+                                            StreamedPrefix = ""
+                                            SettledPrefix = ""
+                                        }
+                                    ))
+
+                                this.EnsureDrain(cancellationToken)
+                            else
+                                let error =
+                                    match completed.Exception with
+                                    | null -> Exception("The prompt failed.")
+                                    | aggregate when aggregate.InnerExceptions.Count > 0 ->
+                                        aggregate.InnerExceptions[0]
+                                    | aggregate -> aggregate :> exn
+
+                                line $"ERROR not-accepted ({error.Message})"
+                        finally
+                            clearInflight ())
                     |> ignore
                 with error ->
-                    try
-                        waitCts.Cancel()
-                    with _ ->
-                        ()
-
-                    line $"ERROR {error.Message}"
+                    clearInflight ()
+                    line $"ERROR not-accepted ({error.Message})"
         }
 
-    /// Folds follow-up text into the running turn without its own waiter:
+    /// Folds follow-up text into the running turn with its own receipt:
     /// Inject appends and folds at the next iteration boundary without
-    /// starting a new turn, so the in-flight waiter settles the folded
-    /// turn once as Completed.
+    /// starting an independent turn. The ACCEPTED line names the Inject
+    /// receipt; the eventual effect still settles the folded turn once.
+    /// Replies never claim independent turns; only explicit
+    /// execution-control actions (/abort, /steer Interrupt, /follow
+    /// Inject) affect execution.
     /// <param name="session">The session to prompt.</param>
     /// <param name="text">The user text.</param>
     /// <param name="cancellationToken">Abandons the prompt.</param>
-    member private _.InjectAsync(session: ReplSession, text: string, cancellationToken: CancellationToken) : Task =
+    member private this.InjectAsync(session: ReplSession, text: string, cancellationToken: CancellationToken) : Task =
         task {
+            this.EnsureAttachment(session, cancellationToken)
+
             let message: UserMessage option =
                 try
                     Some(UserMessage.Text text)
                 with error ->
-                    line $"ERROR {error.Message}"
+                    line $"ERROR not-accepted ({error.Message})"
                     None
 
             match message with
             | None -> ()
             | Some userMessage ->
+                // Fire-and-forget like the queue path: Inject acceptance
+                // may ride behind a running turn, so awaiting would block
+                // steering. Inject never claims an independent turn. Marked
+                // in flight so /quit waits for the acceptance.
+                markInflight ()
+
                 try
                     let promptTask =
                         SessionClientOperations.PromptAsync(
@@ -1089,17 +1769,33 @@ type Engine
                         )
 
                     promptTask.ContinueWith(fun (completed: Task<AcceptedOperation>) ->
-                        if not completed.IsCompletedSuccessfully then
-                            let error =
-                                match completed.Exception with
-                                | null -> Exception("The prompt failed.")
-                                | aggregate when aggregate.InnerExceptions.Count > 0 -> aggregate.InnerExceptions[0]
-                                | aggregate -> aggregate :> exn
+                        try
+                            if completed.IsCompletedSuccessfully then
+                                let accepted = completed.Result
 
-                            line $"ERROR {error.Message}")
+                                // Inject never claims an independent turn: the
+                                // receipt is accepted control, the folded turn's
+                                // settlement is the eventual effect observed on
+                                // the attachment.
+                                line
+                                    $"ACCEPTED op={accepted.Position} kind={accepted.Kind} session={accepted.SessionId} (inject folds; no independent turn)"
+
+                                lock operationGate (fun () -> authoritativeRunning <- true)
+                            else
+                                let error =
+                                    match completed.Exception with
+                                    | null -> Exception("The prompt failed.")
+                                    | aggregate when aggregate.InnerExceptions.Count > 0 ->
+                                        aggregate.InnerExceptions[0]
+                                    | aggregate -> aggregate :> exn
+
+                                line $"ERROR not-accepted ({error.Message})"
+                        finally
+                            clearInflight ())
                     |> ignore
                 with error ->
-                    line $"ERROR {error.Message}"
+                    clearInflight ()
+                    line $"ERROR not-accepted ({error.Message})"
         }
 
     /// Lists the current session journal positions to branch from: paged
@@ -1198,7 +1894,7 @@ type Engine
     /// <param name="session">The source session.</param>
     /// <param name="argument">The sequence text the user typed.</param>
     /// <param name="cancellationToken">Abandons the fork.</param>
-    member private _.ForkAsync(session: ReplSession, argument: string, cancellationToken: CancellationToken) : Task =
+    member private this.ForkAsync(session: ReplSession, argument: string, cancellationToken: CancellationToken) : Task =
         task {
             let text = argument.Trim()
 
@@ -1222,6 +1918,10 @@ type Engine
                         current <- sessions.Count - 1
                         line $"FORKED {forked.Id} from {session.Id} up-to {sequence}"
                         line $"RESUMED {forked.Id}"
+                        // The fork is a new attachment target with its own
+                        // cursor from zero; the source cursor is untouched.
+                        this.EnsureAttachment(sessions[current], cancellationToken)
+                        line $"ATTACHED {forked.Id} cursor=0 (continuous observation)"
                     with error ->
                         line $"ERROR {error.Message}"
         }
@@ -1230,7 +1930,7 @@ type Engine
     /// tail, free because the facade clamps beyond-tail cursors.
     /// <param name="session">The source session.</param>
     /// <param name="cancellationToken">Abandons the fork.</param>
-    member private _.CloneAsync(session: ReplSession, cancellationToken: CancellationToken) : Task =
+    member private this.CloneAsync(session: ReplSession, cancellationToken: CancellationToken) : Task =
         task {
             try
                 let! forked = SessionClientOperations.ForkAsync(client, session.Id, Int64.MaxValue, cancellationToken)
@@ -1246,6 +1946,8 @@ type Engine
                 current <- sessions.Count - 1
                 line $"FORKED {forked.Id} from {session.Id} up-to tail"
                 line $"RESUMED {forked.Id}"
+                this.EnsureAttachment(sessions[current], cancellationToken)
+                line $"ATTACHED {forked.Id} cursor=0 (continuous observation)"
             with error ->
                 line $"ERROR {error.Message}"
         }
@@ -1260,7 +1962,7 @@ type Engine
     /// runtime re-reads every turn.
     /// <param name="title">The session title.</param>
     /// <param name="cancellationToken">Abandons the open.</param>
-    member private _.OpenAsync(title: string, cancellationToken: CancellationToken) : Task =
+    member private this.OpenAsync(title: string, cancellationToken: CancellationToken) : Task =
         task {
             let! agentId = ensureModelAgentAsync agents packages currentModel cancellationToken
 
@@ -1280,12 +1982,22 @@ type Engine
 
             current <- sessions.Count - 1
             line $"SESSION {created.Id} {created.Title}"
+            // Attachment starts on open, including before any prompt.
+            this.EnsureAttachment(sessions[current], cancellationToken)
+
+            line
+                $"ATTACHED {created.Id} cursor=0 (continuous observation; waits, deadlines, and terminal results never detach)"
         }
 
     /// Attaches an existing stored session by id or open index. The probe
     /// reads the SQLite journal, so sessions opened by an earlier dot
     /// process attach here and the follow-up turn continues their
-    /// context.
+    /// context. Attaching to already-running or suspended work starts
+    /// continuous observation with no prompt; the target session's own
+    /// last actually observed durable cursor is the only resume position.
+    /// Detaching or switching releases the obsolete observer promptly
+    /// without aborting detached work; reattach recovers retained events,
+    /// results, and actual state.
     /// <param name="text">The id or 1-based index.</param>
     /// <param name="cancellationToken">Abandons the probe.</param>
     /// <returns>True when the attach landed.</returns>
@@ -1296,7 +2008,11 @@ type Engine
             if found >= 0 then
                 current <- found
                 do! this.SyncModelAsync(sessions[found].Id, cancellationToken)
+                // Switch uses the target session's own cursor; never
+                // borrows another session's cursor or skips queued events.
+                this.EnsureAttachment(sessions[found], cancellationToken)
                 line $"RESUMED {sessions[found].Id}"
+                line $"ATTACHED {sessions[found].Id} cursor={sessions[found].Cursor} (continuous observation)"
                 return true
             else
                 let mutable parsed = Unchecked.defaultof<SessionId>
@@ -1317,10 +2033,17 @@ type Engine
                             current <- sessions.Count - 1
 
                         do! this.SyncModelAsync(parsed, cancellationToken)
+                        this.EnsureAttachment(sessions[current], cancellationToken)
                         line $"RESUMED {parsed}"
+                        line $"ATTACHED {parsed} cursor={sessions[current].Cursor} (continuous observation)"
                         return true
-                    with :? SessionNotFoundException ->
+                    with
+                    | :? SessionNotFoundException ->
                         line $"RESUME-FAILED no session {parsed} in this process."
+                        return false
+                    | :? InvalidOperationException as invalid ->
+                        line $"UNSUPPORTED-CONTRACT session={parsed} reason={invalid.Message}"
+                        line cleanStartHelp
                         return false
         }
 
@@ -1435,7 +2158,15 @@ type Engine
                 return true
             elif text = "/quit" || text = "/exit" then
                 do! this.DrainAsync(cancellationToken)
+                // Quit releases observation promptly without aborting:
+                // stopping observation never affects execution.
+                this.DetachAttachment()
                 return false
+            elif text = "/help" then
+                line commandsUsage
+                line waitSemanticsHelp
+                line cleanStartHelp
+                return true
             elif text = "/compact" then
                 try
                     let session = currentSession ()
@@ -1461,6 +2192,12 @@ type Engine
                     match current with
                     | null -> line "ABORT NoCurrentTurn"
                     | target ->
+                        // Only explicit execution-control actions affect
+                        // execution: stopping a wait, detaching, or
+                        // cancelling observation never aborts. /abort is
+                        // explicit control with a durable intent receipt;
+                        // terminal settlement is separate and observed on
+                        // the attachment.
                         let! receipt =
                             SessionClientOperations.AbortAsync(
                                 client,
@@ -1471,7 +2208,8 @@ type Engine
                                 cancellationToken
                             )
 
-                        line $"ABORT {receipt.Outcome}: {receipt.TurnId} (terminal settlement is separate)"
+                        line
+                            $"ABORT {receipt.Outcome}: {receipt.TurnId} (terminal settlement is separate; attachment keeps observing)"
                 with error ->
                     line $"ERROR {error.Message}"
 
@@ -1611,6 +2349,10 @@ type Engine
                 if arg = "" then
                     line "ERROR /follow needs text: /follow <text>"
                 elif isDrainRunning () then
+                    // A live client wait means work may still be live under
+                    // the authoritative observation: fold without claiming
+                    // an independent turn. Idle folds through the receipt
+                    // path with the same Inject kind.
                     do! this.InjectAsync(currentSession (), arg, cancellationToken)
                 else
                     do! this.EnqueueTurnAsync(currentSession (), arg, DeliveryMode.Inject, cancellationToken)
