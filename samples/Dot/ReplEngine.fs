@@ -628,14 +628,6 @@ type Engine
             writer.WriteLine(text)
             writer.Flush())
 
-    /// True while the drain loop owns a live turn.
-    let isDrainRunning () : bool =
-        lock pendingGate (fun () ->
-            match drainTask with
-            | Some running when not running.IsCompleted -> true
-            | Some _
-            | None -> false)
-
     /// Marks one inline approval wait as pending.
     let markApproval () : unit =
         lock approvalGate (fun () -> approvalCount <- approvalCount + 1)
