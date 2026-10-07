@@ -156,6 +156,7 @@
     <Compile Include="ControlActorProtocolTests.fs" />
     <Compile Include="SqliteSessionListTests.fs" />
     <Compile Include="SqliteSessionEventStoreTests.fs" />
+    <Compile Include="SqliteContentionEnvelopeTests.fs" />
     <Compile Include="SqliteAgentStoreTests.fs" />
     <Compile Include="SqliteBlobStoreTests.fs" />
     <Compile Include="SqliteAgentPackageStoreTests.fs" />
