@@ -46,7 +46,12 @@ let initialTurnState: SessionState = SessionState.Idle
 /// turn runs, permission/question suspension waits for host input, its
 /// resolve resumes, and any settled turn returns to idle. Unknown events
 /// (deltas, usage, compaction) keep the current state so fast streams do
-/// not flicker the bar.
+/// not flicker the bar. This is session-lifecycle evidence from the
+/// attachment stream only: authoritative accepted-operation state
+/// (accepted-queued, executing, awaiting input, committed
+/// success/failure/abort, explicit unknown/unavailable) comes from
+/// GetOperationResultAsync via ReplEngine.DescribeOperationState, and
+/// local task running or ending is never presented as runtime state.
 /// <param name="current">The current turn state.</param>
 /// <param name="evt">The Subscribe event just observed.</param>
 /// <returns>The next turn state.</returns>
@@ -65,6 +70,34 @@ let updateTurnState (current: SessionState) (evt: SessionEvent) : SessionState =
         | :? TurnFailedEvent -> SessionState.Idle
         | :? SessionClosedEvent -> SessionState.Closed
         | _ -> current
+
+/// Names one authoritative operation observation status explicitly:
+/// Pending is accepted-queued with no committed winner; Terminal is the
+/// committed winning result; Unknown means the session, entry, or
+/// association is missing or mismatched; Unavailable means storage
+/// failed. Unknown and Unavailable never read as running, successful,
+/// resumed, or idle.
+/// <param name="status">The authoritative operation status.</param>
+/// <returns>The explicit state text.</returns>
+let describeOperationStatus (status: OperationStatus) : string =
+    match status with
+    | OperationStatus.Pending -> "accepted-queued (no committed result yet)"
+    | OperationStatus.Terminal -> "committed (winning terminal result present)"
+    | OperationStatus.Unknown -> "unknown (stale, missing, or mismatched evidence)"
+    | OperationStatus.Unavailable -> "unavailable (storage failed; never terminal)"
+    | _ -> "unknown (unrecognized status)"
+
+/// Names one committed terminal TurnStatus explicitly: an idle session
+/// may retain a failed last operation, so committed failure or abort is
+/// shown as such rather than as idle or running.
+/// <param name="status">The committed turn status.</param>
+/// <returns>The explicit outcome text.</returns>
+let describeTerminalStatus (status: TurnStatus) : string =
+    match status with
+    | TurnStatus.Completed -> "committed-success"
+    | TurnStatus.Aborted -> "committed-abort"
+    | TurnStatus.Failed -> "committed-failure"
+    | _ -> $"committed status={status}"
 
 // ──────────────────────────────────────────────────────────────────────────
 // Status bar
@@ -95,6 +128,38 @@ let statusText (sessionId: SessionId) (model: ModelReference) (state: SessionSta
             model.Value
 
     $"session {shortSessionId sessionId} | model {modelText} | {state}"
+
+/// The status-bar line with explicit authoritative operation evidence:
+/// the session lifecycle plus the accepted-operation observation
+/// (accepted-queued, executing, awaiting input, committed
+/// success/failure/abort, or explicit unknown/unavailable). Unavailable,
+/// stale, or insufficient evidence reads explicitly as
+/// unknown/unavailable, never as running, successful, resumed, or idle.
+/// <param name="sessionId">The session the shell shows.</param>
+/// <param name="model">The current model reference.</param>
+/// <param name="state">The live turn state.</param>
+/// <param name="operation">The authoritative operation text, or null for unknown.</param>
+/// <returns>The rendered status line.</returns>
+let statusTextWithOperation
+    (sessionId: SessionId)
+    (model: ModelReference)
+    (state: SessionState)
+    (operation: string | null)
+    : string =
+    let baseLine = statusText sessionId model state
+
+    let operationText =
+        if isNull (box operation) then
+            "unknown (insufficient evidence)"
+        else
+            let text = unbox<string> (box operation)
+
+            if String.IsNullOrWhiteSpace text then
+                "unknown (insufficient evidence)"
+            else
+                text
+
+    $"{baseLine} | {operationText}"
 
 // ──────────────────────────────────────────────────────────────────────────
 // Alternate-screen constants

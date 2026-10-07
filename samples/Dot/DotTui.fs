@@ -275,6 +275,18 @@ let runSpikeAsync
 
                     let view = snapshotRenderer ()
 
+                    // Authoritative status: pending permission/question
+                    // widgets bound to the selected session and actual turn
+                    // read WaitingForInput; otherwise the engine's
+                    // authoritative execution flag (receipt Pending and
+                    // durable TurnStarted/permission/question vs committed
+                    // terminal settlement, never local task lifetime) reads
+                    // Running; unavailable or insufficient evidence reads
+                    // explicitly as unknown via the operation text, never
+                    // as running, success, or idle. Post-deadline
+                    // observation keeps the attachment, so committed
+                    // events and terminal outcomes stay visible and
+                    // steer/follow/abort plus replies stay usable.
                     let state =
                         if DotRender.hasPendingPermission view || DotRender.hasPendingQuestion view then
                             SessionState.WaitingForInput
@@ -283,7 +295,13 @@ let runSpikeAsync
                         else
                             SessionState.Idle
 
-                    let status = DotShell.statusText engine.CurrentSessionId engine.CurrentModel state
+                    let status =
+                        DotShell.statusTextWithOperation
+                            engine.CurrentSessionId
+                            engine.CurrentModel
+                            state
+                            engine.LastOperationText
+
                     let key = (width, height, input.Editor, input.Picker, view, status, scrollOffset)
 
                     if lastPaintKey <> Some key then
@@ -525,7 +543,7 @@ let runHeadlessSmokeAsync
                             24
                             false
                             (DotRender.toViewportLines view)
-                            (DotShell.statusText sessionId initialModel state)
+                            (DotShell.statusTextWithOperation sessionId initialModel state engine.LastOperationText)
                             []
 
                     Console.Out.Write(frame)
