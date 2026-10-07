@@ -962,6 +962,7 @@ let private spawnWriterActor
             OnInjectJournaled = None
             Logger = null
             Compact = None
+            StorePipe = None
         }
 
     let runner: SessionActor.SuspendableRunner =

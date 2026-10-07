@@ -49,6 +49,7 @@
     <Compile Include="LegateOptionsBinding.fs" />
     <Compile Include="LegateDefaults.fs" />
     <Compile Include="PromptWaitHub.fs" />
+    <Compile Include="LifecyclePipe.fs" />
     <Compile Include="SessionActor.fs" />
     <Compile Include="SessionRouteMessages.fs" />
     <Compile Include="SessionPermissions.fs" />

@@ -101,6 +101,7 @@ let private spawnSession
             OnInjectJournaled = None
             Logger = null
             Compact = None
+            StorePipe = None
         }
 
     spawn system $"test-{Guid.NewGuid():N}" (SessionActor.behavior props)
@@ -125,6 +126,7 @@ let private spawnSessionWithProbe
             OnInjectJournaled = None
             Logger = null
             Compact = None
+            StorePipe = None
         }
 
     spawn system $"test-{Guid.NewGuid():N}" (SessionActor.behavior props)
@@ -1141,6 +1143,7 @@ let private spawnSuspendable
             OnInjectJournaled = None
             Logger = null
             Compact = None
+            StorePipe = None
         }
 
     let deps: SessionActor.SuspendDeps =
@@ -1718,6 +1721,7 @@ let private spawnSessionFull
             OnInjectJournaled = Some(fun event -> lock journaled (fun () -> journaled.Add(event)))
             Logger = null
             Compact = None
+            StorePipe = None
         }
 
     spawn system $"test-{Guid.NewGuid():N}" (SessionActor.behavior props)
@@ -2512,6 +2516,7 @@ let private spawnSessionWithCompact
             OnInjectJournaled = None
             Logger = null
             Compact = Some compact
+            StorePipe = None
         }
 
     spawn system $"test-{Guid.NewGuid():N}" (SessionActor.behavior props)
@@ -3268,6 +3273,7 @@ let ``Session actor prompt and settle carry all six scopes and leak no secret`` 
             OnInjectJournaled = None
             Logger = logger :> Microsoft.Extensions.Logging.ILogger
             Compact = None
+            StorePipe = None
         }
 
     let session = spawn system $"test-{Guid.NewGuid():N}" (SessionActor.behavior props)
@@ -3471,6 +3477,7 @@ let private spawnSuspendableOver
             OnInjectJournaled = None
             Logger = null
             Compact = None
+            StorePipe = None
         }
 
     let deps: SessionActor.SuspendDeps =
@@ -3785,6 +3792,7 @@ let ``Kill mid-turn restarts exactly once with the journal prefix intact`` () =
                 OnInjectJournaled = None
                 Logger = null
                 Compact = None
+                StorePipe = None
             }
 
         let deps: SessionActor.SuspendDeps =
@@ -3911,6 +3919,7 @@ let ``Running with empty inbox and marker-only journal settles Failed instead of
             OnInjectJournaled = None
             Logger = null
             Compact = None
+            StorePipe = None
         }
 
     let deps: SessionActor.SuspendDeps =
@@ -4069,6 +4078,7 @@ let ``Orphan fail takeover loser journals nothing under the fresh token`` () =
                 OnInjectJournaled = None
                 Logger = null
                 Compact = None
+                StorePipe = None
             }
 
         let deps: SessionActor.SuspendDeps =
@@ -4300,27 +4310,25 @@ let private reprimeFor
     (sessionId: SessionId)
     (owner: string)
     ()
-    : TurnClaim option =
-    try
-        let bootstrap =
-            UserMessagePayload(UserMessage.Text "legate journal prime") :> InboxPayload
+    : Task<TurnClaim option> =
+    task {
+        try
+            let bootstrap =
+                UserMessagePayload(UserMessage.Text "legate journal prime") :> InboxPayload
 
-        store
-            .AppendInboxMessage(tenantId, sessionId, bootstrap, DeliveryMode.Queue, CancellationToken.None)
-            .GetAwaiter()
-            .GetResult()
-        |> ignore
+            let! _ =
+                store.AppendInboxMessage(tenantId, sessionId, bootstrap, DeliveryMode.Queue, CancellationToken.None)
 
-        match
-            store.ClaimNextTurn(tenantId, sessionId, owner, TimeSpan.FromSeconds 120.0, CancellationToken.None)
-            |> fun task -> task.GetAwaiter().GetResult()
-        with
-        | :? TurnLeaseRenewed as renewed when not (isNull (box renewed)) -> Some renewed.Claim
-        | :? TurnLeaseHeld as held when not (isNull (box held)) -> Some held.Claim
-        | :? TurnLeaseExpiring as expiring when not (isNull (box expiring)) -> Some expiring.Claim
-        | _ -> None
-    with _ ->
-        None
+            match!
+                store.ClaimNextTurn(tenantId, sessionId, owner, TimeSpan.FromSeconds 120.0, CancellationToken.None)
+            with
+            | :? TurnLeaseRenewed as renewed when not (isNull (box renewed)) -> return Some renewed.Claim
+            | :? TurnLeaseHeld as held when not (isNull (box held)) -> return Some held.Claim
+            | :? TurnLeaseExpiring as expiring when not (isNull (box expiring)) -> return Some expiring.Claim
+            | _ -> return None
+        with _ ->
+            return None
+    }
 
 /// Spawns a suspendable actor with a live re-prime, for SetAgent protocol
 /// tests that drive the runner directly.
@@ -4347,6 +4355,7 @@ let private spawnReprimeable
             OnInjectJournaled = None
             Logger = null
             Compact = compact
+            StorePipe = None
         }
 
     let deps: SessionActor.SuspendDeps =
@@ -4731,7 +4740,7 @@ let private spawnProbe
     (sessionId: SessionId)
     (token: string)
     (runner: SessionActor.SuspendableRunner)
-    (reprime: (unit -> TurnClaim option) option)
+    (reprime: (unit -> Task<TurnClaim option>) option)
     (era: TenantId -> SessionId -> CancellationToken -> Task<bool>)
     (settled: ResizeArray<TurnResult>)
     : IActorRef =
@@ -4746,6 +4755,7 @@ let private spawnProbe
             OnInjectJournaled = None
             Logger = null
             Compact = None
+            StorePipe = None
         }
 
     let deps: SessionActor.SuspendDeps =

@@ -426,6 +426,7 @@ module ControlActorProtocolTests =
                         OnInjectJournaled = None
                         Compact = None
                         Logger = null
+                        StorePipe = None
                     }
 
                 let suspend: SessionActor.SuspendDeps =
@@ -452,7 +453,15 @@ module ControlActorProtocolTests =
                     spawn system "session" (fun mailbox ->
                         try
                             let behavior =
-                                SessionActor.behaviorWithSuspendRouted (fun () -> ()) props suspend clock None mailbox
+                                SessionActor.behaviorWithSuspendRouted
+                                    (fun () -> ())
+                                    (fun _ -> ())
+                                    props
+                                    suspend
+                                    clock
+                                    None
+                                    []
+                                    mailbox
 
                             initialized.SetResult true
                             behavior
@@ -1137,6 +1146,7 @@ module ControlActorProtocolTests =
                 OnInjectJournaled = None
                 Compact = None
                 Logger = null
+                StorePipe = None
             }
 
         let deps: SessionActor.SuspendDeps =
