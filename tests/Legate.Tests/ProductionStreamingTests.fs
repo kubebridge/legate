@@ -1811,7 +1811,7 @@ let ``runner losing the claim journals zero streaming writes`` () =
             (client :> IChatClient)
             store
             journalTenant
-            (fun _ -> (tools, TurnLoop.TurnLoopOptions.Default))
+            (fun _ _ -> Task.FromResult((tools, TurnLoop.TurnLoopOptions.Default)))
             (NeverDelay() :> ILlmDelay)
             Unchecked.defaultof<IPermissionPolicy>
             None

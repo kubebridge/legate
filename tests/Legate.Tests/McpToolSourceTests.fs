@@ -179,7 +179,7 @@ let private sourceFor
 
 /// Resolves tools synchronously for tests.
 let private resolve (source: McpToolSource) : IReadOnlyList<AITool> =
-    (source :> IToolSource).GetTools(sampleContext ()).GetAwaiter().GetResult()
+    (source :> IToolSource).GetTools(sampleContext (), CancellationToken.None).GetAwaiter().GetResult()
 
 /// The tool names in resolution order.
 let private namesOf (tools: IReadOnlyList<AITool>) : string list =
@@ -629,7 +629,7 @@ let private artifactSource
 /// Invokes the first resolved tool and returns its text.
 let private invokeFirst (source: McpToolSource) : string =
     let tools =
-        (source :> IToolSource).GetTools(sampleContext ()).GetAwaiter().GetResult()
+        (source :> IToolSource).GetTools(sampleContext (), CancellationToken.None).GetAwaiter().GetResult()
 
     tools.Count |> should equal 1
 

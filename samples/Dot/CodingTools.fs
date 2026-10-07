@@ -663,8 +663,11 @@ type CodingToolSource
         /// Resolves the seven coding tools for one session over its bound
         /// workspace.
         /// <param name="context">The tenant, agent, and session asking for its tools.</param>
+        /// <param name="cancellationToken">Abandons the resolution.</param>
         /// <returns>The tools offered to the model, or the empty list when degraded.</returns>
-        member _.GetTools(context: ToolSourceContext) : Task<IReadOnlyList<AITool>> =
+        member _.GetTools
+            (context: ToolSourceContext, cancellationToken: CancellationToken)
+            : Task<IReadOnlyList<AITool>> =
             task {
                 try
                     // ToolSourceContext carries no null annotation, so the
@@ -673,16 +676,16 @@ type CodingToolSource
                         logDegraded "no tool source context" null
                         return ResizeArray<AITool>() :> IReadOnlyList<AITool>
                     else
-                        let! session = sessions.GetSession(context.Tenant, context.SessionId, CancellationToken.None)
+                        let! session = sessions.GetSession(context.Tenant, context.SessionId, cancellationToken)
 
                         match session with
                         | null ->
                             logDegraded "the session is unknown to the session store" null
                             return ResizeArray<AITool>() :> IReadOnlyList<AITool>
                         | known ->
-                            let! workspace = runtime.Bind(known, null, CancellationToken.None)
+                            let! workspace = runtime.Bind(known, null, cancellationToken)
 
-                            let! agent = agents.GetAgent(context.Tenant, context.AgentId, CancellationToken.None)
+                            let! agent = agents.GetAgent(context.Tenant, context.AgentId, cancellationToken)
 
                             let env =
                                 match agent with
@@ -724,7 +727,10 @@ type CodingToolSource
                             tools.Add(createExecTool workspace env :> AITool)
 
                             return tools :> IReadOnlyList<AITool>
-                with error ->
+                with
+                | :? OperationCanceledException as canceled ->
+                    return! Task.FromException<IReadOnlyList<AITool>>(canceled)
+                | error ->
                     logDegraded "the session workspace could not be bound" error
                     return ResizeArray<AITool>() :> IReadOnlyList<AITool>
             }

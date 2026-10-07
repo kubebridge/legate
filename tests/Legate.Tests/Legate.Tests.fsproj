@@ -127,6 +127,7 @@
     <Compile Include="PromptWaitHubTests.fs" />
     <Compile Include="PromptAndWaitTests.fs" />
     <Compile Include="SessionClientFacadeTests.fs" />
+    <Compile Include="ProductionSetupCancellationTests.fs" />
     <Compile Include="OperationReceiptsTests.fs" />
     <Compile Include="OperationWaitTests.fs" />
     <Compile Include="ConversationEvidenceTests.fs" />

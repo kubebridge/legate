@@ -74,8 +74,11 @@ internal sealed class CapturedDelay : ILlmDelay
 
 internal sealed class Source : IToolSource
 {
-    public Task<IReadOnlyList<AITool>> GetTools(ToolSourceContext context) =>
-        Task.FromResult<IReadOnlyList<AITool>>([AIFunctionFactory.Create(() => "allowed", "approved", "A sample approval.")]);
+    public Task<IReadOnlyList<AITool>> GetTools(ToolSourceContext context, System.Threading.CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return Task.FromResult<IReadOnlyList<AITool>>([AIFunctionFactory.Create(() => "allowed", "approved", "A sample approval.")]);
+    }
 }
 internal sealed class AskPolicy : IPermissionPolicy
 {

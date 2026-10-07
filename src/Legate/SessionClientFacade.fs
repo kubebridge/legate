@@ -1931,92 +1931,103 @@ module internal SessionClientWiring =
                     return Option.ofObj agent |> Option.map (fun agent -> agent.Model)
         }
 
-    /// Resolves one entry's tool set and turn budget: the session row
-    /// carries the agent (for the tool context) and the options snapshot
-    /// (for the budget through TurnLoop.resolveBudget with the session
-    /// AskUser winning over the configured default). Tool names validate
-    /// on assembly and first registration wins across sources. The budget's
-    /// Compaction stays unset here: the production runner merges the
-    /// per-turn force-aware hook (issue 386) over these options, so the
-    /// hook carries the live turn id, attempt, claim, and actor-shared
-    /// force cell resolveInputs never sees.
+    /// Resolves one entry's tool set and turn budget asynchronously under
+    /// the attempt token: the session row carries the agent (for the tool
+    /// context) and the options snapshot (for the budget through
+    /// TurnLoop.resolveBudget with the session AskUser winning over the
+    /// configured default). Tool discovery runs sequentially in
+    /// registration order with the attempt token on every source call, so a
+    /// slow source never blocks actor dispatch or unrelated sessions: the
+    /// runner awaits this task on the turn thread while the actor thread
+    /// keeps processing controls. Tool names validate on assembly and first
+    /// registration wins across sources. The budget's Compaction stays unset
+    /// here: the production runner merges the per-turn force-aware hook
+    /// (issue 386) over these options, so the hook carries the live turn
+    /// id, attempt, claim, and actor-shared force cell resolveInputs never
+    /// sees. Cancellation propagates (never degraded to empty or partial);
+    /// a throwing source fails the setup truthfully (degrading is the
+    /// source's own empty-list job); a null discovery result reads as empty;
+    /// invalid names fail loudly. A late result arriving after the attempt
+    /// lost authority is inert: the runner's last-moment fence discards it.
+    /// Stopping observation never cancels accepted durable work.
     /// <param name="store">The durable store session rows persist through.</param>
     /// <param name="tenant">The tenant facade-driven sessions belong to.</param>
     /// <param name="sources">The registered tool sources, in registration order.</param>
     /// <param name="turns">The configured turn defaults.</param>
     /// <param name="askUserDefault">The configured ask-user default, or null.</param>
-    /// <returns>The per-entry tool set and budget resolver the runner calls.</returns>
+    /// <returns>The per-entry tool set and budget resolver the runner awaits under the attempt token.</returns>
     let resolveInputs
         (store: ISessionStore)
         (tenant: TenantId)
         (sources: IToolSource list)
         (turns: TurnsOptions)
         (askUserDefault: AskUserOptions | null)
-        : (InboxEntry -> IReadOnlyDictionary<string, AITool> * TurnLoop.TurnLoopOptions) =
+        : (InboxEntry -> CancellationToken -> Task<IReadOnlyDictionary<string, AITool> * TurnLoop.TurnLoopOptions>) =
         ArgumentNullException.ThrowIfNull(store)
         ArgumentNullException.ThrowIfNull(turns)
 
-        fun entry ->
-            let stored =
-                store.GetSession(tenant, entry.SessionId, CancellationToken.None).GetAwaiter().GetResult()
+        fun entry cancellationToken ->
+            task {
+                let! stored = store.GetSession(tenant, entry.SessionId, cancellationToken)
 
-            let session =
-                match stored with
-                | null ->
-                    raise (
-                        InvalidOperationException(
-                            sprintf "The session %O has no stored row for its running turn." entry.SessionId
+                let session =
+                    match stored with
+                    | null ->
+                        raise (
+                            InvalidOperationException(
+                                sprintf "The session %O has no stored row for its running turn." entry.SessionId
+                            )
                         )
-                    )
-                | live -> live
+                    | live -> live
 
-            let sessionOptions =
-                match box session.Options with
-                | null -> SessionOptions()
-                | _ -> session.Options
+                let sessionOptions =
+                    match box session.Options with
+                    | null -> SessionOptions()
+                    | _ -> session.Options
 
-            let context =
-                {
-                    Tenant = tenant
-                    AgentId = session.AgentId
-                    SessionId = entry.SessionId
-                }
+                let context =
+                    {
+                        Tenant = tenant
+                        AgentId = session.AgentId
+                        SessionId = entry.SessionId
+                    }
 
-            let table = Dictionary<string, AITool>(StringComparer.Ordinal)
+                let table = Dictionary<string, AITool>(StringComparer.Ordinal)
 
-            for source in sources do
-                if not (isNull (box source)) then
-                    let tools = source.GetTools(context).GetAwaiter().GetResult()
+                for source in sources do
+                    if not (isNull (box source)) then
+                        let! tools = source.GetTools(context, cancellationToken)
 
-                    if not (isNull (box tools)) then
-                        for tool in tools do
-                            if not (isNull (box tool)) then
-                                if String.IsNullOrWhiteSpace tool.Name then
-                                    raise (
-                                        ArgumentException(
-                                            "A tool source returned a tool with no name: every tool name must match [a-zA-Z0-9_-]{1,128}.",
-                                            "tools"
+                        if not (isNull (box tools)) then
+                            for tool in tools do
+                                if not (isNull (box tool)) then
+                                    if String.IsNullOrWhiteSpace tool.Name then
+                                        raise (
+                                            ArgumentException(
+                                                "A tool source returned a tool with no name: every tool name must match [a-zA-Z0-9_-]{1,128}.",
+                                                "tools"
+                                            )
                                         )
-                                    )
-                                elif not (ToolNameRules.TryValidate tool.Name) then
-                                    raise (
-                                        ArgumentException(
-                                            sprintf
-                                                "A tool source returned a non-conforming tool name '%s': every tool name must match [a-zA-Z0-9_-]{1,128}."
-                                                tool.Name,
-                                            "tools"
+                                    elif not (ToolNameRules.TryValidate tool.Name) then
+                                        raise (
+                                            ArgumentException(
+                                                sprintf
+                                                    "A tool source returned a non-conforming tool name '%s': every tool name must match [a-zA-Z0-9_-]{1,128}."
+                                                    tool.Name,
+                                                "tools"
+                                            )
                                         )
-                                    )
-                                elif not (table.ContainsKey tool.Name) then
-                                    table[tool.Name] <- tool
+                                    elif not (table.ContainsKey tool.Name) then
+                                        table[tool.Name] <- tool
 
-            let budget = TurnLoop.resolveBudget sessionOptions turns
+                let budget = TurnLoop.resolveBudget sessionOptions turns
 
-            let ask =
-                Option.ofObj sessionOptions.AskUser
-                |> Option.orElse (Option.ofObj askUserDefault)
+                let ask =
+                    Option.ofObj sessionOptions.AskUser
+                    |> Option.orElse (Option.ofObj askUserDefault)
 
-            (table :> IReadOnlyDictionary<string, AITool>, { budget with AskUser = ask })
+                return (table :> IReadOnlyDictionary<string, AITool>, { budget with AskUser = ask })
+            }
 
     /// Builds the per-entry composed system prompt hook from the session's
     /// host instruction files: read fresh every turn and joined through
@@ -2208,38 +2219,43 @@ module internal SessionClientWiring =
             let baseInputs =
                 resolveInputs store clientOptions.Tenant sources legateOptions.Turns legateOptions.AskUser
 
-            let inputs (available: IReadOnlyList<Agent>) entry =
-                let tools, options = baseInputs entry
+            let inputs (available: IReadOnlyList<Agent>) entry (cancellationToken: CancellationToken) =
+                task {
+                    let! setup = baseInputs entry cancellationToken
+                    let tools, options = setup
 
-                match agentStore with
-                | null -> tools, options
-                | agents ->
-                    let nested =
-                        available
-                        |> Seq.filter (fun agent -> agent.Enabled && not (String.IsNullOrWhiteSpace agent.Description))
-                        |> Seq.toArray
-                        :> IReadOnlyList<Agent>
+                    match agentStore with
+                    | null -> return tools, options
+                    | agents ->
+                        let nested =
+                            available
+                            |> Seq.filter (fun agent ->
+                                agent.Enabled && not (String.IsNullOrWhiteSpace agent.Description))
+                            |> Seq.toArray
+                            :> IReadOnlyList<Agent>
 
-                    if nested.Count = 0 then
-                        tools, options
-                    else
-                        let table = Dictionary<string, AITool>(tools, StringComparer.Ordinal)
-                        table[TaskTool.ToolName] <- TaskTool.Create(TaskTool.DescriptionFor nested)
+                        if nested.Count = 0 then
+                            return tools, options
+                        else
+                            let table = Dictionary<string, AITool>(tools, StringComparer.Ordinal)
+                            table[TaskTool.ToolName] <- TaskTool.Create(TaskTool.DescriptionFor nested)
 
-                        let deps: TaskRunner.TaskHookDeps =
-                            {
-                                Store = agents
-                                Tenant = clientOptions.Tenant
-                                Config = legateOptions.Sessions.SubAgents
-                                Depth = 0
-                                ResolveClient = Some(fun model -> modelClients.Resolve(model, client))
-                                Journal = None
-                            }
+                            let deps: TaskRunner.TaskHookDeps =
+                                {
+                                    Store = agents
+                                    Tenant = clientOptions.Tenant
+                                    Config = legateOptions.Sessions.SubAgents
+                                    Depth = 0
+                                    ResolveClient = Some(fun model -> modelClients.Resolve(model, client))
+                                    Journal = None
+                                }
 
-                        table :> IReadOnlyDictionary<string, AITool>,
-                        { options with
-                            TaskNested = Some(TaskRunner.createHook deps)
-                        }
+                            return
+                                table :> IReadOnlyDictionary<string, AITool>,
+                                { options with
+                                    TaskNested = Some(TaskRunner.createHook deps)
+                                }
+                }
 
             // Bounded progressive streaming (issue 379): the per-attempt
             // journaler bounds resolve once from the configured turn

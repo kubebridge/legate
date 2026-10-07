@@ -169,8 +169,11 @@ type internal CustomToolSource
         /// loadable tool. Degrades to the empty list when the store cannot
         /// serve; cancellation propagates.
         /// <param name="context">The tenant, agent, and session asking for its tools.</param>
+        /// <param name="cancellationToken">Abandons the listing.</param>
         /// <returns>The tools offered to the model, free of null entries.</returns>
-        member this.GetTools(context: ToolSourceContext) : Task<IReadOnlyList<AITool>> =
+        member this.GetTools
+            (context: ToolSourceContext, cancellationToken: CancellationToken)
+            : Task<IReadOnlyList<AITool>> =
             if isNull (box context) then
                 raise (ArgumentNullException(nameof context))
 
@@ -178,7 +181,7 @@ type internal CustomToolSource
                 let! rows =
                     task {
                         try
-                            return! toolStore.ListCustomTools(context.Tenant, context.AgentId, CancellationToken.None)
+                            return! toolStore.ListCustomTools(context.Tenant, context.AgentId, cancellationToken)
                         with
                         | :? OperationCanceledException as canceled ->
                             return! Task.FromException<IReadOnlyList<AgentCustomTool>>(canceled)

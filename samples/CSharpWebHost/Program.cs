@@ -99,8 +99,11 @@ internal sealed record AbortRequest(string ExpectedTurnId, string Reason);
 internal static class SampleSignals { internal static int Waiters; }
 internal sealed class SampleTools : IToolSource
 {
-    public Task<IReadOnlyList<AITool>> GetTools(ToolSourceContext context) =>
-        Task.FromResult<IReadOnlyList<AITool>>([AIFunctionFactory.Create(() => "approval demo allowed", "approval_demo", "Sample permission demonstration.")]);
+    public Task<IReadOnlyList<AITool>> GetTools(ToolSourceContext context, System.Threading.CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return Task.FromResult<IReadOnlyList<AITool>>([AIFunctionFactory.Create(() => "approval demo allowed", "approval_demo", "Sample permission demonstration.")]);
+    }
 }
 internal sealed class SamplePermissions : IPermissionPolicy
 {

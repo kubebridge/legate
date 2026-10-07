@@ -965,9 +965,15 @@ module internal SessionActor =
                     let turnId = TurnId.New()
 
                     let drainInjected () : IReadOnlyList<InboxEntry> =
+                        // Cancellable Inject read (issue 391): the attempt
+                        // token reaches the store, so Abort and shutdown
+                        // during the fold propagate truthfully instead of
+                        // hiding as empty. A failed read propagates instead
+                        // of hiding as no Injects; pending input stays
+                        // pending, never lost nor fabricated.
                         let pending =
                             wiring.Store
-                                .ReadPendingInbox(wiring.Tenant, wiring.SessionId, CancellationToken.None)
+                                .ReadPendingInbox(wiring.Tenant, wiring.SessionId, cancellationToken)
                                 .GetAwaiter()
                                 .GetResult()
 
@@ -1018,6 +1024,11 @@ module internal SessionActor =
                             | _ -> ()
 
                     let consumeInjected (injected: InboxEntry) : unit =
+                        // Truthful Inject consume (issue 391): the attempt
+                        // token reaches the store; cancellation and store
+                        // failures propagate instead of claiming success.
+                        // A fenced-out loser raises TurnLeaseLostException
+                        // with zero effects; pending input stays pending.
                         if not (isNull (box injected)) then
                             let positions = [| injected.Position |] :> IReadOnlyList<int64>
 
@@ -1031,7 +1042,7 @@ module internal SessionActor =
                                             claim
                                             wiring.SessionId
                                             positions
-                                            CancellationToken.None
+                                            cancellationToken
                                         |> fun task -> task.GetAwaiter().GetResult()
 
                                     if not landed then
@@ -1042,14 +1053,15 @@ module internal SessionActor =
                                             wiring.Tenant,
                                             wiring.SessionId,
                                             positions,
-                                            CancellationToken.None
+                                            cancellationToken
                                         )
                                         .GetAwaiter()
                                         .GetResult()
                                     |> ignore
                             with
                             | :? TurnLoop.TurnLeaseLostException -> reraise ()
-                            | _ -> ()
+                            | :? OperationCanceledException -> reraise ()
+                            | _ -> reraise ()
 
                     // Initial evidence, once per delivery semantics: the
                     // turn's own entry journals exactly once under the

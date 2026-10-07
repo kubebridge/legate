@@ -81,7 +81,7 @@ let private productionRunner
         (client :> IChatClient)
         store
         tenant
-        (fun _ -> (tools, TurnLoop.TurnLoopOptions.Default))
+        (fun _ _ -> Task.FromResult((tools, TurnLoop.TurnLoopOptions.Default)))
         (NeverDelay() :> ILlmDelay)
         policy
         None

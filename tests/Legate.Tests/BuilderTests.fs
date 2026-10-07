@@ -93,7 +93,8 @@ type StubAuditSink() =
 type StubToolSource() =
 
     interface IToolSource with
-        member _.GetTools(_context: ToolSourceContext) =
+        member _.GetTools(_context: ToolSourceContext, cancellationToken: CancellationToken) =
+            cancellationToken.ThrowIfCancellationRequested()
             Task.FromResult(ResizeArray<AITool>() :> IReadOnlyList<AITool>)
 
 /// A permission policy that allows every call.
