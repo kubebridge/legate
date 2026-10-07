@@ -608,7 +608,9 @@ type private StaticSource(tools: IReadOnlyList<AITool>) =
     do ArgumentNullException.ThrowIfNull(tools)
 
     interface IToolSource with
-        member _.GetTools(_) = Task.FromResult(tools)
+        member _.GetTools(_, cancellationToken: CancellationToken) =
+            cancellationToken.ThrowIfCancellationRequested()
+            Task.FromResult(tools)
 
 // ──────────────────────────────────────────────────────────────────────────
 // Provider keys (issues 307, 328)

@@ -123,9 +123,10 @@ internal sealed class StaticSource : IToolSource
         _tools = tools;
     }
 
-    public Task<IReadOnlyList<AITool>> GetTools(ToolSourceContext context)
+    public Task<IReadOnlyList<AITool>> GetTools(ToolSourceContext context, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(context);
+        cancellationToken.ThrowIfCancellationRequested();
         return Task.FromResult(_tools);
     }
 }

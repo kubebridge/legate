@@ -1319,7 +1319,7 @@ let private productionHistoryRunner
         (client :> IChatClient)
         store
         runnerTenant
-        (fun _ -> (tools, TurnLoop.TurnLoopOptions.Default))
+        (fun _ _ -> Task.FromResult((tools, TurnLoop.TurnLoopOptions.Default)))
         (NeverDelay() :> ILlmDelay)
         null
         None

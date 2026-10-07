@@ -281,7 +281,7 @@ let ``suspended renewal consumes no reply and resumes no work by itself`` () =
             (chat :> IChatClient)
             store
             tenant
-            (fun _ -> (toolsDict, TurnLoop.TurnLoopOptions.Default))
+            (fun _ _ -> Task.FromResult((toolsDict, TurnLoop.TurnLoopOptions.Default)))
             delay
             policy
             None

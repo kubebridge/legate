@@ -111,7 +111,7 @@ type ToolSourceContext =
 /// How a host (and Legate.Mcp for plain MCP servers) contributes tools to a
 /// session. The runtime asks every registered source for the tools of the
 /// session's context and offers the combined set to the model. The contract
-/// pins four rules:
+/// pins six rules:
 /// <list type="bullet">
 /// <item><description><b>Naming.</b> Every returned tool's name must satisfy
 /// <see cref="P:Legate.ToolNameRules.Pattern" />; validate once when the tool
@@ -130,18 +130,38 @@ type ToolSourceContext =
 /// deterministically. A source should namespace its names (for example
 /// <c>mcp_getServerStatus</c>) to avoid triggering either behaviour and can
 /// never rely on another source's names.</description></item>
+/// <item><description><b>Cancellation.</b> The token abandons the resolution:
+/// a cancelled resolution throws <see cref="T:System.OperationCanceledException" />,
+/// never an empty list as if degraded and never a partial set as if
+/// complete. Stopping a caller's observation never cancels accepted durable
+/// work; it only abandons this resolution, and a later resolution for the
+/// same session remains valid.</description></item>
+/// <item><description><b>Non-cooperative bound.</b> A source whose backing
+/// dependency cannot observe cancellation (a non-cooperative store or
+/// server) still returns promptly: it degrades to the empty list on failure
+/// and never blocks the attempt past the turn's own deadline. A late result
+/// arriving after the attempt lost authority is inert: the runner's
+/// last-moment fence discards it and launches no model or tool invocation.
+/// No new fixed deadline is introduced here; the turn Timeout the host
+/// configured still bounds the attempt.</description></item>
 /// </list>
 type IToolSource =
 
     /// Resolves the tools this source contributes to one session. The
     /// runtime calls this when it builds a session's tool set, not per tool
-    /// call; sources may resolve asynchronously.
+    /// call; sources may resolve asynchronously. A degraded source returns
+    /// the empty list (never an error); a cancelled resolution throws
+    /// <see cref="T:System.OperationCanceledException" /> (never empty as
+    /// if degraded). A source that throws any other exception violates this
+    /// contract: the runtime propagates it truthfully and the setup fails
+    /// instead of degrading.
     /// <param name="context">The tenant, agent, and session asking for its tools.</param>
+    /// <param name="cancellationToken">Abandons the resolution.</param>
     /// <returns>The tools offered to the model, never null and free of null entries: an empty list when the source contributes none or is degraded, per the interface's rules.</returns>
-    abstract GetTools: context: ToolSourceContext -> Task<IReadOnlyList<AITool>>
+    abstract GetTools: context: ToolSourceContext * cancellationToken: CancellationToken -> Task<IReadOnlyList<AITool>>
 
 /// Optional lifecycle for a source that owns resources outside a
-/// <see cref="M:Legate.IToolSource.GetTools(Legate.ToolSourceContext)" />
+/// <see cref="M:Legate.IToolSource.GetTools(Legate.ToolSourceContext,System.Threading.CancellationToken)" />
 /// call, such as a subprocess (an MCP server, for instance) or a pooled
 /// connection. The lifetime is per source instance: the runtime starts each
 /// lifecycle source once before it resolves tools through it and stops it

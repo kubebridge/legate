@@ -3,6 +3,7 @@ namespace Legate.Testing
 
 open System
 open System.Collections.Generic
+open System.Threading
 open System.Threading.Tasks
 open Legate
 open Microsoft.Extensions.AI
@@ -61,8 +62,9 @@ type StaticToolSource(tools: IReadOnlyList<AITool>) =
         table :> IReadOnlyDictionary<string, AITool>
 
     interface IToolSource with
-        member _.GetTools(context: ToolSourceContext) =
+        member _.GetTools(context: ToolSourceContext, cancellationToken: CancellationToken) =
             if isNull (box context) then
                 raise (ArgumentNullException(nameof context))
 
+            cancellationToken.ThrowIfCancellationRequested()
             Task.FromResult(ResizeArray<AITool>(snapshot) :> IReadOnlyList<AITool>)

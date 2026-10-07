@@ -33,7 +33,7 @@ module StaticToolSourceTests =
         task {
             let source = sourced [ "lookup"; "exec" ]
 
-            let! tools = (source :> IToolSource).GetTools(context ())
+            let! tools = (source :> IToolSource).GetTools(context (), CancellationToken.None)
 
             let names = tools |> Seq.map (fun tool -> tool.Name) |> List.ofSeq
 
@@ -45,7 +45,7 @@ module StaticToolSourceTests =
         task {
             let source = StaticToolSource(ResizeArray<AITool>() :> IReadOnlyList<AITool>)
 
-            let! tools = (source :> IToolSource).GetTools(context ())
+            let! tools = (source :> IToolSource).GetTools(context (), CancellationToken.None)
 
             Assert.Empty(tools)
             Assert.Empty(source.Tools)
@@ -93,6 +93,6 @@ module StaticToolSourceTests =
         let source = sourced [ "lookup" ]
 
         Assert.Throws<ArgumentNullException>(fun () ->
-            (source :> IToolSource).GetTools(Unchecked.defaultof<ToolSourceContext>)
+            (source :> IToolSource).GetTools(Unchecked.defaultof<ToolSourceContext>, CancellationToken.None)
             |> ignore)
         |> ignore

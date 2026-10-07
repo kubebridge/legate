@@ -194,7 +194,8 @@ type FakeToolSource(tools: NamedTool list) =
     let mutable stops: CancellationToken list = []
 
     interface IToolSource with
-        member _.GetTools(context) =
+        member _.GetTools(context, cancellationToken) =
+            cancellationToken.ThrowIfCancellationRequested()
             lock lockObject (fun () -> resolved <- context :: resolved)
 
             let list = ResizeArray<AITool>()
@@ -227,7 +228,9 @@ let ``Source resolves tools for the requested context`` () =
     let contract = source :> IToolSource
 
     let context = sampleContext ()
-    let resolved = contract.GetTools(context).GetAwaiter().GetResult()
+
+    let resolved =
+        contract.GetTools(context, CancellationToken.None).GetAwaiter().GetResult()
 
     resolved.Count |> should equal 1
     resolved[0].Name |> should equal "read_file"
@@ -237,7 +240,8 @@ let ``Source resolves tools for the requested context`` () =
 let ``Source returns an empty list on degraded conditions and the runtime reads empty as empty`` () =
     let source = FakeToolSource([]) :> IToolSource
 
-    let resolved = source.GetTools(sampleContext ()).GetAwaiter().GetResult()
+    let resolved =
+        source.GetTools(sampleContext (), CancellationToken.None).GetAwaiter().GetResult()
 
     resolved |> should not' (be null)
     resolved.Count |> should equal 0
@@ -282,7 +286,8 @@ let ``A source can implement IToolSource without IToolSourceLifecycle`` () =
     source.Started.Length |> should equal 0
     source.Stopped.Length |> should equal 0
 
-    let resolved = contract.GetTools(sampleContext ()).GetAwaiter().GetResult()
+    let resolved =
+        contract.GetTools(sampleContext (), CancellationToken.None).GetAwaiter().GetResult()
 
     resolved.Count |> should equal 1
     source.Resolved.Length |> should equal 1

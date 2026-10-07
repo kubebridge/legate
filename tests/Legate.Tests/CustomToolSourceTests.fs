@@ -119,7 +119,7 @@ let private context () : ToolSourceContext =
 
 /// Resolves the source's tools for one session.
 let private getTools (source: CustomToolSource) : IReadOnlyList<AITool> =
-    ((source :> IToolSource).GetTools(context ())).GetAwaiter().GetResult()
+    ((source :> IToolSource).GetTools(context (), CancellationToken.None)).GetAwaiter().GetResult()
 
 // ───────────────────────────────────────────────────────────────────────────
 // Per-session wiring
@@ -279,7 +279,9 @@ let ``A null context is a host bug that throws`` () =
     let source = makeSource [ row "alpha" null ] false (logger :> ILogger)
 
     (fun () ->
-        ((source :> IToolSource).GetTools(Unchecked.defaultof<ToolSourceContext>)).GetAwaiter().GetResult()
+        ((source :> IToolSource).GetTools(Unchecked.defaultof<ToolSourceContext>, CancellationToken.None))
+            .GetAwaiter()
+            .GetResult()
         |> ignore)
     |> should throw typeof<ArgumentNullException>
 

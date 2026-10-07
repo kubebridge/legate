@@ -444,11 +444,16 @@ module internal SessionPermissions =
     /// AllowForSession check runs before Evaluate on every attempt. The
     /// crash seed rides the runner into both fresh-run shapes: Some seeds
     /// the history input with the rehydrated transcript plus note, None
-    /// runs from the entry.
+    /// runs from the entry. Setup (session row plus tool discovery) awaits
+    /// asynchronously under the attempt token: a slow dependency never
+    /// blocks actor dispatch, Abort and shutdown during setup process
+    /// controls before release, and an obsolete or late setup completion
+    /// launches no model or tool invocation (last-moment authority check).
+    /// Stopping observation never cancels accepted durable work.
     /// <param name="client">The chat client turns run against. Must not be null.</param>
     /// <param name="store">The durable store the Inject drain and consume read. Must not be null.</param>
     /// <param name="tenant">The tenant runner-driven sessions belong to.</param>
-    /// <param name="resolveInputs">Resolves one entry's tool set and turn budget. Must not be null and never return null tools.</param>
+    /// <param name="resolveInputs">Resolves one entry's tool set and turn budget under the attempt token. Must not be null and never return null tools.</param>
     /// <param name="loopDelay">The delay seam the turn's hard deadline fires off. Must not be null.</param>
     /// <param name="policy">The permission policy, or null for no gate (every call executes).</param>
     /// <param name="getSystemPrompt">The composed system prompt hook (issue 66), or None to run with no system message.</param>
@@ -460,7 +465,8 @@ module internal SessionPermissions =
         (client: IChatClient)
         (store: ISessionStore)
         (tenant: TenantId)
-        (resolveInputs: InboxEntry -> IReadOnlyDictionary<string, AITool> * TurnLoop.TurnLoopOptions)
+        (resolveInputs:
+            InboxEntry -> CancellationToken -> Task<IReadOnlyDictionary<string, AITool> * TurnLoop.TurnLoopOptions>)
         (loopDelay: ILlmDelay)
         (policy: IPermissionPolicy | null)
         (getSystemPrompt: PromptComposition.GetTurnSystemPrompt option)
@@ -485,22 +491,26 @@ module internal SessionPermissions =
 
         /// Builds the last-moment per-tool admission fence for the running
         /// attempt (issue 376): ClaimFence.checkBeforeCallAsync over the
-        /// AsyncLocal running claim, failing closed on lost, missing, or
-        /// unverifiable authority. Some false denies dispatch (TurnLoop
-        /// raises TurnLeaseLostException); never None, which would read as
-        /// no fence. The renewed isLeaseValid hook (LeaseAdmission over the
-        /// #375 heartbeat view) stays the fast cached check; this verify is
-        /// the token check immediately before each dispatch.
+        /// AsyncLocal running claim under the attempt token, failing closed
+        /// on lost, missing, or unverifiable authority. Some false denies
+        /// dispatch (TurnLoop raises TurnLeaseLostException); never None,
+        /// which would read as no fence. The renewed isLeaseValid hook
+        /// (LeaseAdmission over the #375 heartbeat view) stays the fast
+        /// cached check; this verify is the token check immediately before
+        /// each dispatch. Cancellation propagates instead of denying: a
+        /// cancelled verify throws rather than returning false.
+        /// <param name="runnerToken">The attempt token fencing the verify.</param>
         /// <returns>The VerifyClaim hook the turn runs with.</returns>
-        let verifyForCurrentClaim () : (unit -> Task<bool>) option =
+        let verifyForCurrentClaim (runnerToken: CancellationToken) : (unit -> Task<bool>) option =
             match FencedClaimScope.currentClaim () with
             | Some claim when not (isNull (box claim)) ->
                 Some(fun () ->
                     task {
                         try
-                            return! ClaimFence.checkBeforeCallAsync store tenant claim CancellationToken.None
-                        with _ ->
-                            return false
+                            return! ClaimFence.checkBeforeCallAsync store tenant claim runnerToken
+                        with
+                        | :? OperationCanceledException as canceled -> return! Task.FromException<bool>(canceled)
+                        | _ -> return false
                     })
             | _ -> Some(fun () -> Task.FromResult(false))
 
@@ -508,28 +518,30 @@ module internal SessionPermissions =
         /// loop filters Inject user messages itself, so the drain returns
         /// the raw pending read minus the running entry (an Inject start
         /// never refolds itself, or its input would duplicate in history
-        /// and evidence). Runs on the turn thread, blocking like the
-        /// base Inject wiring.
+        /// and evidence). Runs on the turn thread under the attempt token
+        /// through the running claim fence: cancellation propagates
+        /// truthfully (never empty as if no Injects arrived), and a failed
+        /// read propagates instead of hiding as empty. Pending input stays
+        /// pending on failure, so it is neither lost nor fabricated.
+        /// Non-cooperative stores that ignore the token bound the wait by
+        /// the turn Timeout; a late result after authority loss is inert.
         /// <param name="entry">The entry the running turn executes.</param>
+        /// <param name="runnerToken">The attempt token fencing the read.</param>
         /// <returns>The pending inbox entries.</returns>
-        let drainInjected (entry: InboxEntry) () : IReadOnlyList<InboxEntry> =
-            try
-                let pending =
-                    store.ReadPendingInbox(tenant, entry.SessionId, CancellationToken.None).GetAwaiter().GetResult()
+        let drainInjected (entry: InboxEntry) (runnerToken: CancellationToken) () : IReadOnlyList<InboxEntry> =
+            let pending =
+                store.ReadPendingInbox(tenant, entry.SessionId, runnerToken).GetAwaiter().GetResult()
 
-                if isNull (box pending) then
-                    ResizeArray<InboxEntry>() :> IReadOnlyList<InboxEntry>
-                else
-                    // The running entry stays pending until settle:
-                    // exclude it so an Inject start never refolds
-                    // itself and journals twice.
-                    pending
-                    |> Seq.filter (fun candidate ->
-                        isNull (box candidate) |> not && candidate.Position <> entry.Position)
-                    |> ResizeArray
-                    :> IReadOnlyList<InboxEntry>
-            with _ ->
+            if isNull (box pending) then
                 ResizeArray<InboxEntry>() :> IReadOnlyList<InboxEntry>
+            else
+                // The running entry stays pending until settle:
+                // exclude it so an Inject start never refolds
+                // itself and journals twice.
+                pending
+                |> Seq.filter (fun candidate -> isNull (box candidate) |> not && candidate.Position <> entry.Position)
+                |> ResizeArray
+                :> IReadOnlyList<InboxEntry>
 
         /// Marks one folded Inject entry consumed so it never refolds: the
         /// consume lands atomically under the running claim through the
@@ -538,11 +550,15 @@ module internal SessionPermissions =
         /// settle drain would redeliver the folded entry as a new turn.
         /// Fails closed: a lost claim raises TurnLeaseLostException with
         /// zero effects, and a missing claim raises too (never an unfenced
-        /// consume). Runs on the turn thread, blocking like the base Inject
-        /// wiring.
+        /// consume). Cancellation and store failures propagate truthfully
+        /// instead of mapping to lease loss or claiming success: pending
+        /// input stays pending, never lost nor redelivered as a fabricated
+        /// separate turn. Runs on the turn thread under the attempt token,
+        /// blocking like the base Inject wiring.
         /// <param name="entry">The running turn's entry, carrying the session.</param>
+        /// <param name="runnerToken">The attempt token fencing the consume.</param>
         /// <param name="injected">The folded entry to consume.</param>
-        let consumeInjected (entry: InboxEntry) (injected: InboxEntry) : unit =
+        let consumeInjected (entry: InboxEntry) (runnerToken: CancellationToken) (injected: InboxEntry) : unit =
             if not (isNull (box injected)) then
                 if not (ControlAdmission.check ()) then
                     raise (TurnLoop.TurnLeaseLostException())
@@ -552,24 +568,14 @@ module internal SessionPermissions =
 
                 let positions = [| injected.Position |] :> IReadOnlyList<int64>
 
-                try
-                    match FencedClaimScope.currentClaim () with
-                    | Some claim when not (isNull (box claim)) ->
-                        let landed =
-                            ClaimFence.consumeInboxAsync
-                                store
-                                tenant
-                                claim
-                                entry.SessionId
-                                positions
-                                CancellationToken.None
-                            |> fun task -> task.GetAwaiter().GetResult()
+                match FencedClaimScope.currentClaim () with
+                | Some claim when not (isNull (box claim)) ->
+                    let landed =
+                        ClaimFence.consumeInboxAsync store tenant claim entry.SessionId positions runnerToken
+                        |> fun task -> task.GetAwaiter().GetResult()
 
-                        if not landed then
-                            raise (TurnLoop.TurnLeaseLostException())
-                    | _ -> raise (TurnLoop.TurnLeaseLostException())
-                with
-                | :? TurnLoop.TurnLeaseLostException -> reraise ()
+                    if not landed then
+                        raise (TurnLoop.TurnLeaseLostException())
                 | _ -> raise (TurnLoop.TurnLeaseLostException())
 
         /// Builds the progressive delta hooks (issue 379) from the ambient
@@ -673,50 +679,75 @@ module internal SessionPermissions =
                         table :> IReadOnlyDictionary<string, AITool>
 
         fun entry _attempt allowed cursor reply seed runnerToken onTurnStarted onUsageCheckpoint onSkillLoaded turnId ->
-            let tools, loopOptions = resolveInputs entry
+            task {
 
-            // Fail fast outside the task computation: a null tool set or
-            // budget is a host wiring bug, never a turn outcome.
-            let miswired: Task<TurnLoop.TurnLoopCompletion> option =
+                // Async cancellable setup (issue 391): the session row plus
+                // per-source discovery await under the attempt token on the
+                // turn thread, never blocking actor dispatch. Abort and
+                // shutdown during setup process controls before release;
+                // cancellation propagates truthfully (never degraded to
+                // empty or partial). A throwing source fails the setup
+                // truthfully; null discovery reads as empty; invalid names
+                // fail loudly with first-registration-wins intact.
+                let! setup = resolveInputs entry runnerToken
+                let tools, loopOptions = setup
+
+                // Fail fast for a miswired resolver: a null tool set or
+                // budget is a host wiring bug, never a turn outcome.
                 if isNull (box tools) then
-                    Some(
+                    return!
                         Task.FromException<TurnLoop.TurnLoopCompletion>(
                             InvalidOperationException(
                                 "The session tool resolver returned null: it must return the session tools, empty when there are none."
                             )
                         )
-                    )
                 elif isNull (box loopOptions) then
-                    Some(
+                    return!
                         Task.FromException<TurnLoop.TurnLoopCompletion>(
                             InvalidOperationException(
                                 "The session options resolver returned null: it must return the entry's turn budget."
                             )
                         )
-                    )
                 else
-                    None
+                    // Last-moment authority (issues 376/391): an obsolete or
+                    // late setup completion launches no model or tool
+                    // invocation. Fenced turns verify the live claim under
+                    // the attempt token after setup: the cached admission
+                    // checks run first, then the token verify. A cancelled
+                    // verify propagates instead of denying. Unclaimed shells
+                    // (harness and direct test constructions with no running
+                    // claim) skip the fence: with no authority to lose they
+                    // keep the harness shape.
+                    match FencedClaimScope.currentClaim () with
+                    | Some claim when not (isNull (box claim)) ->
+                        if not (ControlAdmission.check () && LeaseAdmission.check ()) then
+                            raise (TurnLoop.TurnLeaseLostException())
 
-            match miswired with
-            | Some failed -> failed
-            | None ->
-                // Production compaction (issue 386): resolve the per-turn
-                // force-aware hook outside the task computation, so a
-                // miswired resolver fails fast like resolveInputs. The hook
-                // merges into every branch below (fresh, crash-rebuild, and
-                // both resumes), so resume continuations carry it without
-                // refiring turn-started semantics.
-                let compactionHook =
-                    match resolveCompaction with
-                    | Some resolve -> resolve entry turnId _attempt client
-                    | None -> loopOptions.Compaction
+                        match verifyForCurrentClaim runnerToken with
+                        | Some verify ->
+                            let! live = verify ()
 
-                let baseOptions =
-                    { loopOptions with
-                        Compaction = compactionHook
-                    }
+                            if not live then
+                                raise (TurnLoop.TurnLeaseLostException())
+                        | None -> raise (TurnLoop.TurnLeaseLostException())
+                    | _ -> ()
 
-                task {
+                    // Production compaction (issue 386): resolve the per-turn
+                    // force-aware hook after setup, so it carries the live
+                    // turn id, attempt, claim, and actor-shared force cell.
+                    // The hook merges into every branch below (fresh,
+                    // crash-rebuild, and both resumes), so resume
+                    // continuations carry it without refiring turn-started
+                    // semantics.
+                    let compactionHook =
+                        match resolveCompaction with
+                        | Some resolve -> resolve entry turnId _attempt client
+                        | None -> loopOptions.Compaction
+
+                    let baseOptions =
+                        { loopOptions with
+                            Compaction = compactionHook
+                        }
 
                     // Per-attempt streaming journaler (issue 379): built
                     // under the running fenced claim with the real turn id
@@ -758,8 +789,8 @@ module internal SessionPermissions =
                     // boundary (issue 366, Task 9): the hook below journals
                     // only what the loop actually folds, so pending or
                     // never-folded input stays unjournaled and unfabricated.
-                    let drain = drainInjected entry
-                    let consume = consumeInjected entry
+                    let drain = drainInjected entry runnerToken
+                    let consume = consumeInjected entry runnerToken
 
                     // Fenced evidence sinks for this attempt (issue 366,
                     // Tasks 3 and 9): the settled-tool markers and the
@@ -830,7 +861,7 @@ module internal SessionPermissions =
 
                             let merged =
                                 { baseOptions with
-                                    VerifyClaim = verifyForCurrentClaim ()
+                                    VerifyClaim = verifyForCurrentClaim runnerToken
                                     OnTurnStarted = onTurnStarted
                                     OnUsageCheckpoint = onUsageCheckpoint
                                     OnSkillLoaded = onSkillLoaded
@@ -876,7 +907,7 @@ module internal SessionPermissions =
                         if not (ControlAdmission.check () && LeaseAdmission.check ()) then
                             raise (TurnLoop.TurnLeaseLostException())
 
-                        match verifyForCurrentClaim () with
+                        match verifyForCurrentClaim runnerToken with
                         | Some verify ->
                             let! admitted = verify ()
 
@@ -902,7 +933,7 @@ module internal SessionPermissions =
 
                         let merged =
                             { baseOptions with
-                                VerifyClaim = verifyForCurrentClaim ()
+                                VerifyClaim = verifyForCurrentClaim runnerToken
                                 OnTurnStarted = None
                                 OnUsageCheckpoint = onUsageCheckpoint
                                 OnSkillLoaded = onSkillLoaded
@@ -939,7 +970,7 @@ module internal SessionPermissions =
 
                         let merged =
                             { baseOptions with
-                                VerifyClaim = verifyForCurrentClaim ()
+                                VerifyClaim = verifyForCurrentClaim runnerToken
                                 OnTurnStarted = None
                                 OnUsageCheckpoint = onUsageCheckpoint
                                 OnSkillLoaded = onSkillLoaded
@@ -987,7 +1018,7 @@ module internal SessionPermissions =
 
                         let merged =
                             { baseOptions with
-                                VerifyClaim = verifyForCurrentClaim ()
+                                VerifyClaim = verifyForCurrentClaim runnerToken
                                 OnTurnStarted = onTurnStarted
                                 OnUsageCheckpoint = onUsageCheckpoint
                                 OnSkillLoaded = onSkillLoaded
@@ -1023,7 +1054,7 @@ module internal SessionPermissions =
                                     "The suspendable runner received a cursor without a matching reply."
                                 )
                             )
-                }
+            }
 
     /// Resolves the permission policy the production runner evaluates
     /// against: the container's IPermissionPolicy, or null when the host

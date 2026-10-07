@@ -194,10 +194,14 @@ type SkillToolSource(store: IAgentPackageStore, logger: ILogger<SkillToolSource>
 
         /// Resolves the skill tool for one session over its package scope.
         /// <param name="context">The tenant, agent, and session asking for its tools.</param>
+        /// <param name="cancellationToken">Abandons the resolution.</param>
         /// <returns>The skill tool, or the empty list when degraded.</returns>
-        member _.GetTools(context: ToolSourceContext) : Task<IReadOnlyList<AITool>> =
+        member _.GetTools
+            (context: ToolSourceContext, cancellationToken: CancellationToken)
+            : Task<IReadOnlyList<AITool>> =
             task {
                 try
+                    cancellationToken.ThrowIfCancellationRequested()
                     // ToolSourceContext carries no null annotation, so the
                     // check is a runtime guard for non-F# callers.
                     if isNull (box context) then
@@ -225,7 +229,10 @@ type SkillToolSource(store: IAgentPackageStore, logger: ILogger<SkillToolSource>
                         let tools = ResizeArray<AITool>()
                         tools.Add(tool :> AITool)
                         return tools :> IReadOnlyList<AITool>
-                with error ->
+                with
+                | :? OperationCanceledException as canceled ->
+                    return! Task.FromException<IReadOnlyList<AITool>>(canceled)
+                | error ->
                     logDegraded "the skill tool could not be built" error
                     return ResizeArray<AITool>() :> IReadOnlyList<AITool>
             }
