@@ -2,6 +2,7 @@
 module Dot.DotRender
 
 open System
+open System.Text.Json
 open Legate
 
 // Streaming renderer for the dot TUI transcript viewport (issue 333): a
@@ -106,6 +107,12 @@ type RendererState =
         Reasoning: string
         /// The tool cards by tool-call id.
         Tools: Map<string, ToolCard>
+        /// The session/turn which owns each original tool-call id.
+        ToolOwners: Map<string, string>
+        /// The current nested invocation for a session/turn/call, whose id is reused by the journal.
+        NestedCalls: Map<string * string, string>
+        /// Nested card keys linked to their parent task card.
+        ToolParents: Map<string, string>
         /// The tool-card order, oldest first.
         Order: string list
         /// The pending permission widgets, oldest first.
@@ -143,6 +150,9 @@ let empty: RendererState =
         AssistantTruncated = false
         Reasoning = ""
         Tools = Map.empty
+        ToolOwners = Map.empty
+        NestedCalls = Map.empty
+        ToolParents = Map.empty
         Order = []
         Permissions = []
         Questions = []
@@ -189,6 +199,34 @@ let private takeTail (cap: int) (lines: string list) : string list =
 /// Appends one meta line keeping the tail window.
 let private addMeta (lines: string list) (line: string) : string list =
     takeTail maxMetaLines (lines @ [ line ])
+
+let private toolLabel (started: ToolCallStartedEvent) =
+    let name = safe started.ToolName
+
+    if name = "task" && not (String.IsNullOrWhiteSpace started.ArgumentsJson) then
+        try
+            use args = JsonDocument.Parse(safe started.ArgumentsJson)
+            let mutable agent = Unchecked.defaultof<JsonElement>
+
+            if
+                args.RootElement.ValueKind = JsonValueKind.Object
+                && args.RootElement.TryGetProperty("subagent", &agent)
+                && agent.ValueKind = JsonValueKind.String
+            then
+                let label = safe (agent.GetString())
+
+                if String.IsNullOrWhiteSpace label then
+                    name
+                else
+                    $"task · {label}"
+            else
+                name
+        with :? JsonException ->
+            name
+    elif name = "" then
+        "unknown"
+    else
+        name
 
 // ──────────────────────────────────────────────────────────────────────────
 // Consumer deduplication (issue 385)
@@ -304,7 +342,7 @@ let private applyState (state: RendererState) (evt: SessionEvent) : RendererStat
                     }
         | :? ToolCallStartedEvent as started when not (isNull (box started)) ->
             let id = safe started.ToolCallId
-            let name = safe started.ToolName
+            let name = toolLabel started
             let key = if id = "" then $"tool-{state.Order.Length}" else id
 
             if state.Tools.ContainsKey key then
@@ -398,8 +436,22 @@ let private applyState (state: RendererState) (evt: SessionEvent) : RendererStat
                     Order = state.Order @ [ id ]
                 }
             | Some card ->
+                let output, _, overflow =
+                    if card.Output = "" then
+                        appendCapped "" (safe completed.ResultText) maxToolOutputChars
+                    else
+                        card.Output, false, card.Overflow
+
                 { state with
-                    Tools = state.Tools.Add(id, { card with Status = status })
+                    Tools =
+                        state.Tools.Add(
+                            id,
+                            { card with
+                                Status = status
+                                Output = output
+                                Overflow = overflow
+                            }
+                        )
                 }
         | :? PermissionRequestedEvent as asked when not (isNull (box asked)) ->
             let requestId = safe asked.RequestId
@@ -540,7 +592,7 @@ let private applyState (state: RendererState) (evt: SessionEvent) : RendererStat
 /// Duplicate transport delivery repeats the identical durable identity and
 /// folds nothing: the first delivery already rendered it, while distinct
 /// same-text events carry distinct sequences and stay distinct.
-let apply (state: RendererState) (evt: SessionEvent) : RendererState =
+let private applyCore (state: RendererState) (evt: SessionEvent) : RendererState =
     let duplicate =
         not (isNull (box evt))
         && not (isNull (box state))
@@ -587,6 +639,81 @@ let apply (state: RendererState) (evt: SessionEvent) : RendererState =
         | :? TurnFailedEvent as failed -> append (ErrorText($"Error: {failed.Reason}"))
         | :? TurnAbortedEvent as aborted -> append (ErrorText($"Aborted: {aborted.Reason}"))
         | _ -> next
+
+/// Routes nested tool markers to independent cards. The nested journal reuses
+/// the parent call id for every invocation, so turn and start order also matter.
+let apply (state: RendererState) (evt: SessionEvent) : RendererState =
+    let state = if isNull (box state) then empty else state
+
+    let callId =
+        match evt with
+        | :? ToolCallStartedEvent as e -> Some e.ToolCallId
+        | :? ToolCallOutputEvent as e -> Some e.ToolCallId
+        | :? ToolCallCompletedEvent as e -> Some e.ToolCallId
+        | _ -> None
+
+    let duplicate =
+        DotDedup.durableKeyOf evt
+        |> Option.exists (fun identity -> state.Rendered.Contains identity)
+
+    match callId with
+    | _ when duplicate -> state
+    | None -> applyCore state evt
+    | Some id ->
+        let scope = DotDedup.sessionKeyOf evt + "/" + DotDedup.turnKeyOf evt
+        let ownerKey = DotDedup.sessionKeyOf evt + "/" + id
+
+        match state.ToolOwners.TryFind ownerKey with
+        | Some owner when owner <> scope ->
+            let invocation = scope, id
+
+            let key =
+                match evt, state.NestedCalls.TryFind invocation with
+                | (:? ToolCallStartedEvent), _
+                | _, None -> $"{id}/{scope}/{state.Order.Length}"
+                | _, Some existing -> existing
+
+            let routed =
+                match evt with
+                | :? ToolCallStartedEvent as e ->
+                    ToolCallStartedEvent(
+                        e.SessionId,
+                        e.TurnId,
+                        e.Sequence,
+                        e.Timestamp,
+                        key,
+                        e.ToolName,
+                        e.ArgumentsJson
+                    )
+                    :> SessionEvent
+                | :? ToolCallOutputEvent as e ->
+                    ToolCallOutputEvent(e.SessionId, e.TurnId, e.Sequence, e.Timestamp, key, e.Output) :> SessionEvent
+                | :? ToolCallCompletedEvent as e ->
+                    ToolCallCompletedEvent(e.SessionId, e.TurnId, e.Sequence, e.Timestamp, key, e.Error, e.ResultText)
+                    :> SessionEvent
+                | _ -> evt
+
+            let next =
+                applyCore
+                    { state with
+                        NestedCalls = state.NestedCalls.Add(invocation, key)
+                        ToolParents = state.ToolParents.Add(key, id)
+                    }
+                    routed
+
+            // Child turns must not reset the parent's streaming/settlement deduplication.
+            { next with
+                ActiveSession = state.ActiveSession
+                ActiveTurn = state.ActiveTurn
+                TurnStreamed = state.TurnStreamed
+                StreamedTurn = state.StreamedTurn
+            }
+        | _ ->
+            applyCore
+                { state with
+                    ToolOwners = state.ToolOwners.Add(ownerKey, scope)
+                }
+                evt
 
 /// Folds a sequence of Subscribe events into the renderer state, oldest
 /// first.
@@ -848,6 +975,18 @@ let renderToolCard (card: ToolCard) : string list =
 
     [ header ] @ outputLines @ errorLines @ expansion
 
+let private renderToolTree (state: RendererState) id =
+    let parent =
+        state.Tools.TryFind id |> Option.map renderToolCard |> Option.defaultValue []
+
+    let children =
+        state.Order
+        |> List.filter (fun key -> state.ToolParents.TryFind key = Some id)
+        |> List.choose (fun key -> state.Tools.TryFind key)
+        |> List.collect (fun card -> renderToolCard card |> List.map (fun line -> "  " + line))
+
+    parent @ children
+
 /// Renders the whole renderer state as viewport lines: the streaming
 /// assistant markdown-lite block, one card per tool call, the inline
 /// permission/question widgets, the turn lifecycle markers, the retained
@@ -922,7 +1061,8 @@ let toDisplayLines (state: RendererState) : string list =
             | UserText text -> [ "> " + text ]
             | AssistantText text -> [ ""; "Dot" ] @ renderMarkdownLite text @ [ "" ]
             | ReasoningText text -> renderMarkdownLite text
-            | ToolReference id -> state.Tools.TryFind id |> Option.map renderToolCard |> Option.defaultValue []
+            | ToolReference id when state.ToolParents.ContainsKey id -> []
+            | ToolReference id -> renderToolTree state id
             | ErrorText text -> renderMarkdownLite text
             | Notice text -> renderMarkdownLite text)
 
@@ -946,9 +1086,10 @@ let toSessionCells (state: RendererState) : DotShell.SessionCell list =
             | UserText text -> Some(cell DotShell.User text)
             | AssistantText text -> Some(cell DotShell.Assistant text)
             | ReasoningText text -> Some(cell DotShell.Reasoning text)
+            | ToolReference id when state.ToolParents.ContainsKey id -> None
             | ToolReference id ->
                 state.Tools.TryFind id
-                |> Option.map (fun tool -> cell DotShell.Tool (renderToolCard tool |> String.concat "\n"))
+                |> Option.map (fun _ -> cell DotShell.Tool (renderToolTree state id |> String.concat "\n"))
             | ErrorText text -> Some(cell DotShell.Error text)
             | Notice text -> Some(cell DotShell.Plain text))
 
@@ -962,6 +1103,36 @@ let toSessionCells (state: RendererState) : DotShell.SessionCell list =
         |> List.map (fun pending -> cell DotShell.Assistant $"[question] {pending.Question}")
 
     blocks @ permissions @ questions
+
+/// Appends transient response progress below the last cell, driven by the
+/// engine's authoritative state rather than the lifetime of a local wait.
+let withResponseProgress (state: SessionState) (frame: int64) (cells: DotShell.SessionCell list) =
+    if state = SessionState.Running then
+        let frames =
+            [|
+                "⠋"
+                "⠙"
+                "⠹"
+                "⠸"
+                "⠼"
+                "⠴"
+                "⠦"
+                "⠧"
+                "⠇"
+                "⠏"
+            |]
+
+        let glyph = frames[int (abs (frame % int64 frames.Length))]
+
+        cells
+        @ [
+            {
+                DotShell.Style = DotShell.Plain
+                DotShell.Text = $"{glyph} Waiting for response…"
+            }
+        ]
+    else
+        cells
 
 // Maps one typed permission choice to the REPL-identical decision: s or
 // session allows for the session, d or deny denies, and everything else
