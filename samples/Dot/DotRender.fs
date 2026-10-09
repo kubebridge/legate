@@ -345,9 +345,21 @@ let private applyState (state: RendererState) (evt: SessionEvent) : RendererStat
             let name = toolLabel started
             let key = if id = "" then $"tool-{state.Order.Length}" else id
 
-            if state.Tools.ContainsKey key then
-                state
-            else
+            match state.Tools.TryFind key with
+            | Some card ->
+                // A child can arrive before the parent's settled observation.
+                // Replace that provisional task label when its real start arrives.
+                { state with
+                    Tools =
+                        state.Tools.Add(
+                            key,
+                            { card with
+                                Name = name
+                                Status = Running
+                            }
+                        )
+                }
+            | None ->
                 let card: ToolCard =
                     {
                         Id = key
@@ -635,7 +647,14 @@ let private applyCore (state: RendererState) (evt: SessionEvent) : RendererState
                 | _ -> next.Display @ [ ReasoningText delta.Text ]
 
             { next with Display = blocks }
-        | :? ToolCallStartedEvent as tool -> append (ToolReference tool.ToolCallId)
+        | :? ToolCallStartedEvent as tool ->
+            if
+                next.ToolParents.ContainsKey tool.ToolCallId
+                || next.Display |> List.contains (ToolReference tool.ToolCallId)
+            then
+                next
+            else
+                append (ToolReference tool.ToolCallId)
         | :? TurnFailedEvent as failed -> append (ErrorText($"Error: {failed.Reason}"))
         | :? TurnAbortedEvent as aborted -> append (ErrorText($"Aborted: {aborted.Reason}"))
         | _ -> next
@@ -663,8 +682,39 @@ let apply (state: RendererState) (evt: SessionEvent) : RendererState =
         let scope = DotDedup.sessionKeyOf evt + "/" + DotDedup.turnKeyOf evt
         let ownerKey = DotDedup.sessionKeyOf evt + "/" + id
 
-        match state.ToolOwners.TryFind ownerKey with
-        | Some owner when owner <> scope ->
+        let nested =
+            match state.ToolOwners.TryFind ownerKey with
+            | Some owner -> owner <> scope
+            | None ->
+                state.ActiveSession = DotDedup.sessionKeyOf evt
+                && state.ActiveTurn <> ""
+                && state.ActiveTurn <> DotDedup.turnKeyOf evt
+
+        if nested then
+            // Production journals child observations while the parent task is
+            // still running; the parent's own batch arrives only on settlement.
+            // Reserve its transcript position now and reconcile its name later.
+            let state =
+                if state.Tools.ContainsKey id then
+                    state
+                else
+                    let parent =
+                        {
+                            Id = id
+                            Name = "task"
+                            Status = Running
+                            Output = ""
+                            Overflow = 0
+                            Expanded = false
+                        }
+
+                    { state with
+                        Tools = state.Tools.Add(id, parent)
+                        Order = state.Order @ [ id ]
+                        Display = state.Display @ [ ToolReference id ]
+                        ToolOwners = state.ToolOwners.Add(ownerKey, state.ActiveSession + "/" + state.ActiveTurn)
+                    }
+
             let invocation = scope, id
 
             let key =
@@ -708,7 +758,7 @@ let apply (state: RendererState) (evt: SessionEvent) : RendererState =
                 TurnStreamed = state.TurnStreamed
                 StreamedTurn = state.StreamedTurn
             }
-        | _ ->
+        else
             applyCore
                 { state with
                     ToolOwners = state.ToolOwners.Add(ownerKey, scope)

@@ -168,6 +168,94 @@ let ``interleaved sub-agents keep their names outputs and failures separate`` ()
     Assert.Contains("command failed", cards[1].Text)
     Assert.DoesNotContain("source code", cards[1].Text)
 
+[<Fact>]
+let ``production child-first observations reconcile under the eventual parent task`` () =
+    let s, parent, child = sid (), tid (), tid ()
+
+    let initial =
+        applyAll
+            empty
+            [
+                started s parent
+                delta s parent "Delegating"
+            ]
+
+    let children: SessionEvent list =
+        [
+            ToolCallStartedEvent(s, child, at 3, stamp, "task-1", "read_file", "{}")
+            ToolCallOutputEvent(s, child, at 4, stamp, "task-1", "first contents")
+            ToolCallCompletedEvent(s, child, at 5, stamp, "task-1", null, "first contents")
+            ToolCallStartedEvent(s, child, at 6, stamp, "task-1", "grep", "{}")
+            ToolCallOutputEvent(s, child, at 7, stamp, "task-1", "second contents")
+            ToolCallCompletedEvent(s, child, at 8, stamp, "task-1", null, "second contents")
+        ]
+
+    let pending = applyAll initial children
+    Assert.Equal(3, pending.Tools.Count)
+    Assert.Equal(Running, pending.Tools["task-1"].Status)
+    Assert.Equal(initial.ActiveTurn, pending.ActiveTurn)
+    Assert.Equal("Delegating", pending.TurnStreamed)
+
+    let parents: SessionEvent list =
+        [
+            ToolCallStartedEvent(s, parent, at 9, stamp, "task-1", "task", """{"subagent":"explore"}""")
+            ToolCallOutputEvent(s, parent, at 10, stamp, "task-1", "summary")
+            ToolCallCompletedEvent(s, parent, at 11, stamp, "task-1", null, "summary")
+        ]
+
+    let finished = applyAll pending parents
+
+    let cards =
+        toSessionCells finished
+        |> List.filter (fun cell -> cell.Style = Dot.DotShell.Tool)
+
+    Assert.Single cards |> ignore
+    Assert.Equal(3, finished.Tools.Count)
+    Assert.Contains("[tool task · explore done]", cards.Head.Text)
+    Assert.Contains("  [tool read_file done]", cards.Head.Text)
+    Assert.Contains("  [tool grep done]", cards.Head.Text)
+    Assert.Equal("summary", finished.Tools["task-1"].Output)
+
+    let childCards =
+        finished.ToolParents
+        |> Map.toList
+        |> List.map (fun (key, _) -> finished.Tools[key])
+
+    Assert.Contains(childCards, fun card -> card.Name = "read_file" && card.Output = "first contents")
+    Assert.Contains(childCards, fun card -> card.Name = "grep" && card.Output = "second contents")
+    Assert.Equal(finished, applyAll finished (children @ parents))
+
+[<Fact>]
+let ``interleaved child-first tasks keep independent provisional parents`` () =
+    let s, parent, childA, childB = sid (), tid (), tid (), tid ()
+
+    let events: SessionEvent list =
+        [
+            TurnStartedEvent(s, parent, at 1, stamp)
+            ToolCallStartedEvent(s, childA, at 2, stamp, "a", "read_file", "{}")
+            ToolCallStartedEvent(s, childB, at 3, stamp, "b", "exec", "{}")
+            ToolCallCompletedEvent(s, childA, at 4, stamp, "a", null, "source code")
+            ToolCallCompletedEvent(s, childB, at 5, stamp, "b", "command failed", null)
+            ToolCallStartedEvent(s, parent, at 6, stamp, "b", "task", """{"subagent":"general"}""")
+            ToolCallCompletedEvent(s, parent, at 7, stamp, "b", null, "handled error")
+            ToolCallStartedEvent(s, parent, at 8, stamp, "a", "task", """{"subagent":"explore"}""")
+            ToolCallCompletedEvent(s, parent, at 9, stamp, "a", null, "summary")
+        ]
+
+    let state = applyAll empty events
+
+    let cards =
+        toSessionCells state |> List.filter (fun cell -> cell.Style = Dot.DotShell.Tool)
+
+    Assert.Equal(4, state.Tools.Count)
+    Assert.Equal(2, cards.Length)
+    Assert.Contains("task · explore done", cards[0].Text)
+    Assert.Contains("source code", cards[0].Text)
+    Assert.DoesNotContain("command failed", cards[0].Text)
+    Assert.Contains("task · general done", cards[1].Text)
+    Assert.Contains("command failed", cards[1].Text)
+    Assert.DoesNotContain("source code", cards[1].Text)
+
 /// A test-only unknown event subtype: proves unsupported shapes fail
 /// clearly (a system notice) without fabricating assistant content.
 type private BogusEvent(sessionId: SessionId, turnId: TurnId, sequence: Nullable<int64>) =
