@@ -63,6 +63,9 @@ jobs:
       - name: Smoke samples
         run: dotnet fsi build.fsx -- -t SmokeSamples
 
+      - name: Smoke C# web host
+        run: dotnet fsi build.fsx -- -t SmokeWebHost
+
       - name: Pack
         run: dotnet fsi build.fsx -- -t Pack
 
@@ -107,7 +110,14 @@ jobs:
       - name: Run crash-resume smoke
         run: dotnet fsi samples/cluster-compose/smoke.crash-resume.fsx
 
+      - name: Run adapter active-owner recovery smoke
+        run: python3 samples/CSharpWebHost/cluster/smoke.py
+
       - name: Tear down harness
         if: always()
         working-directory: samples/cluster-compose
         run: docker compose down -v
+
+      - name: Tear down adapter harness
+        if: always()
+        run: docker compose -f samples/CSharpWebHost/cluster/compose.yaml down -v

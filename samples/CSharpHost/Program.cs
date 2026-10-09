@@ -75,6 +75,21 @@ internal sealed class ScriptedClient : IChatClient
     }
 }
 
+// Compile-time C# proof of the targeted, receipt-returning control boundary.
+// Callers retain expectedTurnId across uncertain responses instead of retargeting retries.
+internal static class HostAbortControl
+{
+    internal static Task<HostAbortReceipt> RequestAsync(
+        SessionClient client, SessionId sessionId, TurnId expectedTurnId,
+        CancellationToken cancellationToken) =>
+        client.AbortAsync(sessionId, expectedTurnId, StopCause.ExplicitAbort,
+            "host requested stop", cancellationToken);
+
+    internal static Task<AbortTarget?> ReadTargetAsync(
+        SessionClient client, SessionId sessionId, CancellationToken cancellationToken) =>
+        client.ReadAbortTargetAsync(sessionId, cancellationToken);
+}
+
 internal sealed class StubScriptedProvider : ILlmProvider
 {
     private readonly IChatClient _client;
@@ -108,9 +123,10 @@ internal sealed class StaticSource : IToolSource
         _tools = tools;
     }
 
-    public Task<IReadOnlyList<AITool>> GetTools(ToolSourceContext context)
+    public Task<IReadOnlyList<AITool>> GetTools(ToolSourceContext context, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(context);
+        cancellationToken.ThrowIfCancellationRequested();
         return Task.FromResult(_tools);
     }
 }
@@ -150,6 +166,8 @@ internal sealed class StreamOutcome
 {
     internal bool SawPermissionRequested;
     internal bool SawPermissionResolved;
+    internal TaskCompletionSource<TurnStatus> Terminal { get; } =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
 }
 
 internal static class CSharpHost
@@ -284,14 +302,15 @@ internal static class CSharpHost
             builder.Services.AddSingleton<ILlmProvider>(new StubScriptedProvider(scripted));
             builder.Services.AddSingleton<IChatClient>(scripted);
 
+            var rootBinding = new SessionHostBinding(
+                TenantId.Default,
+                new Func<IServiceProvider, IServiceProvider>(root => root));
+            LegateServiceCollectionExtensions.AddLegateSessionBinding(builder.Services, rootBinding);
+
             using var host = builder.Build();
 
-            // Resolve before starting: the resolve triggers the session
-            // router wiring, which must land before the actor system spawns
-            // its router.
-            var client = host.Services.GetRequiredService<SessionClient>();
-
             await host.StartAsync(CancellationToken.None).ConfigureAwait(false);
+            var client = rootBinding.Client;
 
             try
             {
@@ -338,25 +357,36 @@ internal static class CSharpHost
             var outcome = new StreamOutcome();
             var streaming = StreamAndReplyAsync(client, session.Id, outcome, streamCts.Token);
 
-            var result = await wait.ConfigureAwait(false);
+            var terminal = outcome.Terminal.Task.WaitAsync(bound, cancellationToken);
+            var winner = await Task.WhenAny(wait, terminal).ConfigureAwait(false);
+            TurnResult? result = null;
+
+            if (ReferenceEquals(winner, wait))
+            {
+                result = await wait.ConfigureAwait(false);
+            }
 
             try
             {
                 streamCts.Cancel();
-                await streaming.ConfigureAwait(false);
+                await streaming.WaitAsync(TimeSpan.FromSeconds(1)).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
             }
+            catch (TimeoutException)
+            {
+            }
 
-            await Console.Out.WriteLineAsync($"RESULT {result.Status}").ConfigureAwait(false);
+            var status = result?.Status ?? await terminal.ConfigureAwait(false);
+            await Console.Out.WriteLineAsync($"RESULT {status}").ConfigureAwait(false);
 
-            if (!string.IsNullOrEmpty(result.AssistantText))
+            if (result is not null && !string.IsNullOrEmpty(result.AssistantText))
             {
                 await Console.Out.WriteLineAsync($"TEXT {result.AssistantText}").ConfigureAwait(false);
             }
 
-            if (result.Status == TurnStatus.Completed
+            if (status == TurnStatus.Completed
                 && outcome.SawPermissionRequested
                 && outcome.SawPermissionResolved)
             {
@@ -366,7 +396,7 @@ internal static class CSharpHost
             await Console.Error
                 .WriteLineAsync(
                     $"csharp: expected a completed turn with a resolved permission "
-                    + $"(status={result.Status} requested={outcome.SawPermissionRequested} resolved={outcome.SawPermissionResolved}).")
+                    + $"(status={status} requested={outcome.SawPermissionRequested} resolved={outcome.SawPermissionResolved}).")
                 .ConfigureAwait(false);
             return 1;
         }
@@ -416,6 +446,19 @@ internal static class CSharpHost
                     .WriteLineAsync($"RESOLVED id={resolved.RequestId} decision={resolved.Decision}")
                     .ConfigureAwait(false);
                 outcome.SawPermissionResolved = true;
+            }
+
+            if (evt is TurnCompletedEvent)
+            {
+                outcome.Terminal.TrySetResult(TurnStatus.Completed);
+            }
+            else if (evt is TurnFailedEvent)
+            {
+                outcome.Terminal.TrySetResult(TurnStatus.Failed);
+            }
+            else if (evt is TurnAbortedEvent)
+            {
+                outcome.Terminal.TrySetResult(TurnStatus.Aborted);
             }
         }
     }

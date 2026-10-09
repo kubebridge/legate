@@ -166,7 +166,7 @@ let ``Migration options reject a null prefix`` () =
 // Baseline round-trip
 
 [<Fact>]
-let ``Baseline creates all ten tables with their indexes`` () =
+let ``Migrations create all twelve tables with their indexes`` () =
     let keepAlive, connectionString = openDatabase ()
     use _keep = keepAlive
 
@@ -185,11 +185,14 @@ let ``Baseline creates all ten tables with their indexes`` () =
             "cleanup_claims"
             "custom_tools"
             "events"
+            "execution_settlements"
             "inbox"
             "outbox"
             "schedule_occurrences"
+            "session_control"
             "session_grants"
             "sessions"
+            "turn_completion_era"
             "turns"
         ]
 
@@ -214,8 +217,23 @@ let ``Baseline creates all ten tables with their indexes`` () =
             "IX_outbox_pending_created"
             "IX_outbox_delivered_at"
             "IX_session_grants_uq_grant"
+            "IX_turn_completion_era_pk_session"
+            "IX_execution_settlements_pk_entry"
         ] do
         indexes |> should contain expected
+
+[<Fact>]
+let ``Turn completion era table carries the session key`` () =
+    let keepAlive, connectionString = openDatabase ()
+    use _keep = keepAlive
+
+    use provider =
+        buildProvider connectionString (fun (options: MigrationOptions) -> options.Schema <- "")
+
+    migrateUp provider
+
+    columnNames keepAlive "turn_completion_era"
+    |> should equal [ "tenant"; "session_id"; "marked_at" ]
 
 [<Fact>]
 let ``Baseline columns carry the contract shapes`` () =
@@ -256,6 +274,7 @@ let ``Baseline columns carry the contract shapes`` () =
             "delivery_mode"
             "consumed"
             "appended_at"
+            "turn_id"
         ]
 
     columnNames keepAlive "turns"
@@ -363,6 +382,10 @@ let ``Baseline columns carry the contract shapes`` () =
             "delivered_at"
             "lease_owner"
             "lease_expires_at"
+            // The completion destination migration (issue 378) snapshots
+            // the immutable tenant route per row; old null rows stay
+            // unsupported and pending.
+            "destination_id"
         ]
 
     columnNames keepAlive "session_grants"

@@ -59,6 +59,9 @@ module internal SessionExpiry =
     /// Closes one expired session through the idempotent store close:
     /// closing an already-closed session is a no-op returning the stored
     /// shape, and the store evicts the session's permission grants.
+    /// Bounded transient state (issue 384): once the durable close lands,
+    /// the session's hub, live hints, and auto-title marker release.
+    /// Transient-only: execution authority and durable rows are untouched.
     /// <param name="store">The durable store.</param>
     /// <param name="tenant">The tenant the session belongs to.</param>
     /// <param name="sessionId">The session to close.</param>
@@ -70,8 +73,13 @@ module internal SessionExpiry =
         (sessionId: SessionId)
         (cancellationToken: CancellationToken)
         : Task<Session> =
-        ArgumentNullException.ThrowIfNull(store)
-        store.CloseSession(tenant, sessionId, cancellationToken)
+        task {
+            ArgumentNullException.ThrowIfNull(store)
+            let! closed = store.CloseSession(tenant, sessionId, cancellationToken)
+            PromptWaitHubs.ReleaseSession tenant sessionId |> ignore
+            SessionAutoTitle.Release tenant sessionId
+            return closed
+        }
 
     /// Runs one full pass: pages the tenant's Idle sessions in bounded
     /// batches and closes every session idle beyond the configured expiry.

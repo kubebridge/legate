@@ -99,8 +99,89 @@ module internal SessionExpiryStartup =
                     )
                 )
 
+    let requireForSnapshot (provider: IServiceProvider) (sessions: SessionsOptions) =
+        if isEnabled sessions && not (isDurable (provider.GetService<IBlobStore>())) then
+            invalidOp
+                "Session expiry requires a durable IBlobStore in this execution binding, or disable Sessions:Expiry."
+
 // ──────────────────────────────────────────────────────────────────────────
 // Required-registration check
+
+type internal ExecutionValidation(callback: Action<IServiceProvider, ClusterMode>) =
+    member _.Validate(provider, nodeMode) = callback.Invoke(provider, nodeMode)
+
+module internal ExecutionGraphValidation =
+    let resolve (provider: IServiceProvider) (contract: Type) =
+        try
+            provider.GetService(contract)
+        with _ ->
+            invalidOp (
+                $"Legate execution binding could not resolve {contract.Name}; check its registration and settings. Cluster hosts require explicit execution providers."
+            )
+
+    let providers (provider: IServiceProvider) =
+        try
+            match resolve provider typeof<IEnumerable<ILlmProvider>> with
+            | null -> Array.empty
+            | :? IEnumerable<ILlmProvider> as values -> values |> Seq.toArray
+            | _ -> invalidOp "ILlmProvider registrations are incompatible."
+        with _ ->
+            invalidOp "Legate execution binding could not resolve ILlmProvider registrations."
+
+    let require (provider: IServiceProvider) (binding: string) =
+        let missing = ResizeArray<string>()
+        let store = resolve provider typeof<ISessionStore> :?> ISessionStore | null
+
+        let journal =
+            resolve provider typeof<ISessionEventStore> :?> ISessionEventStore | null
+
+        if isNull (box store) then
+            missing.Add("ISessionStore")
+        elif not (store :? ISessionAbortControlStore) then
+            missing.Add("ISessionAbortControlStore")
+
+        let settlement =
+            match resolve provider typeof<ISessionSettlementStore> with
+            | null ->
+                match box store with
+                | :? ISessionSettlementStore as capable -> Some capable
+                | _ -> None
+            | registered -> Some(registered :?> ISessionSettlementStore)
+
+        match settlement with
+        | None -> missing.Add("ISessionSettlementStore")
+        | Some capable ->
+            match journal with
+            | null -> ()
+            | actual ->
+                let compatible =
+                    try
+                        capable.SupportsSettlementJournal actual
+                    with _ ->
+                        invalidOp (
+                            $"Legate {binding} could not validate ISessionSettlementStore/ISessionEventStore compatibility."
+                        )
+
+                if not compatible then
+                    missing.Add("ISessionSettlementStore(ISessionEventStore incompatible)")
+
+        if isNull (box journal) then
+            missing.Add("ISessionEventStore")
+
+        if isNull (resolve provider typeof<Microsoft.Extensions.AI.IChatClient>) then
+            missing.Add("IChatClient")
+
+        if isNull (resolve provider typeof<IWorkspaceRuntime>) then
+            missing.Add("IWorkspaceRuntime")
+
+        if (providers provider).Length = 0 then
+            missing.Add("ILlmProvider")
+
+        if missing.Count > 0 then
+            invalidOp (
+                $"Legate {binding} is missing required registrations: "
+                + String.Join(", ", missing)
+            )
 
 /// Fails host startup with one message listing every missing required
 /// registration: no <see cref="T:Legate.ILlmProvider" />, no
@@ -112,30 +193,24 @@ type internal LegateStartupValidation(serviceProvider: IServiceProvider) =
     do ArgumentNullException.ThrowIfNull(serviceProvider)
 
     interface IHostedService with
-        member _.StartAsync(_cancellationToken: CancellationToken) =
-            let missing = ResizeArray<string>()
+        member _.StartAsync(cancellationToken: CancellationToken) =
+            let hasBindings =
+                match serviceProvider.GetService<ISessionHostContexts>() with
+                | null -> false
+                | contexts -> contexts.HasDeclaredBindings
 
-            if Seq.isEmpty (serviceProvider.GetServices<ILlmProvider>()) then
-                missing.Add "an LLM provider (ILlmProvider): call Llm.AddProvider"
+            // Explicit bindings are independent execution boundaries; their
+            // providers are validated atomically by the context registry.
+            // Without explicit bindings the root is the deferred self-binding
+            // and must report the complete aggregate dependency set.
+            if not hasBindings then
+                ExecutionGraphValidation.require serviceProvider "startup"
 
-            if isNull (box (serviceProvider.GetService<ISessionStore>())) then
-                missing.Add "a session store (ISessionStore): call Storage.UseSessionStore"
+            SessionExpiryStartup.requireDurableBlobStore serviceProvider
 
-            if isNull (box (serviceProvider.GetService<IWorkspaceRuntime>())) then
-                missing.Add "a workspace runtime (IWorkspaceRuntime): call Workspace.UseRuntime"
-
-            if missing.Count = 0 then
-                SessionExpiryStartup.requireDurableBlobStore serviceProvider
-
-                Task.CompletedTask
-            else
-                let listed = String.Join("; ", missing)
-
-                raise (
-                    InvalidOperationException(
-                        $"Legate is missing required registrations: %s{listed}. Register them through the AddLegate builder before the host starts."
-                    )
-                )
+            match serviceProvider.GetService<ISessionHostContexts>() with
+            | null -> Task.CompletedTask
+            | contexts -> contexts.InitializeAsync(cancellationToken)
 
         member _.StopAsync(_cancellationToken: CancellationToken) = Task.CompletedTask
 

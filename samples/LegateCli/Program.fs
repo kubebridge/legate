@@ -94,19 +94,24 @@ type private StaticSource(tools: IReadOnlyList<AITool>) =
     do ArgumentNullException.ThrowIfNull(tools)
 
     interface IToolSource with
-        member _.GetTools(_) = Task.FromResult(tools)
+        member _.GetTools(_, cancellationToken: CancellationToken) =
+            cancellationToken.ThrowIfCancellationRequested()
+            Task.FromResult(tools)
 
 // ──────────────────────────────────────────────────────────────────────────
 // Host building
 
 /// Creates the scripted chat client with the smoke script: a permission
-/// gated echo call, then the fixture echo call, then plain answers.
+/// gated echo call, then the fixture echo call, then the idle-compaction
+/// summary (explicit idle requests compact eligible context below the
+/// automatic threshold), then plain answers.
 let private scriptedClient () : ScriptedClient =
     let steps = Queue<ScriptStep>()
     steps.Enqueue(ToolCall("call-1", "scripted-echo"))
     steps.Enqueue(Text "scripted answer one")
     steps.Enqueue(ToolCall("call-2", "fixture_echo"))
     steps.Enqueue(Text "fixture says hi")
+    steps.Enqueue(Text "compacted summary")
     steps.Enqueue(Text "scripted answer two")
     new ScriptedClient(steps)
 
@@ -256,12 +261,8 @@ let main (argv: string[]) : int =
 
             use host = application.Build()
 
-            // Resolve before starting: the resolve triggers the session
-            // router wiring, which must land before the actor system spawns
-            // its router.
-            let client = host.Services.GetRequiredService<SessionClient>()
-
             do! host.StartAsync(CancellationToken.None)
+            let client = host.Services.GetRequiredService<SessionClient>()
 
             let! exit =
                 try

@@ -3,24 +3,27 @@ namespace Legate.Storage.InMemory
 
 open System
 open System.Collections.Generic
+open System.Text.Json
 open System.Threading
 open System.Threading.Tasks
 open Legate
+open Legate.Storage
 
 /// The in-memory <see cref="T:Legate.ISessionStore" />: session CRUD, the
 /// inbox, turn claims under a lease with the fencing semantics the contract
 /// pins, dispatch candidates, and the capacity counts. One live claim per
 /// session and one open turn per session:
 /// <see cref="M:Legate.ISessionStore.ClaimNextTurn" /> consumes the head
-/// pending user message into a new turn, or the head pending reply into a
-/// resume of the open turn with the attempt incremented; a live unexpired
-/// claim makes every further claim the missing branch. Lease expiry reads
-/// the database's clock, and every transition runs under the database's
-/// gate lock, so claims and settlements are atomic under concurrent
-/// callers and a takeover race leaves the loser with zero effects. The
-/// stored row's <see cref="P:Legate.Session.CurrentTurnId" /> is stamped on
-/// claim and cleared on settlement, the basis of the CurrentTurnId-based
-/// state rules.
+/// pending user message into a new turn under its durable real-turn identity
+/// (stamped at accept; legacy rows bind once at first claim), or the head
+/// pending reply into a resume of the open turn with the attempt incremented;
+/// a live unexpired claim makes every further claim the missing branch.
+/// Lease expiry reads the database's clock, and every transition runs under
+/// the database's gate lock, so claims and settlements are atomic under
+/// concurrent callers and a takeover race leaves the loser with zero
+/// effects. The stored row's <see cref="P:Legate.Session.CurrentTurnId" />
+/// is stamped on claim and cleared on settlement, the basis of the
+/// CurrentTurnId-based state rules.
 type InMemorySessionStore(database: InMemoryDatabase) =
 
     do
@@ -30,6 +33,21 @@ type InMemorySessionStore(database: InMemoryDatabase) =
     let mintToken () = Ulid.NewUlid().ToString()
 
     let ok value = Task.FromResult value
+
+    let copySession (session: Session) =
+        { session with
+            Options = SessionOptionsPersistence.Snapshot session.Options
+            PermissionGrants =
+                if isNull (box session.PermissionGrants) then
+                    List<string>()
+                else
+                    List<string>(session.PermissionGrants)
+        }
+
+    let copyCompletion (completion: SessionCompletion) : SessionCompletion =
+        match JsonSerializer.Deserialize<SessionCompletion>(JsonSerializer.Serialize completion) with
+        | null -> raise (InvalidOperationException("Completion snapshot must be non-null."))
+        | copied -> copied
 
     let sessionRow (tenant: TenantId) (sessionId: SessionId) =
         match database.Sessions.TryGetValue((tenant, sessionId)) with
@@ -132,8 +150,9 @@ type InMemorySessionStore(database: InMemoryDatabase) =
         {
             Tenant = row.Tenant
             SessionId = row.Completion.SessionId
+            DestinationId = row.DestinationId
             IdempotencyKey = row.Completion.IdempotencyKey
-            Completion = row.Completion
+            Completion = copyCompletion row.Completion
             CreatedAt = row.CreatedAt
             Delivered = row.Delivered
             DeliveredAt = row.DeliveredAt
@@ -141,20 +160,467 @@ type InMemorySessionStore(database: InMemoryDatabase) =
             LeaseExpiresAt = row.LeaseExpiresAt
         }
 
+    let controlState tenant sessionId =
+        requireSession tenant sessionId |> ignore
+
+        match database.ControlStates.TryGetValue((tenant, sessionId)) with
+        | true, text -> ControlTargetProtocol.decode sessionId text
+        | _ ->
+            raise (
+                InvalidSessionStateException(
+                    sessionId,
+                    "unsupportedControlFormat",
+                    "Legacy session control data is unsupported. Start a new session."
+                )
+            )
+
+    /// Whether a decided-but-unretired control verdict still owns the entry
+    /// (issue 363 plus #393): while this holds the quiescent settlement keeps
+    /// the prime so the actor's retireControl still has authority, and the
+    /// existing prime settle releases it afterwards exactly as before.
+    /// Missing control state reads as nothing pending; an undecodable row
+    /// reads the same (every control operation would already have refused
+    /// it before settlement runs).
+    let controlRetirementPending tenant sessionId position =
+        try
+            match database.ControlStates.TryGetValue((tenant, sessionId)) with
+            | false, _ -> false
+            | true, text ->
+                ControlTargetProtocol.decode sessionId text
+                |> fun state -> ControlTargetProtocol.retirementPendingFor state position
+        with _ ->
+            false
+
+    let controlContext tenant sessionId =
+        let session = requireSession tenant sessionId
+        session.Options.ValidatePersistence()
+
+        let prime =
+            match database.LiveClaims.TryGetValue((tenant, sessionId)) with
+            | true, claim -> Some claim
+            | _ -> None
+
+        let entries =
+            match database.Inboxes.TryGetValue((tenant, sessionId)) with
+            | true, entries ->
+                entries
+                |> Seq.choose (fun entry ->
+                    match entry.Payload with
+                    | :? UserMessagePayload -> Some(entry.Position, entry.Consumed)
+                    | _ -> None)
+                |> Map.ofSeq
+            | _ -> Map.empty
+
+        {
+            SessionId = sessionId
+            Lifecycle = session.State
+            Now = database.UtcNow
+            Prime = prime
+            Entries = entries
+        }
+
+    let control tenant sessionId (ct: CancellationToken) operation =
+        ct.ThrowIfCancellationRequested()
+
+        lock database.Gate (fun () ->
+            ct.ThrowIfCancellationRequested()
+            let state = controlState tenant sessionId
+            let result, updated = operation (controlContext tenant sessionId) state
+            ct.ThrowIfCancellationRequested()
+
+            if not (obj.ReferenceEquals(state, updated)) then
+                let snapshot = ControlTargetProtocol.encode updated
+                ct.ThrowIfCancellationRequested()
+                database.ControlStates[(tenant, sessionId)] <- snapshot
+
+            ct.ThrowIfCancellationRequested()
+            result)
+        |> ok
+
+    let requireNoBinding tenant sessionId =
+        let state = controlState tenant sessionId
+
+        if not (isNull (box state.Binding)) then
+            raise (
+                InvalidSessionStateException(
+                    sessionId,
+                    "controlPending",
+                    "Current control work must be retired before changing prime ownership or lifecycle."
+                )
+            )
+
+    interface ISessionAbortControlStore with
+        member _.TryRecoverControlTarget(tenant, sessionId, turn, owner, duration, ct) =
+            control tenant sessionId ct (fun context state ->
+                let outcome, recovered =
+                    ControlTargetProtocol.recover context state turn owner duration
+
+                match recovered, state.Binding with
+                | Some claim, target ->
+                    match target with
+                    | null ->
+                        raise (
+                            InvalidSessionStateException(
+                                sessionId,
+                                "missingControlTarget",
+                                "Recovery has no original target."
+                            )
+                        )
+                    | target ->
+                        let entry =
+                            database.Inboxes[(tenant, sessionId)]
+                            |> Seq.find (fun entry -> entry.Position = target.InboxPosition)
+
+                        ct.ThrowIfCancellationRequested()
+                        database.LiveClaims[(tenant, sessionId)] <- { claim with Token = claim.Token }
+                        database.OpenTurns[(tenant, sessionId)] <- OpenTurnRow(claim.TurnId, claim.Attempt)
+
+                        {
+                            Outcome = outcome
+                            Target = target
+                            Claim = claim
+                            Entry = entry
+                        },
+                        state
+                | _ ->
+                    {
+                        Outcome = outcome
+                        Target = state.Binding
+                        Claim = null
+                        Entry = null
+                    },
+                    state)
+
+        member _.ReadAbortTarget(tenant, sessionId, ct) =
+            control tenant sessionId ct (fun context state -> ControlTargetProtocol.read context state, state)
+
+        member _.RequestHostAbort(tenant, sessionId, turn, cause, reason, ct) =
+            control tenant sessionId ct (fun context state ->
+                ControlTargetProtocol.request context state turn cause reason)
+
+        member _.BindControlTarget(tenant, sessionId, turn, position, claim, ct) =
+            control tenant sessionId ct (fun context state ->
+                ControlTargetProtocol.bind context state turn position claim)
+
+        member _.CheckControlTarget(tenant, sessionId, turn, position, claim, ct) =
+            control tenant sessionId ct (fun context state ->
+                ControlTargetProtocol.check context state turn position claim, state)
+
+        member _.TryDecideControlTarget(tenant, sessionId, turn, position, claim, id, status, cause, reason, ct) =
+            control tenant sessionId ct (fun context state ->
+                ControlTargetProtocol.decide context state turn position claim id status cause reason)
+
+        member _.RetireControlTarget(tenant, sessionId, turn, position, claim, id, ct) =
+            control tenant sessionId ct (fun context state ->
+                ControlTargetProtocol.retire context state turn position claim id)
+
+    interface ISessionSettlementStore with
+        member _.SupportsSettlementJournal(eventStore) =
+            match eventStore with
+            | :? InMemorySessionEventStore as journal -> Object.ReferenceEquals(database, journal.Database)
+            | _ -> false
+
+        member _.AdmitExecution(tenant, sessionId, position, claim, _) =
+            if isNull (box claim) then
+                raise (ArgumentNullException(nameof claim))
+
+            lock database.Gate (fun () ->
+                let session =
+                    match sessionRow tenant sessionId with
+                    | Some row -> row
+                    | None ->
+                        raise (
+                            SessionNotFoundException(
+                                sessionId,
+                                sprintf "No session %O exists in tenant %O." sessionId tenant
+                            )
+                        )
+
+                if session.State = SessionState.Closed then
+                    false
+                else
+                    let entryExists =
+                        match database.Inboxes.TryGetValue((tenant, sessionId)) with
+                        | true, entries -> entries |> Seq.exists (fun entry -> entry.Position = position)
+                        | false, _ -> false
+
+                    if not entryExists then
+                        false
+                    else
+                        match resolve tenant claim with
+                        | Choice1Of3(id, live) when id = sessionId && live.ExpiresAt > database.UtcNow ->
+                            let key = (tenant, sessionId, position)
+
+                            match database.ExecutionAdmissions.TryGetValue key with
+                            | true, admitted ->
+                                admitted.TurnId = claim.TurnId
+                                && admitted.Token = claim.Token
+                                && admitted.Attempt = claim.Attempt
+                            | _ ->
+                                database.ExecutionAdmissions[key] <- claim
+                                true
+                        | _ -> false)
+            |> ok
+
+        member _.SettleExecution(tenant, request, _) =
+            if isNull (box request) then
+                raise (ArgumentNullException(nameof request))
+
+            if isNull (box request.Claim) then
+                raise (ArgumentNullException(nameof request))
+
+            if isNull (box request.Result) then
+                raise (ArgumentNullException(nameof request))
+
+            if String.IsNullOrWhiteSpace request.CompletionKey then
+                raise (ArgumentException("The completion key must be a non-empty string.", nameof request))
+
+            lock database.Gate (fun () ->
+                let sessionId = request.SessionId
+                let key = (tenant, sessionId, request.Position)
+
+                let session =
+                    match sessionRow tenant sessionId with
+                    | Some row -> row
+                    | None ->
+                        raise (
+                            SessionNotFoundException(
+                                sessionId,
+                                sprintf "No session %O exists in tenant %O." sessionId tenant
+                            )
+                        )
+
+                let emptyEvents = Array.empty<SessionEvent> :> IReadOnlyList<SessionEvent>
+
+                let rejected () =
+                    SessionSettlementOutcome(
+                        SessionSettlementStatus.Rejected,
+                        session.State,
+                        Unchecked.defaultof<TurnResult>,
+                        Unchecked.defaultof<SessionCompletion>,
+                        Unchecked.defaultof<InboxEntry>,
+                        emptyEvents,
+                        null
+                    )
+
+                let fingerprint =
+                    sprintf
+                        "%O|%d|%O|%s|%d|%O|%O|%s"
+                        sessionId
+                        request.Position
+                        request.Claim.TurnId
+                        request.Claim.Token
+                        request.Claim.Attempt
+                        request.ExecutionId
+                        request.Result.Status
+                        request.CompletionKey
+
+                match database.ExecutionSettlements.TryGetValue key with
+                | true, (prior, outcome) when prior = fingerprint ->
+                    SessionSettlementOutcome(
+                        SessionSettlementStatus.AlreadyApplied,
+                        outcome.State,
+                        outcome.Result,
+                        outcome.Completion,
+                        outcome.Following,
+                        emptyEvents,
+                        outcome.JournalReason
+                    )
+                | true, _ -> rejected ()
+                | false, _ ->
+                    if session.State = SessionState.Closed then
+                        rejected ()
+                    else
+                        let claim = request.Claim
+
+                        let admitted =
+                            match database.ExecutionAdmissions.TryGetValue key with
+                            | true, prior ->
+                                prior.TurnId = claim.TurnId
+                                && prior.Token = claim.Token
+                                && prior.Attempt = claim.Attempt
+                            | _ -> false
+
+                        match resolve tenant claim with
+                        | Choice1Of3(id, _) when id = sessionId && admitted ->
+                            let result = request.Result
+
+                            match result.Status with
+                            | TurnStatus.Completed
+                            | TurnStatus.Aborted
+                            | TurnStatus.Failed -> ()
+                            | _ -> raise (ArgumentException("Settlement requires a terminal result.", nameof request))
+
+                            let entryExists =
+                                match database.Inboxes.TryGetValue((tenant, sessionId)) with
+                                | true, entries ->
+                                    entries |> Seq.exists (fun entry -> entry.Position = request.Position)
+                                | false, _ -> false
+
+                            if not entryExists then
+                                rejected ()
+                            else
+                                let mutable events = emptyEvents
+                                let mutable journalReason: string | null = null
+
+                                match request.TerminalEvent with
+                                | null -> ()
+                                | terminalEvent ->
+                                    let journal = InMemorySessionEventStore(database) :> ISessionEventStore
+                                    let batch = [| terminalEvent |] :> IReadOnlyList<SessionEvent>
+
+                                    try
+                                        match
+                                            journal
+                                                .Append(tenant, sessionId, claim.Token, batch, CancellationToken.None)
+                                                .GetAwaiter()
+                                                .GetResult()
+                                        with
+                                        | :? EventAppended as appended -> events <- appended.Events
+                                        | _ -> journalReason <- "rejected"
+                                    with
+                                    | :? EventLimitExceededException -> journalReason <- "rejected"
+                                    | _ -> journalReason <- "failed"
+
+                                consume tenant sessionId request.Position
+
+                                let following =
+                                    pendingInOrder tenant sessionId
+                                    |> List.filter (fun entry ->
+                                        not (isNull (box entry)) && (entry.Payload :? UserMessagePayload))
+                                    |> List.sortBy (fun entry ->
+                                        (if entry.Delivery = DeliveryMode.Interrupt then 0 else 1), entry.Position)
+                                    |> List.tryHead
+
+                                let autoClose =
+                                    result.Status = TurnStatus.Completed
+                                    && not (isNull (box session.Options))
+                                    && session.Options.AutoClose
+
+                                let state =
+                                    if autoClose then SessionState.Closed
+                                    elif following.IsSome then SessionState.Running
+                                    else SessionState.Idle
+
+                                let completion: SessionCompletion | null =
+                                    if isNull (box session.Options) then
+                                        Unchecked.defaultof<SessionCompletion>
+                                    else
+                                        match session.Options.CompletionDestinationId with
+                                        | null -> Unchecked.defaultof<SessionCompletion>
+                                        | destinationId ->
+                                            if not (CompletionDestinationRules.IsValid destinationId) then
+                                                Unchecked.defaultof<SessionCompletion>
+                                            else
+                                                let payload =
+                                                    {
+                                                        SessionId = sessionId
+                                                        TurnResult = result
+                                                        Metadata = session.Options.Metadata
+                                                        IdempotencyKey = request.CompletionKey
+                                                    }
+
+                                                match database.Outbox.TryGetValue((tenant, request.CompletionKey)) with
+                                                | true, row -> copyCompletion row.Completion
+                                                | false, _ ->
+                                                    let row =
+                                                        OutboxRow(
+                                                            tenant,
+                                                            destinationId,
+                                                            copyCompletion payload,
+                                                            database.UtcNow
+                                                        )
+
+                                                    database.Outbox[(tenant, request.CompletionKey)] <- row
+                                                    copyCompletion row.Completion
+
+                                database.UsageCheckpoints[(tenant, sessionId, claim.TurnId)] <- result.Usage
+
+                                // Quiescent release (issue 363): the prime and
+                                // its turn tracking clear only here. While a
+                                // decided-but-unretired control verdict still
+                                // owns the entry (#393), the prime stays so
+                                // the actor's retireControl keeps authority;
+                                // the existing prime settle releases it
+                                // afterwards exactly as before.
+                                if
+                                    state <> SessionState.Running
+                                    && not (controlRetirementPending tenant sessionId request.Position)
+                                then
+                                    applySettlement tenant sessionId claim result.Status result.Outcome
+
+                                let stored = requireSession tenant sessionId
+
+                                database.Sessions[(tenant, sessionId)] <-
+                                    { stored with
+                                        State = state
+                                        UpdatedAt = database.UtcNow
+                                        ClosedAt =
+                                            (if autoClose then
+                                                 Nullable database.UtcNow
+                                             else
+                                                 stored.ClosedAt)
+                                        PermissionGrants =
+                                            (if autoClose then
+                                                 Array.empty<string> :> IReadOnlyList<string>
+                                             else
+                                                 stored.PermissionGrants)
+                                    }
+
+                                let outcome =
+                                    SessionSettlementOutcome(
+                                        SessionSettlementStatus.Applied,
+                                        state,
+                                        result,
+                                        completion,
+                                        (following |> Option.defaultValue Unchecked.defaultof<InboxEntry>),
+                                        events,
+                                        journalReason
+                                    )
+
+                                database.ExecutionSettlements[key] <- (fingerprint, outcome)
+                                outcome
+                        | _ -> rejected ())
+            |> ok
+
+        member _.TryReadCommitted(tenant, sessionId, position, _) =
+            lock database.Gate (fun () ->
+                let key = (tenant, sessionId, position)
+
+                match database.ExecutionSettlements.TryGetValue key with
+                | true, (_, outcome) -> outcome
+                | false, _ -> Unchecked.defaultof<SessionSettlementOutcome>)
+            |> ok
+
+        member _.TryReadEntry(tenant, sessionId, position, _) =
+            lock database.Gate (fun () ->
+                match database.Inboxes.TryGetValue((tenant, sessionId)) with
+                | true, entries ->
+                    match entries |> Seq.tryFind (fun entry -> entry.Position = position) with
+                    | Some entry -> entry
+                    | None -> Unchecked.defaultof<InboxEntry>
+                | false, _ -> Unchecked.defaultof<InboxEntry>)
+            |> ok
+
     interface ISessionStore with
 
         member _.CreateSession(tenant, session, _) =
             if isNull (box session) then
                 raise (ArgumentNullException(nameof session))
 
+            let session = copySession session
+
             lock database.Gate (fun () ->
-                match sessionRow tenant session.Id with
+                match
+                    database.Sessions.Values
+                    |> Seq.tryFind (fun existing -> existing.Id = session.Id)
+                with
                 | Some _ ->
                     raise (
                         InvalidSessionStateException(
                             session.Id,
                             nameof SessionState,
-                            sprintf "A session %O already exists in tenant %O." session.Id tenant
+                            "The session id already exists in this shared store."
                         )
                     )
                 | None ->
@@ -172,11 +638,55 @@ type InMemorySessionStore(database: InMemoryDatabase) =
                         }
 
                     database.Sessions[(tenant, session.Id)] <- stored
-                    stored)
+
+                    database.ControlStates[(tenant, session.Id)] <-
+                        ControlTargetProtocol.encode (ControlTargetProtocol.fresh ())
+
+                    copySession stored)
             |> ok
 
         member _.GetSession(tenant, sessionId, _) =
-            lock database.Gate (fun () -> sessionRow tenant sessionId) |> Option.toObj |> ok
+            lock database.Gate (fun () -> sessionRow tenant sessionId |> Option.map copySession)
+            |> Option.toObj
+            |> ok
+
+        member _.ListRecoveryCandidates(tenant, state, size, token, ct) =
+            ct.ThrowIfCancellationRequested()
+            RecoveryCandidateCursor.validate state size
+            let cursor = RecoveryCandidateCursor.decode tenant state token
+
+            lock database.Gate (fun () ->
+                ct.ThrowIfCancellationRequested()
+
+                let identities =
+                    database.Sessions.Values |> Seq.filter (fun session -> session.Tenant = tenant)
+
+                let upper =
+                    match cursor with
+                    | Some cursor -> cursor.Upper
+                    | None ->
+                        identities
+                        |> Seq.map (fun session -> session.Id.ToString())
+                        |> Seq.sortWith (fun a b -> StringComparer.Ordinal.Compare(a, b))
+                        |> Seq.tryLast
+                        |> Option.defaultValue ""
+
+                let last =
+                    cursor |> Option.map (fun cursor -> cursor.Last) |> Option.defaultValue ""
+
+                let rows =
+                    identities
+                    |> Seq.filter (fun session -> session.State = state && session.CurrentTurnId.HasValue)
+                    |> Seq.map (fun session -> session.Id.ToString())
+                    |> Seq.filter (fun id ->
+                        StringComparer.Ordinal.Compare(id, last) > 0
+                        && StringComparer.Ordinal.Compare(id, upper) <= 0)
+                    |> Seq.sortWith (fun a b -> StringComparer.Ordinal.Compare(a, b))
+                    |> Seq.truncate (size + 1)
+                    |> Seq.toList
+
+                RecoveryCandidateCursor.page tenant state size upper rows)
+            |> ok
 
         member _.ListSessions(tenant, state, agentId, createdFrom, createdTo, pageSize, continuation, _) =
             if pageSize <= 0 then
@@ -217,7 +727,7 @@ type InMemorySessionStore(database: InMemoryDatabase) =
                 let hasMore = remaining.Length > page.Length
 
                 {
-                    Items = page :> IReadOnlyList<Session>
+                    SessionPage.Items = (page |> List.map copySession) :> IReadOnlyList<Session>
                     Continuation =
                         (match hasMore, List.tryLast page with
                          | true, Some last -> tokenOf last
@@ -228,6 +738,10 @@ type InMemorySessionStore(database: InMemoryDatabase) =
         member _.UpdateSessionState(tenant, sessionId, state, _) =
             lock database.Gate (fun () ->
                 let session = requireSession tenant sessionId
+                ControlTargetProtocol.requireTransition sessionId state (controlState tenant sessionId)
+
+                if state = SessionState.Idle || state = SessionState.Closed then
+                    requireNoBinding tenant sessionId
 
                 if session.State = SessionState.Closed && state <> SessionState.Closed then
                     raise (
@@ -245,15 +759,16 @@ type InMemorySessionStore(database: InMemoryDatabase) =
                     }
 
                 database.Sessions[(tenant, sessionId)] <- updated
-                updated)
+                copySession updated)
             |> ok
 
         member _.CloseSession(tenant, sessionId, _) =
             lock database.Gate (fun () ->
                 let session = requireSession tenant sessionId
+                requireNoBinding tenant sessionId
 
                 if session.State = SessionState.Closed then
-                    session
+                    copySession session
                 else
                     let now = database.UtcNow
 
@@ -266,7 +781,7 @@ type InMemorySessionStore(database: InMemoryDatabase) =
                         }
 
                     database.Sessions[(tenant, sessionId)] <- updated
-                    updated)
+                    copySession updated)
             |> ok
 
         member _.GrantSessionTool(tenant, sessionId, toolName, _) =
@@ -297,7 +812,7 @@ type InMemorySessionStore(database: InMemoryDatabase) =
                     }
 
                 database.Sessions[(tenant, sessionId)] <- updated
-                updated)
+                copySession updated)
             |> ok
 
         member _.SetSessionAgent(tenant, sessionId, agentId, _) =
@@ -357,6 +872,16 @@ type InMemorySessionStore(database: InMemoryDatabase) =
 
                 database.InboxPositions[(tenant, sessionId)] <- position + 1L
 
+                // Real-turn identity (issue 374): every accepted user message
+                // gets a stable durable TurnId tied to its inbox entry at
+                // accept; reply entries carry the default sentinel and never
+                // start a turn. Distinct queued entries never share a synthetic
+                // bootstrap identity.
+                let turnId =
+                    match payload with
+                    | :? UserMessagePayload -> TurnId.New()
+                    | _ -> Unchecked.defaultof<TurnId>
+
                 let entry =
                     {
                         SessionId = sessionId
@@ -365,6 +890,7 @@ type InMemorySessionStore(database: InMemoryDatabase) =
                         Delivery = delivery
                         Consumed = false
                         AppendedAt = database.UtcNow
+                        TurnId = turnId
                     }
 
                 match database.Inboxes.TryGetValue((tenant, sessionId)) with
@@ -417,6 +943,7 @@ type InMemorySessionStore(database: InMemoryDatabase) =
                 requireSession tenant sessionId |> ignore
 
                 let now = database.UtcNow
+                requireNoBinding tenant sessionId
                 let expiresAt = now + leaseDuration
 
                 // One live claim per session: an unexpired claim makes
@@ -466,14 +993,31 @@ type InMemorySessionStore(database: InMemoryDatabase) =
                     | Some {
                                Payload = :? UserMessagePayload
                                Position = position
+                               TurnId = stamped
                            },
                       _ ->
-                        // New turn: consume the message and mint a fresh
-                        // turn; a stale open turn from a lapsed claim is
-                        // abandoned (replaced, never settled).
+                        // New turn: consume the message and claim under its
+                        // durable real-turn identity (issue 374). The TurnId
+                        // was stamped at accept; legacy rows without one are
+                        // bound once here without rewriting history. A stale
+                        // open turn from a lapsed claim is abandoned
+                        // (replaced, never settled).
                         consume tenant sessionId position
 
-                        let turnId = TurnId.New()
+                        let isDefault = isNull (box stamped.Value)
+
+                        let turnId = if isDefault then TurnId.New() else stamped
+
+                        // Backfill legacy pending entries that carried the
+                        // default sentinel, so the identity stays stable for
+                        // the rest of this entry's life.
+                        if isDefault then
+                            match database.Inboxes.TryGetValue((tenant, sessionId)) with
+                            | true, entries ->
+                                for index in 0 .. entries.Count - 1 do
+                                    if entries[index].Position = position then
+                                        entries[index] <- { entries[index] with TurnId = turnId }
+                            | false, _ -> ()
 
                         let claim =
                             {
@@ -585,6 +1129,7 @@ type InMemorySessionStore(database: InMemoryDatabase) =
 
                 match resolve tenant claim with
                 | Choice1Of3(sessionId, _: TurnClaim) ->
+                    requireNoBinding tenant sessionId
                     // The token still fences: the first settle wins, and a
                     // lapsed-but-uncontested lease does not unseat it (a
                     // settle is terminal; nothing can take over a turn the
@@ -623,6 +1168,7 @@ type InMemorySessionStore(database: InMemoryDatabase) =
                 match resolve tenant claim with
                 | Choice1Of3(sessionId, live) ->
                     // Abort settles Aborted and releases the lease; a
+                    requireNoBinding tenant sessionId
                     // later settle observes the applied settlement.
                     applySettlement tenant sessionId claim TurnStatus.Aborted null
                     TurnLeaseHeld live :> TurnLeaseState
@@ -630,7 +1176,133 @@ type InMemorySessionStore(database: InMemoryDatabase) =
                 | Choice3Of3() -> TurnLeaseMissing claim.TurnId :> TurnLeaseState)
             |> ok
 
-        member _.EnqueueCompletionOutbox(tenant, completion, _) =
+        member _.ConsumeInboxUnderClaim(tenant, claim, sessionId, positions, _) =
+            if isNull (box claim) then
+                raise (ArgumentNullException(nameof claim))
+
+            if isNull (box positions) then
+                raise (ArgumentNullException(nameof positions))
+
+            lock database.Gate (fun () ->
+                requireSession tenant sessionId |> ignore
+
+                match resolve tenant claim with
+                | Choice1Of3(sid, live) when sid = sessionId ->
+                    if live.ExpiresAt <= database.UtcNow then
+                        TurnLeaseLost(claim.TurnId, "expired") :> TurnLeaseState
+                    elif live.Attempt <> claim.Attempt then
+                        TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState
+                    else
+                        match database.Inboxes.TryGetValue((tenant, sessionId)) with
+                        | true, entries ->
+                            let wanted = HashSet positions
+
+                            for index in 0 .. entries.Count - 1 do
+                                let entry = entries[index]
+
+                                if not entry.Consumed && wanted.Contains entry.Position then
+                                    entries[index] <- { entry with Consumed = true }
+                        | false, _ -> ()
+
+                        TurnLeaseHeld live :> TurnLeaseState
+                | Choice1Of3(_, _) -> TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState
+                | Choice2Of3() -> TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState
+                | Choice3Of3() -> TurnLeaseMissing claim.TurnId :> TurnLeaseState)
+            |> ok
+
+        member _.UpdateSessionStateUnderClaim(tenant, claim, sessionId, state, _) =
+            if isNull (box claim) then
+                raise (ArgumentNullException(nameof claim))
+
+            if state <> SessionState.Running && state <> SessionState.WaitingForInput then
+                raise (
+                    InvalidSessionStateException(
+                        sessionId,
+                        nameof state,
+                        "Only execution-owned states (Running, WaitingForInput) update under a claim."
+                    )
+                )
+
+            lock database.Gate (fun () ->
+                let session = requireSession tenant sessionId
+
+                if session.State = SessionState.Closed then
+                    raise (
+                        InvalidSessionStateException(
+                            sessionId,
+                            nameof session.State,
+                            "A closed session cannot leave the Closed state."
+                        )
+                    )
+
+                match resolve tenant claim with
+                | Choice1Of3(sid, live) when sid = sessionId ->
+                    if live.ExpiresAt <= database.UtcNow then
+                        TurnLeaseLost(claim.TurnId, "expired") :> TurnLeaseState
+                    elif live.Attempt <> claim.Attempt then
+                        TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState
+                    else
+                        ControlTargetProtocol.requireTransition sessionId state (controlState tenant sessionId)
+
+                        let updated =
+                            { session with
+                                State = state
+                                UpdatedAt = database.UtcNow
+                            }
+
+                        database.Sessions[(tenant, sessionId)] <- updated
+                        TurnLeaseHeld live :> TurnLeaseState
+                | Choice1Of3(_, _) -> TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState
+                | Choice2Of3() -> TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState
+                | Choice3Of3() -> TurnLeaseMissing claim.TurnId :> TurnLeaseState)
+            |> ok
+
+        member _.GrantSessionToolUnderClaim(tenant, claim, sessionId, toolName, _) =
+            if isNull (box claim) then
+                raise (ArgumentNullException(nameof claim))
+
+            if String.IsNullOrWhiteSpace toolName then
+                raise (ArgumentException("The tool name must be a non-empty string.", nameof toolName))
+
+            lock database.Gate (fun () ->
+                let session = requireSession tenant sessionId
+
+                match resolve tenant claim with
+                | Choice1Of3(sid, live) when sid = sessionId ->
+                    if live.ExpiresAt <= database.UtcNow then
+                        TurnLeaseLost(claim.TurnId, "expired") :> TurnLeaseState
+                    elif live.Attempt <> claim.Attempt then
+                        TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState
+                    elif session.State = SessionState.Closed then
+                        raise (
+                            InvalidSessionStateException(
+                                sessionId,
+                                nameof session.State,
+                                "A closed session carries no grant memory."
+                            )
+                        )
+                    else
+                        let grants = ResizeArray<string>(storedGrants session)
+
+                        if not (grants.Contains toolName) then
+                            grants.Add toolName
+
+                        let updated =
+                            { session with
+                                PermissionGrants = grants :> IReadOnlyList<string>
+                                UpdatedAt = database.UtcNow
+                            }
+
+                        database.Sessions[(tenant, sessionId)] <- updated
+                        TurnLeaseHeld live :> TurnLeaseState
+                | Choice1Of3(_, _) -> TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState
+                | Choice2Of3() -> TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState
+                | Choice3Of3() -> TurnLeaseMissing claim.TurnId :> TurnLeaseState)
+            |> ok
+
+        member _.EnqueueCompletionOutbox(tenant, destinationId, completion, _) =
+            CompletionDestinationRules.Validate destinationId
+
             if isNull (box completion) then
                 raise (ArgumentNullException(nameof completion))
 
@@ -643,9 +1315,15 @@ type InMemorySessionStore(database: InMemoryDatabase) =
                 requireSession tenant completion.SessionId |> ignore
 
                 match database.Outbox.TryGetValue((tenant, completion.IdempotencyKey)) with
-                | true, row -> outboxEntry row
+                | true, row ->
+                    if row.Completion.SessionId <> completion.SessionId then
+                        raise (ArgumentException("The idempotency key belongs to another session."))
+
+                    outboxEntry row
                 | false, _ ->
-                    let row = OutboxRow(tenant, completion, database.UtcNow)
+                    let row =
+                        OutboxRow(tenant, destinationId, copyCompletion completion, database.UtcNow)
+
                     database.Outbox[(tenant, completion.IdempotencyKey)] <- row
                     outboxEntry row)
             |> ok
@@ -669,7 +1347,11 @@ type InMemorySessionStore(database: InMemoryDatabase) =
                     isNull (box row.LeaseOwner)
                     || not row.LeaseExpiresAt.HasValue
                     || row.LeaseExpiresAt.Value <= now)
-                |> Seq.sortBy (fun row -> row.CreatedAt)
+                |> Seq.sortBy (fun row ->
+                    row.LeaseExpiresAt.HasValue,
+                    row.LeaseExpiresAt.GetValueOrDefault(),
+                    row.CreatedAt,
+                    row.Completion.IdempotencyKey)
                 |> Seq.truncate maxBatch
                 |> Seq.map (fun row ->
                     row.LeaseOwner <- owner
@@ -695,6 +1377,25 @@ type InMemorySessionStore(database: InMemoryDatabase) =
                     && String.Equals(row.LeaseOwner, owner, StringComparison.Ordinal)
                     && row.LeaseExpiresAt.HasValue
                     && row.LeaseExpiresAt.Value > database.UtcNow)
+            |> ok
+
+        member _.RenewCompletionClaim(tenant, key, owner, duration, ct) =
+            ct.ThrowIfCancellationRequested()
+
+            if duration <= TimeSpan.Zero then
+                raise (ArgumentOutOfRangeException(nameof duration))
+
+            lock database.Gate (fun () ->
+                match database.Outbox.TryGetValue((tenant, key)) with
+                | true, row when
+                    not row.Delivered
+                    && row.LeaseOwner = owner
+                    && row.LeaseExpiresAt.HasValue
+                    && row.LeaseExpiresAt.Value > database.UtcNow
+                    ->
+                    row.LeaseExpiresAt <- Nullable(database.UtcNow + duration)
+                    true
+                | _ -> false)
             |> ok
 
         member _.MarkCompletionDelivered(tenant, idempotencyKey, owner, _) =

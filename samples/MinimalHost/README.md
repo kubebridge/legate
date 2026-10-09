@@ -76,14 +76,18 @@ curl -X POST http://127.0.0.1:5097/sessions/$SID/reply \
 # 409 {"error":"The session has no pending request for the reply.","type":"ReplyMismatch"}
 ```
 
-Abort the running turn (`cause` is `explicitAbort` or `hostShutdown`;
-Idle and WaitingForInput acknowledge without effect):
+Read the current real-entry target, then request durable abort intent (`cause` is
+`explicitAbort` or `hostShutdown`). A null target means no current turn. Acceptance
+is not terminal completion; WaitingForInput refuses a new request. Retain the exact
+target for retries after an uncertain response, rather than rereading and retargeting.
 
 ```bash
+curl http://127.0.0.1:5097/sessions/$SID/abort-target
+# Capture the returned turnId as TARGET before the request below.
 curl -X POST http://127.0.0.1:5097/sessions/$SID/abort \
   -H 'Content-Type: application/json' \
-  -d '{"cause":"explicitAbort","reason":"done exploring"}'
-# {"sessionId":"<sessionId>","aborted":true}
+  -d "{\"expectedTurnId\":\"$TARGET\",\"cause\":\"explicitAbort\",\"reason\":\"done exploring\"}"
+# A HostAbortReceipt reports the acceptance outcome, not aborted:true.
 ```
 
 Stream the session's events (replay from the cursor, then live):

@@ -8,6 +8,7 @@ open System.Text.Json
 open System.Threading
 open System.Threading.Tasks
 open Legate
+open Legate.Storage
 open Npgsql
 open PostgresSql
 
@@ -55,12 +56,97 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
     member private this.InboxTable = qualified options "inbox"
     member private _.TurnsTable = qualified options "turns"
     member private this.OutboxTable = qualified options "outbox"
+    member private this.EraTable = qualified options "turn_completion_era"
+    member private _.ControlTable = qualified options "session_control"
+
+    member private this.Control(tenant, sessionId, ct, operation) =
+        this.EnsureMigrated()
+
+        let result =
+            transact options (fun connection transaction ->
+                RelationalControlTarget.invoke
+                    connection
+                    transaction
+                    this.SessionsTable
+                    this.InboxTable
+                    this.TurnsTable
+                    this.ControlTable
+                    true
+                    tenant
+                    sessionId
+                    (fun () -> this.UtcNow)
+                    ct
+                    operation)
+
+        ct.ThrowIfCancellationRequested()
+        Task.FromResult result
+
+    member private this.RequireNoControlBinding(connection, transaction, tenant, sessionId) =
+        RelationalControlTarget.requireNoBinding connection transaction this.ControlTable tenant sessionId
+
+    member private this.LockClaimSession(connection, transaction, tenant, claim: TurnClaim) =
+        use cmd =
+            command connection transaction $"SELECT session_id FROM {this.TurnsTable} WHERE tenant=@t AND turn_id=@tid"
+
+        textParam cmd "t" (tenant.ToString())
+        textParam cmd "tid" (claim.TurnId.ToString())
+        let value = cmd.ExecuteScalar()
+
+        if not (isNull value) && value <> box DBNull.Value then
+            this.RequireSession(connection, transaction, tenant, SessionId.Parse(string value))
+
+    /// Marks the session era-marked (issue 289): an idempotent upsert
+    /// over the turn_completion_era table. Internal: the registration
+    /// closes the runtime's era gate over it. A missing table (migrations
+    /// not run) throws, and the gate degrades to pre-era quiet.
+    member internal this.MarkCompletionEraAsync
+        (tenant: TenantId, sessionId: SessionId, _cancellationToken: CancellationToken)
+        : Task =
+        this.EnsureMigrated()
+
+        transact options (fun connection transaction ->
+            use cmd =
+                command
+                    connection
+                    transaction
+                    $"INSERT INTO {this.EraTable} (tenant, session_id, marked_at) VALUES (@t, @sid, @now) ON CONFLICT (tenant, session_id) DO UPDATE SET marked_at = @now"
+
+            textParam cmd "t" (tenant.ToString())
+            textParam cmd "sid" (sessionId.ToString())
+            textParam cmd "now" (stamp this.UtcNow)
+            cmd.ExecuteNonQuery() |> ignore)
+        |> Task.FromResult
+        :> Task
+
+    /// Reads whether the session is era-marked (issue 289): true once
+    /// marked, false for absent rows (pre-era quiet). Internal: the
+    /// registration closes the runtime's era gate over it.
+    member internal this.IsCompletionEraMarkedAsync
+        (tenant: TenantId, sessionId: SessionId, _cancellationToken: CancellationToken)
+        : Task<bool> =
+        this.EnsureMigrated()
+
+        transact options (fun connection transaction ->
+            use cmd =
+                command
+                    connection
+                    transaction
+                    $"SELECT 1 FROM {this.EraTable} WHERE tenant = @t AND session_id = @sid LIMIT 1"
+
+            textParam cmd "t" (tenant.ToString())
+            textParam cmd "sid" (sessionId.ToString())
+
+            use reader = cmd.ExecuteReader()
+            let found = reader.Read()
+            reader.Close()
+            found)
+        |> Task.FromResult
 
     member private _.SessionColumns =
         "id, tenant, agent_id, title, state, current_turn_id, created_at, updated_at, closed_at, workspace_binding, options_json, permission_grants_json"
 
     member private _.OutboxColumns =
-        "idempotency_key, tenant, session_id, completion_json, created_at, delivered, delivered_at, lease_owner, lease_expires_at"
+        "idempotency_key, tenant, session_id, completion_json, created_at, delivered, delivered_at, lease_owner, lease_expires_at, destination_id"
 
     /// Statuses a turn is still said to be open under, as the quoted
     /// filter text for IN lists: anything not terminal.
@@ -102,16 +188,7 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
 
                 this.StoredGrants(items :> IReadOnlyList<string>)
 
-        let optionsValue: SessionOptions =
-            if optionsText = "null" then
-                // A host that persisted a null options snapshot reads back
-                // as default options; the store itself always writes
-                // non-null.
-                SessionOptions()
-            else
-                match JsonSerializer.Deserialize(optionsText, jsonOptions) with
-                | null -> raise (InvalidOperationException("The stored session options are null."))
-                | decoded -> decoded
+        let optionsValue = SessionOptionsPersistence.Deserialize optionsText
 
         {
             Id = SessionId.Parse(reader.GetString(0))
@@ -148,6 +225,7 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
         {
             Tenant = TenantId.Create(reader.GetString(1))
             SessionId = SessionId.Parse(reader.GetString(2))
+            DestinationId = getTextOrNull reader 9
             IdempotencyKey = reader.GetString(0)
             Completion = completion
             CreatedAt = parseStamp (reader.GetString(4))
@@ -359,6 +437,75 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
         reader.Close()
         entry
 
+    interface ISessionAbortControlStore with
+        member this.TryRecoverControlTarget(tenant, sessionId, turn, owner, duration, ct) =
+            this.EnsureMigrated()
+
+            let result =
+                transact options (fun connection transaction ->
+                    RelationalControlTarget.recover
+                        connection
+                        transaction
+                        this.SessionsTable
+                        this.InboxTable
+                        this.TurnsTable
+                        this.ControlTable
+                        true
+                        tenant
+                        sessionId
+                        (fun () -> this.UtcNow)
+                        ct
+                        turn
+                        owner
+                        duration)
+
+            ct.ThrowIfCancellationRequested()
+            Task.FromResult result
+
+        member this.ReadAbortTarget(tenant, sessionId, ct) =
+            this.Control(tenant, sessionId, ct, fun context state -> ControlTargetProtocol.read context state, state)
+
+        member this.RequestHostAbort(tenant, sessionId, turn, cause, reason, ct) =
+            this.Control(
+                tenant,
+                sessionId,
+                ct,
+                fun context state -> ControlTargetProtocol.request context state turn cause reason
+            )
+
+        member this.BindControlTarget(tenant, sessionId, turn, position, claim, ct) =
+            this.Control(
+                tenant,
+                sessionId,
+                ct,
+                fun context state -> ControlTargetProtocol.bind context state turn position claim
+            )
+
+        member this.CheckControlTarget(tenant, sessionId, turn, position, claim, ct) =
+            this.Control(
+                tenant,
+                sessionId,
+                ct,
+                fun context state -> ControlTargetProtocol.check context state turn position claim, state
+            )
+
+        member this.TryDecideControlTarget(tenant, sessionId, turn, position, claim, id, status, cause, reason, ct) =
+            this.Control(
+                tenant,
+                sessionId,
+                ct,
+                fun context state ->
+                    ControlTargetProtocol.decide context state turn position claim id status cause reason
+            )
+
+        member this.RetireControlTarget(tenant, sessionId, turn, position, claim, id, ct) =
+            this.Control(
+                tenant,
+                sessionId,
+                ct,
+                fun context state -> ControlTargetProtocol.retire context state turn position claim id
+            )
+
     interface ISessionStore with
 
         member this.CreateSession(tenant, session, _) =
@@ -419,9 +566,10 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
                 textParam insertCmd "created" nowText
                 textParam insertCmd "updated" nowText
                 textParam insertCmd "binding" stored.WorkspaceBinding
-                textParam insertCmd "options" (serialize<SessionOptions> stored.Options)
+                textParam insertCmd "options" (SessionOptionsPersistence.Serialize stored.Options)
                 textParam insertCmd "grants" (serialize<List<string>> (List<string>(grants)))
                 insertCmd.ExecuteNonQuery() |> ignore
+                RelationalControlTarget.initialize connection transaction this.ControlTable tenant stored.Id
 
                 stored)
             |> Task.FromResult
@@ -449,6 +597,39 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
 
                 reader.Close()
                 row |> Option.toObj)
+            |> Task.FromResult
+
+        member this.ListRecoveryCandidates(tenant, state, size, token, ct) =
+            ct.ThrowIfCancellationRequested()
+            RecoveryCandidateCursor.validate state size
+            let cursor = RecoveryCandidateCursor.decode tenant state token
+            this.EnsureMigrated()
+
+            transact options (fun connection transaction ->
+                use cmd =
+                    command
+                        connection
+                        transaction
+                        $"WITH fence AS (SELECT COALESCE(@upper, (SELECT MAX(id COLLATE \"C\") FROM {this.SessionsTable} WHERE tenant = @t)) AS upper_id) SELECT s.id, f.upper_id FROM {this.SessionsTable} s CROSS JOIN fence f WHERE s.tenant = @t AND s.state = @state AND s.current_turn_id IS NOT NULL AND s.id COLLATE \"C\" > @last AND s.id COLLATE \"C\" <= f.upper_id COLLATE \"C\" ORDER BY s.id COLLATE \"C\" LIMIT @take"
+
+                textParam cmd "t" (tenant.ToString())
+                textParam cmd "state" (state.ToString())
+                textParam cmd "upper" (cursor |> Option.map (fun c -> c.Upper) |> Option.toObj)
+                textParam cmd "last" (cursor |> Option.map (fun c -> c.Last) |> Option.defaultValue "")
+                intParam cmd "take" (size + 1)
+                ct.ThrowIfCancellationRequested()
+                use reader = cmd.ExecuteReader()
+                let mutable upper = ""
+
+                let rows =
+                    [
+                        while reader.Read() do
+                            ct.ThrowIfCancellationRequested()
+                            upper <- reader.GetString(1)
+                            yield reader.GetString(0)
+                    ]
+
+                RecoveryCandidateCursor.page tenant state size upper rows)
             |> Task.FromResult
 
         member this.ListSessions(tenant, state, agentId, createdFrom, createdTo, pageSize, continuation, _) =
@@ -499,7 +680,7 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
 
                 if bogus then
                     {
-                        Items = [] :> IReadOnlyList<Session>
+                        SessionPage.Items = [] :> IReadOnlyList<Session>
                         Continuation = null
                     }
                 else
@@ -535,7 +716,7 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
                     let hasMore = rows.Length > page.Length
 
                     {
-                        Items = page :> IReadOnlyList<Session>
+                        SessionPage.Items = page :> IReadOnlyList<Session>
                         Continuation =
                             match hasMore, List.tryLast page with
                             | true, Some last -> this.PageToken(last)
@@ -562,6 +743,18 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
                     if lockReader.Read() then lockReader.GetString(0) else null
 
                 lockReader.Close()
+
+                if not (isNull (box current)) then
+                    ControlTargetProtocol.requireTransition
+                        sessionId
+                        state
+                        (RelationalControlTarget.load connection transaction this.ControlTable tenant sessionId)
+
+                if
+                    not (isNull (box current))
+                    && (state = SessionState.Idle || state = SessionState.Closed)
+                then
+                    this.RequireNoControlBinding(connection, transaction, tenant, sessionId)
 
                 if isNull (box current) then
                     raise (
@@ -624,6 +817,7 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
 
                 let session = this.ReadSession(lockReader)
                 lockReader.Close()
+                this.RequireNoControlBinding(connection, transaction, tenant, sessionId)
 
                 if session.State = SessionState.Closed then
                     session
@@ -819,11 +1013,19 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
 
                 let now = this.UtcNow
 
+                // Real-turn identity (issue 374): user messages stamp a fresh
+                // durable TurnId at accept; replies carry null (the default
+                // sentinel) and never start a turn.
+                let turnIdText: string | null =
+                    match payload with
+                    | :? UserMessagePayload -> TurnId.New().ToString()
+                    | _ -> null
+
                 use insertCmd =
                     command
                         connection
                         transaction
-                        $"INSERT INTO {this.InboxTable} (session_id, position, tenant, payload_json, delivery_mode, consumed, appended_at) VALUES (@sid, @pos, @t, @payload, @delivery, FALSE, @appended)"
+                        $"INSERT INTO {this.InboxTable} (session_id, position, tenant, payload_json, delivery_mode, consumed, appended_at, turn_id) VALUES (@sid, @pos, @t, @payload, @delivery, FALSE, @appended, @turn)"
 
                 textParam insertCmd "sid" (sessionId.ToString())
                 longParam insertCmd "pos" position
@@ -831,6 +1033,7 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
                 textParam insertCmd "payload" (serialize<InboxPayload> payload)
                 textParam insertCmd "delivery" (delivery.ToString())
                 textParam insertCmd "appended" (stamp now)
+                textParam insertCmd "turn" turnIdText
                 insertCmd.ExecuteNonQuery() |> ignore
 
                 {
@@ -840,6 +1043,10 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
                     Delivery = delivery
                     Consumed = false
                     AppendedAt = now
+                    TurnId =
+                        match turnIdText with
+                        | null -> Unchecked.defaultof<TurnId>
+                        | text -> TurnId.Parse(text)
                 })
             |> Task.FromResult
 
@@ -872,7 +1079,7 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
                     command
                         connection
                         transaction
-                        $"SELECT position, payload_json, delivery_mode, appended_at FROM {this.InboxTable} WHERE session_id = @sid AND tenant = @t AND consumed = FALSE ORDER BY position"
+                        $"SELECT position, payload_json, delivery_mode, appended_at, turn_id FROM {this.InboxTable} WHERE session_id = @sid AND tenant = @t AND consumed = FALSE ORDER BY position"
 
                 textParam cmd "sid" (sessionId.ToString())
                 textParam cmd "t" (tenant.ToString())
@@ -887,6 +1094,8 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
                                 | null -> raise (InvalidOperationException("The stored inbox payload is null."))
                                 | decoded -> decoded
 
+                            let turnText: string | null = getTextOrNull reader 4
+
                             {
                                 SessionId = sessionId
                                 Position = reader.GetInt64(0)
@@ -894,6 +1103,11 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
                                 Delivery = Enum.Parse<DeliveryMode>(reader.GetString(2))
                                 Consumed = false
                                 AppendedAt = parseStamp (reader.GetString(3))
+                                TurnId =
+                                    match turnText with
+                                    | null -> Unchecked.defaultof<TurnId>
+                                    | text when String.IsNullOrWhiteSpace(text) -> Unchecked.defaultof<TurnId>
+                                    | text -> TurnId.Parse(text)
                             }
                     ]
 
@@ -941,6 +1155,7 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
 
             transact options (fun connection transaction ->
                 this.RequireSession(connection, transaction, tenant, sessionId)
+                this.RequireNoControlBinding(connection, transaction, tenant, sessionId)
 
                 let now = this.UtcNow
                 let nowText = stamp now
@@ -989,21 +1204,29 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
                         command
                             connection
                             transaction
-                            $"SELECT position, payload_json FROM {this.InboxTable} WHERE session_id = @sid AND tenant = @t AND consumed = FALSE ORDER BY position LIMIT 1 FOR UPDATE"
+                            $"SELECT position, payload_json, turn_id FROM {this.InboxTable} WHERE session_id = @sid AND tenant = @t AND consumed = FALSE ORDER BY position LIMIT 1 FOR UPDATE"
 
                     textParam headCmd "sid" (sessionId.ToString())
                     textParam headCmd "t" (tenant.ToString())
 
                     use headReader = headCmd.ExecuteReader()
 
-                    let head: (int64 * InboxPayload) option =
+                    let head: (int64 * InboxPayload * TurnId) option =
                         if headReader.Read() then
                             let payload: InboxPayload =
                                 match JsonSerializer.Deserialize(headReader.GetString(1), jsonOptions) with
                                 | null -> raise (InvalidOperationException("The stored inbox payload is null."))
                                 | decoded -> decoded
 
-                            Some(headReader.GetInt64(0), payload)
+                            let turnText: string | null = getTextOrNull headReader 2
+
+                            let stamped =
+                                match turnText with
+                                | null -> Unchecked.defaultof<TurnId>
+                                | text when String.IsNullOrWhiteSpace(text) -> Unchecked.defaultof<TurnId>
+                                | text -> TurnId.Parse(text)
+
+                            Some(headReader.GetInt64(0), payload, stamped)
                         else
                             None
 
@@ -1035,9 +1258,10 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
                         stampCmd.ExecuteNonQuery() |> ignore
 
                     match head, openTurn with
-                    | Some(position, :? ReplyPayload), Some(openTurnId, openAttempt) ->
+                    | Some(position, :? ReplyPayload, _), Some(openTurnId, openAttempt) ->
                         // Resume: consume the reply and re-claim the same
-                        // open turn under a fresh token, attempt + 1.
+                        // open turn under a fresh token, attempt + 1. Reply
+                        // entries never start a turn (issue 374).
                         consume position
 
                         let attempt = openAttempt + 1
@@ -1067,15 +1291,31 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
 
                         stampCurrent (openTurnId.ToString())
                         TurnLeaseRenewed claim :> TurnLeaseState
-                    | Some(position, :? UserMessagePayload), _ ->
-                        // New turn: consume the message and mint a fresh
-                        // turn; a stale open turn from a lapsed claim is
-                        // retired to Aborted with its fence released and no
-                        // settlement recorded, so a later settle on it
-                        // rejects as a stale claim.
+                    | Some(position, :? UserMessagePayload, stamped), _ ->
+                        // New turn: consume the message and claim under its
+                        // durable real-turn identity (issue 374). Legacy rows
+                        // without a stamped identity bind once here. A stale
+                        // open turn from a lapsed claim is retired to Aborted
+                        // with its fence released and no settlement recorded,
+                        // so a later settle on it rejects as a stale claim.
                         consume position
 
-                        let turnId = TurnId.New()
+                        let isDefault = isNull (box stamped.Value)
+
+                        let turnId = if isDefault then TurnId.New() else stamped
+
+                        if isDefault then
+                            use backfillCmd =
+                                command
+                                    connection
+                                    transaction
+                                    $"UPDATE {this.InboxTable} SET turn_id = @turn WHERE session_id = @sid AND tenant = @t AND position = @pos"
+
+                            textParam backfillCmd "turn" (turnId.ToString())
+                            textParam backfillCmd "sid" (sessionId.ToString())
+                            textParam backfillCmd "t" (tenant.ToString())
+                            longParam backfillCmd "pos" position
+                            backfillCmd.ExecuteNonQuery() |> ignore
 
                         let claim =
                             {
@@ -1224,6 +1464,7 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
             this.EnsureMigrated()
 
             transact options (fun connection transaction ->
+                this.LockClaimSession(connection, transaction, tenant, claim)
                 let nowText = stamp this.UtcNow
 
                 // The guard runs inside the transaction, so the typed
@@ -1267,6 +1508,7 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
 
                 match this.ResolveClaim(connection, transaction, tenant, claim, nowText) with
                 | Choice1Of3(sessionId, _) ->
+                    this.RequireNoControlBinding(connection, transaction, tenant, sessionId)
                     // The token still fences: the first settle wins, and a
                     // lapsed-but-uncontested lease does not unseat it (a
                     // settle is terminal; nothing can take over a turn the
@@ -1346,10 +1588,12 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
             this.EnsureMigrated()
 
             transact options (fun connection transaction ->
+                this.LockClaimSession(connection, transaction, tenant, claim)
                 let nowText = stamp this.UtcNow
 
                 match this.ResolveClaim(connection, transaction, tenant, claim, nowText) with
                 | Choice1Of3(sessionId, live) ->
+                    this.RequireNoControlBinding(connection, transaction, tenant, sessionId)
                     // Abort settles Aborted and releases the lease; a
                     // later settle observes the applied settlement.
                     this.ApplySettlement(
@@ -1368,7 +1612,201 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
                 | Choice3Of3() -> TurnLeaseMissing claim.TurnId :> TurnLeaseState)
             |> Task.FromResult
 
-        member this.EnqueueCompletionOutbox(tenant, completion, _) =
+        member this.ConsumeInboxUnderClaim(tenant, claim, sessionId, positions, _) =
+            if isNull (box claim) then
+                raise (ArgumentNullException(nameof claim))
+
+            if isNull (box positions) then
+                raise (ArgumentNullException(nameof positions))
+
+            this.EnsureMigrated()
+
+            transact options (fun connection transaction ->
+                this.RequireSession(connection, transaction, tenant, sessionId)
+                let now = this.UtcNow
+                let nowText = stamp now
+
+                match this.ResolveClaim(connection, transaction, tenant, claim, nowText) with
+                | Choice1Of3(sid, live) when sid = sessionId && live.Attempt = claim.Attempt ->
+                    if live.ExpiresAt <= now then
+                        TurnLeaseLost(claim.TurnId, "expired") :> TurnLeaseState
+                    else
+                        use cmd =
+                            command
+                                connection
+                                transaction
+                                $"UPDATE {this.InboxTable} SET consumed = TRUE WHERE session_id = @sid AND tenant = @t AND consumed = FALSE AND position = ANY (@positions)"
+
+                        textParam cmd "sid" (sessionId.ToString())
+                        textParam cmd "t" (tenant.ToString())
+
+                        let arrayParam =
+                            NpgsqlParameter(
+                                "positions",
+                                NpgsqlTypes.NpgsqlDbType.Array ||| NpgsqlTypes.NpgsqlDbType.Bigint
+                            )
+
+                        arrayParam.Value <- box (Seq.toArray positions)
+                        cmd.Parameters.Add(arrayParam) |> ignore
+                        cmd.ExecuteNonQuery() |> ignore
+                        TurnLeaseHeld live :> TurnLeaseState
+                | Choice1Of3(_, _) -> TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState
+                | Choice2Of3() -> TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState
+                | Choice3Of3() -> TurnLeaseMissing claim.TurnId :> TurnLeaseState)
+            |> Task.FromResult
+
+        member this.UpdateSessionStateUnderClaim(tenant, claim, sessionId, state, _) =
+            if isNull (box claim) then
+                raise (ArgumentNullException(nameof claim))
+
+            if state <> SessionState.Running && state <> SessionState.WaitingForInput then
+                raise (
+                    InvalidSessionStateException(
+                        sessionId,
+                        nameof state,
+                        "Only execution-owned states (Running, WaitingForInput) update under a claim."
+                    )
+                )
+
+            this.EnsureMigrated()
+
+            transact options (fun connection transaction ->
+                use lockCmd =
+                    command
+                        connection
+                        transaction
+                        $"SELECT state FROM {this.SessionsTable} WHERE id = @id AND tenant = @t FOR UPDATE"
+
+                textParam lockCmd "id" (sessionId.ToString())
+                textParam lockCmd "t" (tenant.ToString())
+
+                use lockReader = lockCmd.ExecuteReader()
+
+                let current: string | null =
+                    if lockReader.Read() then lockReader.GetString(0) else null
+
+                lockReader.Close()
+
+                if isNull (box current) then
+                    raise (
+                        SessionNotFoundException(
+                            sessionId,
+                            sprintf "No session %O exists in tenant %O." sessionId tenant
+                        )
+                    )
+
+                if current = SessionState.Closed.ToString() then
+                    raise (
+                        InvalidSessionStateException(
+                            sessionId,
+                            nameof state,
+                            "A closed session cannot leave the Closed state."
+                        )
+                    )
+
+                let now = this.UtcNow
+                let nowText = stamp now
+
+                match this.ResolveClaim(connection, transaction, tenant, claim, nowText) with
+                | Choice1Of3(sid, live) when sid = sessionId && live.Attempt = claim.Attempt ->
+                    if live.ExpiresAt <= now then
+                        TurnLeaseLost(claim.TurnId, "expired") :> TurnLeaseState
+                    else
+                        use updateCmd =
+                            command
+                                connection
+                                transaction
+                                $"UPDATE {this.SessionsTable} SET state = @state, updated_at = @now WHERE id = @id AND tenant = @t"
+
+                        textParam updateCmd "state" (state.ToString())
+                        textParam updateCmd "now" nowText
+                        textParam updateCmd "id" (sessionId.ToString())
+                        textParam updateCmd "t" (tenant.ToString())
+                        updateCmd.ExecuteNonQuery() |> ignore
+                        TurnLeaseHeld live :> TurnLeaseState
+                | Choice1Of3(_, _) -> TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState
+                | Choice2Of3() -> TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState
+                | Choice3Of3() -> TurnLeaseMissing claim.TurnId :> TurnLeaseState)
+            |> Task.FromResult
+
+        member this.GrantSessionToolUnderClaim(tenant, claim, sessionId, toolName, _) =
+            if String.IsNullOrWhiteSpace toolName then
+                raise (ArgumentException("The tool name must be a non-empty string.", nameof toolName))
+
+            if isNull (box claim) then
+                raise (ArgumentNullException(nameof claim))
+
+            this.EnsureMigrated()
+
+            transact options (fun connection transaction ->
+                use lockCmd =
+                    command
+                        connection
+                        transaction
+                        $"SELECT {this.SessionColumns} FROM {this.SessionsTable} WHERE id = @id AND tenant = @t FOR UPDATE"
+
+                textParam lockCmd "id" (sessionId.ToString())
+                textParam lockCmd "t" (tenant.ToString())
+
+                use lockReader = lockCmd.ExecuteReader()
+
+                if not (lockReader.Read()) then
+                    lockReader.Close()
+
+                    raise (
+                        SessionNotFoundException(
+                            sessionId,
+                            sprintf "No session %O exists in tenant %O." sessionId tenant
+                        )
+                    )
+
+                let session = this.ReadSession(lockReader)
+                lockReader.Close()
+                let now = this.UtcNow
+                let nowText = stamp now
+
+                match this.ResolveClaim(connection, transaction, tenant, claim, nowText) with
+                | Choice1Of3(sid, live) when sid = sessionId && live.Attempt = claim.Attempt ->
+                    if live.ExpiresAt <= now then
+                        TurnLeaseLost(claim.TurnId, "expired") :> TurnLeaseState
+                    elif session.State = SessionState.Closed then
+                        raise (
+                            InvalidSessionStateException(
+                                sessionId,
+                                nameof session.State,
+                                "A closed session carries no grant memory."
+                            )
+                        )
+                    else
+                        let grants = ResizeArray<string>(this.StoredGrants(session.PermissionGrants))
+
+                        if not (grants.Contains toolName) then
+                            grants.Add toolName
+
+                        use updateCmd =
+                            command
+                                connection
+                                transaction
+                                $"UPDATE {this.SessionsTable} SET permission_grants_json = @grants, updated_at = @now WHERE id = @id AND tenant = @t"
+
+                        textParam
+                            updateCmd
+                            "grants"
+                            (serialize<List<string>> (List<string>(grants :> IReadOnlyList<string>)))
+
+                        textParam updateCmd "now" nowText
+                        textParam updateCmd "id" (sessionId.ToString())
+                        textParam updateCmd "t" (tenant.ToString())
+                        updateCmd.ExecuteNonQuery() |> ignore
+                        TurnLeaseHeld live :> TurnLeaseState
+                | Choice1Of3(_, _) -> TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState
+                | Choice2Of3() -> TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState
+                | Choice3Of3() -> TurnLeaseMissing claim.TurnId :> TurnLeaseState)
+            |> Task.FromResult
+
+        member this.EnqueueCompletionOutbox(tenant, destinationId, completion, _) =
+            CompletionDestinationRules.Validate destinationId
+
             if isNull (box completion) then
                 raise (ArgumentNullException(nameof completion))
 
@@ -1401,6 +1839,12 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
                         None
 
                 findReader.Close()
+
+                match row with
+                | Some existing when existing.SessionId <> completion.SessionId ->
+                    raise (ArgumentException("The idempotency key belongs to another session."))
+                | _ -> ()
+
                 row
 
             let insertAttempt () =
@@ -1416,13 +1860,14 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
                             command
                                 connection
                                 transaction
-                                $"INSERT INTO {this.OutboxTable} (idempotency_key, tenant, session_id, completion_json, created_at, delivered, delivered_at, lease_owner, lease_expires_at) VALUES (@key, @t, @sid, @completion, @created, FALSE, NULL, NULL, NULL)"
+                                $"INSERT INTO {this.OutboxTable} (idempotency_key, tenant, session_id, completion_json, created_at, delivered, delivered_at, lease_owner, lease_expires_at, destination_id) VALUES (@key, @t, @sid, @completion, @created, FALSE, NULL, NULL, NULL, @destination)"
 
                         textParam insertCmd "key" completion.IdempotencyKey
                         textParam insertCmd "t" (tenant.ToString())
                         textParam insertCmd "sid" (completion.SessionId.ToString())
                         textParam insertCmd "completion" (serialize<SessionCompletion> completion)
                         textParam insertCmd "created" nowText
+                        textParam insertCmd "destination" destinationId
                         insertCmd.ExecuteNonQuery() |> ignore
 
                         Choice2Of2())
@@ -1465,7 +1910,7 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
                     command
                         connection
                         transaction
-                        $"SELECT idempotency_key, tenant FROM {this.OutboxTable} WHERE delivered = FALSE AND (lease_owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= @now) ORDER BY created_at, idempotency_key LIMIT @take FOR UPDATE SKIP LOCKED"
+                        $"SELECT idempotency_key, tenant FROM {this.OutboxTable} WHERE delivered = FALSE AND (lease_owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= @now) ORDER BY CASE WHEN lease_expires_at IS NULL THEN 0 ELSE 1 END, lease_expires_at, created_at, idempotency_key LIMIT @take FOR UPDATE SKIP LOCKED"
 
                 textParam claimCmd "now" nowText
                 intParam claimCmd "take" maxBatch
@@ -1542,6 +1987,30 @@ type PostgresSessionStore(options: PostgresOptions, timeProvider: TimeProvider) 
                         | _ -> false
 
                 live)
+            |> Task.FromResult
+
+        member this.RenewCompletionClaim(tenant, key, owner, duration, ct) =
+            ct.ThrowIfCancellationRequested()
+
+            if duration <= TimeSpan.Zero then
+                raise (ArgumentOutOfRangeException(nameof duration))
+
+            this.EnsureMigrated()
+
+            transact options (fun connection transaction ->
+                use cmd =
+                    command
+                        connection
+                        transaction
+                        $"UPDATE {this.OutboxTable} SET lease_expires_at = @expires WHERE tenant = @t AND idempotency_key = @key AND delivered = FALSE AND lease_owner = @owner AND lease_expires_at > @now"
+
+                textParam cmd "t" (tenant.ToString())
+                textParam cmd "key" key
+                textParam cmd "owner" owner
+                textParam cmd "now" (stamp this.UtcNow)
+                textParam cmd "expires" (stamp (this.UtcNow + duration))
+                ct.ThrowIfCancellationRequested()
+                cmd.ExecuteNonQuery() = 1)
             |> Task.FromResult
 
         member this.MarkCompletionDelivered(tenant, idempotencyKey, owner, _) =

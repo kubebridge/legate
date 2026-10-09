@@ -22,10 +22,21 @@ open Microsoft.Extensions.Options
 // through the idempotent check-inbox actor message, which starts a turn on
 // the oldest drainable entry when Idle and no-ops otherwise. The
 // in-process wake sink only shortens the wait for the next cycle. No
-// dispatcher-side ClaimNextTurn: claim ownership and fencing stay with the
-// actor's start path. No external services: only ISessionStore, the
-// TimeProvider clock, and the ILlmDelay seam, so Legate still builds and
-// tests with no Redis, Docker, Postgres, or Kubernetes.
+// dispatcher-side ClaimNextTurn on the pending path: claim ownership and
+// fencing stay with the actor's start path. A second internal sweep (issue
+// 289) covers live-turn orphans: Idle sessions still carrying a live turn
+// with a consumed inbox, whose journal holds an unterminated marker — for
+// the live turn id itself, or for the orphan id a won prime replaced (the
+// marker is the only surviving record of it) — on an era-marked session,
+// which the pending sweep above can never list.
+// Each orphan candidate is lease-gated through an atomic priming claim (a
+// live owner wins, the poke loses silently and re-consumes its bootstrap)
+// and a winner settles directly inside the sweep: it journals the fenced
+// TurnFailedEvent for the orphan id under the won poke token and settles
+// the prime quietly, with no entity involvement. Every settle effect stays
+// fenced under the fresh primed claim token. No external services: only
+// ISessionStore, the TimeProvider clock, and the ILlmDelay seam, so Legate
+// still builds and tests with no Redis, Docker, Postgres, or Kubernetes.
 
 // ──────────────────────────────────────────────────────────────────────────
 // One pass
@@ -61,6 +72,93 @@ module internal Dispatcher =
             QueuedAgent = 0
         }
 
+    /// The claim owner identity the orphan poke primes under: distinct
+    /// from the facade prime owner, so forensics tell a poke-won claim
+    /// from an entity-start prime.
+    let private orphanPokeOwner = "legate-dispatcher-orphan-poke"
+
+    /// The bootstrap text the orphan poke appends before its priming
+    /// claim: always consumed by a winning claim or re-consumed on a
+    /// loss, so it never drains as a turn.
+    let private orphanPokeText = "legate orphan poke"
+
+    /// Reads the journal state for one turn id (issue 289): whether the
+    /// journal holds the TurnStartedEvent marker for the id, whether
+    /// any terminal row (TurnCompleted, TurnFailed, TurnAborted,
+    /// SessionClosed) carries it, and the latest marker id with no
+    /// terminal row (the journal-derived orphan, mirroring the
+    /// entity-side journalOrphanState fallback). Read-only: never
+    /// appends. A failed replay reads as no marker, so the candidate
+    /// stays skipped.
+    ///
+    /// The fallback exists because a winning prime replaces the row's
+    /// turn id: after a poke-claim wins post-expiry, CurrentTurnId names
+    /// the prime, never the orphan, so marker-for-live-id alone would
+    /// stay quiet forever. The orphan id survives only in the journal.
+    /// <param name="eventStore">The journal to replay.</param>
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="sessionId">The session to inspect.</param>
+    /// <param name="liveId">The live turn to inspect.</param>
+    /// <param name="cancellationToken">Abandons the replay.</param>
+    /// <returns>The marker flag and the terminal flag for the turn id, plus the latest unterminated marker id.</returns>
+    let private turnStateAsync
+        (eventStore: ISessionEventStore)
+        (tenant: TenantId)
+        (sessionId: SessionId)
+        (liveId: TurnId)
+        (cancellationToken: CancellationToken)
+        : Task<bool * bool * TurnId option> =
+        task {
+            let mutable marker = false
+            let mutable terminal = false
+            let markers = ResizeArray<TurnId>()
+            let terminals = HashSet<TurnId>()
+            let mutable cursor = 0L
+            let mutable paging = true
+
+            while paging do
+                try
+                    let! outcome = eventStore.Replay(tenant, sessionId, cursor, 100, cancellationToken)
+
+                    match outcome with
+                    | :? EventReplayPage as page when not (isNull (box page)) ->
+                        if not (isNull (box page.Events)) then
+                            for event in page.Events do
+                                if not (isNull (box event)) then
+                                    if event.TurnId.Equals(liveId) then
+                                        match event with
+                                        | :? TurnStartedEvent -> marker <- true
+                                        | :? TurnCompletedEvent
+                                        | :? TurnFailedEvent
+                                        | :? TurnAbortedEvent
+                                        | :? SessionClosedEvent -> terminal <- true
+                                        | _ -> ()
+
+                                    match event with
+                                    | :? TurnStartedEvent -> markers.Add(event.TurnId)
+                                    | :? TurnCompletedEvent
+                                    | :? TurnFailedEvent
+                                    | :? TurnAbortedEvent
+                                    | :? SessionClosedEvent -> terminals.Add(event.TurnId) |> ignore
+                                    | _ -> ()
+
+                        if page.NextCursor.HasValue then
+                            cursor <- page.NextCursor.Value
+                        else
+                            paging <- false
+                    | _ -> paging <- false
+                with
+                | :? OperationCanceledException as cancelled -> raise cancelled
+                | _ -> paging <- false
+
+            let fallback =
+                markers
+                |> Seq.filter (fun candidate -> not (terminals.Contains(candidate)))
+                |> Seq.tryLast
+
+            return marker, terminal, fallback
+        }
+
     /// Runs one full pass: pages the tenant's dispatch candidates in bounded
     /// batches following HasMore and wakes every admitted session. The
     /// capacity snapshots read once per pass plus the local in-flight gate
@@ -69,7 +167,19 @@ module internal Dispatcher =
     /// the pass, so gate-blocked sessions that stay pending never spin it.
     /// A vanished session (null row mid-pass) or a per-session wake failure
     /// skips that session for this pass; the next interval retries.
+    /// A second bounded sweep then settles live-turn orphans (issue 289):
+    /// Idle sessions still carrying a live turn with an empty inbox page
+    /// through ListSessions; each candidate must also hold an unterminated
+    /// marker — for the live turn id itself, or for the orphan id a won
+    /// prime replaced (the journal-derived fallback, mirroring the
+    /// entity-side probe) — on an era-marked session before it lease-gates
+    /// through an atomic priming claim, so a live owner always wins and
+    /// the poke loses silently while an expired or missing lease lets the
+    /// poke win and settle directly inside the sweep. Orphan pokes check
+    /// the capacity gate but never consume it and never count as queued.
     /// <param name="store">The durable store.</param>
+    /// <param name="eventStore">The journal orphan candidates read their terminal rows from.</param>
+    /// <param name="eraMarked">Reads whether a session opened in the completion era.</param>
     /// <param name="tenant">The tenant whose pending sessions to sweep.</param>
     /// <param name="sessions">The session knobs carrying the process and per-tenant limits.</param>
     /// <param name="dispatcher">The dispatcher knobs carrying the batch size and the per-agent limit.</param>
@@ -77,17 +187,23 @@ module internal Dispatcher =
     /// <param name="clock">The clock dispatch latency reads.</param>
     /// <param name="cancellationToken">Abandons the pass.</param>
     /// <returns>What the pass woke and what stayed queued behind each limit.</returns>
-    let passOnceAsync
+    let passOnceRoutedWithCursorAndLogAsync
+        (validateRoute: Session -> bool)
         (store: ISessionStore)
+        (eventStore: ISessionEventStore)
+        (eraMarked: CompletionEra.CompletionEraReader)
         (tenant: TenantId)
         (sessions: SessionsOptions)
         (dispatcher: DispatcherOptions)
         (resolve: SessionId -> CancellationToken -> Task<IActorRef>)
         (clock: TimeProvider)
         (cancellationToken: CancellationToken)
+        (recoveryCursor: (string | null) ref)
+        (log: ILogger)
         : Task<DispatchPassResult> =
         task {
             ArgumentNullException.ThrowIfNull(store)
+            ArgumentNullException.ThrowIfNull(eventStore)
             ArgumentNullException.ThrowIfNull(sessions)
             ArgumentNullException.ThrowIfNull(dispatcher)
             ArgumentNullException.ThrowIfNull(clock)
@@ -95,9 +211,12 @@ module internal Dispatcher =
             if isNull (box resolve) then
                 raise (ArgumentNullException(nameof resolve))
 
+            if isNull (box eraMarked) then
+                raise (ArgumentNullException(nameof eraMarked))
+
             let maxBatch =
                 if dispatcher.MaxBatchSize > 0 then
-                    dispatcher.MaxBatchSize
+                    min 1000 dispatcher.MaxBatchSize
                 else
                     50
 
@@ -107,6 +226,7 @@ module internal Dispatcher =
             let agentSnapshots = Dictionary<AgentId, int>()
             let agentLocal = Dictionary<AgentId, int>()
             let visited = HashSet<SessionId>()
+            let woken = HashSet<SessionId>()
 
             let mutable runningLocal = 0
             let mutable tenantLocal = 0
@@ -115,6 +235,31 @@ module internal Dispatcher =
             let mutable queuedTenant = 0
             let mutable queuedAgent = 0
             let mutable more = true
+
+            // The cached per-agent snapshot plus this pass's local
+            // in-flight count for one agent: shared by the pending sweep
+            // and the orphan sweep below, so both gate on the same
+            // snapshots.
+            let agentCountsAsync (agentId: AgentId) : Task<int * int> =
+                task {
+                    let! snapshot =
+                        match agentSnapshots.TryGetValue(agentId) with
+                        | true, count -> task { return count }
+                        | false, _ ->
+                            task {
+                                let! count = store.CountSessionsByAgent(tenant, agentId, cancellationToken)
+
+                                agentSnapshots[agentId] <- count
+                                return count
+                            }
+
+                    let startedLocal =
+                        match agentLocal.TryGetValue(agentId) with
+                        | true, count -> count
+                        | false, _ -> 0
+
+                    return snapshot, startedLocal
+                }
 
             while more do
                 let! batch = store.GetDispatchCandidates(tenant, maxBatch, cancellationToken)
@@ -131,27 +276,40 @@ module internal Dispatcher =
                         more <- false
                     else
                         for sessionId in unseen do
-                            let! session = store.GetSession(tenant, sessionId, cancellationToken)
+                            // A refusal belongs to this candidate, never to the whole sweep.
+                            let! session =
+                                task {
+                                    try
+                                        let! blocked =
+                                            task {
+                                                match store with
+                                                | :? ISessionAbortControlStore as control ->
+                                                    let! target =
+                                                        control.ReadAbortTarget(tenant, sessionId, cancellationToken)
+
+                                                    return
+                                                        match target with
+                                                        | null -> false
+                                                        | target ->
+                                                            target.State <> ControlTargetState.Active
+                                                            || not (isNull (box target.Stop))
+                                                | _ -> return false
+                                            }
+
+                                        if blocked then
+                                            return null
+                                        else
+                                            return! store.GetSession(tenant, sessionId, cancellationToken)
+                                    with
+                                    | :? OperationCanceledException as cancelled -> return raise cancelled
+                                    | _ -> return null
+                                }
 
                             match session with
                             | null -> () // Vanished mid-pass: stays out of this pass.
+                            | live when not (validateRoute live) -> ()
                             | live ->
-                                let! agentCount =
-                                    match agentSnapshots.TryGetValue(live.AgentId) with
-                                    | true, count -> task { return count }
-                                    | false, _ ->
-                                        task {
-                                            let! count =
-                                                store.CountSessionsByAgent(tenant, live.AgentId, cancellationToken)
-
-                                            agentSnapshots[live.AgentId] <- count
-                                            return count
-                                        }
-
-                                let agentStarted =
-                                    match agentLocal.TryGetValue(live.AgentId) with
-                                    | true, count -> count
-                                    | false, _ -> 0
+                                let! agentCount, agentStarted = agentCountsAsync live.AgentId
 
                                 // Conjunctive gate, checked process ->
                                 // tenant -> agent for observability labeling
@@ -185,6 +343,7 @@ module internal Dispatcher =
 
                                         let! actor = resolve sessionId cancellationToken
                                         do! SessionActor.checkInboxAsync store tenant sessionId actor cancellationToken
+                                        woken.Add(sessionId) |> ignore
 
                                         runningLocal <- runningLocal + 1
                                         tenantLocal <- tenantLocal + 1
@@ -196,6 +355,316 @@ module internal Dispatcher =
 
                         more <- batch.HasMore
 
+            // Orphan sweep (issue 289): Idle sessions still carrying a
+            // live turn with a fully consumed inbox never appear in the
+            // pending sweep above, yet their journal may hold an
+            // unterminated marker — for the live turn id itself, or for
+            // the orphan id a won prime replaced (the marker is the only
+            // surviving record of it) — on an era-marked session. Each
+            // candidate lease-gates through an atomic priming claim: a
+            // live owner makes the claim the missing branch, so the poke
+            // loses silently and re-consumes its bootstrap, while an
+            // expired or missing lease lets the poke win and settle
+            // directly inside the sweep, so a later poke re-finds the
+            // orphan through the fallback instead of going single-shot.
+            // Sessions with pending work stay with the authoritative
+            // sweep, and a tripped capacity gate skips the poke silently:
+            // orphans are recovery probes, not dispatch demand, so they
+            // never consume the gate and never count as queued. Bounded
+            // to MaxBatchSize primes per pass, following the ListSessions
+            // continuation like the HasMore paging above.
+            let mutable orphanBudget = maxBatch
+            let mutable orphanContinuation: string | null = null
+            let mutable orphanPaging = true
+
+            while orphanPaging && orphanBudget > 0 do
+                let! page =
+                    store.ListRecoveryCandidates(
+                        tenant,
+                        SessionState.Idle,
+                        maxBatch,
+                        orphanContinuation,
+                        cancellationToken
+                    )
+
+                if isNull (box page) || isNull (box page.Items) then
+                    orphanPaging <- false
+                else
+                    for candidateId in page.Items do
+                        if orphanBudget > 0 then
+                            try
+                                match store with
+                                | :? ISessionAbortControlStore as control ->
+                                    let! target = control.ReadAbortTarget(tenant, candidateId, cancellationToken)
+
+                                    if
+                                        match target with
+                                        | null -> false
+                                        | target ->
+                                            target.State <> ControlTargetState.Active || not (isNull (box target.Stop))
+                                    then
+                                        raise (
+                                            InvalidSessionStateException(
+                                                candidateId,
+                                                "controlPending",
+                                                "Dispatcher orphan prime is forbidden for unresolved control work."
+                                            )
+                                        )
+                                | _ -> ()
+
+                                let! fresh = store.GetSession(tenant, candidateId, cancellationToken)
+
+                                match fresh with
+                                | null -> ()
+                                | current when current.State <> SessionState.Idle || not current.CurrentTurnId.HasValue ->
+                                    ()
+                                | current when not (validateRoute current) -> ()
+                                | current ->
+                                    let! agentCount, agentStarted = agentCountsAsync current.AgentId
+
+                                    if runningSnapshot + runningLocal >= sessions.Capacity then
+                                        ()
+                                    elif tenantSnapshot + tenantLocal >= sessions.MaxSessionsPerTenant then
+                                        ()
+                                    elif agentCount + agentStarted >= dispatcher.MaxSessionsPerAgent then
+                                        ()
+                                    else
+                                        let! pending = store.ReadPendingInbox(tenant, current.Id, cancellationToken)
+
+                                        let hasPending =
+                                            not (isNull (box pending))
+                                            && pending |> Seq.exists (fun entry -> not (isNull (box entry)))
+
+                                        if not hasPending then
+                                            // Completion-row-aware plus era-gated candidate (issue 289):
+                                            // the settling id is the live turn id when its marker
+                                            // stands unterminated, else the journal-derived orphan
+                                            // the prime replaced, on an era-marked session.
+                                            // Terminated tails, settled rows, empty tails, and
+                                            // pre-era sessions never consume the orphan budget.
+                                            let liveOpt =
+                                                if current.CurrentTurnId.HasValue then
+                                                    Some current.CurrentTurnId.Value
+                                                else
+                                                    None
+
+                                            let! settlingOpt =
+                                                task {
+                                                    match liveOpt with
+                                                    | None -> return None
+                                                    | Some liveId ->
+                                                        let! marker, terminal, fallback =
+                                                            turnStateAsync
+                                                                eventStore
+                                                                tenant
+                                                                current.Id
+                                                                liveId
+                                                                cancellationToken
+
+                                                        let settling =
+                                                            if marker && not terminal then Some liveId else fallback
+
+                                                        match settling with
+                                                        | None -> return None
+                                                        | Some _ ->
+                                                            try
+                                                                let! marked =
+                                                                    eraMarked tenant current.Id cancellationToken
+
+                                                                if marked then return settling else return None
+                                                            with _ ->
+                                                                return None
+                                                }
+
+                                            match settlingOpt with
+                                            | None -> ()
+                                            | Some settlingId ->
+                                                orphanBudget <- orphanBudget - 1
+
+                                                let bootstrap =
+                                                    UserMessagePayload(UserMessage.Text(orphanPokeText)) :> InboxPayload
+
+                                                let! appended =
+                                                    store.AppendInboxMessage(
+                                                        tenant,
+                                                        current.Id,
+                                                        bootstrap,
+                                                        DeliveryMode.Queue,
+                                                        cancellationToken
+                                                    )
+
+                                                let cleanupPoke () : Task<unit> =
+                                                    task {
+                                                        try
+                                                            let! _ =
+                                                                store.MarkInboxConsumed(
+                                                                    tenant,
+                                                                    current.Id,
+                                                                    [| appended.Position |] :> IReadOnlyList<int64>,
+                                                                    cancellationToken
+                                                                )
+
+                                                            ()
+                                                        with _ ->
+                                                            ()
+                                                    }
+
+                                                let settleDirect (claim: TurnClaim) : Task<unit> =
+                                                    task {
+                                                        try
+                                                            let failedEvent =
+                                                                TurnFailedEvent(
+                                                                    current.Id,
+                                                                    settlingId,
+                                                                    Nullable<int64>(),
+                                                                    clock.GetUtcNow(),
+                                                                    SessionActor.CrashFailReason
+                                                                )
+                                                                :> SessionEvent
+
+                                                            let events =
+                                                                ResizeArray<SessionEvent>([| failedEvent |])
+                                                                :> IReadOnlyList<SessionEvent>
+
+                                                            let! _ =
+                                                                JournalWriter.appendWithTokenAsync
+                                                                    eventStore
+                                                                    tenant
+                                                                    current.Id
+                                                                    claim.Token
+                                                                    events
+                                                                    cancellationToken
+
+                                                            ()
+                                                        with _ ->
+                                                            ()
+
+                                                        try
+                                                            let! _ =
+                                                                store.SettleTurn(
+                                                                    tenant,
+                                                                    claim,
+                                                                    TurnStatus.Completed,
+                                                                    null,
+                                                                    cancellationToken
+                                                                )
+
+                                                            ()
+                                                        with _ ->
+                                                            ()
+
+                                                        do! cleanupPoke ()
+                                                        started <- started + 1
+                                                    }
+
+                                                try
+                                                    let! lease =
+                                                        store.ClaimNextTurn(
+                                                            tenant,
+                                                            current.Id,
+                                                            orphanPokeOwner,
+                                                            sessions.LeaseDuration,
+                                                            cancellationToken
+                                                        )
+
+                                                    match lease with
+                                                    | :? TurnLeaseRenewed as renewed -> do! settleDirect renewed.Claim
+                                                    | :? TurnLeaseHeld as held -> do! settleDirect held.Claim
+                                                    | :? TurnLeaseExpiring as expiring ->
+                                                        do! settleDirect expiring.Claim
+                                                    | _ -> do! cleanupPoke ()
+                                                with
+                                                | :? OperationCanceledException as cancelled ->
+                                                    do! cleanupPoke ()
+                                                    raise cancelled
+                                                | _ -> do! cleanupPoke ()
+                            with
+                            | :? OperationCanceledException as cancelled -> raise cancelled
+                            | _ -> ()
+
+                    orphanContinuation <- page.Continuation
+                    orphanPaging <- not (isNull (box page.Continuation))
+
+            // A Running slot is already admitted. Discovery sends only a wake;
+            // the existing execution factory/provider decides lease authority.
+            // Keep the upper-fenced keyset between bounded passes so live owners
+            // at the front cannot starve eligible sessions further down the set.
+            let mutable recoveryBudget = maxBatch
+            let mutable recoveryPaging = true
+            let mutable reports = min 8 maxBatch
+
+            let report category sessionId =
+                if reports > 0 then
+                    reports <- reports - 1
+                    log.LogDebug("Running recovery {Category} for {SessionId}.", category, sessionId)
+
+            while recoveryPaging && recoveryBudget > 0 do
+                cancellationToken.ThrowIfCancellationRequested()
+
+                let! page =
+                    store.ListRecoveryCandidates(
+                        tenant,
+                        SessionState.Running,
+                        recoveryBudget,
+                        recoveryCursor.Value,
+                        cancellationToken
+                    )
+
+                if isNull (box page) || isNull (box page.Items) then
+                    recoveryCursor.Value <- null
+                    recoveryPaging <- false
+                else
+                    for candidateId in page.Items do
+                        cancellationToken.ThrowIfCancellationRequested()
+
+                        try
+                            let! current = store.GetSession(tenant, candidateId, cancellationToken)
+
+                            match current with
+                            | null -> ()
+                            | current when
+                                woken.Contains(candidateId)
+                                || current.Id <> candidateId
+                                || current.Tenant <> tenant
+                                || current.State <> SessionState.Running
+                                || not current.CurrentTurnId.HasValue
+                                ->
+                                report "lifecycleRefused" candidateId
+                            | current when not (validateRoute current) -> report "routeRefused" candidateId
+                            | _ ->
+                                match store with
+                                | :? ISessionAbortControlStore as control ->
+                                    let! target = control.ReadAbortTarget(tenant, candidateId, cancellationToken)
+
+                                    match target with
+                                    | null -> ()
+                                    | target when
+                                        target.State = ControlTargetState.Active
+                                        && isNull (box target.Stop)
+                                        && target.SessionId = candidateId
+                                        ->
+                                        recoveryBudget <- recoveryBudget - 1
+                                        let! actor = resolve candidateId cancellationToken
+
+                                        do!
+                                            SessionActor.checkInboxAsync
+                                                store
+                                                tenant
+                                                candidateId
+                                                actor
+                                                cancellationToken
+
+                                        report "wakeSent" candidateId
+                                    | _ -> report "controlRefused" candidateId
+                                | _ -> ()
+                        with
+                        | :? OperationCanceledException as cancelled -> raise cancelled
+                        | _ -> report "activationRefused" candidateId
+
+                    let previous = recoveryCursor.Value
+                    recoveryCursor.Value <- page.Continuation
+                    recoveryPaging <- not (isNull page.Continuation) && page.Continuation <> previous
+
             return
                 {
                     Started = started
@@ -204,6 +673,68 @@ module internal Dispatcher =
                     QueuedAgent = queuedAgent
                 }
         }
+
+    let passOnceRoutedWithCursorAsync
+        validateRoute
+        store
+        eventStore
+        eraMarked
+        tenant
+        sessions
+        dispatcher
+        resolve
+        clock
+        ct
+        cursor
+        =
+        passOnceRoutedWithCursorAndLogAsync
+            validateRoute
+            store
+            eventStore
+            eraMarked
+            tenant
+            sessions
+            dispatcher
+            resolve
+            clock
+            ct
+            cursor
+            NullLogger.Instance
+
+    let passOnceRoutedAsync validateRoute store eventStore eraMarked tenant sessions dispatcher resolve clock ct =
+        passOnceRoutedWithCursorAsync
+            validateRoute
+            store
+            eventStore
+            eraMarked
+            tenant
+            sessions
+            dispatcher
+            resolve
+            clock
+            ct
+            (ref null)
+
+    let passOnceAsync store eventStore eraMarked tenant sessions dispatcher resolve clock ct =
+        passOnceRoutedAsync
+            (fun session ->
+                try
+                    if isNull (box session) || isNull (box session.Options) then
+                        false
+                    else
+                        session.Options.ValidatePersistence()
+                        isNull session.Options.CompletionDestinationId
+                with :? CompletionRoutingException ->
+                    false)
+            store
+            eventStore
+            eraMarked
+            tenant
+            sessions
+            dispatcher
+            resolve
+            clock
+            ct
 
 // ──────────────────────────────────────────────────────────────────────────
 // Hosted service
@@ -230,19 +761,13 @@ type internal DispatcherService
         ArgumentNullException.ThrowIfNull(timeProvider)
         ArgumentNullException.ThrowIfNull(delay)
 
-    let log: ILogger = NullLogger.Instance :> ILogger
+    let log: ILogger =
+        match serviceProvider.GetService<ILogger<DispatcherService>>() with
+        | null -> NullLogger.Instance :> ILogger
+        | logger -> logger
+
     let lifetime = new CancellationTokenSource()
     let mutable loop: Task | null = null
-
-    /// Resolves the locally scoped sweep tenant: the facade client's tenant
-    /// when one is registered, else the default single-tenant id. The sweep
-    /// stays tenant-scoped with no new store API by covering exactly the
-    /// tenant this node serves.
-    /// <returns>The tenant whose sessions to sweep.</returns>
-    member private _.SweepTenant() : TenantId =
-        match serviceProvider.GetService<SessionClientOptions>() with
-        | null -> TenantId.Default
-        | clientOptions -> clientOptions.Tenant
 
     /// The dispatcher knobs, falling back to the defaults when the options
     /// root or section is missing.
@@ -255,42 +780,65 @@ type internal DispatcherService
         else
             legateOptions.Dispatcher
 
-    /// The session knobs, falling back to the defaults when the options
-    /// root or section is missing.
-    /// <returns>The session knobs the gate enforces.</returns>
-    member private _.SessionKnobs() : SessionsOptions =
-        let legateOptions = options.Value
-
-        if isNull (box legateOptions) || isNull (box legateOptions.Sessions) then
-            SessionsOptions()
-        else
-            legateOptions.Sessions
-
     /// Runs one full cycle: drains the coalesced wakes (the sweep that
     /// follows covers them authoritatively) and runs the poll pass.
     /// <param name="cancellationToken">Abandons the cycle.</param>
     /// <returns>What the pass woke and what stayed queued.</returns>
-    member internal this.RunOnceAsync(cancellationToken: CancellationToken) : Task<Dispatcher.DispatchPassResult> =
+    member internal _.RunOnceAsync(cancellationToken: CancellationToken) : Task<Dispatcher.DispatchPassResult> =
         task {
-            let store = serviceProvider.GetRequiredService<ISessionStore>()
-            let client = serviceProvider.GetRequiredService<SessionClient>()
             let sink = serviceProvider.GetRequiredService<DispatcherWakeSink>()
-            let tenant = this.SweepTenant()
-
             sink.TakePending() |> ignore
+            let contexts = serviceProvider.GetRequiredService<ISessionHostContexts>()
+            let mutable total = Dispatcher.emptyResult
 
-            let resolve (sessionId: SessionId) (candidateToken: CancellationToken) : Task<IActorRef> =
-                client.Resolve(sessionId, candidateToken)
+            for context in contexts.All do
+                cancellationToken.ThrowIfCancellationRequested()
 
-            return!
-                Dispatcher.passOnceAsync
-                    store
-                    tenant
-                    (this.SessionKnobs())
-                    (this.DispatcherKnobs())
-                    resolve
-                    timeProvider
-                    cancellationToken
+                try
+                    contexts.Get(context.Tenant) |> ignore
+
+                    let! result =
+                        context.WorkTracker.Track(fun () ->
+                            let client = context.Client.Value :?> SessionClient
+                            let inputs = context.Background
+
+                            Dispatcher.passOnceRoutedWithCursorAndLogAsync
+                                (fun session ->
+                                    try
+                                        client.ValidateCompletionRoute session
+                                        true
+                                    with :? CompletionRoutingException ->
+                                        false)
+                                context.Store
+                                context.EventStore
+                                inputs.EraMarked
+                                context.Tenant
+                                inputs.Sessions
+                                inputs.Dispatcher
+                                (fun id token -> client.Resolve(id, token))
+                                inputs.Clock
+                                cancellationToken
+                                inputs.RecoveryCursor
+                                log)
+
+                    total <-
+                        {
+                            Started = total.Started + result.Started
+                            QueuedProcess = total.QueuedProcess + result.QueuedProcess
+                            QueuedTenant = total.QueuedTenant + result.QueuedTenant
+                            QueuedAgent = total.QueuedAgent + result.QueuedAgent
+                        }
+
+                    log.LogDebug("Dispatch graph sweep completed for {Tenant}.", context.Tenant)
+                with
+                | :? OperationCanceledException as cancelled -> raise cancelled
+                | _ ->
+                    log.LogWarning(
+                        "Dispatch graph sweep refused or failed for {Tenant}; retry next cycle.",
+                        context.Tenant
+                    )
+
+            return total
         }
 
     /// The tick interval for the loop: the configured poll interval when it
@@ -320,8 +868,7 @@ type internal DispatcherService
                     ()
                 with
                 | :? OperationCanceledException -> running <- false
-                | failed ->
-                    log.LogWarning("Dispatch pass failed and will retry next interval: {Reason}", failed.Message)
+                | _ -> log.LogWarning("Dispatch pass failed and will retry next interval.")
 
                 if running && not lifetime.Token.IsCancellationRequested then
                     try

@@ -221,6 +221,17 @@ module internal JournalWriter =
                 map source.Output
             )
             :> SessionEvent
+        | :? ToolCallStartedEvent as source when not (isNull (box source)) ->
+            ToolCallStartedEvent(
+                source.SessionId,
+                source.TurnId,
+                source.Sequence,
+                source.Timestamp,
+                source.ToolCallId,
+                source.ToolName,
+                map source.ArgumentsJson
+            )
+            :> SessionEvent
         | :? ToolCallCompletedEvent as source when not (isNull (box source)) ->
             ToolCallCompletedEvent(
                 source.SessionId,
@@ -228,7 +239,8 @@ module internal JournalWriter =
                 source.Sequence,
                 source.Timestamp,
                 source.ToolCallId,
-                map source.Error
+                map source.Error,
+                map source.ResultText
             )
             :> SessionEvent
         | :? QuestionAskedEvent as source when not (isNull (box source)) ->
@@ -266,6 +278,24 @@ module internal JournalWriter =
             :> SessionEvent
         | :? CompactionFailedEvent as source when not (isNull (box source)) ->
             CompactionFailedEvent(source.SessionId, source.TurnId, source.Sequence, source.Timestamp, map source.Reason)
+            :> SessionEvent
+        | :? CompactedEvent as source when not (isNull (box source)) ->
+            // The summary is text-bearing and redacts/bounds like any
+            // reason; the retained current-format tail passes through
+            // verbatim so provider-required pairing, required content,
+            // and artifact references survive exactly as the summariser
+            // boundary built them.
+            CompactedEvent(
+                source.SessionId,
+                source.TurnId,
+                source.Sequence,
+                source.Timestamp,
+                source.BeforeEstimate,
+                source.AfterEstimate,
+                map source.Summary,
+                source.RetainedMessages,
+                source.FormatVersion
+            )
             :> SessionEvent
         | :? SkillInvalidEvent as source when not (isNull (box source)) ->
             SkillInvalidEvent(
@@ -334,12 +364,15 @@ module internal JournalWriter =
         | :? TextDeltaEvent as source when not (isNull (box source)) -> length source.Text
         | :? ReasoningDeltaEvent as source when not (isNull (box source)) -> length source.Text
         | :? ToolCallOutputEvent as source when not (isNull (box source)) -> length source.Output
-        | :? ToolCallCompletedEvent as source when not (isNull (box source)) -> length source.Error
+        | :? ToolCallStartedEvent as source when not (isNull (box source)) -> length source.ArgumentsJson
+        | :? ToolCallCompletedEvent as source when not (isNull (box source)) ->
+            max (length source.Error) (length source.ResultText)
         | :? QuestionAskedEvent as source when not (isNull (box source)) -> length source.Question
         | :? QuestionAnsweredEvent as source when not (isNull (box source)) -> length source.Answer
         | :? TurnAbortedEvent as source when not (isNull (box source)) -> length source.Reason
         | :? TurnFailedEvent as source when not (isNull (box source)) -> length source.Reason
         | :? CompactionFailedEvent as source when not (isNull (box source)) -> length source.Reason
+        | :? CompactedEvent as source when not (isNull (box source)) -> length source.Summary
         | :? SkillInvalidEvent as source when not (isNull (box source)) ->
             max (length source.SkillName) (length source.Reason)
         | :? UserMessageEvent as source when not (isNull (box source)) ->
@@ -556,7 +589,7 @@ module internal JournalWriter =
     /// <param name="tenant">The tenant the session belongs to.</param>
     /// <param name="sessionId">The session whose journal appended.</param>
     /// <param name="stamped">The stamped events, in append order.</param>
-    let private notifyPublished
+    let internal notifyPublished
         (tenant: TenantId)
         (sessionId: SessionId)
         (stamped: IReadOnlyList<SessionEvent>)
@@ -728,6 +761,52 @@ module internal JournalWriter =
             return result
         }
 
+    /// Appends prepared idle/host-control events under the store-side
+    /// lifecycle fence: the caller authorizes the write (host permissions,
+    /// lifecycle restrictions, accepted/deferred/rejected behavior) before
+    /// calling, and the store verifies the session's UpdatedAt version stamp
+    /// at the last moment, rejecting a stale or closed session with zero
+    /// writes. Fresh idle writes carry the default (unstamped) TurnId
+    /// sentinel by caller convention; history copies carry preserved ids.
+    /// No claim token plumbs through here: execution writes stay
+    /// token-fenced, host writes stay lifecycle-fenced. Transient failures
+    /// retry bounded, then fail with the typed reason. A landed batch
+    /// publishes its stamped events to live subscribers before returning;
+    /// fenced-out and failed writes publish nothing.
+    /// <param name="eventStore">The journal the events append to. Must not be null.</param>
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="sessionId">The session whose journal appends.</param>
+    /// <param name="expectedUpdatedAt">The session UpdatedAt the caller read before authorizing. Must exactly match the stored stamp or the append rejects.</param>
+    /// <param name="events">The events to append, in order. Must not be null or empty and must carry no nulls.</param>
+    /// <param name="cancellationToken">Abandons the append.</param>
+    /// <returns>The write result: stamped events, the stable rejection, or the typed failure.</returns>
+    let appendHostAsync
+        (eventStore: ISessionEventStore)
+        (tenant: TenantId)
+        (sessionId: SessionId)
+        (expectedUpdatedAt: DateTimeOffset)
+        (events: IReadOnlyList<SessionEvent>)
+        (cancellationToken: CancellationToken)
+        : Task<JournalWriteResult> =
+        ArgumentNullException.ThrowIfNull(eventStore)
+
+        let prepared = prepareBatch events
+
+        task {
+            let! result =
+                appendWithRetry
+                    (fun cancellationToken ->
+                        eventStore.AppendHostEvents(tenant, sessionId, expectedUpdatedAt, prepared, cancellationToken))
+                    cancellationToken
+
+            match result with
+            | JournalAppended stamped -> notifyPublished tenant sessionId stamped
+            | JournalRejected _ -> ()
+            | JournalFailed _ -> ()
+
+            return result
+        }
+
     // ────────────────── Scoped outcome logging (issue 93) ──────────────────
 
     /// Resolves a nullable logger to a live one: the given logger, or the
@@ -821,6 +900,34 @@ module internal JournalWriter =
         : Task<JournalWriteResult> =
         task {
             let! result = appendWithTokenAsync eventStore tenant sessionId claimToken events cancellationToken
+            reportOutcome logger scope result
+            return result
+        }
+
+    /// Appends under the host lifecycle fence and reports the outcome under
+    /// the caller's scope.
+    /// <param name="eventStore">The journal the events append to. Must not be null.</param>
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="sessionId">The session whose journal appends.</param>
+    /// <param name="expectedUpdatedAt">The session UpdatedAt the caller read before authorizing. Must exactly match the stored stamp or the append rejects.</param>
+    /// <param name="events">The events to append, in order. Must not be null or empty and must carry no nulls.</param>
+    /// <param name="cancellationToken">Abandons the append.</param>
+    /// <param name="logger">The logger, or null for no logging.</param>
+    /// <param name="scope">The pre-built scope entries, or null for no scope entries.</param>
+    /// <returns>The write result.</returns>
+    let appendHostAsyncWithLogger
+        (eventStore: ISessionEventStore)
+        (tenant: TenantId)
+        (sessionId: SessionId)
+        (expectedUpdatedAt: DateTimeOffset)
+        (events: IReadOnlyList<SessionEvent>)
+        (cancellationToken: CancellationToken)
+        (logger: ILogger | null)
+        (scope: IReadOnlyList<KeyValuePair<string, obj>> | null)
+        : Task<JournalWriteResult> =
+        task {
+            let! result = appendHostAsync eventStore tenant sessionId expectedUpdatedAt events cancellationToken
+
             reportOutcome logger scope result
             return result
         }

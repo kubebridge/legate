@@ -228,12 +228,19 @@ and [<Sealed>] ReplyPayload(reply: Reply) =
 /// the stable <c>$type</c> discriminators
 /// <see cref="T:Legate.UserMessagePayload" /> and
 /// <see cref="T:Legate.ReplyPayload" /> declare; the envelope's own fields
-/// (delivery mode, consumed flag, position) serialise flat. Position is
-/// the store-assigned per-session ordering key: entries consume in
-/// position order, and a store assigns the next position on append, so
+/// (delivery mode, consumed flag, position, turn identity) serialise flat.
+/// Position is the store-assigned per-session ordering key: entries consume
+/// in position order, and a store assigns the next position on append, so
 /// readers never observe two entries with the same position in one
-/// session. Consumed entries stay readable until the implementation's
-/// retention policy removes them; ReadPendingInbox never returns one.
+/// session. TurnId is the stable durable identity of the real turn this
+/// entry runs as, assigned once at accept for user messages: distinct queued
+/// user messages never share an identity, including the synthetic journal
+/// prime bootstrap. Reply entries carry the default (unstamped) TurnId
+/// sentinel and never start a turn; they resume the suspended real turn.
+/// Legacy rows without a stamped identity read as the default sentinel and
+/// are bound on first claim without rewriting history. Consumed entries stay
+/// readable until the implementation's retention policy removes them;
+/// ReadPendingInbox never returns one.
 /// Constructible from C# through property setters and serialises with
 /// System.Text.Json.
 [<CLIMutable; NoComparison>]
@@ -254,6 +261,11 @@ type InboxEntry =
         Consumed: bool
         /// When the entry was appended.
         AppendedAt: DateTimeOffset
+        /// The stable durable identity of the real turn this entry runs as,
+        /// assigned at accept for user messages. Distinct user messages carry
+        /// distinct identities; reply entries and legacy rows carry the default
+        /// (unstamped) sentinel.
+        TurnId: TurnId
     }
 
 /// One bounded page of the session list: what
@@ -308,6 +320,8 @@ type CompletionOutboxEntry =
         Tenant: TenantId
         /// The session that completed.
         SessionId: SessionId
+        /// Immutable tenant destination captured by the first enqueue. Null means unsupported old data.
+        DestinationId: string | null
         /// The stable key the runtime minted at settlement; sinks
         /// deduplicate on it because delivery is at-least-once. Never null.
         IdempotencyKey: string
@@ -378,22 +392,45 @@ type CompletionOutboxEntry =
 /// change and its timestamp land together or not at all.</description></item>
 /// <item><description><b>GrantSessionTool</b> is atomic: the grant and its
 /// timestamp land together or not at all.</description></item>
+/// <item><description><b>ConsumeInboxUnderClaim</b>,
+/// <b>UpdateSessionStateUnderClaim</b>, and
+/// <b>GrantSessionToolUnderClaim</b> are atomic: the claim token plus the
+/// current turn and attempt are checked in the same statement or
+/// transaction as the write, so a takeover between a preliminary
+/// verification and the write rejects atomically with zero effects.
+/// A retry under the same live claim is idempotent: an already-consumed
+/// position, the already-applied state, or the already-stored grant
+/// observes the held outcome with no further effects.</description></item>
 /// </list>
 ///
 /// <para>Fencing rules implementations and callers must honour: every side
-/// effect performed on behalf of a turn (checkpoint, settle, abort, and
-/// any tool call or journal write the runtime makes after claiming) must
-/// verify the claim token at the last moment, immediately before the
-/// effect. A correlation id is evidence, not authority; only
-/// <see cref="T:Legate.TurnClaim" />.Token is. A stale token must never
-/// produce an effect: renew, checkpoint, settle, and abort return the
-/// lost/rejected outcomes instead of acting. Completion delivery is fenced
+/// effect performed on behalf of a turn (checkpoint, settle, abort,
+/// fenced inbox consumption, fenced execution lifecycle, fenced
+/// persistent grants, and any tool call or journal write the runtime
+/// makes after claiming) must verify the claim token at the last moment,
+/// immediately before the effect. A correlation id is evidence, not
+/// authority; only <see cref="T:Legate.TurnClaim" />.Token is. A stale
+/// token must never produce an effect: renew, checkpoint, settle, abort,
+/// and the fenced nonterminal writes return the lost/rejected outcomes
+/// instead of acting. Custom providers implement the fencing with no
+/// unsafe fallback. Completion delivery is fenced
 /// the same way on the outbox lease: the re-driver claims a row, verifies
 /// the lease owner at the last moment before
 /// <see cref="M:Legate.ISessionCompletionSink.Notify*" />, notifies, then
 /// marks delivered under the same owner; a stale owner notifies nothing
 /// and marks nothing, and an inline delivery overlapping a re-drive
 /// deduplicates on the shared idempotency key.</para>
+/// One bounded recovery-discovery page. IDs are evidence, never execution authority.
+[<CLIMutable; NoComparison>]
+type SessionCandidatePage =
+    {
+        /// Tenant-scoped matching IDs, in immutable ordinal ascending order.
+        Items: IReadOnlyList<SessionId>
+        /// Versioned scope-bound continuation with a finite upper ID fence, or null at end.
+        Continuation: string | null
+    }
+
+/// Required durable session and recovery-discovery contract for custom providers.
 type ISessionStore =
 
     // ── Sessions ──
@@ -445,6 +482,26 @@ type ISessionStore =
         continuation: string | null *
         cancellationToken: CancellationToken ->
             Task<SessionPage>
+
+    /// Discovers IDs using only exact tenant, state and a non-null current turn.
+    /// Does not decode options, inbox or control records. Strict reads validate each candidate separately.
+    /// Uses ordinal immutable-ID keyset paging and a finite upper fence captured on the first page.
+    /// Concurrent eligibility changes are rechecked on load; this is not a cross-page snapshot.
+    /// <param name="tenant">The exact tenant scope.</param>
+    /// <param name="state">A defined lifecycle state.</param>
+    /// <param name="pageSize">Maximum emitted IDs, from 1 through 1000.</param>
+    /// <param name="continuation">The previous page's scope-bound cursor, or null for a fresh sweep.</param>
+    /// <param name="cancellationToken">Cancels this read-only scan.</param>
+    /// <returns>A bounded independent ID list and advancing cursor, or null continuation at end.</returns>
+    /// <exception cref="T:System.ArgumentException">The cursor is malformed or belongs to another tenant/state.</exception>
+    /// <exception cref="T:System.ArgumentOutOfRangeException">The page size or state is invalid.</exception>
+    abstract ListRecoveryCandidates:
+        tenant: TenantId *
+        state: SessionState *
+        pageSize: int *
+        continuation: string | null *
+        cancellationToken: CancellationToken ->
+            Task<SessionCandidatePage>
 
     /// Updates a session's lifecycle state and stamps
     /// <see cref="T:Legate.Session" />.UpdatedAt. Atomic: the state change
@@ -523,14 +580,16 @@ type ISessionStore =
     // ── Inbox ──
 
     /// Appends one message to the session's inbox with its delivery mode.
-    /// Atomic: the entry and its assigned position become visible
-    /// together.
+    /// Atomic: the entry, its assigned position, and its durable real-turn
+    /// identity become visible together. User messages are assigned a fresh
+    /// stable TurnId at accept; reply entries carry the default (unstamped)
+    /// sentinel and never start a turn.
     /// <param name="tenant">The tenant the session belongs to.</param>
     /// <param name="sessionId">The session to append to.</param>
     /// <param name="payload">What the entry carries: a user message or a reply. Must not be null.</param>
     /// <param name="delivery">How the message was delivered.</param>
     /// <param name="cancellationToken">Token that abandons the append.</param>
-    /// <returns>The stored entry, position and timestamp stamped by the store.</returns>
+    /// <returns>The stored entry, position, real-turn identity, and timestamp stamped by the store.</returns>
     /// <exception cref="T:System.ArgumentNullException">The payload is null.</exception>
     /// <exception cref="T:Legate.SessionNotFoundException">The session id does not exist in this tenant.</exception>
     abstract AppendInboxMessage:
@@ -568,9 +627,13 @@ type ISessionStore =
     // ── Claims and leases ──
 
     /// Claims the session's next pending turn under a lease. Atomic:
-    /// exactly one caller wins a turn. Returns the missing lease state
-    /// when the session has no claimable turn, so the caller branches on
-    /// the result rather than catching an exception.
+    /// exactly one caller wins a turn, bound to the accepted entry's durable
+    /// real-turn identity: a user message claims under its stamped TurnId,
+    /// never a fresh synthetic bootstrap identity, so distinct queued entries
+    /// yield distinct durable TurnIds. A reply resumes the open turn with the
+    /// attempt incremented and never starts one. Returns the missing lease
+    /// state when the session has no claimable turn, so the caller branches
+    /// on the result rather than catching an exception.
     /// <param name="tenant">The tenant the session belongs to.</param>
     /// <param name="sessionId">The session whose next turn to claim.</param>
     /// <param name="owner">The claim owner identity. Must not be null.</param>
@@ -672,6 +735,89 @@ type ISessionStore =
     abstract AbortTurn:
         tenant: TenantId * claim: TurnClaim * cancellationToken: CancellationToken -> Task<TurnLeaseState>
 
+    // ── Fenced nonterminal writes ──
+
+    /// Consumes inbox entries under the claim: the turn-owned Inject and
+    /// reply consumption the runtime folds or resumes. Fenced: the token
+    /// plus the current turn and attempt are checked in the same statement
+    /// or transaction as the write, so a takeover between a preliminary
+    /// verification and the write rejects atomically with zero effects.
+    /// Atomic and idempotent: consuming an already-consumed position under
+    /// the same live claim observes the held outcome with no further
+    /// effects. A stale or missing claim consumes nothing and returns the
+    /// lost or missing lease state. Host and idle paths keep the unfenced
+    /// <see cref="M:Legate.ISessionStore.MarkInboxConsumed*" />.
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="claim">The claim fencing the consumption. Must not be null.</param>
+    /// <param name="sessionId">The session whose entries to consume.</param>
+    /// <param name="positions">The positions to consume. Must not be null.</param>
+    /// <param name="cancellationToken">Token that abandons the consume.</param>
+    /// <returns>The lease state after the fenced consume: held when the consume landed, lost or missing otherwise.</returns>
+    /// <exception cref="T:System.ArgumentNullException">The claim or the position list is null.</exception>
+    /// <exception cref="T:Legate.SessionNotFoundException">The session id does not exist in this tenant.</exception>
+    abstract ConsumeInboxUnderClaim:
+        tenant: TenantId *
+        claim: TurnClaim *
+        sessionId: SessionId *
+        positions: IReadOnlyList<int64> *
+        cancellationToken: CancellationToken ->
+            Task<TurnLeaseState>
+
+    /// Updates the execution-owned lifecycle state under the claim:
+    /// <see cref="F:Legate.SessionState.Running" /> or
+    /// <see cref="F:Legate.SessionState.WaitingForInput" /> only. Fenced:
+    /// the token plus the current turn and attempt are checked in the same
+    /// statement or transaction as the write, so a takeover between a
+    /// preliminary verification and the write rejects atomically with zero
+    /// effects. Atomic: the state change and its timestamp land together.
+    /// A retry under the same live claim observes the held outcome. Host
+    /// and idle lifecycle paths keep the unfenced
+    /// <see cref="M:Legate.ISessionStore.UpdateSessionState*" />.
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="claim">The claim fencing the update. Must not be null.</param>
+    /// <param name="sessionId">The session to update.</param>
+    /// <param name="state">The new execution-owned lifecycle state: Running or WaitingForInput.</param>
+    /// <param name="cancellationToken">Token that abandons the update.</param>
+    /// <returns>The lease state after the fenced update: held when the update landed, lost or missing otherwise.</returns>
+    /// <exception cref="T:System.ArgumentNullException">The claim is null.</exception>
+    /// <exception cref="T:Legate.SessionNotFoundException">The session id does not exist in this tenant.</exception>
+    /// <exception cref="T:Legate.InvalidSessionStateException">The session is Closed, or the state is not execution-owned.</exception>
+    abstract UpdateSessionStateUnderClaim:
+        tenant: TenantId *
+        claim: TurnClaim *
+        sessionId: SessionId *
+        state: SessionState *
+        cancellationToken: CancellationToken ->
+            Task<TurnLeaseState>
+
+    /// Records an AllowForSession grant under the claim: the tool name joins
+    /// the session's <see cref="P:Legate.Session.PermissionGrants" /> and
+    /// stays there across restarts. Fenced: the token plus the current turn
+    /// and attempt are checked in the same statement or transaction as the
+    /// write, so a takeover between a preliminary verification and the
+    /// write rejects atomically with zero effects. Atomic and idempotent:
+    /// the grant and the <see cref="T:Legate.Session" />.UpdatedAt stamp
+    /// land together, and granting a tool name twice stores it once while
+    /// still observing the held outcome. Host permission paths keep the
+    /// unfenced <see cref="M:Legate.ISessionStore.GrantSessionTool*" />.
+    /// <param name="tenant">The tenant the session belongs to.</param>
+    /// <param name="claim">The claim fencing the grant. Must not be null.</param>
+    /// <param name="sessionId">The session to grant the tool for.</param>
+    /// <param name="toolName">The tool name the host allowed for the session. Must be a non-empty string.</param>
+    /// <param name="cancellationToken">Token that abandons the grant.</param>
+    /// <returns>The lease state after the fenced grant: held when the grant landed, lost or missing otherwise.</returns>
+    /// <exception cref="T:System.ArgumentException">The tool name is null, empty, or whitespace.</exception>
+    /// <exception cref="T:System.ArgumentNullException">The claim is null.</exception>
+    /// <exception cref="T:Legate.SessionNotFoundException">The session id does not exist in this tenant.</exception>
+    /// <exception cref="T:Legate.InvalidSessionStateException">The session is Closed.</exception>
+    abstract GrantSessionToolUnderClaim:
+        tenant: TenantId *
+        claim: TurnClaim *
+        sessionId: SessionId *
+        toolName: string *
+        cancellationToken: CancellationToken ->
+            Task<TurnLeaseState>
+
     // ── Completion outbox ──
 
     /// Enqueues one completion delivery at settlement: the row carries the
@@ -688,8 +834,23 @@ type ISessionStore =
     /// <exception cref="T:System.ArgumentException">The completion's idempotency key is null, empty, or whitespace.</exception>
     /// <exception cref="T:Legate.SessionNotFoundException">The session id does not exist in this tenant.</exception>
     abstract EnqueueCompletionOutbox:
-        tenant: TenantId * completion: SessionCompletion * cancellationToken: CancellationToken ->
+        tenant: TenantId * destinationId: string * completion: SessionCompletion * cancellationToken: CancellationToken ->
             Task<CompletionOutboxEntry>
+
+    /// Renews only the still-live owner's completion delivery lease. Expiry or takeover returns false.
+    /// <param name="tenant">The delivery tenant.</param>
+    /// <param name="idempotencyKey">The original immutable key.</param>
+    /// <param name="owner">The unique delivery attempt owner.</param>
+    /// <param name="leaseDuration">The positive lease extension.</param>
+    /// <param name="cancellationToken">Cancels renewal.</param>
+    /// <returns>True only if the current lease was extended atomically.</returns>
+    abstract RenewCompletionClaim:
+        tenant: TenantId *
+        idempotencyKey: string *
+        owner: string *
+        leaseDuration: TimeSpan *
+        cancellationToken: CancellationToken ->
+            Task<bool>
 
     /// Claims pending completion rows under a delivery lease, oldest first,
     /// bounded to one batch the re-driver may act on at once. Process-wide
@@ -754,6 +915,12 @@ type ISessionStore =
 
     /// Lists sessions of the tenant with pending inbox entries, bounded to
     /// a batch. The dispatcher polls this to wake sessions with work.
+    /// Sessions with no pending inbox entries are never listed here, even
+    /// when they still carry a live turn (a crash orphan whose claim
+    /// consumed the inbox while the row stayed Idle): the dispatcher's
+    /// internal live-turn sweep wakes those through a lease-gated priming
+    /// claim, aligned with the live-turn definition
+    /// <see cref="M:Legate.ISessionStore.CountRunningSessions*" /> counts by.
     /// <param name="tenant">The tenant whose pending sessions to list.</param>
     /// <param name="maxBatch">The maximum number of sessions in the batch; must be positive.</param>
     /// <param name="cancellationToken">Token that abandons the query.</param>
@@ -780,7 +947,10 @@ type ISessionStore =
 
     /// Counts the sessions with a turn in flight across every tenant the
     /// process serves, the per-process capacity input. Atomic snapshot per
-    /// call.
+    /// call. Live-turn-based: a session counts while its
+    /// <see cref="P:Legate.Session.CurrentTurnId" /> is set and stops
+    /// counting when settlement clears it, which is also the predicate the
+    /// dispatcher's internal live-turn orphan sweep pages by.
     /// <param name="cancellationToken">Token that abandons the count.</param>
     /// <returns>The session count with a turn in flight.</returns>
     abstract CountRunningSessions: cancellationToken: CancellationToken -> Task<int>

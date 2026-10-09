@@ -12,6 +12,7 @@ type internal FakeClockTimer =
         mutable Due: DateTimeOffset
         mutable Period: TimeSpan
         Callback: TimerCallback
+        State: obj | null
         mutable Cancelled: bool
     }
 
@@ -85,7 +86,7 @@ type FakeClock(start: DateTimeOffset) =
                             true)
 
                 if repeat then
-                    timer.Callback.Invoke(null)
+                    timer.Callback.Invoke(timer.State)
 
     /// Moves the clock to the given instant; must not move backwards.
     /// <param name="target">The instant to jump to.</param>
@@ -101,7 +102,7 @@ type FakeClock(start: DateTimeOffset) =
 
     override _.GetUtcNow() = instant
 
-    override _.CreateTimer(callback: TimerCallback, _state: obj, dueTime: TimeSpan, period: TimeSpan) : ITimer =
+    override _.CreateTimer(callback: TimerCallback, state: obj, dueTime: TimeSpan, period: TimeSpan) : ITimer =
         if isNull (box callback) then
             raise (ArgumentNullException(nameof callback))
 
@@ -119,6 +120,7 @@ type FakeClock(start: DateTimeOffset) =
                         Due = instant + (if dueTime < TimeSpan.Zero then TimeSpan.Zero else dueTime)
                         Period = (if period < TimeSpan.Zero then TimeSpan.Zero else period)
                         Callback = callback
+                        State = state
                         Cancelled = false
                     }
 

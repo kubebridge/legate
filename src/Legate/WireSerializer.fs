@@ -177,6 +177,8 @@ module internal WireSerialization =
     /// wire are still always DTOs.
     let boundTypes: Type list =
         [
+            typeof<SessionRouteRequest>
+            typeof<SessionRouteResponse>
             typeof<SessionActorMessage>
             typeof<SessionActor.SuspendableActorMessage>
             typeof<SessionPromptReply>
@@ -357,7 +359,19 @@ type internal WireSerializer(system: ExtendedActorSystem) =
                         $"Wire manifest '{manifest}' is newer than the registered v{wireCase.Version}."
                 elif
                     version <> wireCase.Version
-                    && not (wireCase.Version > 1 && version = wireCase.Version - 1)
+                    && not (
+                        wireCase.Version > 1
+                        && version = wireCase.Version - 1
+                        && name <> "AbortSession"
+                        && name <> "SuspendableAbortSession"
+                        && name <> "ScopedRequest"
+                        && name <> "ScopedResponse"
+                        && name <> "EventBatch"
+                        && name <> "SessionClosed"
+                        && name <> "SetAgentApplied"
+                        && name <> "SetAgentPending"
+                        && name <> "SessionEvent"
+                    )
                 then
                     this.refuse
                         Telemetry.RejectionFailed

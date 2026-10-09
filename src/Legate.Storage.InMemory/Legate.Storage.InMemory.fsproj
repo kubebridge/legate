@@ -7,9 +7,13 @@
 
   <!-- Compile order is explicit: register every new file here, in dependency order. -->
   <ItemGroup>
+    <Compile Include="AssemblyInfo.fs" />
+    <Compile Include="ControlTargetProtocol.fs" />
+    <Compile Include="RecoveryCandidateCursor.fs" />
     <Compile Include="InMemoryDatabase.fs" />
-    <Compile Include="InMemorySessionStore.fs" />
+    <Compile Include="InMemoryCompletionEra.fs" />
     <Compile Include="InMemorySessionEventStore.fs" />
+    <Compile Include="InMemorySessionStore.fs" />
     <Compile Include="InMemoryAgentStore.fs" />
     <Compile Include="InMemoryBlobStore.fs" />
     <Compile Include="InMemoryAgentPackageStore.fs" />

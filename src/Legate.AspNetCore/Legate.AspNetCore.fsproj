@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>Legate.AspNetCore</RootNamespace>
+    <Description>ASP.NET Core registration and tenant-bound request integration for Legate.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Hosting.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <ProjectReference Include="../Legate/Legate.fsproj" />
+    <ProjectReference Include="../Legate.Storage.InMemory/Legate.Storage.InMemory.fsproj" />
+    <ProjectReference Include="../Legate.Workspace.Process/Legate.Workspace.Process.fsproj" />
+  </ItemGroup>
+</Project>

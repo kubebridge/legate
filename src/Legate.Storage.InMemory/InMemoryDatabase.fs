@@ -60,6 +60,7 @@ type InMemoryDatabase(timeProvider: TimeProvider, options: InMemoryStoreOptions)
 
     // Sessions keyed by (tenant, session id).
     let sessions = Dictionary<(TenantId * SessionId), Session>()
+    let controlStates = Dictionary<(TenantId * SessionId), string>()
 
     // Inbox rows per (tenant, session id), append-ordered.
     let inboxes = Dictionary<(TenantId * SessionId), List<InboxEntry>>()
@@ -77,6 +78,16 @@ type InMemoryDatabase(timeProvider: TimeProvider, options: InMemoryStoreOptions)
     // Terminal settlements per (tenant, session id, turn id): first
     // outcome wins; retries observe it.
     let settlements = Dictionary<(TenantId * SessionId * TurnId), TurnStatus>()
+
+    // Atomic terminal settlement receipts per (tenant, session id, inbox
+    // position): the narrow provider-supported settlement bookkeeping
+    // (issue 363). Keyed by immutable entry position because multiple real
+    // entries share one prime; identical retry returns AlreadyApplied with
+    // the recorded result and key, conflicting verdict rejects.
+    let executionAdmissions = Dictionary<(TenantId * SessionId * int64), TurnClaim>()
+
+    let executionSettlements =
+        Dictionary<(TenantId * SessionId * int64), string * SessionSettlementOutcome>()
 
     // Usage checkpoints per (tenant, session id, turn id): last write wins.
     let usageCheckpoints = Dictionary<(TenantId * SessionId * TurnId), UsageSummary>()
@@ -135,6 +146,7 @@ type InMemoryDatabase(timeProvider: TimeProvider, options: InMemoryStoreOptions)
     /// The session rows, keyed by (tenant, session id). Internal: stores
     /// mutate through the gate only.
     member internal _.Sessions = sessions
+    member internal _.ControlStates = controlStates
 
     /// The inbox rows per (tenant, session id), in append order.
     member internal _.Inboxes = inboxes
@@ -150,6 +162,12 @@ type InMemoryDatabase(timeProvider: TimeProvider, options: InMemoryStoreOptions)
 
     /// The terminal settlement per (tenant, session id, turn id).
     member internal _.Settlements = settlements
+
+    /// The atomic execution admissions per (tenant, session id, position).
+    member internal _.ExecutionAdmissions = executionAdmissions
+
+    /// The atomic execution settlement receipts per (tenant, session id, position).
+    member internal _.ExecutionSettlements = executionSettlements
 
     /// The last usage checkpoint per (tenant, session id, turn id).
     member internal _.UsageCheckpoints = usageCheckpoints
@@ -240,7 +258,9 @@ and internal OpenTurnRow(turnId: TurnId, attempt: int) =
 /// the mark lands; a delivered row stays until the retention purge removes
 /// it. The lease owner and expiry fence Notify: only the live owner
 /// delivers and marks.
-and internal OutboxRow(tenant: TenantId, completion: SessionCompletion, createdAt: DateTimeOffset) =
+and internal OutboxRow
+    (tenant: TenantId, destinationId: string, completion: SessionCompletion, createdAt: DateTimeOffset) =
+    member _.DestinationId = destinationId
 
     /// The tenant the session belongs to.
     member val Tenant = tenant with get, set

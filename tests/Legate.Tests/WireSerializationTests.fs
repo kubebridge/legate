@@ -4,6 +4,7 @@ module Legate.Tests.WireSerializationTests
 open System
 open System.Collections.Generic
 open System.Diagnostics.Metrics
+open System.Text
 open System.Text.Json
 open System.Threading
 open Akka.Actor
@@ -32,6 +33,7 @@ let private textEntry (text: string) (position: int64) : InboxEntry =
         Delivery = DeliveryMode.Queue
         Consumed = false
         AppendedAt = DateTimeOffset.UtcNow
+        TurnId = TurnId.New()
     }
 
 /// Builds a stored session with null host hooks, the cluster-safe shape.
@@ -65,6 +67,7 @@ let private completedResult () : TurnResult =
 let private settledCompletion () : TurnLoop.TurnLoopCompletion =
     {
         Result = completedResult ()
+        TurnId = TurnId.Parse("01ARZ3NDEKTSV4RRFFQ69G5FAX")
         HasPendingInjects = false
         Suspension = None
     }
@@ -78,6 +81,7 @@ let private liveCursor () : TurnLoop.TurnLoopSuspension =
 
     {
         RequestId = "req-1"
+        OriginTurnId = TurnId.Parse("01ARZ3NDEKTSV4RRFFQ69G5FAX")
         ToolName = "probe-tool"
         ToolCallId = "call-1"
         Kind = TurnLoop.SuspensionKind.PermissionSuspension
@@ -124,7 +128,9 @@ let private everyLiveMessage () : obj list =
 
     let eventBatch: CrossNodeSubscriptions.CrossNodeEventBatch =
         {
+            Tenant = session.Tenant
             SessionId = session.Id
+            SubscriberToken = "wire-subscriber"
             Events =
                 [|
                     TextDeltaEvent(session.Id, TurnId.New(), Nullable<int64>(7L), DateTimeOffset.UtcNow, "wire event")
@@ -147,6 +153,7 @@ let private everyLiveMessage () : obj list =
             entry,
             {
                 Result = completedResult ()
+                TurnId = TurnId.Parse("01ARZ3NDEKTSV4RRFFQ69G5FAX")
                 HasPendingInjects = true
                 Suspension = Some(liveCursor ())
             },
@@ -159,7 +166,7 @@ let private everyLiveMessage () : obj list =
         InjectPrompt(entry.Payload, CancellationToken.None) :> obj
         InterruptPrompt(entry.Payload, CancellationToken.None) :> obj
         CloseSession(CancellationToken.None) :> obj
-        AbortSession(StopCause.ExplicitAbort, "host abort", CancellationToken.None) :> obj
+        ObserveHostAbort(session.Tenant, session.Id, TurnId.Parse("01ARZ3NDEKTSV4RRFFQ69G5FAX")) :> obj
         CompactSession(CancellationToken.None) :> obj
         GetSnapshot :> obj
         SessionTurnSettled(entry, completedResult ()) :> obj
@@ -169,12 +176,13 @@ let private everyLiveMessage () : obj list =
         SessionActor.SuspendableInterruptPrompt(entry.Payload, CancellationToken.None) :> obj
         finished :> obj
         suspended :> obj
-        SessionActor.SuspendableFaulted(entry, error, 1) :> obj
+        SessionActor.SuspendableFaulted(entry, error, 1, None) :> obj
         SessionActor.ReplyEntry(entry) :> obj
         SessionActor.SuspendableGetSnapshot :> obj
         SessionActor.SuspendTimedOut("req-1") :> obj
         SessionActor.SuspendableCloseSession(CancellationToken.None) :> obj
-        SessionActor.SuspendableAbortSession(StopCause.HostShutdown, "shutting down", CancellationToken.None) :> obj
+        SessionActor.SuspendableObserveHostAbort(session.Tenant, session.Id, TurnId.Parse("01ARZ3NDEKTSV4RRFFQ69G5FAX"))
+        :> obj
         SessionActor.SuspendableCompactSession(CancellationToken.None) :> obj
         SessionActor.SuspendableCheckInbox :> obj
         SessionActor.SuspendableSetAgent(agentId, CancellationToken.None) :> obj
@@ -273,25 +281,256 @@ let private toWireBytes (serializer: WireSerializer) (message: obj) : byte[] * s
     let manifest = serializer.Manifest(message)
     (serializer.ToBinary(message), manifest)
 
+[<Fact>]
+let issue395ExhaustiveWireScopeRefusalMatrixIsTypedAndFailClosed () =
+    let tenantA = TenantId.Create "wire-matrix-a"
+    let tenantB = TenantId.Create "wire-matrix-b"
+    let addressA = SessionAddress(tenantA, SessionId.New())
+    let addressB = SessionAddress(tenantB, addressA.SessionId)
+
+    let subscribe = WireDtos.SubscribeDto()
+    subscribe.Tenant <- " wire-matrix-a "
+    subscribe.SessionId <- addressA.SessionId.ToString()
+    subscribe.SubscriberToken <- "same-token"
+    let decodedSubscribe = WireDtos.ofWire subscribe
+
+    let paddedTenant =
+        Assert.Throws<SessionScopeRejectedException>(fun () -> SessionRouting.validatePayload addressA decodedSubscribe)
+
+    Assert.Equal(SessionScopeRejectionReason.AddressMismatch, paddedTenant.Reason)
+
+    let wrongScopePayload: obj =
+        ({
+            Tenant = tenantB
+            SessionId = addressB.SessionId
+            FromSequence = 0L
+            SubscriberToken = "same-token"
+        }
+        : CrossNodeSubscriptions.CrossNodeSubscribeRequest)
+
+    let wrongScope =
+        Assert.Throws<SessionScopeRejectedException>(fun () ->
+            SessionRouting.validatePayload addressA wrongScopePayload)
+
+    Assert.Equal(SessionScopeRejectionReason.AddressMismatch, wrongScope.Reason)
+
+    let wrongEvent =
+        TextDeltaEvent(SessionId.New(), TurnId.New(), Nullable<int64>(1L), DateTimeOffset.UtcNow, "wrong-session-event")
+        :> SessionEvent
+
+    let responseWithWrongEvent: CrossNodeSubscriptions.CrossNodeEventBatch =
+        {
+            Tenant = tenantA
+            SessionId = addressA.SessionId
+            SubscriberToken = "same-token"
+            Events = [| wrongEvent |] :> IReadOnlyList<SessionEvent>
+            NextCursor = 1L
+            EndOfStream = true
+        }
+
+    let wrongEventId =
+        Assert.Throws<SessionScopeRejectedException>(fun () ->
+            SessionRouting.validateResponse addressA (responseWithWrongEvent :> obj))
+
+    Assert.Equal(SessionScopeRejectionReason.ResponseMismatch, wrongEventId.Reason)
+
+    let wrongBatchTenant =
+        { responseWithWrongEvent with
+            Tenant = tenantB
+        }
+
+    let wrongBatchScope =
+        Assert.Throws<SessionScopeRejectedException>(fun () ->
+            SessionRouting.validateResponse addressA (wrongBatchTenant :> obj))
+
+    Assert.Equal(SessionScopeRejectionReason.ResponseMismatch, wrongBatchScope.Reason)
+
+    let missingToken =
+        { responseWithWrongEvent with
+            Events = Array.empty<SessionEvent> :> IReadOnlyList<SessionEvent>
+            SubscriberToken = ""
+        }
+
+    let wrongToken =
+        Assert.Throws<SessionScopeRejectedException>(fun () ->
+            SessionRouting.validateResponse addressA (missingToken :> obj))
+
+    Assert.Equal(SessionScopeRejectionReason.ResponseMismatch, wrongToken.Reason)
+
+    let dto = WireDtos.EventBatchDto()
+    dto.SessionId <- addressA.SessionId.ToString()
+    dto.SubscriberToken <- "same-token"
+    dto.Events <- [||]
+    let decodedMissingTenant = WireDtos.ofWire dto
+
+    let missingTenant =
+        Assert.Throws<SessionScopeRejectedException>(fun () ->
+            SessionRouting.validateResponse addressA decodedMissingTenant)
+
+    Assert.Equal(SessionScopeRejectionReason.ResponseMismatch, missingTenant.Reason)
+
+    let system = createWireSystem ()
+
+    try
+        let serializer = envelopeSerializerOf system
+
+        let legacy =
+            Assert.Throws<WireManifests.WireRejectedException>(fun () ->
+                serializer.FromBinary(Encoding.UTF8.GetBytes("{}"), "legate.subscription.EventBatch.v1")
+                |> ignore)
+
+        Assert.Equal(Telemetry.RejectionFailed, legacy.Reason)
+
+        let incompatible =
+            Assert.Throws<WireManifests.WireRejectedException>(fun () ->
+                serializer.FromBinary([| 0xFFuy |], "legate.subscription.EventBatch.v2")
+                |> ignore)
+
+        Assert.Equal(Telemetry.RejectionFailed, incompatible.Reason)
+    finally
+        system.Terminate().GetAwaiter().GetResult() |> ignore
+
 // ────────────────── Manifest table ──────────────────
 
 [<Fact>]
-let ``Manifest table carries one unique legate manifest per wire case at v1`` () =
+let ``Manifest table versions session-bearing and targeted routing payloads at v2`` () =
     let manifests = WireManifests.cases |> List.map WireManifests.manifestOf
 
-    manifests.Length |> should equal 41
+    manifests.Length |> should equal 43
     manifests |> List.distinct |> List.length |> should equal manifests.Length
 
     for wireCase in WireManifests.cases do
         let manifest = WireManifests.manifestOf wireCase
         manifest.StartsWith("legate.", StringComparison.Ordinal) |> should equal true
-        manifest.EndsWith(".v1", StringComparison.Ordinal) |> should equal true
-        wireCase.Version |> should equal 1
+
+        let version =
+            if
+                wireCase.Name = "AbortSession"
+                || wireCase.Name = "SuspendableAbortSession"
+                || wireCase.Name = "ScopedRequest"
+                || wireCase.Name = "ScopedResponse"
+                || wireCase.Name = "EventBatch"
+                || wireCase.Name = "SessionClosed"
+                || wireCase.Name = "SetAgentApplied"
+                || wireCase.Name = "SetAgentPending"
+                || wireCase.Name = "SessionEvent"
+            then
+                2
+            else
+                1
+
+        manifest.EndsWith($".v{version}", StringComparison.Ordinal) |> should equal true
+        wireCase.Version |> should equal version
         (wireCase.MaxBytes >= 1) |> should equal true
         wireCase.DtoType.IsClass |> should equal true
 
     let dtoTypes = WireManifests.cases |> List.map (fun wireCase -> wireCase.DtoType)
     dtoTypes |> List.distinct |> List.length |> should equal dtoTypes.Length
+
+[<Fact>]
+let ``Legacy untargeted abort manifests and missing targeted versions fail closed`` () =
+    use system = createWireSystem ()
+    let serializer = envelopeSerializerOf system
+
+    let bytes =
+        System.Text.Encoding.UTF8.GetBytes("{\"Cause\":0,\"Reason\":\"old abort\"}")
+
+    for manifest in
+        [
+            "legate.actor.AbortSession.v1"
+            "legate.entity.SuspendableAbortSession.v1"
+        ] do
+        Assert.ThrowsAny<Exception>(fun () -> serializer.FromBinary(bytes, manifest) |> ignore)
+        |> ignore
+
+    Assert.Throws<InvalidOperationException>(fun () -> WireDtos.ofWire (WireDtos.AbortSessionDto()) |> ignore)
+    |> ignore
+
+    Assert.Throws<InvalidOperationException>(fun () ->
+        WireDtos.toWire (AbortSession(StopCause.ExplicitAbort, "local", CancellationToken.None))
+        |> ignore)
+    |> ignore
+
+[<Fact>]
+let ``Superseded session-bearing v1 manifests fail closed without a minus-one read`` () =
+    use system = createWireSystem ()
+    let serializer = envelopeSerializerOf system
+
+    let bytes = System.Text.Encoding.UTF8.GetBytes("{\"Session\":null}")
+
+    for manifest in
+        [
+            "legate.actor.SessionClosed.v1"
+            "legate.entity.SetAgentApplied.v1"
+            "legate.entity.SetAgentPending.v1"
+            "legate.event.SessionEvent.v1"
+        ] do
+        let refused =
+            Assert.Throws<WireManifests.WireRejectedException>(fun () ->
+                serializer.FromBinary(bytes, manifest) |> ignore)
+
+        Assert.Equal(Telemetry.RejectionFailed, refused.Reason)
+
+[<Fact>]
+let ``Completion routing refusals cross scoped responses as kind 22`` () =
+    let tenant = TenantId.Create "acme"
+    let sessionId = SessionId.New()
+
+    let refusal =
+        {
+            Tenant = tenant
+            SessionId = sessionId
+            DestinationId = "receiver-a"
+            Reason = CompletionRoutingReason.Unknown
+        }
+
+    let response: SessionRouteResponse =
+        {
+            Address = SessionAddress(tenant, sessionId).Key
+            Owner = "owner-a"
+            Payload = refusal :> obj
+        }
+
+    let dto = WireDtos.toWire (response :> obj) :?> WireDtos.ScopedResponseDto
+
+    dto.Kind |> should equal 22
+    dto.SessionId.Value |> should equal sessionId
+    dto.DestinationId |> should equal "receiver-a"
+    dto.RoutingReason |> should equal CompletionRoutingReason.Unknown
+
+    match WireDtos.ofWire dto with
+    | :? SessionRouteResponse as back ->
+        match back.Payload with
+        | :? CompletionRoutingRefused as rebuilt ->
+            rebuilt.Tenant |> should equal tenant
+            rebuilt.SessionId |> should equal sessionId
+            rebuilt.DestinationId |> should equal "receiver-a"
+            rebuilt.Reason |> should equal CompletionRoutingReason.Unknown
+        | other -> failwith $"Expected a routing refusal but rebuilt '{other.GetType().Name}'."
+    | other -> failwith $"Expected a scoped response but rebuilt '{other.GetType().Name}'."
+
+[<Fact>]
+let ``Routing refusal decoding rejects unknown reasons and missing scope`` () =
+    let tenant = TenantId.Create "acme"
+    let sessionId = SessionId.New()
+
+    let invalidReason = WireDtos.ScopedResponseDto()
+    invalidReason.Format <- 2
+    invalidReason.Address <- SessionAddress(tenant, sessionId).Key
+    invalidReason.Kind <- 22
+    invalidReason.SessionId <- Nullable sessionId
+    invalidReason.RoutingReason <- enum<CompletionRoutingReason> 99
+
+    (fun () -> WireDtos.ofWire invalidReason |> ignore)
+    |> should throw typeof<InvalidOperationException>
+
+    let missingSession = WireDtos.ScopedResponseDto()
+    missingSession.Format <- 2
+    missingSession.Address <- SessionAddress(tenant, sessionId).Key
+    missingSession.Kind <- 22
+
+    (fun () -> WireDtos.ofWire missingSession |> ignore)
+    |> should throw typeof<InvalidOperationException>
 
 [<Fact>]
 let ``No manifests stay reserved after the subscription promotion`` () =
@@ -363,21 +602,80 @@ let ``Prompt DTO round-trips its payload and drops its token`` () =
     | other -> failwith $"Expected a SessionActorMessage but rebuilt '{other.GetType().Name}'."
 
 [<Fact>]
-let ``Abort DTO carries its cause and reason`` () =
-    let dto =
-        WireDtos.toWire (AbortSession(StopCause.HostShutdown, "shutting down", CancellationToken.None))
-        :?> WireDtos.AbortSessionDto
+let ``Scoped route DTOs round-trip only their explicit typed fields`` () =
+    let address = SessionAddress(TenantId.Default, SessionId.New())
 
-    dto.Cause |> should equal StopCause.HostShutdown
-    dto.Reason |> should equal "shutting down"
+    let request: SessionRouteRequest =
+        {
+            Address = address.Key
+            Scope = address.Tenant.Value
+            Payload = SessionRouteProbe
+        }
+
+    let requestDto = WireDtos.toWire request
+
+    let requestJson =
+        JsonSerializer.Serialize(requestDto, requestDto.GetType(), WireSerialization.wireOptions ())
+
+    let requestBack =
+        match JsonSerializer.Deserialize(requestJson, requestDto.GetType(), WireSerialization.wireOptions ()) with
+        | null -> failwith "Expected the scoped request DTO to deserialise."
+        | back -> WireDtos.ofWire back
+
+    match requestBack with
+    | :? SessionRouteRequest as rebuilt ->
+        rebuilt.Address |> should equal address.Key
+        rebuilt.Scope |> should equal address.Tenant.Value
+        rebuilt.Payload |> should equal SessionRouteProbe
+    | other -> failwith $"Expected scoped request but rebuilt '{other.GetType().Name}'."
+
+    let response: SessionRouteResponse =
+        {
+            Address = address.Key
+            Owner = "akka://test@127.0.0.1:2551"
+            Payload = SessionRouteAccepted
+        }
+
+    let responseDto = WireDtos.toWire response
+
+    let responseJson =
+        JsonSerializer.Serialize(responseDto, responseDto.GetType(), WireSerialization.wireOptions ())
+
+    let responseBack =
+        match JsonSerializer.Deserialize(responseJson, responseDto.GetType(), WireSerialization.wireOptions ()) with
+        | null -> failwith "Expected the scoped response DTO to deserialise."
+        | back -> WireDtos.ofWire back
+
+    match responseBack with
+    | :? SessionRouteResponse as rebuilt ->
+        rebuilt.Address |> should equal address.Key
+        rebuilt.Payload |> should equal SessionRouteAccepted
+    | other -> failwith $"Expected scoped response but rebuilt '{other.GetType().Name}'."
+
+    let oldRequest = WireDtos.ScopedRequestDto()
+    oldRequest.Format <- 1
+
+    Assert.Throws<InvalidOperationException>(fun () -> WireDtos.ofWire oldRequest |> ignore)
+    |> ignore
+
+[<Fact>]
+let ``Abort wake DTO carries exact tenant session and target without authority`` () =
+    let session = SessionId.New()
+    let turn = TurnId.New()
+
+    let dto =
+        WireDtos.toWire (ObserveHostAbort(TenantId.Default, session, turn)) :?> WireDtos.AbortSessionDto
+
+    dto.ControlVersion |> should equal 2
+    dto.TargetTurnId |> should equal turn
 
     match WireDtos.ofWire dto with
     | :? SessionActorMessage as message ->
         match message with
-        | AbortSession(cause, reason, token) ->
-            cause |> should equal StopCause.HostShutdown
-            reason |> should equal "shutting down"
-            token |> should equal CancellationToken.None
+        | ObserveHostAbort(tenant, receivedSession, receivedTurn) ->
+            tenant |> should equal TenantId.Default
+            receivedSession |> should equal session
+            receivedTurn |> should equal turn
         | other -> failwith $"Expected AbortSession but rebuilt '{other.GetType().Name}'."
     | other -> failwith $"Expected a SessionActorMessage but rebuilt '{other.GetType().Name}'."
 
@@ -401,7 +699,8 @@ let ``Fault DTO maps exceptions to reason strings and rebuilds the fault path`` 
     | other -> failwith $"Expected a SessionActorMessage but rebuilt '{other.GetType().Name}'."
 
     let nameless =
-        WireDtos.toWire (SessionActor.SuspendableFaulted(entry, Exception(""), 2)) :?> WireDtos.SuspendableFaultedDto
+        WireDtos.toWire (SessionActor.SuspendableFaulted(entry, Exception(""), 2, None))
+        :?> WireDtos.SuspendableFaultedDto
 
     nameless.Reason |> should equal "Exception"
     nameless.Attempt |> should equal 2
@@ -471,6 +770,7 @@ let ``Suspended cursor round-trips without its nested resume`` () =
     let completion: TurnLoop.TurnLoopCompletion =
         {
             Result = completedResult ()
+            TurnId = TurnId.Parse("01ARZ3NDEKTSV4RRFFQ69G5FAX")
             HasPendingInjects = true
             Suspension = Some(liveCursor ())
         }
@@ -483,6 +783,8 @@ let ``Suspended cursor round-trips without its nested resume`` () =
     dto.Suspension.RequestId |> should equal "req-1"
     dto.Suspension.Kind |> should equal "permission"
     dto.Suspension.PendingCall.Name |> should equal "probe-tool"
+    dto.TurnId |> should equal "01ARZ3NDEKTSV4RRFFQ69G5FAX"
+    dto.Suspension.OriginTurnId |> should equal "01ARZ3NDEKTSV4RRFFQ69G5FAX"
 
     let json = JsonSerializer.Serialize(dto, WireSerialization.wireOptions ())
 
@@ -499,6 +801,7 @@ let ``Suspended cursor round-trips without its nested resume`` () =
             attempt |> should equal 2
             granted.Contains("probe-tool") |> should equal true
             rebuilt.HasPendingInjects |> should equal true
+            rebuilt.TurnId |> should equal (TurnId.Parse("01ARZ3NDEKTSV4RRFFQ69G5FAX"))
 
             match rebuilt.Suspension with
             | None -> failwith "Expected the suspended cursor to survive the wire."
@@ -509,8 +812,20 @@ let ``Suspended cursor round-trips without its nested resume`` () =
                 cursor.InputTokens |> should equal 3L
                 cursor.HistorySnapshot.Count |> should equal 1
                 cursor.Nested |> should equal None
+                cursor.OriginTurnId |> should equal (TurnId.Parse("01ARZ3NDEKTSV4RRFFQ69G5FAX"))
         | other -> failwith $"Expected SuspendableFinished but rebuilt '{other.GetType().Name}'."
     | other -> failwith $"Expected a SuspendableActorMessage but rebuilt '{other.GetType().Name}'."
+
+[<Fact>]
+let ``Old finished payloads without turn ids default to the turn-cell fallback`` () =
+    // Wire compat (issue 289): payloads written before the additive turn-id
+    // fields read back with null ids, which the settle choke points resolve
+    // through the turn cell and the CurrentTurnId snapshot.
+    let dto = WireDtos.SuspendableFinishedDto()
+    (isNull (box dto.TurnId)) |> should equal true
+
+    let suspension = WireDtos.SuspensionDto()
+    (isNull (box suspension.OriginTurnId)) |> should equal true
 
 // ────────────────── Fail-closed envelope ──────────────────
 
@@ -690,7 +1005,7 @@ let ``HOCON fragment binds every protocol type to the wire serializer`` () =
         let key = $"{boundType.FullName}, {boundType.Assembly.GetName().Name}"
         fragment.Contains(key, StringComparison.Ordinal) |> should equal true
 
-    WireSerialization.boundTypes.Length |> should equal 13
+    WireSerialization.boundTypes.Length |> should equal 15
 
 [<Fact>]
 let ``Cluster HOCON carries the wire maximum from options`` () =

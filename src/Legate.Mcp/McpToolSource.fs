@@ -341,10 +341,12 @@ type McpToolSource
         tools :> IReadOnlyList<AITool>
 
     interface IToolSource with
-        member this.GetTools(context: ToolSourceContext) : Task<IReadOnlyList<AITool>> =
+        member this.GetTools
+            (context: ToolSourceContext, cancellationToken: CancellationToken)
+            : Task<IReadOnlyList<AITool>> =
             task {
                 try
-                    do! this.EnsureStartedAsync(CancellationToken.None)
+                    do! this.EnsureStartedAsync(cancellationToken)
 
                     if not (isNull (box failure)) then
                         return ResizeArray<AITool>() :> IReadOnlyList<AITool>
@@ -355,13 +357,15 @@ type McpToolSource
                         for session in sessions do
                             if isNull (box error) then
                                 try
-                                    let! listed = session.ListToolsAsync(CancellationToken.None)
+                                    let! listed = session.ListToolsAsync(cancellationToken)
 
                                     if not (isNull (box listed)) then
                                         for discovered in listed do
                                             if not (isNull (box discovered)) then
                                                 pairs.Add(session, discovered)
-                                with ex ->
+                                with
+                                | :? OperationCanceledException as canceled -> raise canceled
+                                | ex ->
                                     error <-
                                         $"MCP server '{session.ServerName}' failed to list tools: {ex.GetType().Name}: {ex.Message}"
 
@@ -387,7 +391,10 @@ type McpToolSource
                             | Error message ->
                                 logDegrade.Invoke(message)
                                 return ResizeArray<AITool>() :> IReadOnlyList<AITool>
-                with ex ->
+                with
+                | :? OperationCanceledException as canceled ->
+                    return! Task.FromException<IReadOnlyList<AITool>>(canceled)
+                | ex ->
                     logDegrade.Invoke($"{ex.GetType().Name}: {ex.Message}")
                     return ResizeArray<AITool>() :> IReadOnlyList<AITool>
             }

@@ -43,11 +43,13 @@ let sampleEvents: (string * (unit -> SessionEvent)) list =
         "reasoningDelta",
         fun () -> ReasoningDeltaEvent(sessionId, turnId, noSequence, stamp, "checking the name") :> SessionEvent
         "toolCallStarted",
-        fun () -> ToolCallStartedEvent(sessionId, turnId, noSequence, stamp, "call-1", "read_file") :> SessionEvent
+        fun () ->
+            ToolCallStartedEvent(sessionId, turnId, noSequence, stamp, "call-1", "read_file", "{}") :> SessionEvent
         "toolCallOutput",
         fun () -> ToolCallOutputEvent(sessionId, turnId, noSequence, stamp, "call-1", "line one") :> SessionEvent
         "toolCallCompleted",
-        fun () -> ToolCallCompletedEvent(sessionId, turnId, noSequence, stamp, "call-1", nullString) :> SessionEvent
+        fun () ->
+            ToolCallCompletedEvent(sessionId, turnId, noSequence, stamp, "call-1", nullString, "result") :> SessionEvent
         "permissionRequested",
         fun () -> PermissionRequestedEvent(sessionId, turnId, noSequence, stamp, "req-1", "write_file") :> SessionEvent
         "permissionResolved",
@@ -59,7 +61,20 @@ let sampleEvents: (string * (unit -> SessionEvent)) list =
         "questionAnswered",
         fun () -> QuestionAnsweredEvent(sessionId, turnId, noSequence, stamp, "q-1", "blue") :> SessionEvent
         "usage", fun () -> UsageEvent(sessionId, turnId, noSequence, stamp, 1200L, 340L) :> SessionEvent
-        "compacted", fun () -> CompactedEvent(sessionId, turnId, noSequence, stamp, 9000L, 1200L) :> SessionEvent
+        "compacted",
+        fun () ->
+            CompactedEvent(
+                sessionId,
+                turnId,
+                noSequence,
+                stamp,
+                9000L,
+                1200L,
+                "kept facts",
+                ResizeArray<ChatMessage>() :> IReadOnlyList<ChatMessage>,
+                SessionEventContract.CompactedContextVersion
+            )
+            :> SessionEvent
         "compactionFailed",
         fun () -> CompactionFailedEvent(sessionId, turnId, noSequence, stamp, "model denied") :> SessionEvent
         "turnCompleted", fun () -> TurnCompletedEvent(sessionId, turnId, noSequence, stamp) :> SessionEvent
@@ -228,7 +243,7 @@ let ``ReasoningDelta round-trips its text payload`` () =
 let ``ToolCallStarted round-trips its call id and tool name`` () =
     let restored =
         roundTrip "toolCallStarted" (fun () ->
-            ToolCallStartedEvent(sessionId, turnId, noSequence, stamp, "call-7", "grep") :> SessionEvent)
+            ToolCallStartedEvent(sessionId, turnId, noSequence, stamp, "call-7", "grep", "{}") :> SessionEvent)
 
     let started = restored :?> ToolCallStartedEvent
     started.ToolCallId |> should equal "call-7"
@@ -248,7 +263,8 @@ let ``ToolCallOutput round-trips its call id and output`` () =
 let ``ToolCallCompleted round-trips a success without an error`` () =
     let restored =
         roundTrip "toolCallCompleted" (fun () ->
-            ToolCallCompletedEvent(sessionId, turnId, noSequence, stamp, "call-7", nullString) :> SessionEvent)
+            ToolCallCompletedEvent(sessionId, turnId, noSequence, stamp, "call-7", nullString, "result")
+            :> SessionEvent)
 
     let completed = restored :?> ToolCallCompletedEvent
     completed.ToolCallId |> should equal "call-7"
@@ -258,7 +274,8 @@ let ``ToolCallCompleted round-trips a success without an error`` () =
 let ``ToolCallCompleted round-trips a failure with an error reason`` () =
     let restored =
         roundTrip "toolCallCompleted" (fun () ->
-            ToolCallCompletedEvent(sessionId, turnId, noSequence, stamp, "call-7", "exit code 1") :> SessionEvent)
+            ToolCallCompletedEvent(sessionId, turnId, noSequence, stamp, "call-7", "exit code 1", "result")
+            :> SessionEvent)
 
     let completed = restored :?> ToolCallCompletedEvent
     completed.Error |> should equal "exit code 1"
@@ -314,14 +331,40 @@ let ``Usage round-trips both token counts`` () =
     usage.OutputTokens |> should equal 7L
 
 [<Fact>]
-let ``Compacted round-trips both estimates`` () =
+let ``Compacted round-trips estimates, summary, and retained tail`` () =
+    let retained =
+        ResizeArray<ChatMessage>(
+            [|
+                ChatMessage(ChatRole.User, "kept question")
+                ChatMessage(ChatRole.Assistant, "kept answer")
+            |]
+        )
+        :> IReadOnlyList<ChatMessage>
+
     let restored =
         roundTrip "compacted" (fun () ->
-            CompactedEvent(sessionId, turnId, noSequence, stamp, 9000L, 1200L) :> SessionEvent)
+            CompactedEvent(
+                sessionId,
+                turnId,
+                noSequence,
+                stamp,
+                9000L,
+                1200L,
+                "kept facts",
+                retained,
+                SessionEventContract.CompactedContextVersion
+            )
+            :> SessionEvent)
 
     let compacted = restored :?> CompactedEvent
     compacted.BeforeEstimate |> should equal 9000L
     compacted.AfterEstimate |> should equal 1200L
+    compacted.Summary |> should equal "kept facts"
+
+    compacted.FormatVersion
+    |> should equal SessionEventContract.CompactedContextVersion
+
+    compacted.RetainedMessages.Count |> should equal 2
 
 [<Fact>]
 let ``CompactionFailed round-trips its failure reason`` () =

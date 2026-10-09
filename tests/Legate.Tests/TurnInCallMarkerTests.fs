@@ -102,7 +102,9 @@ let private createServices
         services,
         ?configure =
             Some(fun (builder: LegateBuilder) ->
+                builder.Llm.AddProvider(BuilderTests.StubLlmProvider()) |> ignore
                 builder.Storage.UseSessionStore(InMemorySessionStore(database)) |> ignore
+                builder.Workspace.UseRuntime(BuilderTests.StubWorkspaceRuntime()) |> ignore
 
                 builder.Tools.AddSource(StaticToolSource(ResizeArray<AITool>(tools) :> IReadOnlyList<AITool>))
                 |> ignore
@@ -139,13 +141,13 @@ let private actorServiceOf (provider: IServiceProvider) : LocalActorSystemServic
         | :? LocalActorSystemService as local -> Some local
         | _ -> None)
 
-/// Resolves the client (triggering the router wiring), starts the local
-/// actor system, runs the work, then stops the system.
+/// Starts the local actor system, resolves the initialized client, runs the
+/// work, then stops the system.
 let private withClient (provider: IServiceProvider) (work: SessionClient -> Task<'T>) : Task<'T> =
     task {
-        let client = provider.GetRequiredService<SessionClient>()
         let service = actorServiceOf provider
         do! (service :> IHostedService).StartAsync(CancellationToken.None)
+        let client = provider.GetRequiredService<SessionClient>()
 
         try
             let! outcome = work client
@@ -218,11 +220,24 @@ let private tool (name: string) (result: string) : AITool =
     AIFunctionFactory.Create(method, name, Unchecked.defaultof<string>, Unchecked.defaultof<JsonSerializerOptions>)
     :> AITool
 
+/// Reads the text parts of an accepted user message in order.
+let private userTextOf (message: UserMessage) : string =
+    if isNull (box message) || isNull (box message.Parts) then
+        ""
+    else
+        message.Parts
+        |> Seq.choose (fun part ->
+            match part with
+            | :? TextContent as text when not (isNull (box text)) ->
+                Some(if isNull (box text.Text) then "" else text.Text)
+            | _ -> None)
+        |> String.concat ""
+
 // ──────────────────────────────────────────────────────────────────────────
 // First write (tasks 2+3)
 
 [<Fact>]
-let ``First journal write is the in-call marker and the turn settles promptly`` () : Task =
+let ``First journal writes are user evidence then the in-call marker and the turn settles promptly`` () : Task =
     task {
         let calls = ref 0
 
@@ -261,11 +276,20 @@ let ``First journal write is the in-call marker and the turn settles promptly`` 
                     result.AssistantText |> should equal "marker scripted reply"
 
                     let! journal = collectJournal client created.Id
-                    journal.Length |> should be (greaterThanOrEqualTo 1)
-                    journal.Head |> should be ofExactType<TurnStartedEvent>
+                    journal.Length |> should be (greaterThanOrEqualTo 2)
 
-                    let head = journal.Head :?> TurnStartedEvent
-                    head.SessionId |> should equal created.Id
+                    // User evidence journals once before the first provider
+                    // call (issue 366); the in-call marker follows it.
+                    journal.Head |> should be ofExactType<UserMessageEvent>
+
+                    let evidence = journal.Head :?> UserMessageEvent
+                    evidence.SessionId |> should equal created.Id
+                    userTextOf evidence.Message |> should equal "hello"
+
+                    journal.Tail.Head |> should be ofExactType<TurnStartedEvent>
+
+                    let marker = journal.Tail.Head :?> TurnStartedEvent
+                    marker.SessionId |> should equal created.Id
 
                     // The settle observation lands before the Idle row write
                     // (notify precedes UpdateSessionState), so poll for the
@@ -338,14 +362,17 @@ let ``Takeover loser journals nothing and never reaches the provider`` () : Task
                             CancellationToken.None
                         )
 
-                    let! _ =
-                        SessionClientOperations.PromptAsync(
-                            client,
-                            created.Id,
-                            UserMessage.Text "loser turn",
-                            DeliveryMode.Queue,
-                            CancellationToken.None
-                        )
+                    let! refused =
+                        Assert.ThrowsAsync<InvalidSessionStateException>(fun () ->
+                            SessionClientOperations.PromptAsync(
+                                client,
+                                created.Id,
+                                UserMessage.Text "loser turn",
+                                DeliveryMode.Queue,
+                                CancellationToken.None
+                            ))
+
+                    Assert.Equal("executionAuthorityUnavailable", refused.CurrentState)
 
                     let settled =
                         waitFor (TimeSpan.FromSeconds 10.0) (fun () ->
@@ -369,11 +396,12 @@ let ``Takeover loser journals nothing and never reaches the provider`` () : Task
 
                     calls.Value |> should equal 0
 
-                    PromptWaitHubs.GetOrAdd(created.Id).Settled.Count |> should equal 0
+                    (PromptWaitHubs.GetOrAddScoped client.Tenant created.Id).Settled.Count
+                    |> should equal 0
 
                     let! pending = client.Store.ReadPendingInbox(client.Tenant, created.Id, CancellationToken.None)
 
-                    pending.Count |> should equal 0
+                    pending.Count |> should equal 1
                 })
     }
 
@@ -413,8 +441,12 @@ let ``Subscriber observes the in-call marker while the turn is still running`` (
                                 CancellationToken.None
                             )
 
-                        let! has = awaitWhat (enumerator.MoveNextAsync().AsTask()) "the in-call marker"
+                        let! has = awaitWhat (enumerator.MoveNextAsync().AsTask()) "the user evidence"
                         Assert.True(has)
+                        enumerator.Current |> should be ofExactType<UserMessageEvent>
+
+                        let! marked = awaitWhat (enumerator.MoveNextAsync().AsTask()) "the in-call marker"
+                        Assert.True(marked)
                         enumerator.Current |> should be ofExactType<TurnStartedEvent>
 
                         // Pre-settle: the turn is still inside the delayed
@@ -436,11 +468,12 @@ let ``Subscriber observes the in-call marker while the turn is still running`` (
                     finally
                         enumerator.DisposeAsync().AsTask() |> ignore
 
-                    // The marker opens the journal: sequences run gap-free
+                    // The evidence opens the journal: sequences run gap-free
                     // from 1 with no duplicates across the handoff.
                     let! journal = collectJournal client created.Id
-                    journal.Length |> should be (greaterThanOrEqualTo 1)
-                    journal.Head |> should be ofExactType<TurnStartedEvent>
+                    journal.Length |> should be (greaterThanOrEqualTo 2)
+                    journal.Head |> should be ofExactType<UserMessageEvent>
+                    journal.Tail.Head |> should be ofExactType<TurnStartedEvent>
 
                     journal
                     |> List.mapi (fun index event -> index, event)
@@ -494,10 +527,36 @@ let ``Multi-iteration turn marks exactly once`` () : Task =
                     result.Iterations |> should equal 2
 
                     // Two provider calls, one marker: later iterations never
-                    // refire the hook.
+                    // refire the hook. The settled turn also journals its
+                    // terminal completion row (issue 289), coexisting with
+                    // the single marker, plus the progressive text delta
+                    // (issue 379), the once-per-turn user evidence, and the
+                    // settled tool's Started/Output/Completed markers
+                    // (issue 366).
                     let! journal = collectJournal client created.Id
-                    journal.Length |> should equal 1
-                    journal.Head |> should be ofExactType<TurnStartedEvent>
+                    journal.Length |> should equal 7
+                    journal[0] |> should be ofExactType<UserMessageEvent>
+                    journal[1] |> should be ofExactType<TurnStartedEvent>
+                    journal[2] |> should be ofExactType<ToolCallStartedEvent>
+                    journal[3] |> should be ofExactType<ToolCallOutputEvent>
+                    journal[4] |> should be ofExactType<ToolCallCompletedEvent>
+                    journal[5] |> should be ofExactType<TextDeltaEvent>
+                    journal[6] |> should be ofExactType<TurnCompletedEvent>
+
+                    // The empty-arguments scripted call journals the empty
+                    // object: empty stays empty, never a placeholder.
+                    let started = journal[2] :?> ToolCallStartedEvent
+                    started.ToolCallId |> should equal "c1"
+                    started.ToolName |> should equal "echo"
+                    started.ArgumentsJson |> should equal "{}"
+
+                    let completed = journal[4] :?> ToolCallCompletedEvent
+                    completed.ToolCallId |> should equal "c1"
+                    completed.ResultText |> should equal "ok"
+
+                    journal
+                    |> List.filter (fun event -> event :? TurnStartedEvent)
+                    |> should haveLength 1
                 })
     }
 
@@ -556,11 +615,12 @@ let ``Ask resume marks exactly once`` () : Task =
                     Assert.True(suspended, "The turn should suspend on the permission Ask.")
 
                     let! journal = collectJournal client created.Id
-                    journal.Length |> should equal 2
-                    journal[0] |> should be ofExactType<TurnStartedEvent>
-                    journal[1] |> should be ofExactType<PermissionRequestedEvent>
+                    journal.Length |> should equal 3
+                    journal[0] |> should be ofExactType<UserMessageEvent>
+                    journal[1] |> should be ofExactType<TurnStartedEvent>
+                    journal[2] |> should be ofExactType<PermissionRequestedEvent>
 
-                    let request = journal[1] :?> PermissionRequestedEvent
+                    let request = journal[2] :?> PermissionRequestedEvent
 
                     let! _ =
                         SessionClientOperations.ReplyAsync(
@@ -574,14 +634,26 @@ let ``Ask resume marks exactly once`` () : Task =
                     result.Status |> should equal TurnStatus.Completed
 
                     // The resume continuation runs stripped: still exactly
-                    // one marker, plus the resolve event.
+                    // one marker, plus the resolve event, the allowed tool's
+                    // Started/Output/Completed markers (issue 366), the
+                    // post-resume text delta (issue 379), and the terminal
+                    // completion row (issue 289), behind the once-per-turn
+                    // user evidence.
                     let! settled = collectJournal client created.Id
-                    settled.Length |> should equal 3
+                    settled.Length |> should equal 9
 
                     settled
                     |> List.filter (fun event -> event :? TurnStartedEvent)
                     |> should haveLength 1
 
-                    settled[2] |> should be ofExactType<PermissionResolvedEvent>
+                    settled[0] |> should be ofExactType<UserMessageEvent>
+                    settled[1] |> should be ofExactType<TurnStartedEvent>
+                    settled[2] |> should be ofExactType<PermissionRequestedEvent>
+                    settled[3] |> should be ofExactType<PermissionResolvedEvent>
+                    settled[4] |> should be ofExactType<ToolCallStartedEvent>
+                    settled[5] |> should be ofExactType<ToolCallOutputEvent>
+                    settled[6] |> should be ofExactType<ToolCallCompletedEvent>
+                    settled[7] |> should be ofExactType<TextDeltaEvent>
+                    settled[8] |> should be ofExactType<TurnCompletedEvent>
                 })
     }

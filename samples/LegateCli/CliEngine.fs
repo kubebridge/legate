@@ -418,16 +418,22 @@ type Engine(client: SessionClient, reader: System.IO.TextReader, writer: System.
                 try
                     let session = currentSession ()
 
-                    do!
-                        SessionClientOperations.AbortAsync(
-                            client,
-                            session.Id,
-                            StopCause.ExplicitAbort,
-                            "repl /abort",
-                            cancellationToken
-                        )
+                    let! current = SessionClientOperations.ReadAbortTargetAsync(client, session.Id, cancellationToken)
 
-                    line "ABORTED"
+                    match current with
+                    | null -> line "ABORT NoCurrentTurn"
+                    | target ->
+                        let! receipt =
+                            SessionClientOperations.AbortAsync(
+                                client,
+                                session.Id,
+                                target.TurnId,
+                                StopCause.ExplicitAbort,
+                                "repl /abort",
+                                cancellationToken
+                            )
+
+                        line $"ABORT {receipt.Outcome}: {receipt.TurnId} (terminal settlement is separate)"
                 with error ->
                     line $"ERROR {error.Message}"
 

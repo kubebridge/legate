@@ -13,6 +13,11 @@
     <Compile Include="BaselineV1.fs" />
     <Compile Include="CleanupClaimsArchiveLocation.fs" />
     <Compile Include="ScheduleOccurrenceKey.fs" />
+    <Compile Include="TurnCompletionEra.fs" />
+    <Compile Include="SessionControlTargets.fs" />
+    <Compile Include="CompletionDestination.fs" />
+    <Compile Include="ExecutionSettlements.fs" />
+    <Compile Include="InboxRealTurn.fs" />
     <Compile Include="MigrationServiceExtensions.fs" />
   </ItemGroup>
 

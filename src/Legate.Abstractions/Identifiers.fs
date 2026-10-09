@@ -171,9 +171,14 @@ type TurnId private (value: string) =
     /// Returns the canonical identifier string.
     override _.ToString() = value
 
-    /// Hashes the canonical identifier string ordinally.
+    /// Hashes the canonical identifier string ordinally. The default
+    /// (unstamped) host-operation sentinel (issue 373) hashes to 0 instead
+    /// of throwing, mirroring <see cref="T:Legate.CellId" />.
     override _.GetHashCode() =
-        StringComparer.Ordinal.GetHashCode value
+        if isNull (box value) then
+            0
+        else
+            StringComparer.Ordinal.GetHashCode value
 
     /// Compares against a boxed turn id without recursing.
     override this.Equals(other: obj) =
@@ -192,6 +197,25 @@ and internal TurnIdJsonConverter() =
         let mutable parsed = Unchecked.defaultof<TurnId>
         let ok = TurnId.TryParse(value, &parsed)
         ok, parsed
+
+    override this.Read(reader: byref<Utf8JsonReader>, typeToConvert: Type, options: JsonSerializerOptions) =
+        // The host-operation sentinel (issue 373): JSON null reads as the
+        // default (unstamped) TurnId, mirroring how CellId reads null as
+        // its unstamped id. Fresh idle/host-control writes carry the
+        // sentinel; history copies carry preserved real ids. Real ids still
+        // parse strictly through TryGet.
+        if reader.TokenType = JsonTokenType.Null then
+            Unchecked.defaultof<TurnId>
+        else
+            base.Read(&reader, typeToConvert, options)
+
+    override _.Write(writer: Utf8JsonWriter, value: TurnId, _options: JsonSerializerOptions) =
+        // The sentinel's Value is null; boxing avoids passing the null
+        // through a non-nullable string binding.
+        if box value.Value |> isNull then
+            writer.WriteNullValue()
+        else
+            writer.WriteStringValue(value.ToString())
 
 /// A durable identifier for an agent registered with the runtime.
 [<Struct; CustomEquality; NoComparison>]

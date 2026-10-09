@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Working with sessions | Legate</title>
+<meta name="description" content="Open and prompt Legate sessions, handle tool approvals, steer running turns, and reconnect to the event stream from C# or F#.">
+<link rel="icon" type="image/svg+xml" sizes="any" href="logo/favicon.svg">
+<link rel="stylesheet" href="styles.css">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+</head>
+<body>
+<header class="nav">
+<div class="wrap">
+  <a class="brand" href="index.html" aria-label="Legate home">
+    <svg width="30" height="30" viewBox="0 0 32 32" style="display:block;flex:none" aria-hidden="true"><path d="M9 6h3v21H9Z" fill="var(--ink)"/><path d="M12 7H25L23.4 9.4H12Z" fill="var(--logo-b)"/><path d="M12 10.2H22.87L21.27 12.6H12Z" fill="var(--logo-b)"/><path d="M12 13.4H21.27L22.87 15.8H12Z" fill="var(--logo-b)"/><path d="M12 16.6H23.4L25 19H12Z" fill="var(--logo-b)"/></svg>
+    <span style="font-weight:700;letter-spacing:0.12em;font-size:14px">LEGATE</span>
+  </a>
+  <nav class="nav-links" aria-label="Main navigation">
+    <a href="index.html">Home</a>
+    <a href="overview.html">Overview</a>
+    <a class="active" href="sessions.html" aria-current="page">Sessions</a>
+    <a href="durability.html">Durability</a>
+    <a href="build.html">Build</a>
+  </nav>
+  <span class="ver-pill">v0.1.0</span>
+  <button class="theme-btn" type="button" aria-label="Switch color theme" title="Switch color theme"></button>
+  <a class="github-btn" href="https://github.com/kubebridge/legate">GitHub</a>
+</div>
+</header>
+
+<main>
+<div class="wrap hero">
+  <span class="kicker">01 / Sessions</span>
+  <h1 class="hero-title">Working with sessions</h1>
+  <p class="lede">A session holds a conversation with an agent across multiple turns. Your application sends messages, receives events, and handles requests for approval. It can also add instructions while the agent is working or stop the current turn.</p>
+  <p class="lede">The session stays open between turns, keeping its history and workspace binding for the next message.</p>
+</div>
+
+<section class="block" aria-labelledby="send-message"><div class="wrap">
+  <div class="sec-head">
+    <div><span class="sec-no">Client API</span>
+      <h2 class="sec-title" id="send-message">Send a message</h2></div>
+    <p class="sec-sub">Use <code>SessionClient</code> to open a session and prompt it. A turn may include several model calls and tool executions before it returns a result.</p>
+  </div>
+  <div class="content-stack">
+    <p class="body-copy">For a configured host with a resolved client and an agent that does not require interactive approval:</p>
+<pre class="code"><code><span class="k">var</span> ct = CancellationToken.None;
+
+<span class="k">var</span> session = <span class="k">await</span> client.<span class="f">OpenSessionAsync</span>(
+    agentId,
+    <span class="k">new</span> SessionOptions { Title = <span class="s">"Review the project"</span> },
+    ct);
+
+TurnResult result = <span class="k">await</span> client.<span class="f">PromptAndWaitAsync</span>(
+    session.Id,
+    UserMessage.Text(<span class="s">"Summarise this project's structure."</span>),
+    ct);</code></pre>
+    <p class="body-copy"><code>PromptAndWaitAsync</code> sends a message and waits for the result. For an interactive application, use <code>PromptAsync</code>, <code>Subscribe</code>, and <code>ReplyAsync</code> so your interface can handle approval requests as they arrive.</p>
+  </div>
+</div></section>
+
+<section class="block alt" aria-labelledby="delivery"><div class="wrap">
+  <div class="sec-head">
+    <div><span class="sec-no">Delivery modes</span>
+      <h2 class="sec-title" id="delivery">Choose how a message reaches the agent</h2></div>
+    <p class="sec-sub">When the session is idle, all three modes start a turn. When it is waiting for input, new messages join the inbox; <code>ReplyAsync</code> answers the pending request.</p>
+  </div>
+  <div class="grid c3">
+    <div class="card"><h3><span class="dsq" style="background:var(--vb)" aria-hidden="true"></span>Queue</h3><p>Wait for the current turn to finish, then process the message as a new turn. Use this for follow-up work.</p></div>
+    <div class="card"><h3><span class="dsq" style="background:var(--c)" aria-hidden="true"></span>Inject</h3><p>Add the message to the current turn at the next model-loop boundary. Use this to clarify a request or add information while the agent is working.</p></div>
+    <div class="card"><h3><span class="dsq" style="background:var(--a)" aria-hidden="true"></span>Interrupt</h3><p>Abort the running turn and start a new one with this message. Use this when the current request is no longer useful.</p></div>
+  </div>
+</div></section>
+
+<section class="block" aria-labelledby="approvals"><div class="wrap">
+  <div class="sec-head">
+    <div><span class="sec-no">Session lifecycle</span>
+      <h2 class="sec-title" id="approvals">Handle approvals and questions</h2></div>
+    <p class="sec-sub">A turn can pause while it waits for permission to call a tool or for an answer from the host. The event stream identifies the request. Send a matching <code>PermissionDecision</code> or <code>QuestionAnswer</code> through <code>ReplyAsync</code> to continue the same turn.</p>
+  </div>
+  <div class="diagram" tabindex="0" role="region" aria-label="Session lifecycle diagram">
+    <svg viewBox="0 0 980 400" role="img" aria-labelledby="states-title states-desc">
+      <title id="states-title">Session state transitions</title>
+      <desc id="states-desc">PromptAsync moves Idle to Running. Completion or abort returns Running to Idle. An approval request or question pauses Running in WaitingForInput; ReplyAsync returns it to Running. Explicit closure or expiry closes a session from any open state. AutoClose closes it when its run finishes.</desc>
+      <defs>
+        <marker id="sarr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="var(--v)"/></marker>
+      </defs>
+      <rect x="30" y="70" width="170" height="80" rx="40" fill="var(--panel)" stroke="var(--v)" stroke-width="1.5"/>
+      <text x="115" y="116" text-anchor="middle" fill="var(--ink)" font-size="17" font-weight="bold">Idle</text>
+      <rect x="405" y="70" width="170" height="80" rx="40" fill="var(--panel2)" stroke="var(--v)" stroke-width="1.5"/>
+      <text x="490" y="116" text-anchor="middle" fill="var(--ink)" font-size="17" font-weight="bold">Running</text>
+      <rect x="780" y="70" width="170" height="80" rx="40" fill="var(--panel)" stroke="var(--a)" stroke-width="1.5"/>
+      <text x="865" y="116" text-anchor="middle" fill="var(--ink)" font-size="15" font-weight="bold">WaitingForInput</text>
+      <path d="M200 96 H400" fill="none" stroke="var(--c)" stroke-width="2" class="flow" marker-end="url(#sarr)"/>
+      <text x="302" y="80" text-anchor="middle" fill="var(--c)" font-size="13" font-family="monospace">PromptAsync</text>
+      <path d="M405 130 H205" fill="none" stroke="var(--g)" stroke-width="2" marker-end="url(#sarr)"/>
+      <text x="302" y="157" text-anchor="middle" fill="var(--g)" font-size="13">complete / abort</text>
+      <path d="M575 96 H775" fill="none" stroke="var(--a)" stroke-width="2" class="flow" marker-end="url(#sarr)"/>
+      <text x="677" y="80" text-anchor="middle" fill="var(--a)" font-size="13">approval / question</text>
+      <path d="M780 130 H580" fill="none" stroke="var(--g)" stroke-width="2" marker-end="url(#sarr)"/>
+      <text x="677" y="157" text-anchor="middle" fill="var(--g)" font-size="13" font-family="monospace">ReplyAsync</text>
+      <path d="M115 150 V245 H865 V150 M490 150 V305" fill="none" stroke="var(--line-soft)" stroke-width="1.5" marker-end="url(#sarr)"/>
+      <text x="520" y="225" fill="var(--f3)" font-size="13">Close or expiry from any open state</text>
+      <text x="520" y="280" fill="var(--f3)" font-size="13">AutoClose when the run finishes</text>
+      <rect x="405" y="310" width="170" height="70" rx="35" fill="var(--panel)" stroke="var(--line-soft)" stroke-width="1.5"/>
+      <text x="490" y="353" text-anchor="middle" fill="var(--ink)" font-size="17" font-weight="bold">Closed</text>
+    </svg>
+    <div class="caption">A completed or aborted turn normally returns the session to Idle. Closing the session is a separate operation. Sessions opened with AutoClose close when their run finishes.</div>
+  </div>
+  <div class="card table-card" tabindex="0" role="region" aria-label="Session states">
+    <table class="spec">
+      <thead><tr><th scope="col">State</th><th scope="col">What it means</th></tr></thead>
+      <tbody>
+        <tr><td><code>Idle</code></td><td>The session is open and ready for work.</td></tr>
+        <tr><td><code>Running</code></td><td>The agent is processing a turn.</td></tr>
+        <tr><td><code>WaitingForInput</code></td><td>The turn is paused for a host reply.</td></tr>
+        <tr><td><code>Closed</code></td><td>The session no longer accepts messages or replies.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div></section>
+
+<section class="block alt" aria-labelledby="read-events"><div class="wrap">
+  <div class="sec-head">
+    <div><span class="sec-no">Events and history</span>
+      <h2 class="sec-title" id="read-events">Read events and conversation history</h2></div>
+    <p class="sec-sub"><code>Subscribe</code> returns an <code>IAsyncEnumerable&lt;SessionEvent&gt;</code>. It reads stored events after the supplied sequence number, then continues with live events. Save the last processed sequence to reconnect from that point.</p>
+  </div>
+  <div class="grid c2">
+    <div class="card"><h3>Read a page of events</h3><p>Use <code>ReadEventsAsync</code> for a bounded page of journal events, ordered by sequence number.</p></div>
+    <div class="card"><h3>Read the transcript</h3><p>Use <code>ReadTranscriptAsync</code> for the conversation cells derived from journaled events.</p></div>
+  </div>
+  <p class="body-copy">Cluster subscriptions use at-least-once delivery. Use sequence numbers to ignore events you have already processed. See <a href="durability.html#journal">reconnecting to the event stream</a> for replay and retention behaviour.</p>
+</div></section>
+
+<section class="block" aria-labelledby="continue-session"><div class="wrap">
+  <div class="sec-head">
+    <div><span class="sec-no">Patterns</span>
+      <h2 class="sec-title" id="continue-session">Continue, branch, or finish the conversation</h2></div>
+    <p class="sec-sub">Wait for a result in an unattended workflow, fork the history to try another approach, or change the agent that handles future work.</p>
+  </div>
+  <div class="grid c2">
+    <div class="card"><h3>Wait for a result</h3><p><code>PromptAndWaitAsync</code> reports an approval suspension rather than waiting for someone to answer it. Interactive hosts can register <code>WaitForSettleAsync</code> before prompting and handle replies alongside the event stream.</p><p>Cancelling either wait leaves the turn running. Use <code>AbortAsync</code> to stop the turn itself.</p></div>
+    <div class="card"><h3>Fork a session</h3><p><code>ForkAsync</code> creates a new session with the source history up to a chosen event sequence. Continue from that point to try another approach. The source session is unaffected.</p><pre class="code"><code><span class="k">var</span> fork = <span class="k">await</span> client.<span class="f">ForkAsync</span>(
+    session.Id,
+    upToSequence,
+    cancellationToken);</code></pre></div>
+    <div class="card"><h3>Change agents</h3><p><code>SetAgentAsync</code> changes which agent handles future work. The change applies immediately when there is no active turn or pending inbox work; otherwise, it waits until that work has cleared. The session keeps its history.</p></div>
+    <div class="card"><h3>Run unattended</h3><p>Open a session with <code>AutoClose</code> and policies that resolve tool permissions and questions without user interaction. Add a completion sink if another service needs the result. Structured outcome mode gives the agent <code>finish</code> and <code>fail</code> tools.</p><p>Completion notifications use at-least-once delivery and include an idempotency key for deduplication.</p></div>
+  </div>
+  <div class="pager">
+    <a class="btn" href="overview.html">Overview</a>
+    <a class="btn primary" href="durability.html">02 / Durability</a>
+  </div>
+</div></section>
+</main>
+
+<footer><div class="wrap">
+  <a class="brand" href="index.html" style="font-size:12px"><svg width="20" height="20" viewBox="0 0 32 32" aria-hidden="true"><path d="M9 6h3v21H9Z" fill="var(--ink)"/><path d="M12 7H25L23.4 9.4H12Z" fill="var(--logo-b)"/><path d="M12 10.2H22.87L21.27 12.6H12Z" fill="var(--logo-b)"/><path d="M12 13.4H21.27L22.87 15.8H12Z" fill="var(--logo-b)"/><path d="M12 16.6H23.4L25 19H12Z" fill="var(--logo-b)"/></svg>LEGATE</a>
+  <span class="spacer">A <a href="https://kubebridge.com">Kubebridge</a> project · Apache 2.0</span>
+  <nav><a href="https://github.com/kubebridge/legate">GitHub</a><a href="https://www.nuget.org/packages/Legate">NuGet</a></nav>
+</div></footer>
+<script src="theme.js"></script>
+</body>
+</html>

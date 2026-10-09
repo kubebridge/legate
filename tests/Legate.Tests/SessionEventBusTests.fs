@@ -452,10 +452,11 @@ let ``Tenants stay isolated on the bus and the store`` () =
         let tenantA = tenantOf "alpha"
         let tenantB = tenantOf "beta"
         let sharedId = SessionId.New()
+        let otherId = SessionId.New()
         use bus = new SessionEventBus(events)
 
         let! _, claimA = makeSession sessions tenantA sharedId
-        let! _, claimB = makeSession sessions tenantB sharedId
+        let! _, claimB = makeSession sessions tenantB otherId
 
         let! _ =
             appendViaWriter
@@ -470,13 +471,13 @@ let ``Tenants stay isolated on the bus and the store`` () =
         let! fromA = bus.ReadEventsAsync(tenantA, sharedId, 0L, 10, CancellationToken.None)
         fromA.Count |> should equal 1
 
-        let! fromB = bus.ReadEventsAsync(tenantB, sharedId, 0L, 10, CancellationToken.None)
+        let! fromB = bus.ReadEventsAsync(tenantB, otherId, 0L, 10, CancellationToken.None)
         fromB.Count |> should equal 0
 
         let! _ =
-            appendViaWriter events tenantB sharedId claimB.Token ([ closed sharedId claimB.TurnId ] :> IReadOnlyList<_>)
+            appendViaWriter events tenantB otherId claimB.Token ([ closed otherId claimB.TurnId ] :> IReadOnlyList<_>)
 
-        let! receivedB = collectAll (bus.Subscribe(tenantB, sharedId, 0L, CancellationToken.None))
+        let! receivedB = collectAll (bus.Subscribe(tenantB, otherId, 0L, CancellationToken.None))
         receivedB.Count |> should equal 1
         (receivedB[0] :? SessionClosedEvent) |> should equal true
     }
@@ -597,4 +598,143 @@ let ``Bus subscribe and publish carry all six scopes`` () =
                     LoggingScopes.ClaimOwnerKey
                 ] do
                 entry.Scopes |> List.exists (fun (name, _) -> name = key) |> should equal true
+    }
+
+// ──────────────────────────────────────────────────────────────────────────
+// Replay-to-live handoff and lag recovery (issue 382)
+
+[<Fact>]
+let ``Subscribe resumes gap-free from the last observed cursor after partial take`` () =
+    task {
+        let _, sessions, events = makeStores ()
+        let tenant = tenantOf "acme"
+        use bus = new SessionEventBus(events)
+        let! sessionId, claim = makeSession sessions tenant (SessionId.New())
+
+        let! _ =
+            appendViaWriter
+                events
+                tenant
+                sessionId
+                claim.Token
+                ([
+                    delta sessionId claim.TurnId "one"
+                    delta sessionId claim.TurnId "two"
+                    delta sessionId claim.TurnId "three"
+                ]
+                :> IReadOnlyList<_>)
+
+        // Take one event then dispose: events two and three were replayed
+        // but never observed, so resuming from the last observed cursor
+        // must surface them again with no gaps and no duplicates.
+        let! first = collectTake (bus.Subscribe(tenant, sessionId, 0L, CancellationToken.None)) 1
+
+        first
+        |> Seq.map (fun evt -> evt.Sequence.Value)
+        |> Seq.toList
+        |> should equal [ 1L ]
+
+        let! _ =
+            appendViaWriter
+                events
+                tenant
+                sessionId
+                claim.Token
+                ([
+                    delta sessionId claim.TurnId "four"
+                    closed sessionId claim.TurnId
+                ]
+                :> IReadOnlyList<_>)
+
+        let! resumed = collectAll (bus.Subscribe(tenant, sessionId, 1L, CancellationToken.None))
+
+        resumed
+        |> Seq.map (fun evt -> evt.Sequence.Value)
+        |> Seq.toList
+        |> should equal [ 2L; 3L; 4L; 5L ]
+    }
+
+[<Fact>]
+let ``Subscribe cancellation abandons the wait and releases the subscriber`` () =
+    task {
+        let _, sessions, events = makeStores ()
+        let tenant = tenantOf "acme"
+        use bus = new SessionEventBus(events)
+        let! sessionId, claim = makeSession sessions tenant (SessionId.New())
+
+        use abandoned = new CancellationTokenSource()
+        abandoned.Cancel()
+
+        try
+            let! _ = collectAll (bus.Subscribe(tenant, sessionId, 0L, abandoned.Token))
+            failwith "expected OperationCanceledException"
+        with :? OperationCanceledException ->
+            ()
+
+        // The abandoned subscription released its slot and published
+        // nothing: the session still streams from the journal start.
+        let! _ =
+            appendViaWriter
+                events
+                tenant
+                sessionId
+                claim.Token
+                ([
+                    delta sessionId claim.TurnId "after"
+                    closed sessionId claim.TurnId
+                ]
+                :> IReadOnlyList<_>)
+
+        let! received = collectAll (bus.Subscribe(tenant, sessionId, 0L, CancellationToken.None))
+
+        received
+        |> Seq.map (fun evt -> evt.Sequence.Value)
+        |> Seq.toList
+        |> should equal [ 1L; 2L ]
+    }
+
+[<Fact>]
+let ``Disposing the enumerator releases the subscriber slot promptly`` () =
+    task {
+        let _, sessions, events = makeStores ()
+        let tenant = tenantOf "acme"
+
+        let options = SessionSubscriptionOptions()
+        options.MaxSubscribersPerSession <- 1
+
+        use bus = new SessionEventBus(events, options)
+        let! sessionId, claim = makeSession sessions tenant (SessionId.New())
+
+        let first = bus.Subscribe(tenant, sessionId, 0L, CancellationToken.None)
+        let firstEnumerator = first.GetAsyncEnumerator(CancellationToken.None)
+
+        let captured = tryThirdSubscribe bus tenant sessionId
+
+        match captured with
+        | Some(:? SessionSubscriptionLimitExceededException) -> ()
+        | Some unexpected -> failwith $"expected the cap but got {unexpected.GetType().Name}"
+        | None -> failwith "expected the cap"
+
+        do! firstEnumerator.DisposeAsync().AsTask()
+
+        // The disposed enumerator released the single slot: subscribing
+        // again succeeds and streams the journal.
+        let! _ =
+            appendViaWriter
+                events
+                tenant
+                sessionId
+                claim.Token
+                ([
+                    delta sessionId claim.TurnId "one"
+                    closed sessionId claim.TurnId
+                ]
+                :> IReadOnlyList<_>)
+
+        let! received = collectAll (bus.Subscribe(tenant, sessionId, 0L, CancellationToken.None))
+
+        received
+        |> Seq.map (fun evt -> evt.Sequence.Value)
+        |> Seq.toList
+        |> should equal [ 1L; 2L ]
     }

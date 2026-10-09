@@ -306,7 +306,10 @@ module internal TaskRunner =
     /// Builds the nested observation hook from the sink: every settled
     /// nested invocation journals its started, output, and completed
     /// markers under the nested turn carrying the parent call's id, so
-    /// the transcript read links them back to the parent call.
+    /// the transcript read links them back to the parent call. The start
+    /// carries the settling call's real arguments JSON (issue 366): empty
+    /// stays the empty object, a missing payload stays null so recovery
+    /// rejects explicitly, never a hardcoded placeholder.
     /// <param name="journal">The fenced sink, or None to journal nothing.</param>
     /// <param name="isLeaseValid">The last-moment claim fence.</param>
     /// <param name="sessionId">The session the nested run belongs to.</param>
@@ -338,7 +341,8 @@ module internal TaskRunner =
                                 noSequence,
                                 stamp,
                                 parentCallId,
-                                observation.ToolName
+                                observation.ToolName,
+                                observation.ArgumentsJson
                             )
                             :> SessionEvent)
 
@@ -366,7 +370,8 @@ module internal TaskRunner =
                                 noSequence,
                                 stamp,
                                 parentCallId,
-                                Option.toObj observation.Error
+                                Option.toObj observation.Error,
+                                observation.Text
                             )
                             :> SessionEvent)
                 })

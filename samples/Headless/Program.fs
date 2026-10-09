@@ -227,6 +227,7 @@ let private buildServices
     (configuration: IConfiguration)
     (database: InMemoryDatabase)
     (store: InMemorySessionStore)
+    (sink: WebhookCompletionSink)
     (start: HeadlessStart)
     : unit =
     LegateServiceCollectionExtensions.AddLegate(
@@ -241,6 +242,13 @@ let private buildServices
             |> ignore
 
             builder.Permissions.UsePolicy(AllowAllPermissionPolicy()) |> ignore
+
+            builder.AddCompletionDestination(
+                TenantId.Default,
+                "webhook",
+                Func<IServiceProvider, ISessionCompletionSink>(fun _ -> sink :> ISessionCompletionSink)
+            )
+            |> ignore
 
             if start.Scripted then
                 ()
@@ -276,12 +284,11 @@ let private buildServices
         )
         |> ignore
 
-/// Opens the headless session: AutoClose, Structured outcome, allow-all
-/// permissions, the wait bound, and the webhook completion sink
-/// snapshotted at open.
+/// Opens the headless session: AutoClose, Structured outcome, the wait
+/// bound, and the tenant-scoped webhook destination id registered on the
+/// host. Permissions come from the host DI policy, never per-session data.
 let private openHeadlessAsync
     (client: SessionClient)
-    (sink: WebhookCompletionSink)
     (bound: TimeSpan)
     (cancellationToken: CancellationToken)
     : Task<Session> =
@@ -289,8 +296,7 @@ let private openHeadlessAsync
         let options = SessionOptions()
         options.AutoClose <- true
         options.Outcome <- SessionOutcomeMode.Structured
-        options.Permissions <- AllowAllPermissionPolicy()
-        options.CompletionSink <- sink
+        options.CompletionDestinationId <- "webhook"
         options.Timeout <- Nullable<TimeSpan>(bound)
 
         return! SessionClientOperations.OpenSessionAsync(client, AgentId.New(), options, cancellationToken)
@@ -349,22 +355,18 @@ let main (argv: string[]) : int =
             let application = Host.CreateApplicationBuilder()
             let database = InMemoryDatabase()
             let store = InMemorySessionStore(database)
-            buildServices application.Services application.Configuration database store start
+            buildServices application.Services application.Configuration database store sink start
 
             use host = application.Build()
 
-            // Resolve before starting: the resolve triggers the session
-            // router wiring, which must land before the actor system spawns
-            // its router.
-            let client = host.Services.GetRequiredService<SessionClient>()
-
             do! host.StartAsync(CancellationToken.None)
+            let client = host.Services.GetRequiredService<SessionClient>()
 
             let! exit =
                 task {
                     try
                         let bound = TimeSpan.FromMinutes(start.WaitMinutes)
-                        let! session = openHeadlessAsync client sink bound CancellationToken.None
+                        let! session = openHeadlessAsync client bound CancellationToken.None
                         Console.Out.WriteLine($"SESSION {session.Id}")
 
                         let! result =

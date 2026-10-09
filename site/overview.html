@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Durable Session Agents for .NET | Legate</title>
+<meta name="description" content="Embed tool-using agents: prompt sessions, handle approvals, and stream events. Run in one process or across a cluster, with persistent state for crash recovery.">
+<link rel="icon" type="image/svg+xml" sizes="any" href="logo/favicon.svg">
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="overview.css">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+</head>
+<body>
+<header class="nav">
+<div class="wrap">
+  <a class="brand" href="index.html" aria-label="Legate home">
+    <svg width="30" height="30" viewBox="0 0 32 32" aria-hidden="true"><path d="M9 6h3v21H9Z" fill="var(--ink)"/><path d="M12 7H25L23.4 9.4H12Z" fill="var(--logo-b)"/><path d="M12 10.2H22.87L21.27 12.6H12Z" fill="var(--logo-b)"/><path d="M12 13.4H21.27L22.87 15.8H12Z" fill="var(--logo-b)"/><path d="M12 16.6H23.4L25 19H12Z" fill="var(--logo-b)"/></svg>
+    <span>LEGATE</span>
+  </a>
+  <nav class="nav-links" aria-label="Main navigation">
+    <a href="index.html">Home</a>
+    <a class="active" href="overview.html" aria-current="page">Overview</a>
+    <a href="sessions.html">Sessions</a>
+    <a href="durability.html">Durability</a>
+    <a href="build.html">Build</a>
+  </nav>
+  <span class="ver-pill">v0.1.0</span>
+  <button class="theme-btn" type="button" aria-label="Switch color theme" title="Switch color theme"></button>
+  <a class="github-btn" href="https://github.com/kubebridge/legate">GitHub</a>
+</div>
+</header>
+
+<main>
+<section class="wrap overview-hero" id="top" aria-labelledby="overview-title">
+  <div class="hero-grid">
+    <div>
+      <span class="kicker">.NET 10 · Akka.NET · Apache 2.0</span>
+      <h1 class="hero-title" id="overview-title">Durable Session Agents for .NET</h1>
+    </div>
+    <div class="hero-intro">
+      <p class="lede">Embed tool-using agents: prompt sessions, handle approvals, and stream events. Run in one process or across a cluster, with persistent state for crash recovery.</p>
+      <div class="resource-links">
+        <a class="btn primary" href="build.html">Start building</a>
+        <a class="btn" href="sessions.html">Explore sessions</a>
+      </div>
+    </div>
+  </div>
+
+  <div class="example-block">
+  <div class="example-grid">
+    <div class="example-code content-stack">
+      <h2 class="panel-label">With your host configured</h2>
+<pre class="code"><code><span class="k">var</span> session = <span class="k">await</span> client.<span class="f">OpenSessionAsync</span>(
+    agentId, <span class="k">null</span>, ct);
+
+<span class="k">await</span> client.<span class="f">PromptAsync</span>(
+    session.Id,
+    UserMessage.Text(<span class="s">"Review the project."</span>),
+    DeliveryMode.Queue, ct);
+
+<span class="k">await foreach</span> (<span class="k">var</span> e <span class="k">in</span> client.<span class="f">Subscribe</span>(session.Id, 0L, ct))
+    Console.WriteLine(e.GetType().Name);</code></pre>
+    </div>
+    <section class="demo event-demo" id="event-demo" aria-labelledby="event-example-title">
+      <div class="journal-heading">
+        <h2 class="panel-label" id="event-example-title">Session journal</h2>
+        <span>Example</span>
+      </div>
+      <ol class="event-list">
+        <li class="event-row"><span class="event-sequence">1</span><code>TurnStarted</code><span class="event-detail">turn_8f2c</span></li>
+        <li class="event-row" style="--event-color:var(--a)"><span class="event-sequence">2</span><code>ToolCallStarted</code><span class="event-detail">read_file</span></li>
+        <li class="event-row" style="--event-color:var(--a)"><span class="event-sequence">3</span><code>ToolCallCompleted</code><span class="event-detail">done</span></li>
+        <li class="event-row" style="--event-color:var(--g)"><span class="event-sequence">4</span><code>TurnCompleted</code><span class="event-detail">stop</span></li>
+      </ol>
+    </section>
+  </div>
+  </div>
+</section>
+
+<section class="block" id="sessions" aria-labelledby="sessions-title"><div class="wrap">
+  <div class="sec-head">
+    <div><span class="sec-no">01 / Sessions</span>
+      <h2 class="sec-title" id="sessions-title">The backend of an agentic CLI</h2></div>
+    <p class="sec-sub">Send a message to a session and follow its progress through an event stream. Answer approval requests, steer the agent, or abort while it works. The journal keeps the recorded events for replay.</p>
+  </div>
+
+  <div class="demo session-demo" id="session-demo">
+    <div class="session-flow" id="session-flow" role="region" aria-labelledby="session-flow-title">
+      <div class="demo-toolbar">
+        <h3 class="panel-label" id="session-flow-title">Session execution</h3>
+        <div class="demo-controls" hidden>
+          <button class="demo-toggle" type="button">Pause</button>
+          <button class="demo-replay" type="button">Replay</button>
+        </div>
+      </div>
+      <div class="session-flow-scroll" tabindex="0" role="region" aria-label="Animated host, session, turn, and tools diagram">
+        <div class="session-flow-canvas">
+          <div class="session-flow-track">
+            <div class="session-flow-node host"><span>Host</span><strong>CLI or service</strong><code>AddLegate(...)</code></div>
+            <div class="session-edge"><code>PromptAsync</code><div class="session-edge-line"></div></div>
+            <div class="session-flow-node session"><span>Session</span><strong>Session actor</strong><code>inbox · lease</code></div>
+            <div class="session-edge"><code>claim</code><div class="session-edge-line"></div></div>
+            <div class="session-flow-node turn"><span>Turn</span><strong>ReAct loop</strong><code>IChatClient</code></div>
+            <div class="session-edge"><code>call / result</code><div class="session-edge-line"></div></div>
+            <div class="session-flow-node tools"><span>Tools</span><strong>MCP · built-ins</strong><code>ask_user · exec</code></div>
+          </div>
+          <div class="session-edge session-return"><code>SessionEvent stream → host</code><div class="session-edge-line"></div></div>
+          <div class="session-journal">
+            <div class="session-journal-label"><span>Journaled events</span><code id="band-sequence">seq 0</code></div>
+            <div class="journal-band" id="journal-band" aria-hidden="true"></div>
+          </div>
+        </div>
+      </div>
+      <p class="demo-status" aria-live="off">Illustration of session execution and journal growth</p>
+    </div>
+
+    <div class="session-concepts" role="region" aria-labelledby="concepts-title">
+      <div class="session-concepts-heading">
+        <h3 id="concepts-title">Seven concepts</h3>
+        <p>Interactive and unattended work use the same session model.</p>
+      </div>
+      <div class="concept-grid">
+        <div class="concept-card" style="--concept-color:var(--c)"><h4>Agent</h4><p>The model configuration, system prompt, tools, skills, sub-agents, and permission defaults.</p></div>
+        <div class="concept-card" style="--concept-color:var(--v)"><h4>Session <span class="concept-core">Core</span></h4><p>A conversation with an agent. Keeps its state, transcript, inbox, and workspace binding until closed or expired.</p></div>
+        <div class="concept-card" style="--concept-color:var(--p)"><h4>UserMessage</h4><p>Text, files, or images sent by the user. A message can start a turn, join the queue, or steer running work.</p></div>
+        <div class="concept-card" style="--concept-color:var(--a)"><h4>Reply</h4><p>The host's answer to a permission request or question. Resumes the suspended turn.</p></div>
+        <div class="concept-card" style="--concept-color:var(--v)"><h4>Turn <span class="concept-core">Core</span></h4><p>One run of the model and tool loop. Ends on completion, abort, or a limit; can pause for input. Runs under a claim.</p></div>
+        <div class="concept-card" style="--concept-color:var(--g)"><h4>SessionEvent</h4><p>An event in the ordered journal, such as TurnStarted, ToolCallStarted, or TurnCompleted.</p></div>
+        <div class="concept-card" style="--concept-color:var(--c)"><h4>SessionCell</h4><p>A transcript entry derived from journaled events for conversation history and display.</p></div>
+        <div class="concept-card concept-package"><code>Legate.Abstractions</code><p>These contracts share a package with no Akka dependency.</p></div>
+      </div>
+    </div>
+
+    <div class="session-walkthrough" id="session-walkthrough" role="region" aria-labelledby="walkthrough-title">
+      <div class="demo-toolbar">
+        <h3 id="walkthrough-title">A turn, step by step</h3>
+        <div class="demo-controls" hidden>
+          <button class="demo-toggle" type="button">Pause</button>
+          <button class="demo-replay" type="button">Replay</button>
+        </div>
+      </div>
+      <div class="session-step-grid">
+        <ol class="session-step-list">
+          <li><button class="session-step" type="button" data-step="0" aria-controls="session-step-0"><span>01</span><span>Prompt enters the inbox</span></button></li>
+          <li><button class="session-step" type="button" data-step="1" aria-controls="session-step-1"><span>02</span><span>The turn is claimed under a lease</span></button></li>
+          <li><button class="session-step" type="button" data-step="2" aria-controls="session-step-2"><span>03</span><span>Workspace, agent, and model</span></button></li>
+          <li><button class="session-step" type="button" data-step="3" aria-controls="session-step-3"><span>04</span><span>Tools are assembled</span></button></li>
+          <li><button class="session-step" type="button" data-step="4" aria-controls="session-step-4"><span>05</span><span>The model and tool loop runs</span></button></li>
+          <li><button class="session-step" type="button" data-step="5" aria-controls="session-step-5"><span>06</span><span>The turn finishes</span></button></li>
+        </ol>
+        <div class="session-step-detail">
+          <span class="session-step-number" id="session-step-number" aria-hidden="true">01</span>
+          <article id="session-step-0" data-step-panel>
+            <h4>Prompt enters the inbox</h4>
+            <p>The message is appended to the session store. The dispatcher wakes the session actor, which runs locally or on a cluster node.</p>
+            <code>ISessionStore</code>
+          </article>
+          <article id="session-step-1" data-step-panel>
+            <h4>The turn is claimed under a lease</h4>
+            <p>The store grants one worker the claim. The runtime checks its token before invoking tools, and the stores reject writes from expired or replaced claims.</p>
+            <code>ClaimNextTurn</code>
+          </article>
+          <article id="session-step-2" data-step-panel>
+            <h4>Workspace, agent, and model</h4>
+            <p>The runtime binds the workspace, loads the agent's instructions and skills, and prepares the model client with the configured model policy and call limits.</p>
+            <code>IChatClient</code>
+          </article>
+          <article id="session-step-3" data-step-panel>
+            <h4>Tools are assembled</h4>
+            <p>The agent receives its configured built-ins, custom tools, and tools from registered sources such as MCP servers. Calls pass through the permission policy.</p>
+            <code>IPermissionPolicy</code>
+          </article>
+          <article id="session-step-4" data-step-panel>
+            <h4>The model and tool loop runs</h4>
+            <p>The agent calls the model, executes permitted tool calls, and returns results to the model. Recorded events reach subscribers, and injected messages join at iteration boundaries.</p>
+            <code>SessionEvent</code>
+          </article>
+          <article id="session-step-5" data-step-panel>
+            <h4>The turn finishes</h4>
+            <p>Usage is checkpointed and the turn settles. An interactive session returns to idle. AutoClose sessions close after their run and notify a configured completion sink.</p>
+            <code>Idle</code>
+          </article>
+        </div>
+      </div>
+      <p class="demo-status" aria-live="off">Select a step to read at your own pace.</p>
+    </div>
+  </div>
+  <a class="text-link" href="sessions.html">Read about sessions and delivery modes</a>
+</div></section>
+
+<section class="block alt" id="durability" aria-labelledby="durability-title"><div class="wrap">
+  <div class="sec-head">
+    <div><span class="sec-no pk">02 / Durability</span>
+      <h2 class="sec-title" id="durability-title">Recover after a node failure</h2></div>
+    <p class="sec-sub">Each turn runs under a renewable claim. If a node stops, another can take over after the lease expires. The session's recovery policy either starts a new attempt or records the interruption as a failure.</p>
+  </div>
+
+  <div class="demo recovery-demo" id="recovery-demo" role="region" aria-label="Node failure recovery example using FailAttempt">
+    <div class="recovery-nodes">
+      <div class="node-card" data-node="owner" data-state="stopped"><div class="node-heading"><code>legate-1</code><span class="node-dot" aria-hidden="true"></span></div><strong data-node-status>Stopped</strong><p>Original turn owner</p></div>
+      <div class="node-card" data-node="survivor" data-state="ready"><div class="node-heading"><code>legate-2</code><span class="node-dot" aria-hidden="true"></span></div><strong data-node-status>Failure recorded</strong><p>Handles recovery</p></div>
+      <div class="node-card" data-state="available"><div class="node-heading"><code>legate-3</code><span class="node-dot" aria-hidden="true"></span></div><strong>Available</strong><p>Cluster member</p></div>
+      <div class="recovery-journal">
+        <div class="journal-heading"><h3 class="panel-label">Journal</h3><span>FailAttempt</span></div>
+        <ol class="event-list">
+          <li class="event-row"><span class="event-sequence">1</span><code>TurnStarted</code></li>
+          <li class="event-row" data-terminal><span class="event-sequence">2</span><code>TurnFailed</code></li>
+        </ol>
+      </div>
+    </div>
+    <div class="recovery-footer">
+      <div class="recovery-progress" aria-hidden="true"></div>
+      <p class="recovery-caption" aria-live="off">The interrupted turn is recorded as failed. The session is ready for another prompt.</p>
+      <div class="demo-controls" hidden>
+        <button class="demo-toggle" type="button">Pause</button>
+        <button class="demo-replay" type="button">Replay</button>
+      </div>
+    </div>
+  </div>
+  <div class="durability-facts">
+    <div><h3>Claim-protected writes</h3><p>The store checks the current claim before accepting checkpoints, journal appends, or settlement. An expired or replaced claim is rejected.</p></div>
+    <div><h3>Atomic store updates</h3><p>Inbox appends, claims, renewals, usage checkpoints, and turn settlement are each applied atomically.</p></div>
+    <div><h3>Tenant-scoped storage</h3><p>Every store operation includes a <code>TenantId</code>. Storage providers scope reads and writes to that tenant.</p></div>
+  </div>
+  <a class="text-link" href="durability.html">Read about claims, recovery, and event replay</a>
+</div></section>
+
+<section class="block" id="build" aria-labelledby="deployment-title"><div class="wrap">
+  <div class="sec-head">
+    <div><span class="sec-no cy">03 / Build</span>
+      <h2 class="sec-title" id="deployment-title">Choose how to host it</h2></div>
+    <p class="sec-sub">Register Legate in your application's dependency injection container. Choose the model providers, tools, storage, and workspace that fit your deployment.</p>
+  </div>
+  <div class="grid c2 deployment-options">
+    <div class="card">
+      <h3><span class="dsq" style="background:var(--c)" aria-hidden="true"></span>CLI harness</h3>
+      <p>Run in one process with no database server. Use SQLite for persistent sessions and a host-directory workspace for tools that work on local files.</p>
+      <p>The <a href="https://github.com/kubebridge/legate/tree/main/samples/LegateCli">LegateCli</a> sample demonstrates interactive approvals with in-memory storage. <a href="https://github.com/kubebridge/legate/tree/main/samples/CSharpHost">CSharpHost</a> shows the session API in a C# Generic Host.</p>
+    </div>
+    <div class="card">
+      <h3><span class="dsq" style="background:var(--a)" aria-hidden="true"></span>Hosted service</h3>
+      <p>Use Postgres for shared session state, S3 for blobs, and Docker workspaces for container isolation. Add clustering when the service needs multiple nodes.</p>
+      <p><a href="https://github.com/kubebridge/legate/tree/main/samples/MinimalHost">MinimalHost</a> exposes HTTP endpoints and an SSE event stream. <a href="https://github.com/kubebridge/legate/tree/main/samples/Headless">Headless</a> demonstrates AutoClose with a completion webhook.</p>
+    </div>
+  </div>
+  <a class="text-link" href="build.html">Choose packages and configure your host</a>
+</div></section>
+
+<section class="block alt" id="try" aria-labelledby="try-title"><div class="wrap">
+  <div class="sec-head">
+    <div><span class="sec-no cy">Try it locally</span>
+      <h2 class="sec-title" id="try-title">Try the CLI without a provider key</h2></div>
+    <p class="sec-sub">From a checkout, with the .NET 10 SDK installed, build the solution and run the scripted sample. It exercises prompts, tool approvals, and session commands without calling an external model.</p>
+  </div>
+<pre class="code"><code><span class="s" aria-hidden="true">$ </span>dotnet fsi build.fsx
+<span class="s" aria-hidden="true">$ </span>dotnet run --project samples/LegateCli -- --scripted</code></pre>
+  <div class="resource-links">
+    <a class="btn primary" href="https://github.com/kubebridge/legate">Get the source</a>
+    <a class="btn" href="build.html#samples">Browse the samples</a>
+  </div>
+</div></section>
+</main>
+
+<footer><div class="wrap">
+  <a class="brand" href="index.html" style="font-size:12px"><svg width="20" height="20" viewBox="0 0 32 32" aria-hidden="true"><path d="M9 6h3v21H9Z" fill="var(--ink)"/><path d="M12 7H25L23.4 9.4H12Z" fill="var(--logo-b)"/><path d="M12 10.2H22.87L21.27 12.6H12Z" fill="var(--logo-b)"/><path d="M12 13.4H21.27L22.87 15.8H12Z" fill="var(--logo-b)"/><path d="M12 16.6H23.4L25 19H12Z" fill="var(--logo-b)"/></svg>LEGATE</a>
+  <span class="spacer">A <a href="https://kubebridge.com">Kubebridge</a> project · Apache 2.0</span>
+  <nav><a href="https://github.com/kubebridge/legate">GitHub</a><a href="https://www.nuget.org/packages/Legate">NuGet</a></nav>
+</div></footer>
+<script src="theme.js"></script>
+<script src="overview.js"></script>
+</body>
+</html>

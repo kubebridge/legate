@@ -169,6 +169,79 @@ type SessionsOptions() =
     /// <c>Legate:Sessions:SubscriptionMaxEventPayloadBytes</c>.
     member val SubscriptionMaxEventPayloadBytes: int = 1048576 with get, set
 
+    /// The process-wide transient wait hubs the legacy
+    /// <c>WaitForSettleAsync</c> path and the per-operation live hints
+    /// resolve through, keyed by tenant and session. A session with no hub
+    /// past the cap rejects waiter and hint admission with the typed
+    /// admission error instead of evicting a live session's hub; the actor
+    /// settle path never throws for the cap and instead drops the
+    /// transient record while the durable row stays the truth. Closed and
+    /// expired sessions release their hub. Default 16384. Bound from
+    /// <c>Legate:Sessions:MaxWaitHubs</c>.
+    member val MaxWaitHubs: int = 16384 with get, set
+
+    /// The settled results one transient wait hub retains, newest wins: a
+    /// settle past the bound evicts the oldest retained result. The legacy
+    /// wait resolves the next settle through its live waiter queue, never
+    /// through this history, and receipt-bound waits resolve from the
+    /// durable row; the history is a bounded diagnostic only, so a settle
+    /// with no waiter never grows an archive. Default 8. Bound from
+    /// <c>Legate:Sessions:MaxSettledResultsPerHub</c>.
+    member val MaxSettledResultsPerHub: int = 8 with get, set
+
+    /// The live waiters one transient wait hub queues for the next settle.
+    /// A wait queued past the cap rejects with the typed admission error
+    /// instead of parking an unbounded queue; cancellation and bound
+    /// lapses dequeue the abandoned waiter so it never steals a later
+    /// settle. Default 64. Bound from
+    /// <c>Legate:Sessions:MaxSettleWaitersPerHub</c>.
+    member val MaxSettleWaitersPerHub: int = 64 with get, set
+
+    /// The live position-hint keys the process holds for accepted
+    /// operations awaiting settlement, keyed by tenant, session, and inbox
+    /// position. A hint only wakes its observers to re-read the durable
+    /// row; a subscribe past the cap rejects with the typed admission
+    /// error instead of evicting a live observation, and every wake
+    /// re-reads the committed row before honoring any other side.
+    /// Notified and unsubscribed hints leave immediately; closed and
+    /// expired sessions release theirs with a wake. Default 16384. Bound
+    /// from <c>Legate:Sessions:MaxPositionHints</c>.
+    member val MaxPositionHints: int = 16384 with get, set
+
+    /// The live observers one position hint wakes. A subscribe past the
+    /// per-hint cap rejects with the typed admission error instead of
+    /// evicting a live observer; a notify wakes every subscribed observer
+    /// and duplicate notifies only re-read the same committed winner.
+    /// Default 128. Bound from
+    /// <c>Legate:Sessions:MaxPositionHintObservers</c>.
+    member val MaxPositionHintObservers: int = 128 with get, set
+
+    /// The per-session synchronization entries one session client tracks:
+    /// the prompt-serialising semaphores keyed by session. A session past
+    /// the cap rejects with the typed admission error unless an unheld
+    /// entry can be evicted first; entries held or about to be held are
+    /// never evicted, so eviction never introduces overlapping critical
+    /// sections for one session. Session close, client disposal, and the
+    /// explicit release entry point drop unheld entries. Default 2048.
+    /// Bound from <c>Legate:Sessions:MaxSyncSessionsPerClient</c>.
+    member val MaxSyncSessionsPerClient: int = 2048 with get, set
+
+    /// The sessions with an auto-title generation in flight or completed.
+    /// At most one generation fires per session per process; entries clear
+    /// when the call fails or yields nothing so a later prompt retries,
+    /// and session close plus the explicit release entry point drop them
+    /// (a titled session never refires because the stored title is
+    /// non-empty). Past the cap new sessions skip titling until entries
+    /// release: titling is best-effort and never fails a prompt. Default
+    /// 1024. Bound from <c>Legate:Sessions:MaxAutoTitleSessions</c>.
+    member val MaxAutoTitleSessions: int = 1024 with get, set
+
+    /// The poll cadence between durable re-reads while no live hint fires:
+    /// remote, restarted, and reconnected observers converge on this beat
+    /// while live local observers wake on the hint instead. Default 50
+    /// ms. Bound from <c>Legate:Sessions:WaitPollInterval</c>.
+    member val WaitPollInterval: TimeSpan = TimeSpan.FromMilliseconds 50.0 with get, set
+
     /// Returns null when every knob is in range, otherwise a message for the
     /// first violation.
     /// <returns>The first violation's message, or null when the settings are valid.</returns>
@@ -211,6 +284,22 @@ type SessionsOptions() =
                         "SubscriptionReplayCacheSize must be at least 1."
                     if this.SubscriptionMaxEventPayloadBytes < 1 then
                         "SubscriptionMaxEventPayloadBytes must be at least 1."
+                    if this.MaxWaitHubs < 1 then
+                        "MaxWaitHubs must be at least 1."
+                    if this.MaxSettledResultsPerHub < 1 then
+                        "MaxSettledResultsPerHub must be at least 1."
+                    if this.MaxSettleWaitersPerHub < 1 then
+                        "MaxSettleWaitersPerHub must be at least 1."
+                    if this.MaxPositionHints < 1 then
+                        "MaxPositionHints must be at least 1."
+                    if this.MaxPositionHintObservers < 1 then
+                        "MaxPositionHintObservers must be at least 1."
+                    if this.MaxSyncSessionsPerClient < 1 then
+                        "MaxSyncSessionsPerClient must be at least 1."
+                    if this.MaxAutoTitleSessions < 1 then
+                        "MaxAutoTitleSessions must be at least 1."
+                    if this.WaitPollInterval <= TimeSpan.Zero then
+                        "WaitPollInterval must be positive."
                 |]
 
             if violations.Length <> 0 then
@@ -292,6 +381,37 @@ type TurnsOptions() =
     /// <see cref="F:Legate.TurnCrashResume.Fail" />.
     member val CrashResume: TurnCrashResume = TurnCrashResume.Fail with get, set
 
+    /// The assistant-text and reasoning deltas one streaming turn buffers
+    /// before forcing a journal flush, in events. Deltas coalesce in memory
+    /// as they stream; reaching this count flushes a bounded batch through
+    /// the fenced append instead of growing the backlog without bound. The
+    /// turn awaits storage (never subscribers) on a forced flush. Default
+    /// 64. Bound from <c>Legate:Turns:MaxStreamingPendingEvents</c>.
+    member val MaxStreamingPendingEvents: int = 64 with get, set
+
+    /// The assistant-text and reasoning deltas one streaming turn buffers
+    /// before forcing a journal flush, in bytes (UTF-8). Caps sustained
+    /// chunk production under delayed storage alongside
+    /// <see cref="P:Legate.TurnsOptions.MaxStreamingPendingEvents" />:
+    /// whichever cap trips first flushes. Default 65536. Bound from
+    /// <c>Legate:Turns:MaxStreamingPendingBytes</c>.
+    member val MaxStreamingPendingBytes: int = 65536 with get, set
+
+    /// The most delta events one streaming journal append carries. Larger
+    /// coalesced buffers split across bounded appends, so no single storage
+    /// operation grows with the stream. Default 8. Bound from
+    /// <c>Legate:Turns:MaxStreamingAppendBatchEvents</c>.
+    member val MaxStreamingAppendBatchEvents: int = 8 with get, set
+
+    /// The most chars one streaming delta event carries. Larger buffers
+    /// split into several events within
+    /// <see cref="P:Legate.TurnsOptions.MaxStreamingAppendBatchEvents" />,
+    /// so a sustained stream produces bounded appends instead of one
+    /// synchronous storage operation per token or one unbounded event.
+    /// Default 8192. Bound from
+    /// <c>Legate:Turns:MaxStreamingAppendBatchChars</c>.
+    member val MaxStreamingAppendBatchChars: int = 8192 with get, set
+
     /// Returns null when every knob is in range, otherwise a message for the
     /// first violation.
     /// <returns>The first violation's message, or null when the settings are valid.</returns>
@@ -306,6 +426,14 @@ type TurnsOptions() =
                     "DefaultDelivery has an unknown delivery mode."
                 if not (Enum.IsDefined(typeof<TurnCrashResume>, this.CrashResume)) then
                     "CrashResume has an unknown crash resume."
+                if this.MaxStreamingPendingEvents < 1 then
+                    "MaxStreamingPendingEvents must be at least 1."
+                if this.MaxStreamingPendingBytes < 1 then
+                    "MaxStreamingPendingBytes must be at least 1."
+                if this.MaxStreamingAppendBatchEvents < 1 then
+                    "MaxStreamingAppendBatchEvents must be at least 1."
+                if this.MaxStreamingAppendBatchChars < 1 then
+                    "MaxStreamingAppendBatchChars must be at least 1."
             |]
 
         if violations.Length = 0 then
@@ -589,6 +717,9 @@ type CompletionOptions() =
     /// another owner may claim the row. Default 60 s.
     member val ClaimLeaseDuration: TimeSpan = TimeSpan.FromSeconds 60.0 with get, set
 
+    /// Total bound for one awaited completion acknowledgement, including custom sinks.
+    member val AttemptTimeout: TimeSpan = TimeSpan.FromSeconds 30.0 with get, set
+
     /// Returns null when every knob is in range, otherwise a message for the
     /// first violation.
     /// <returns>The first violation's message, or null when the settings are valid.</returns>
@@ -605,6 +736,8 @@ type CompletionOptions() =
                     "RedriveInterval must be positive."
                 if this.ClaimLeaseDuration <= TimeSpan.Zero then
                     "ClaimLeaseDuration must be positive."
+                if this.AttemptTimeout <= TimeSpan.Zero then
+                    "AttemptTimeout must be positive."
             |]
 
         if violations.Length = 0 then

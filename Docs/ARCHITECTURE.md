@@ -20,22 +20,240 @@ conventions live in `Docs/agents/code-rules.md`.
 
 Session state machine: `Idle -> Running -> (Idle | WaitingForInput | Closed)`.
 
+### Global session identity and tenant routing
+
+`SessionId` is globally unique in the shared store. It is not allocated from
+tenant-local sequences, and no tenant-local session id may be substituted for
+it. Relational stores retain tenant-qualified keys, indexes, and migration
+history for isolation and query locality, while the session identity remains
+globally unique. Existing relational keys and landed migrations are retained;
+future changes are additive migrations only.
+
+The cluster entity key is the canonical tenant-qualified address:
+
+```text
+s2.<base64url(UTF-8 tenant.Value)>.<canonical ULID SessionId>
+```
+
+The `s2` prefix identifies the addressing format. The shard schema stamp is
+`2.<hash version>.<shard count>`. The tenant segment uses unpadded
+base64url with strict UTF-8, and the session segment is canonical ULID text.
+The tenant in this address is trusted host binding metadata, not a
+caller-selected routing hint. Authentication and authorization decide whether
+the caller may use a tenant; routing does not grant that permission.
+
+A receiving node performs complete admission before actor activation. It
+validates the address, carried scope, operation, and corresponding host
+binding, then performs a non-activating durable existence probe. A rejected
+scope throws `SessionScopeRejectedException` with one stable reason:
+`InvalidScope`, `AddressMismatch`, `ScopeUnavailable`, `ResponseMismatch`,
+`UnsupportedOperation`, or `NodeStopping`. The probe and all rejection paths
+are non-mutating and do not manufacture claim authority. The node must have
+the full dependency closure for every declared binding even when it only
+receives traffic for that tenant.
+
+### Host-owned execution bindings
+
+`SessionHostBinding` is an immutable, sealed descriptor containing a trusted
+`TenantId` and `Func<IServiceProvider, IServiceProvider>`. Register it on the
+node root with `AddLegateSessionBinding`. The callback returns an existing,
+host-owned, long-lived singleton provider graph exactly once during node
+initialization.
+It must not call `BuildServiceProvider` or create scopes or resources. An
+explicit descriptor may return the node root when that root supplies the
+tenant's complete execution graph. Legate borrows external providers and
+never disposes them. The callback
+runs before actor traffic, and the bound `Client` is published only after
+successful startup. Reading `Client` before startup succeeds is a read-only
+lazy access that throws. Binding and facade assembly perform no lazy writes.
+
+Each binding provider must register `SessionClientOptions` with the same
+tenant, `ILlmProvider`, `IChatClient`, `ISessionStore` implementing
+`ISessionAbortControlStore`, compatible `ISessionSettlementStore` (explicit or
+implemented by that store), `ISessionEventStore`, `IWorkspaceRuntime`, and
+the tenant's tools, permission policy, model policy, and other execution
+dependencies. Explicit bindings suppress the default binding. The default
+self-binding is used only when there are no explicit bindings and the host
+has supplied the complete execution dependency set. A receiving-only node may
+therefore have a root container with only routing and cluster dependencies.
+
+The root provider is never an execution fallback for a declared tenant. The
+host owns construction and lifetime of each independent tenant provider, and
+the tenant option must equal the binding tenant. The context assembler does
+not resolve or start unrelated `IHostedService` implementations; other tenant
+workers and administrative services remain the host's responsibility.
+
+Bindings and their options are frozen after initialization. A running node
+cannot retarget a descriptor, add or remove bindings, replace providers, or
+reuse a descriptor on another node lifetime. A restarted node gets fresh
+binding descriptors. `SessionHostBinding` is ordinary ownership for the root
+self-binding, so shutdown must not double-dispose it.
+
+`ISessionClientFactory.GetClient(tenant)` reads the initialized registry without
+building providers or scopes. It fails before startup, for undeclared tenants and
+once admission closes. ASP.NET Core middleware uses this factory to install an
+immutable request feature for scoped `SessionClient`. Runtime dispatcher/schedule
+workers use initialized graph-local context clients and private frozen inputs,
+not request services or a receiving-only node's root execution defaults.
+
+Preparation copies runtime/client options before validation, finalizing default
+model priority as facade, Llm, usable sole-provider default, then legacy fallback.
+Host-owned options are never normalized in place. Composition validators registered
+with `AddExecutionValidation` run read-only once per graph with actual node mode,
+before any assembly/publication. Compatibility is atomic wiring, not evidence of
+backend sharing or durability. The ASP.NET adapter refuses its implicit ephemeral
+pair/workspace in cluster mode but accepts explicitly chosen compatible providers.
+
+The authoritative dispatcher independently discovers Running/current-turn keys
+with finite keyset continuation, retaining progress between bounded wake passes so
+front-of-list live owners cannot starve later candidates. Existing Running slots
+do not consume new-work admission twice. Discovery validates tenant/lifecycle/
+control/completion routing and sends the existing check-inbox command. Only the
+execution factory and `TryRecoverControlTarget` mint fresh authority for the exact
+unstopped target after expiry. No recovery reset, bootstrap takeover, protocol or
+schema change grants authority; losing owners remain fenced. Stops and
+terminal-pending barriers remain refused and early lease refusals retry later.
+
+This is the intended C# composition shape. The host constructs the independent
+providers before registering the node bindings, and keeps ownership of them:
+
+```csharp
+static async Task<IHost> StartNodeAsync(
+    IServiceProvider tenantAProvider,
+    IServiceProvider tenantBProvider)
+{
+    var tenantA = TenantId.Create("tenant-a");
+    var tenantB = TenantId.Create("tenant-b");
+
+    var descriptorA = new SessionHostBinding(
+        tenantA,
+        new Func<IServiceProvider, IServiceProvider>(_ => tenantAProvider));
+    var descriptorB = new SessionHostBinding(
+        tenantB,
+        new Func<IServiceProvider, IServiceProvider>(_ => tenantBProvider));
+
+    var builder = Host.CreateApplicationBuilder();
+    LegateServiceCollectionExtensions.AddLegate(builder.Services);
+    builder.Services.AddLegateSessionBinding(descriptorA)
+        .AddLegateSessionBinding(descriptorB);
+
+    // The host builds the node from node plus its cluster and routing
+    // services. The tenant providers were already built by the host and
+    // contain the complete dependency closure described above.
+    var host = builder.Build();
+    await host.StartAsync();
+    SessionClient tenantAClient = descriptorA.Client;
+    // The caller retains host and the borrowed providers, stops host before
+    // disposing the providers, and can use tenantAClient while host is live.
+    return host;
+}
+```
+
+The host must stop and drain the node, quiesce actors and subscriptions, and
+only then dispose each borrowed provider exactly once. A stop timeout is not
+quiescence: retain providers until completion or process exit. Stop closes
+admission and detaches node subscriptions. The host later disposes each
+provider-owned event bus; its static journal hook detaches idempotently. Do not
+re-register borrowed disposables in the node container.
+
 There is no job type. A headless run is a session opened with `AutoClose`,
-an `AllowAll` permission policy, an optional completion sink, and optionally
+an `AllowAll` permission policy, an optional completion destination id
+registered on every participating host, and optionally
 `Outcome = Structured` (which gives the agent `finish`/`fail` tools).
+Settlement snapshots the destination id into the completion outbox; a
+durable redriver resolves the row's snapshot on the delivery host, awaits
+receiver acknowledgement, then marks delivered under the same fenced
+owner. At-least-once delivery: receivers deduplicate on the stable
+idempotency key.
 
 ### Client API
 
 | Area | Members |
 |---|---|
 | Sessions | `OpenSession`, `ResumeSession`, `GetSession`, `ListSessions`, `Close`, `Fork`, `SetAgent` |
-| Prompting | `Prompt(sessionId, UserMessage, DeliveryMode)` where `DeliveryMode` is `Queue`, `Inject`, or `Interrupt` |
-| Replying | `Reply(sessionId, Reply)` |
+| Prompting | `Prompt(sessionId, UserMessage, DeliveryMode)` where `DeliveryMode` is `Queue`, `Inject`, or `Interrupt`, returning `AcceptedOperation` |
+| Replying | `Reply(sessionId, Reply)` returning `AcceptedOperation` |
+| Observation | `GetOperationResultAsync(AcceptedOperation)` returning `OperationResult` with `OperationStatus`, `WaitForOperationAsync(AcceptedOperation, bound)` waiting for the committed terminal observation |
 | Control | `Abort`, `Compact` |
 | Reading | `ReadTranscript`, `ReadEvents(fromSequence)`, `Subscribe(sessionId, fromSequence)` as `IAsyncEnumerable<SessionEvent>` |
 | Sugar | `PromptAndWait` extension returning `TurnResult` |
 
+### Accepted-operation receipts and authoritative result lookup
+
+Every accepted `Prompt` (all `DeliveryMode`) and `Reply` returns an
+`AcceptedOperation` receipt: the session id, the immutable per-session
+inbox `Position`, the durable `OperationId` (`InboxEntry.TurnId` stamped
+at accept for user messages; the default sentinel for reply entries and
+legacy rows), the `OperationKind` (`Queue`, `Inject`, `Interrupt`,
+`Reply`), and the accept timestamp. Rejected input throws and returns
+nothing claiming acceptance. Concurrent accepted inputs carry distinct
+positions and are distinguishable.
+
+Correlation semantics: `Queue` acts on the message once the running turn
+finishes; `Inject` folds into the running turn at its next iteration
+boundary and never promises an independent turn; `Interrupt` pre-empts
+the running turn (settled as `Aborted` under `ExplicitAbort`) and is
+never confused with the displaced turn or following queued work; `Reply`
+resumes the suspended real turn with attempt+1 and never starts one.
+Acceptance is not execution: it promises neither start nor success.
+
+`GetOperationResultAsync` observes one receipt behind a tenant-scoped
+lookup over the single authoritative `execution_settlements` row for
+`(tenant, session, position)`. `Pending` means accepted with no
+committed winner yet (with the associated real turn when known);
+`Terminal` carries the committed winning `TurnResult` (success, failure,
+or abort, including setup failure after acceptance); `Unknown` means the
+session entry is missing or mismatched in this tenant; `Unavailable`
+means storage failed and is never terminal. Unknown sessions (including
+other-tenant sessions) throw `SessionNotFoundException`, so receipt
+possession grants neither access nor turn ownership. Stale or losing
+reports never replace the committed winner.
+
+Availability and retention: committed success, failure, and abort
+outcomes stay available to late and separate-process readers after
+restart for the documented bounded retention window, including sinkless
+sessions. Completion delivery or outbox cleanup never destroys the
+observation record early. Retention is bounded, never permanent, and no
+outcome is reconstructed from incomplete journal history. Unsupported
+providers fail fast before accepting work that needs durable
+observation, with no process-local or unfenced fallback. Unsupported old
+formats reject with `CompletionRoutingException`
+(`UnsupportedFormat`) and a clean-start requirement.
+
+### Receipt-bound waits
+
+Every wait identifies its operation by the receipt's immutable inbox
+position and resolves from the same authoritative
+`execution_settlements` row as `GetOperationResultAsync`, so concurrent
+observers cannot steal one another's results and multiple observers of
+one operation obtain the same committed outcome. `WaitForOperationAsync`
+takes the receipt and a bound and returns the terminal `OperationResult`;
+`PromptAndWait` prompts over `Queue` delivery and then observes that
+prompt's receipt the same way, returning the winning `TurnResult`.
+
+No registration before prompting is required: completion before
+subscription resolves on the first durable read, completion racing
+subscription converges on a live settlement hint plus re-read, and late,
+reconnected, restarted, and separate-process observers poll the same
+durable truth within the retention window. The live hint only wakes the
+observer; it never carries a verdict, and waits never manufacture
+settlement.
+
+Cancelling a wait or lapsing its bound abandons only that observation:
+the turn keeps running, the result is never consumed, another observer is
+never cancelled, and a later wait for the same receipt remains valid. A
+settlement that already won still returns after cancellation. Suspension
+on a permission request surfaces as the typed approval exception instead
+of settling. Explicit abort stays on `Abort`. The legacy
+`WaitForSettleAsync` companion (wait for the next settle without a
+receipt) remains for interactive hosts that queue the wait before
+prompting; prefer receipt-bound waits everywhere else.
+
 ### Turn lifecycle
+
+Targeted host abort is a durable control-intent API, not terminal settlement.
+See [Targeted host abort](host-abort.md) for exact-target retries, provider arbitration,
+pending recovery barriers and breaking 0.1.0/current-format requirements.
 
 1. The host prompts. The message is appended to the session inbox in
    `ISessionStore` and the dispatcher wakes the session entity (a sharded
@@ -55,6 +273,76 @@ an `AllowAll` permission policy, an optional completion sink, and optionally
    or `WaitingForInput`; `AutoClose` sessions close and notify the completion
    sink with at-least-once delivery.
 
+### Unsupported old data versus supported crash recovery
+
+`SessionOptions.FormatVersion` (current: `1`) is the single supported-format
+gate. `SessionOptionsPersistence.Deserialize`/`ValidatePersistence` reject
+anything else with `CompletionRoutingException` carrying
+`CompletionRoutingReason.UnsupportedFormat`, whose message is secret-free and
+points at a clean start. The gate runs before execution or further work on
+every open/resume/recovery path: the session client (`OpenSession`, `Prompt`,
+`Reply`, `SetAgent`, `Compact`, `Fork`, `PromptAndWait`), the dispatcher
+sweeps (unsupported sessions are skipped, never dispatched), the actor
+activation prime, and the store deserializers.
+
+Rejection is fail-closed and non-destructive: it consumes no inbox input,
+rebinds no sink or agent, manufactures no turn identities, conversation,
+usage, or results, and writes nothing to the journal. Repeated rejection and
+competing opens leave the old rows untouched, and the losing side of a claim
+race observes zero effects. Clean start is an explicit host/user choice made
+with fresh supported persistence; the runtime never deletes or resets local
+databases and never rewrites old records into the new format. New shared
+schema migrations stay additive and UTC-versioned; schema evolution does not
+imply support for old session payloads.
+
+Supported current-format crash recovery keeps the store-first inbox with
+atomic claim-fenced terminal settlement: reopening retains actual accepted
+inbox work in order, the recorded turn and ownership identity, suspension,
+and committed settlement. Already-settled work is never re-executed or
+re-settled, and later accepted work stays durable and ordered. Absent journal
+evidence is never treated as proof that an external effect did not happen:
+uncertain execution fails closed with an explicit diagnostic (the
+`OnCrashResume.FailAttempt` terminal or a fenced return to `Idle`) instead
+of automatic unsafe replay or invented historical outcomes. There is no
+exactly-once remote-effect guarantee and no new host privilege.
+
+### Idle authority versus execution authority
+
+Idle and host-control writes (on-demand compaction of an `Idle` session,
+agent rebinds, fork-prefix copies, and other host operations with no turn
+in flight) carry host authority, never a fabricated executing turn.
+`ISessionEventStore.AppendHostEvents` appends them under the caller's host
+permissions with a store-side lifecycle fence: the write lands only when
+the session still carries exactly the `UpdatedAt` version stamp the caller
+read and is not `Closed`. A moved version rejects as `staleLifecycle` and
+a `Closed` session as `sessionClosed`, both with zero writes; a successful
+append bumps `UpdatedAt`, so concurrent idle writers serialize and the
+loser observes the rejection. Fresh idle writes carry the default
+(unstamped) `TurnId` sentinel on the existing event subtypes (no new
+subtypes, no new id field, no `SessionClosedEvent` invention); history
+copies (fork prefixes) preserve their original `TurnId`s. The host path
+cannot claim a turn, consume inbox input, or settle one, so stale execution
+cannot borrow it to consume winner input, alter lifecycle or agent, or
+close the session.
+
+Execution writes fence on the ambient prime claim (`Append` under the turn
+claim token) while attributing to the real durable turn: every accepted user
+message carries a stable `TurnId` stamped at accept on its `InboxEntry`, and
+`ClaimNextTurn` claims under that stamped identity (never a fresh synthetic
+bootstrap), so distinct queued entries yield distinct durable `TurnId`s.
+`Session.CurrentTurnId` plus the turn row own execution, suspension, resume,
+restart, takeover, and settlement through the existing claim-token fence with
+the #363 committed outcome; execution journal events carry the real `TurnId`.
+Reply entries carry the default sentinel and resume the suspended real turn
+with attempt+1, never starting one. The prime, its re-prime, and the
+claim-fenced settlement boundary in `SessionSettlement` are unchanged here
+as the handoff #400 removes the prime onto: #400 re-anchors execution
+fencing from the prime claim onto these real-turn claims without changing
+the attribution defined here. Crash-path terminal writes for interrupted
+turns stay claim-fenced for the same reason: only the token proves the writer
+is no takeover loser. Suspension is not idle authority: a suspended turn still
+owns the history, so on-demand compaction no-ops while waiting for input.
+
 ### Store contracts
 
 `ISessionStore` is the durable store contract the Postgres, SQLite, and
@@ -62,17 +350,18 @@ in-memory implementations implement: session CRUD with tenant-scoped list
 paging (`SessionPage`), the session inbox in front of the turn queue
 (`AppendInboxMessage`, `ReadPendingInbox`, `MarkInboxConsumed`, with the
 `InboxEntry` envelope carrying a `UserMessage` or a `Reply` plus its
-`DeliveryMode`), turn claims under a lease, dispatch candidates, and the
-capacity count queries. Every method takes the `TenantId` the data belongs
-to; isolation across tenants is enforced in the stores, not only in the
-host.
+`DeliveryMode` and its stable real-turn `TurnId`), turn claims under a lease,
+dispatch candidates, and the capacity count queries. Every method takes the
+`TenantId` the data belongs to; isolation across tenants is enforced in the
+stores, not only in the host.
 
 - **Atomicity.** Inbox append, `ClaimNextTurn`, `RenewClaim` /
   `ObserveAndRenewClaim`, `CheckpointUsage`, `SettleTurn`, and
   `UpdateSessionState` must be atomic: each lands in one transaction, so a
   reader never observes a half-applied step. `ClaimNextTurn` in particular
-  hands a turn to exactly one caller; a loser observes no claimable turn,
-  never a double claim.
+  hands a turn to exactly one caller bound to the accepted entry's durable
+  real-turn identity; a loser observes no claimable turn, never a double
+  claim, and distinct queued entries never share an identity.
 - **Fencing.** The claim token lives on `TurnClaim` (with its owner, expiry,
   and attempt) and nowhere else; it is opaque: stores mint it, callers carry
   it verbatim, nothing parses it. Every side effect on behalf of a turn
@@ -111,6 +400,15 @@ throws `EventLimitExceededException` with structured properties before any
 part of the batch lands. Sanitisation is a runtime concern applied before
 the append; the store persists what it is given and validates only bounds.
 
+`ISessionSettlementStore` is the additive atomic settlement capability
+beside `ISessionStore`: `AdmitExecution`/`SettleExecution` commit the
+single winning terminal settlement per `(tenant, session, position)`, and
+`TryReadCommitted`/`TryReadEntry` serve durable observation behind
+`GetOperationResultAsync` with no new table, migration, or backfill. Reads
+are tenant-scoped and winner-only; correlation is evidence, never claim
+authority. Custom providers implement the full capability or fail fast
+before accepting work that needs it.
+
 `IAgentStore` and `IAgentCustomToolStore` are the durable store contracts
 for agent definitions and the custom HTTP tools enabled per agent. Every
 method is tenant-scoped; isolation is enforced in the stores, not only in
@@ -138,7 +436,9 @@ protected and must never be logged.
 Legate.Abstractions         contracts: domain types, store/tool/workspace/policy interfaces
                             deps: FSharp.Core, Microsoft.Extensions.AI.Abstractions (no Akka)
 Legate                      runtime: actors, sharding, dispatcher, ReAct loop, built-in tools,
-                            local LLM coordinator, hosted services, AddLegate()
+                             local LLM coordinator, hosted services, AddLegate()
+Legate.AspNetCore           configuration-aware registration, local profile, tenant request binding
+                            deps: Legate, Storage.InMemory, Workspace.Process, ASP.NET Core
 Legate.Llm.OpenAI           OpenAI, Anthropic (OpenAI-compatible), Ollama Cloud, any compatible base URL
 Legate.Llm.Google           Gemini via Google.GenAI
 Legate.Storage.Postgres     ISessionStore, ISessionEventStore, IAgentStore (migrations shared, see below)
@@ -156,8 +456,7 @@ Legate.Mcp                  IToolSource over the ModelContextProtocol SDK
 Legate.Testing              fakes, clock/delay/random seams, scripted IChatClient
 ```
 
-Only `Legate.Abstractions`, `Legate`, and `Legate.Tests` exist today. New
-packages are added under `src/<PackageName>/` with a matching test module in
+Packages are added under `src/<PackageName>/` with a matching test module in
 `tests/Legate.Tests` (or their own `tests/<PackageName>.Tests` when they need
 external services), registered in `Legate.slnx`, and versioned through
 `Directory.Packages.props`.
@@ -217,16 +516,26 @@ Every index traces to a store query:
 `cleanup_claims(session_id)` needs no secondary index: claim, complete, and
 defer are all point lookups by session.
 
+The shared relational store uses one global `SessionId` identity across
+tenants. Tenant columns remain on session, inbox, turn, event, and control
+records wherever the store contract requires them, so relational isolation
+and tenant-qualified indexes are retained. No migration introduces a
+tenant-local session id or rewrites landed keys. Schema changes are additive,
+versioned UTC `yyyymmddHHMM` migrations only.
+
 ## Cluster
 
-`StaticSeeds` mode joins the named seed nodes and shards session entities
-by session id; `Kubernetes` mode bootstraps through the registered
+`StaticSeeds` mode joins the named seed nodes and shards session entities by
+the `s2` tenant-qualified address; `Kubernetes` mode bootstraps through the registered
 `IClusterBootstrap` hook (Akka.Management plus Kubernetes discovery, owned
 by `Legate.Cluster.Kubernetes`), or runs as a singleton when no hook is
 registered. `StartAsync` completes only once `Cluster:MinimumMembers`
-members are Up, bounded by `Cluster:JoinTimeout`. Every node stamps its
-shard version as the member app-version and fails closed (leaves first)
-on a peer stamp mismatch.
+members are Up, bounded by `Cluster:JoinTimeout`. Every node stamps its shard
+version with the `s2` keyspace, configured shard count and hash version, and
+member app-version, and fails closed (leaves first) on a peer stamp mismatch.
+A coordinated drain is required for stop, homogeneous upgrade, and clean
+restart. Mixed versions, mixed migrations, backfills, legacy adapters, and
+database deletion are not supported.
 
 ### Split-brain resolution
 
@@ -298,13 +607,26 @@ whole stop never exceeds `HostExitDeadline`.
 
 Actor, router, and entity protocol messages cross a node boundary only as
 token-less DTOs under a versioned envelope. Each wire case owns one
-`legate.<family>.<MessageName>.v<version>` manifest, one DTO type, one
-version (all v1 today), and one per-case byte bound. The reader accepts the
-current and the current-minus-one version and refuses anything newer or
-older; older-than-current records `failed`. Every refusal (unknown
-manifest, newer version, oversized payload, failed deserialisation or
-mapping) records `legate.serialization.rejected` with its reason tag, logs
-a warning, and throws so Akka drops the message: fail-closed throughout.
+`legate.<family>.<MessageName>.v<version>` manifest, one DTO type, a current
+version, and a per-case byte bound. The unchanged 393 abort cases remain
+`legate.actor.AbortSession.v2` and
+`legate.entity.SuspendableAbortSession.v2`. The structurally changed 395
+routing and subscription cases, including `ScopedRequest`, `ScopedResponse`,
+and `EventBatch`, are current-only, as are the 378 session-bearing cases
+`SessionClosed`, `SetAgentApplied`, and `SetAgentPending`, whose embedded
+session options moved to the data-only destination format. `ScopedResponse`
+also carries the tenant-scoped completion routing refusal (kind 22) with
+its stable reason. Other unchanged cases retain their current-minus-one rule.
+The manifest table is the source of truth for the exact current version of
+each case, so this document's listing must match that table.
+
+Every refusal (unknown manifest, structurally unsupported version, oversized
+payload, corrupt bytes, failed deserialisation, or failed mapping) records
+`legate.serialization.rejected` with its reason tag, logs a warning, and
+throws so Akka drops the message. Corrupt bytes, malformed manifests, and
+byte-bound violations are transport failures and fail closed before typed
+decoding. A well-formed envelope that decodes but violates tenant or session
+scope is a distinct typed scope failure, also fail closed.
 Oversized payloads are refused before deserialising. The global
 `Cluster:MaxWirePayloadBytes` (default 1 MiB) caps every manifest on top of
 its per-case bound. JSON is field-additive, so minor payload changes cross
@@ -327,7 +649,9 @@ Small bound is 32,768 bytes (control DTOs); large bound is 1,048,576 bytes
 
 | Manifest | DTO type | Version | Bound |
 |---|---|---|---|
-| `legate.actor.AbortSession.v1` | `WireDtos.AbortSessionDto` | 1 | large |
+| `legate.router.ScopedRequest.v2` | `WireDtos.ScopedRequestDto` | 2, current-only | large |
+| `legate.router.ScopedResponse.v2` | `WireDtos.ScopedResponseDto` | 2, current-only | large |
+| `legate.actor.AbortSession.v2` | `WireDtos.AbortSessionDto` | 2 | large |
 | `legate.actor.CloseSession.v1` | `WireDtos.CloseSessionDto` | 1 | small |
 | `legate.actor.CompactCompleted.v1` | `WireDtos.CompactCompletedDto` | 1 | small |
 | `legate.actor.CompactDeferred.v1` | `WireDtos.CompactDeferredDto` | 1 | small |
@@ -341,7 +665,7 @@ Small bound is 32,768 bytes (control DTOs); large bound is 1,048,576 bytes
 | `legate.actor.PromptAccepted.v1` | `WireDtos.PromptAcceptedDto` | 1 | large |
 | `legate.actor.PromptRejected.v1` | `WireDtos.PromptRejectedDto` | 1 | small |
 | `legate.actor.QueuePrompt.v1` | `WireDtos.QueuePromptDto` | 1 | large |
-| `legate.actor.SessionClosed.v1` | `WireDtos.SessionClosedDto` | 1 | large |
+| `legate.actor.SessionClosed.v2` | `WireDtos.SessionClosedDto` | 2, current-only | large |
 | `legate.actor.SessionSnapshot.v1` | `WireDtos.SnapshotDto` | 1 | small |
 | `legate.actor.TurnFaulted.v1` | `WireDtos.TurnFaultedDto` | 1 | large |
 | `legate.actor.TurnSettled.v1` | `WireDtos.TurnSettledDto` | 1 | large |
@@ -349,11 +673,11 @@ Small bound is 32,768 bytes (control DTOs); large bound is 1,048,576 bytes
 | `legate.entity.ReplyAccepted.v1` | `WireDtos.ReplyAcceptedDto` | 1 | large |
 | `legate.entity.ReplyEntry.v1` | `WireDtos.ReplyEntryDto` | 1 | large |
 | `legate.entity.ReplyRejected.v1` | `WireDtos.ReplyRejectedDto` | 1 | small |
-| `legate.entity.SetAgentApplied.v1` | `WireDtos.SetAgentAppliedDto` | 1 | large |
-| `legate.entity.SetAgentPending.v1` | `WireDtos.SetAgentPendingDto` | 1 | large |
+| `legate.entity.SetAgentApplied.v2` | `WireDtos.SetAgentAppliedDto` | 2, current-only | large |
+| `legate.entity.SetAgentPending.v2` | `WireDtos.SetAgentPendingDto` | 2, current-only | large |
 | `legate.entity.SetAgentRejected.v1` | `WireDtos.SetAgentRejectedDto` | 1 | small |
 | `legate.entity.SuspendTimedOut.v1` | `WireDtos.SuspendTimedOutDto` | 1 | small |
-| `legate.entity.SuspendableAbortSession.v1` | `WireDtos.SuspendableAbortSessionDto` | 1 | large |
+| `legate.entity.SuspendableAbortSession.v2` | `WireDtos.SuspendableAbortSessionDto` | 2 | large |
 | `legate.entity.SuspendableCheckInbox.v1` | `WireDtos.SuspendableCheckInboxDto` | 1 | small |
 | `legate.entity.SuspendableCloseSession.v1` | `WireDtos.SuspendableCloseSessionDto` | 1 | small |
 | `legate.entity.SuspendableCompactSession.v1` | `WireDtos.SuspendableCompactSessionDto` | 1 | small |
@@ -366,7 +690,7 @@ Small bound is 32,768 bytes (control DTOs); large bound is 1,048,576 bytes
 | `legate.entity.SuspendableSetAgent.v1` | `WireDtos.SuspendableSetAgentDto` | 1 | small |
 | `legate.subscription.Subscribe.v1` | `WireDtos.SubscribeDto` | 1 | small |
 | `legate.subscription.Unsubscribe.v1` | `WireDtos.UnsubscribeDto` | 1 | small |
-| `legate.subscription.EventBatch.v1` | `WireDtos.EventBatchDto` | 1 | large |
+| `legate.subscription.EventBatch.v2` | `WireDtos.EventBatchDto` | 2, current-only | large |
 | `legate.event.SessionEvent.v1` | `WireDtos.SessionEventDto` | 1 | large |
 
 No reserved manifests remain: the subscription and event namespaces

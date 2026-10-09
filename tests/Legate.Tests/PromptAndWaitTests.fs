@@ -130,9 +130,10 @@ let ``An Ask suspension throws the typed exception, then Reply plus re-wait sett
         let! suspended = harness.GetSessionAsync(CancellationToken.None)
         Assert.Equal(SessionState.WaitingForInput, suspended.State)
 
-        // Re-wait before replying: the waiter queues ahead of the resume,
-        // so the next settle it observes is the resumed turn, never the
-        // follow-up prompt queued behind it.
+        // Re-wait before replying: the wait follows its own follow-up
+        // receipt (issue 383), never the resumed turn settling ahead of
+        // it. The resumed turn still settles first with the first script
+        // step; the re-wait observes only the follow-up turn it prompted.
         let rewait =
             waiter.PromptAndWaitAsync(harness.SessionId, UserMessage.Text "follow-up", CancellationToken.None)
 
@@ -142,15 +143,15 @@ let ``An Ask suspension throws the typed exception, then Reply plus re-wait sett
                 CancellationToken.None
             )
 
-        let! resumed = rewait
-        Assert.Equal(TurnStatus.Completed, resumed.Status)
-        Assert.Equal("finished", resumed.AssistantText)
+        let! followUp = rewait
+        Assert.Equal(TurnStatus.Completed, followUp.Status)
+        Assert.Equal("second", followUp.AssistantText)
         Assert.Equal<string list>([ "exec" ], invocations.Value)
 
         // The follow-up prompt queued behind the suspended turn starts its
-        // own turn once the resumed one settles: drain it before dispose so
-        // no turn is left running. Spins without sleeping; the scripted
-        // turn settles in milliseconds.
+        // own turn once the resumed one settles: drain both before dispose
+        // so no turn is left running. Spins without sleeping; the scripted
+        // turns settle in milliseconds.
         let drainDeadline = DateTimeOffset.UtcNow.AddSeconds(10.0)
 
         while harness.SettledResults.Count < 2 && DateTimeOffset.UtcNow < drainDeadline do
@@ -230,7 +231,7 @@ let ``A settle that already won still returns after cancellation`` () : Task =
         // Spin without sleeping until the hub records the settle; the
         // waiter result lands under the same lock, so cancelling after
         // this point always loses to the settlement.
-        let hub = PromptWaitHubs.GetOrAdd harness.SessionId
+        let hub = PromptWaitHubs.GetOrAddScoped harness.Tenant harness.SessionId
         let deadline = DateTimeOffset.UtcNow.AddSeconds(10.0)
 
         while hub.Settled.Count = 0 && DateTimeOffset.UtcNow < deadline do
@@ -300,7 +301,10 @@ let ``A lapsed wait bound throws while the turn keeps running`` () : Task =
         let! exceeded = Assert.ThrowsAsync<DeadlineExceededException>(invoke)
 
         Assert.Equal("PromptAndWait", exceeded.OperationName)
-        Assert.Equal(bound, Assert.Single(delays.Recorded))
+        // The wait arms its bound on the seam and polls the durable row on
+        // the same seam while no live hint fires: the bound is requested,
+        // never the only delay.
+        Assert.Contains(bound, delays.Recorded)
 
         let! suspended = harness.GetSessionAsync(CancellationToken.None)
         Assert.Equal(SessionState.WaitingForInput, suspended.State)
@@ -387,7 +391,16 @@ let ``A closed session throws InvalidSessionStateException`` () : Task =
 [<Fact>]
 let ``PromptAndWaitAsync stays BCL-only`` () =
     let method =
-        typeof<SessionClientExtensions>.GetMethod("PromptAndWaitAsync", BindingFlags.Public ||| BindingFlags.Static)
+        typeof<SessionClientExtensions>
+            .GetMethod(
+                "PromptAndWaitAsync",
+                [|
+                    typeof<SessionClient>
+                    typeof<SessionId>
+                    typeof<UserMessage>
+                    typeof<CancellationToken>
+                |]
+            )
         |> Option.ofObj
         |> Option.defaultWith (fun () -> raise (InvalidOperationException("PromptAndWaitAsync is missing.")))
 

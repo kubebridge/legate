@@ -301,8 +301,6 @@ module internal ScheduleFire =
             sessionOptions.AutoClose <- true
             sessionOptions.Title <- sprintf "Scheduled run of agent %s at %O" agent.Name occurrenceUtc
 
-            sessionOptions.Permissions <- AllowAllPermissionPolicy() :> IPermissionPolicy
-
             let! session = client.OpenSessionAsync(agent.Id, sessionOptions, cancellationToken)
 
             let! _ =
@@ -341,19 +339,13 @@ type internal ScheduleEvaluatorService
         ArgumentNullException.ThrowIfNull(timeProvider)
         ArgumentNullException.ThrowIfNull(delay)
 
-    let log: ILogger = NullLogger.Instance :> ILogger
+    let log: ILogger =
+        match serviceProvider.GetService<ILogger<ScheduleEvaluatorService>>() with
+        | null -> NullLogger.Instance :> ILogger
+        | logger -> logger
+
     let lifetime = new CancellationTokenSource()
     let mutable loop: Task | null = null
-
-    /// Resolves the locally scoped sweep tenant: the facade client's tenant
-    /// when one is registered, else the default single-tenant id. The sweep
-    /// stays tenant-scoped with no new store API by covering exactly the
-    /// tenant this node serves.
-    /// <returns>The tenant whose scheduled agents to sweep.</returns>
-    member private _.SweepTenant() : TenantId =
-        match serviceProvider.GetService<SessionClientOptions>() with
-        | null -> TenantId.Default
-        | clientOptions -> clientOptions.Tenant
 
     /// The tick interval for the loop: the configured poll interval when it
     /// is a positive bound, else the 60 s default. A non-positive result
@@ -377,20 +369,40 @@ type internal ScheduleEvaluatorService
     /// occurrence at most once.
     /// <param name="cancellationToken">Abandons the tick.</param>
     /// <returns>How many agents fired.</returns>
-    member internal this.RunOnceAsync(cancellationToken: CancellationToken) : Task<int> =
+    member internal _.RunOnceAsync(cancellationToken: CancellationToken) : Task<int> =
         task {
-            let agentStore = serviceProvider.GetRequiredService<IAgentStore>()
-            let client = serviceProvider.GetRequiredService<SessionClient>()
-            let tenant = this.SweepTenant()
+            let contexts = serviceProvider.GetRequiredService<ISessionHostContexts>()
+            let mutable fired = 0
 
-            let! fired =
-                ScheduleEvaluator.passOnceAsync
-                    agentStore
-                    tenant
-                    timeProvider
-                    (fun agent schedule occurrenceUtc ct ->
-                        ScheduleFire.fireAsync client agent schedule occurrenceUtc ct)
-                    cancellationToken
+            for context in contexts.All do
+                cancellationToken.ThrowIfCancellationRequested()
+
+                try
+                    contexts.Get(context.Tenant) |> ignore
+
+                    match context.Background.Agents with
+                    | null -> ()
+                    | agents ->
+                        let! count =
+                            context.WorkTracker.Track(fun () ->
+                                let client = context.Client.Value :?> SessionClient
+
+                                ScheduleEvaluator.passOnceAsync
+                                    agents
+                                    context.Tenant
+                                    context.Background.Clock
+                                    (fun agent schedule occurrenceUtc ct ->
+                                        ScheduleFire.fireAsync client agent schedule occurrenceUtc ct)
+                                    cancellationToken)
+
+                        fired <- fired + count
+                with
+                | :? OperationCanceledException as cancelled -> raise cancelled
+                | _ ->
+                    log.LogWarning(
+                        "Schedule graph sweep refused or failed for {Tenant}; retry next cycle.",
+                        context.Tenant
+                    )
 
             if fired > 0 then
                 log.LogInformation("Schedule evaluator fired {Fired} due occurrences.", fired)
@@ -410,11 +422,7 @@ type internal ScheduleEvaluatorService
                     ()
                 with
                 | :? OperationCanceledException -> running <- false
-                | failed ->
-                    log.LogWarning(
-                        "Schedule evaluator pass failed and will retry next interval: {Reason}",
-                        failed.Message
-                    )
+                | _ -> log.LogWarning("Schedule evaluator pass failed and will retry next interval.")
 
                 if running && not lifetime.Token.IsCancellationRequested then
                     try

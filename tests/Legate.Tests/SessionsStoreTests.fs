@@ -67,6 +67,7 @@ type FakeSessionStore() =
     let sessions = Dictionary<string, Session>()
     let inbox = Dictionary<string, ResizeArray<InboxEntry>>()
     let claims = Dictionary<TenantId * TurnId, TurnClaim>()
+    let claimSessions = Dictionary<TenantId * TurnId, SessionId>()
     let settlement = Dictionary<string, TurnStatus>()
     let outbox = Dictionary<string, CompletionOutboxEntry>()
     let mutable positionCounter = 0L
@@ -128,8 +129,57 @@ type FakeSessionStore() =
 
             Task.FromResult(
                 {
-                    Items = items :> IReadOnlyList<Session>
+                    SessionPage.Items = items :> IReadOnlyList<Session>
                     Continuation = nextContinuation
+                }
+            )
+
+        member _.ListRecoveryCandidates(t, state, pageSize, continuation, ct) =
+            ct.ThrowIfCancellationRequested()
+
+            if pageSize < 1 || pageSize > 1000 then
+                raise (ArgumentOutOfRangeException(nameof pageSize))
+
+            if not (Enum.IsDefined(typeof<SessionState>, state)) then
+                raise (ArgumentOutOfRangeException(nameof state))
+
+            let ids =
+                sessions.Values
+                |> Seq.filter (fun s -> s.Tenant.Equals t)
+                |> Seq.filter (fun s -> s.State = state && s.CurrentTurnId.HasValue)
+                |> Seq.map (fun s -> s.Id.ToString())
+                |> Seq.sortWith (fun a b -> StringComparer.Ordinal.Compare(a, b))
+                |> Array.ofSeq
+
+            let upper = ids |> Array.tryLast |> Option.defaultValue ""
+
+            let last =
+                match continuation with
+                | null -> ""
+                | token ->
+                    match token.Split('|') with
+                    | parts when parts.Length = 2 && parts[0] = t.Value -> parts[1]
+                    | _ -> raise (ArgumentException("The recovery cursor is malformed or out of scope."))
+
+            let rows =
+                ids
+                |> Array.filter (fun id ->
+                    StringComparer.Ordinal.Compare(id, last) > 0
+                    && StringComparer.Ordinal.Compare(id, upper) <= 0)
+                |> Array.truncate (pageSize + 1)
+
+            let emitted = rows |> Array.truncate pageSize
+
+            let next: string | null =
+                if rows.Length <= pageSize then
+                    Unchecked.defaultof<string>
+                else
+                    sprintf "%s|%s" t.Value emitted[emitted.Length - 1]
+
+            Task.FromResult(
+                {
+                    Items = (emitted |> Array.map SessionId.Parse) :> IReadOnlyList<SessionId>
+                    Continuation = next
                 }
             )
 
@@ -233,6 +283,10 @@ type FakeSessionStore() =
                         Delivery = delivery
                         Consumed = false
                         AppendedAt = sessionStamp
+                        TurnId =
+                            match payload with
+                            | :? UserMessagePayload -> TurnId.New()
+                            | _ -> Unchecked.defaultof<TurnId>
                     }
 
                 inbox[key t sessionId].Add entry
@@ -303,6 +357,7 @@ type FakeSessionStore() =
                         | false, _ -> sampleClaim turnId 1
 
                     claims[claimKey t turnId] <- claim
+                    claimSessions[claimKey t turnId] <- sessionId
                     Task.FromResult(TurnLeaseRenewed(claim) :> TurnLeaseState)
 
         member _.RenewClaim(t, claim, _, _) =
@@ -386,7 +441,112 @@ type FakeSessionStore() =
                     claims.Remove(claimKey t claim.TurnId) |> ignore
                     Task.FromResult(TurnLeaseHeld(current) :> TurnLeaseState)
 
-        member this.EnqueueCompletionOutbox(t, completion, _) =
+        member _.ConsumeInboxUnderClaim(t, claim, sessionId, positions, _) =
+            if box claim |> isNull then
+                raise (ArgumentNullException(nameof claim))
+
+            if box positions |> isNull then
+                raise (ArgumentNullException(nameof positions))
+
+            match sessions.TryGetValue(key t sessionId) with
+            | false, _ -> raise (SessionNotFoundException(sessionId, "Session not found."))
+            | true, _ ->
+                match claims.TryGetValue(claimKey t claim.TurnId) with
+                | false, _ -> Task.FromResult(TurnLeaseMissing(claim.TurnId) :> TurnLeaseState)
+                | true, current ->
+                    if current.Token <> claim.Token || current.Attempt <> claim.Attempt then
+                        Task.FromResult(TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState)
+                    else
+                        match claimSessions.TryGetValue(claimKey t claim.TurnId) with
+                        | true, bound when bound <> sessionId ->
+                            Task.FromResult(TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState)
+                        | _ ->
+                            match inbox.TryGetValue(key t sessionId) with
+                            | false, _ -> raise (SessionNotFoundException(sessionId, "Session not found."))
+                            | true, entries ->
+                                for position in positions do
+                                    for index in 0 .. entries.Count - 1 do
+                                        if entries[index].Position = position && not entries[index].Consumed then
+                                            entries[index] <- { entries[index] with Consumed = true }
+
+                                Task.FromResult(TurnLeaseHeld(current) :> TurnLeaseState)
+
+        member _.UpdateSessionStateUnderClaim(t, claim, sessionId, state, _) =
+            if box claim |> isNull then
+                raise (ArgumentNullException(nameof claim))
+
+            if state <> SessionState.Running && state <> SessionState.WaitingForInput then
+                raise (InvalidSessionStateException(sessionId, "nonExecutionState", "Only Running or WaitingForInput."))
+
+            match sessions.TryGetValue(key t sessionId) with
+            | false, _ -> raise (SessionNotFoundException(sessionId, "Session not found."))
+            | true, session ->
+                if session.State = SessionState.Closed then
+                    raise (InvalidSessionStateException(sessionId, "Closed", "A closed session stays closed."))
+                else
+                    match claims.TryGetValue(claimKey t claim.TurnId) with
+                    | false, _ -> Task.FromResult(TurnLeaseMissing(claim.TurnId) :> TurnLeaseState)
+                    | true, current ->
+                        if current.Token <> claim.Token || current.Attempt <> claim.Attempt then
+                            Task.FromResult(TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState)
+                        else
+                            match claimSessions.TryGetValue(claimKey t claim.TurnId) with
+                            | true, bound when bound <> sessionId ->
+                                Task.FromResult(TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState)
+                            | _ ->
+                                sessions[key t sessionId] <-
+                                    { session with
+                                        State = state
+                                        UpdatedAt = sessionStamp
+                                    }
+
+                                Task.FromResult(TurnLeaseHeld(current) :> TurnLeaseState)
+
+        member _.GrantSessionToolUnderClaim(t, claim, sessionId, toolName, _) =
+            if box claim |> isNull then
+                raise (ArgumentNullException(nameof claim))
+
+            if String.IsNullOrWhiteSpace toolName then
+                raise (ArgumentException("The tool name must be a non-empty string.", nameof toolName))
+
+            match sessions.TryGetValue(key t sessionId) with
+            | false, _ -> raise (SessionNotFoundException(sessionId, "Session not found."))
+            | true, session ->
+                match claims.TryGetValue(claimKey t claim.TurnId) with
+                | false, _ -> Task.FromResult(TurnLeaseMissing(claim.TurnId) :> TurnLeaseState)
+                | true, current ->
+                    if current.Token <> claim.Token || current.Attempt <> claim.Attempt then
+                        Task.FromResult(TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState)
+                    else
+                        match claimSessions.TryGetValue(claimKey t claim.TurnId) with
+                        | true, bound when bound <> sessionId ->
+                            Task.FromResult(TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState)
+                        | _ ->
+                            if session.State = SessionState.Closed then
+                                raise (
+                                    InvalidSessionStateException(
+                                        sessionId,
+                                        "Closed",
+                                        "A closed session carries no grants."
+                                    )
+                                )
+                            else
+                                let grants = ResizeArray<string>(session.PermissionGrants)
+
+                                if not (grants.Contains toolName) then
+                                    grants.Add toolName
+
+                                sessions[key t sessionId] <-
+                                    { session with
+                                        PermissionGrants = grants :> IReadOnlyList<string>
+                                        UpdatedAt = sessionStamp
+                                    }
+
+                                Task.FromResult(TurnLeaseHeld(current) :> TurnLeaseState)
+
+        member this.EnqueueCompletionOutbox(t, destinationId, completion, _) =
+            CompletionDestinationRules.Validate destinationId
+
             if box completion |> isNull then
                 raise (ArgumentNullException(nameof completion))
 
@@ -399,12 +559,17 @@ type FakeSessionStore() =
             | false, _ -> raise (SessionNotFoundException(completion.SessionId, "Session not found."))
             | true, _ ->
                 match outbox.TryGetValue(outboxKey t completion.IdempotencyKey) with
-                | true, existing -> Task.FromResult existing
+                | true, existing ->
+                    if existing.SessionId <> completion.SessionId then
+                        raise (ArgumentException("The idempotency key belongs to another session."))
+
+                    Task.FromResult existing
                 | false, _ ->
                     let row: CompletionOutboxEntry =
                         {
                             Tenant = t
                             SessionId = completion.SessionId
+                            DestinationId = destinationId
                             IdempotencyKey = completion.IdempotencyKey
                             Completion = completion
                             CreatedAt = this.Clock.GetUtcNow()
@@ -497,6 +662,32 @@ type FakeSessionStore() =
                         }
 
                     outbox[outboxKey t idempotencyKey] <- marked
+                    Task.FromResult true
+
+        member this.RenewCompletionClaim(t, idempotencyKey, owner, leaseDuration, ct) =
+            ct.ThrowIfCancellationRequested()
+
+            if leaseDuration <= TimeSpan.Zero then
+                raise (ArgumentOutOfRangeException(nameof leaseDuration))
+
+            match outbox.TryGetValue(outboxKey t idempotencyKey) with
+            | false, _ -> Task.FromResult false
+            | true, row ->
+                if
+                    row.Delivered
+                    || box row.LeaseOwner |> isNull
+                    || not (String.Equals(row.LeaseOwner, owner, StringComparison.Ordinal))
+                    || not row.LeaseExpiresAt.HasValue
+                    || row.LeaseExpiresAt.Value <= this.Clock.GetUtcNow()
+                then
+                    Task.FromResult false
+                else
+                    let renewed =
+                        { row with
+                            LeaseExpiresAt = Nullable(this.Clock.GetUtcNow() + leaseDuration)
+                        }
+
+                    outbox[outboxKey t idempotencyKey] <- renewed
                     Task.FromResult true
 
         member _.PurgeDeliveredCompletions(deliveredBefore, _) =
@@ -1462,7 +1653,7 @@ let ``DispatchBatch carries its sessions and the has-more flag`` () =
 
 [<Fact>]
 let ``SessionPage carries its items and continuation`` () =
-    let page =
+    let page: SessionPage =
         {
             Items = ResizeArray([ sampleSession () ]) :> IReadOnlyList<Session>
             Continuation = nullString
@@ -1484,6 +1675,7 @@ let ``Every ISessionStore method takes a TenantId where the contract demands`` (
             "CreateSession"
             "GetSession"
             "ListSessions"
+            "ListRecoveryCandidates"
             "UpdateSessionState"
             "CloseSession"
             "SetSessionAgent"
@@ -1499,6 +1691,7 @@ let ``Every ISessionStore method takes a TenantId where the contract demands`` (
             "SettleTurn"
             "AbortTurn"
             "EnqueueCompletionOutbox"
+            "RenewCompletionClaim"
             "VerifyCompletionClaim"
             "MarkCompletionDelivered"
             "GetDispatchCandidates"
@@ -1559,6 +1752,7 @@ let ``CompletionOutboxEntry JSON round-trip preserves every field`` () =
         {
             Tenant = tenant
             SessionId = SessionId.New()
+            DestinationId = "receiver-a"
             IdempotencyKey = "key-1"
             Completion = sampleCompletion (SessionId.New()) "key-1"
             CreatedAt = sessionStamp
@@ -1586,7 +1780,12 @@ let ``EnqueueCompletionOutbox stores a pending unleased row`` () =
         let sessionStore = store :> ISessionStore
 
         let! row =
-            sessionStore.EnqueueCompletionOutbox(tenant, sampleCompletion created.Id "key-1", CancellationToken.None)
+            sessionStore.EnqueueCompletionOutbox(
+                tenant,
+                "receiver-a",
+                sampleCompletion created.Id "key-1",
+                CancellationToken.None
+            )
 
         row.Tenant |> should equal tenant
         row.SessionId |> should equal created.Id
@@ -1605,7 +1804,12 @@ let ``EnqueueCompletionOutbox guards nulls, blank keys, and unknown sessions`` (
 
         Assert.Throws<ArgumentNullException>(fun () ->
             sessionStore
-                .EnqueueCompletionOutbox(tenant, Unchecked.defaultof<SessionCompletion>, CancellationToken.None)
+                .EnqueueCompletionOutbox(
+                    tenant,
+                    "receiver-a",
+                    Unchecked.defaultof<SessionCompletion>,
+                    CancellationToken.None
+                )
                 .GetAwaiter()
                 .GetResult()
             |> ignore)
@@ -1613,7 +1817,12 @@ let ``EnqueueCompletionOutbox guards nulls, blank keys, and unknown sessions`` (
 
         Assert.Throws<ArgumentException>(fun () ->
             sessionStore
-                .EnqueueCompletionOutbox(tenant, sampleCompletion created.Id "  ", CancellationToken.None)
+                .EnqueueCompletionOutbox(
+                    tenant,
+                    "receiver-a",
+                    sampleCompletion created.Id "  ",
+                    CancellationToken.None
+                )
                 .GetAwaiter()
                 .GetResult()
             |> ignore)
@@ -1621,7 +1830,12 @@ let ``EnqueueCompletionOutbox guards nulls, blank keys, and unknown sessions`` (
 
         Assert.Throws<SessionNotFoundException>(fun () ->
             sessionStore
-                .EnqueueCompletionOutbox(tenant, sampleCompletion (SessionId.New()) "key-x", CancellationToken.None)
+                .EnqueueCompletionOutbox(
+                    tenant,
+                    "receiver-a",
+                    sampleCompletion (SessionId.New()) "key-x",
+                    CancellationToken.None
+                )
                 .GetAwaiter()
                 .GetResult()
             |> ignore)
@@ -1635,10 +1849,20 @@ let ``EnqueueCompletionOutbox is idempotent: the same key observes the first row
         let sessionStore = store :> ISessionStore
 
         let! first =
-            sessionStore.EnqueueCompletionOutbox(tenant, sampleCompletion created.Id "key-1", CancellationToken.None)
+            sessionStore.EnqueueCompletionOutbox(
+                tenant,
+                "receiver-a",
+                sampleCompletion created.Id "key-1",
+                CancellationToken.None
+            )
 
         let! retry =
-            sessionStore.EnqueueCompletionOutbox(tenant, sampleCompletion created.Id "key-1", CancellationToken.None)
+            sessionStore.EnqueueCompletionOutbox(
+                tenant,
+                "receiver-a",
+                sampleCompletion created.Id "key-1",
+                CancellationToken.None
+            )
 
         retry.CreatedAt |> should equal first.CreatedAt
         retry.Delivered |> should equal false
@@ -1661,7 +1885,12 @@ let ``ClaimCompletionOutbox leases oldest-first, bounded, skipping delivered and
 
         for key in [| "key-1"; "key-2"; "key-3" |] do
             let! _ =
-                sessionStore.EnqueueCompletionOutbox(tenant, sampleCompletion created.Id key, CancellationToken.None)
+                sessionStore.EnqueueCompletionOutbox(
+                    tenant,
+                    "receiver-a",
+                    sampleCompletion created.Id key,
+                    CancellationToken.None
+                )
 
             clock.Advance(TimeSpan.FromSeconds 1.)
 
@@ -1725,7 +1954,12 @@ let ``An expired lease is claimable again by another owner`` () =
         let! created = sessionStore.CreateSession(tenant, sampleSession (), CancellationToken.None)
 
         let! _ =
-            sessionStore.EnqueueCompletionOutbox(tenant, sampleCompletion created.Id "key-1", CancellationToken.None)
+            sessionStore.EnqueueCompletionOutbox(
+                tenant,
+                "receiver-a",
+                sampleCompletion created.Id "key-1",
+                CancellationToken.None
+            )
 
         let! first = sessionStore.ClaimCompletionOutbox("owner-a", 10, TimeSpan.FromMinutes 5., CancellationToken.None)
         first.Count |> should equal 1
@@ -1749,7 +1983,12 @@ let ``VerifyCompletionClaim is fail-closed and side-effect free`` () =
         missing |> should equal false
 
         let! _ =
-            sessionStore.EnqueueCompletionOutbox(tenant, sampleCompletion created.Id "key-1", CancellationToken.None)
+            sessionStore.EnqueueCompletionOutbox(
+                tenant,
+                "receiver-a",
+                sampleCompletion created.Id "key-1",
+                CancellationToken.None
+            )
 
         // Unleased rows verify false: nothing changed, so the row stays
         // claimable.
@@ -1786,7 +2025,12 @@ let ``MarkCompletionDelivered marks under a live lease and rejects the loser wit
         let! created = sessionStore.CreateSession(tenant, sampleSession (), CancellationToken.None)
 
         let! _ =
-            sessionStore.EnqueueCompletionOutbox(tenant, sampleCompletion created.Id "key-1", CancellationToken.None)
+            sessionStore.EnqueueCompletionOutbox(
+                tenant,
+                "receiver-a",
+                sampleCompletion created.Id "key-1",
+                CancellationToken.None
+            )
 
         // Missing rows mark false.
         let! missing = sessionStore.MarkCompletionDelivered(tenant, "nope", "owner-a", CancellationToken.None)
@@ -1839,7 +2083,12 @@ let ``An expired lease cannot mark: the retake winner owns the row`` () =
         let! created = sessionStore.CreateSession(tenant, sampleSession (), CancellationToken.None)
 
         let! _ =
-            sessionStore.EnqueueCompletionOutbox(tenant, sampleCompletion created.Id "key-1", CancellationToken.None)
+            sessionStore.EnqueueCompletionOutbox(
+                tenant,
+                "receiver-a",
+                sampleCompletion created.Id "key-1",
+                CancellationToken.None
+            )
 
         let! _ = sessionStore.ClaimCompletionOutbox("owner-a", 10, TimeSpan.FromMinutes 5., CancellationToken.None)
 
@@ -1869,7 +2118,12 @@ let ``PurgeDeliveredCompletions removes only delivered rows at or before the cut
                 "pending"
             |] do
             let! _ =
-                sessionStore.EnqueueCompletionOutbox(tenant, sampleCompletion created.Id key, CancellationToken.None)
+                sessionStore.EnqueueCompletionOutbox(
+                    tenant,
+                    "receiver-a",
+                    sampleCompletion created.Id key,
+                    CancellationToken.None
+                )
 
             clock.Advance(TimeSpan.FromSeconds 1.)
 

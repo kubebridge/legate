@@ -6,6 +6,7 @@ open System.Collections.Generic
 open System.Threading
 open System.Threading.Tasks
 open Legate
+open Legate.Storage
 open Microsoft.Data.Sqlite
 
 // The SQLite ISessionStore: session CRUD, the inbox, turn claims under a
@@ -13,12 +14,14 @@ open Microsoft.Data.Sqlite
 // the completion outbox, and the capacity counts. One live claim per
 // session and one open turn per session, mirroring the in-memory
 // implementation: ClaimNextTurn consumes the head pending user message into
-// a new turn, or the head pending reply into a resume of the open turn with
-// the attempt incremented; a live unexpired claim makes every further claim
-// the missing branch. Every transition that touches more than one row runs
-// as a single transaction under the database gate, so claims and
-// settlements are atomic and a takeover race leaves the loser with zero
-// effects. Every SqliteException funnels through the SqliteErrors boundary.
+// a new turn under its durable real-turn identity (stamped at accept;
+// legacy rows bind once at first claim), or the head pending reply into a
+// resume of the open turn with the attempt incremented; a live unexpired
+// claim makes every further claim the missing branch. Every transition that
+// touches more than one row runs as a single transaction under the database
+// gate, so claims and settlements are atomic and a takeover race leaves the
+// loser with zero effects. Every SqliteException funnels through the
+// SqliteErrors boundary.
 
 /// What a fenced call against the claim's turn resolved to.
 type private ClaimResolution =
@@ -67,6 +70,7 @@ type SqliteSessionStore(database: SqliteDatabase) =
     let inboxTable () = database.Table "inbox"
     let turnsTable () = database.Table "turns"
     let outboxTable () = database.Table "outbox"
+    let eraTable () = database.Table "turn_completion_era"
 
     let grantsOf (session: Session) : List<string> =
         if isNull (box session.PermissionGrants) then
@@ -106,7 +110,7 @@ type SqliteSessionStore(database: SqliteDatabase) =
 
         let optionsJson = reader.GetString(10)
         let grantsJson = reader.GetString(11)
-        let options = SqliteJson.deserialize<SessionOptions> optionsJson
+        let options = SessionOptionsPersistence.Deserialize optionsJson
         let grants = SqliteJson.deserialize<List<string>> grantsJson
 
         {
@@ -133,6 +137,20 @@ type SqliteSessionStore(database: SqliteDatabase) =
         let appendedAt = ofIso (reader.GetString(5))
         let payload = SqliteJson.deserialize<InboxPayload> payloadJson
 
+        // Real-turn identity (issue 374): column 6 is turn_id when the
+        // migration has landed; older readers see FieldCount 6 and legacy
+        // rows read as the default sentinel.
+        let turnId =
+            if reader.FieldCount > 6 && not (reader.IsDBNull(6)) then
+                let text = reader.GetString(6)
+
+                if String.IsNullOrWhiteSpace(text) then
+                    Unchecked.defaultof<TurnId>
+                else
+                    TurnId.Parse(text)
+            else
+                Unchecked.defaultof<TurnId>
+
         {
             SessionId = sessionId
             Position = position
@@ -140,6 +158,7 @@ type SqliteSessionStore(database: SqliteDatabase) =
             Delivery = delivery
             Consumed = consumed
             AppendedAt = appendedAt
+            TurnId = turnId
         }
 
     let readOutboxEntry (reader: SqliteDataReader) : CompletionOutboxEntry =
@@ -168,6 +187,7 @@ type SqliteSessionStore(database: SqliteDatabase) =
         {
             Tenant = tenant
             SessionId = completion.SessionId
+            DestinationId = if reader.IsDBNull(9) then null else reader.GetString(9)
             IdempotencyKey = key
             Completion = completion
             CreatedAt = createdAt
@@ -280,14 +300,14 @@ type SqliteSessionStore(database: SqliteDatabase) =
         (connection: SqliteConnection)
         (transaction: SqliteTransaction | null)
         (sessionId: SessionId)
-        : (int64 * InboxPayload) option =
+        : (int64 * InboxPayload * TurnId) option =
         use command = connection.CreateCommand()
 
         if not (isNull (box transaction)) then
             command.Transaction <- transaction
 
         command.CommandText <-
-            $"SELECT position, payload_json FROM \"%s{inboxTable ()}\" WHERE session_id = $session AND consumed = 0 ORDER BY position LIMIT 1"
+            $"SELECT position, payload_json, turn_id FROM \"%s{inboxTable ()}\" WHERE session_id = $session AND consumed = 0 ORDER BY position LIMIT 1"
 
         command.Parameters.AddWithValue("$session", sessionId.Value) |> ignore
 
@@ -296,7 +316,19 @@ type SqliteSessionStore(database: SqliteDatabase) =
         if reader.Read() then
             let position = reader.GetInt64(0)
             let payload = SqliteJson.deserialize<InboxPayload> (reader.GetString(1))
-            Some(position, payload)
+
+            let stamped =
+                if reader.FieldCount > 2 && not (reader.IsDBNull(2)) then
+                    let text = reader.GetString(2)
+
+                    if String.IsNullOrWhiteSpace(text) then
+                        Unchecked.defaultof<TurnId>
+                    else
+                        TurnId.Parse(text)
+                else
+                    Unchecked.defaultof<TurnId>
+
+            Some(position, payload, stamped)
         else
             None
 
@@ -370,6 +402,146 @@ type SqliteSessionStore(database: SqliteDatabase) =
         else
             raise (SessionNotFoundException(sessionId, sprintf "No session %O exists in tenant %O." sessionId tenant))
 
+    /// Marks the session era-marked (issue 289): an idempotent upsert
+    /// over the turn_completion_era table. Internal: the registration
+    /// closes the runtime's era gate over it. A missing table (migrations
+    /// not run) throws, and the gate degrades to pre-era quiet.
+    let controlTable () =
+        "\"" + database.Table "session_control" + "\""
+
+    let requireNoBinding connection transaction tenant sessionId =
+        RelationalControlTarget.requireNoBinding connection transaction (controlTable ()) tenant sessionId
+
+    let control tenant sessionId (ct: CancellationToken) operation =
+        task {
+            try
+                return
+                    lock database.Gate (fun () ->
+                        ct.ThrowIfCancellationRequested()
+                        use connection = database.OpenConnection()
+                        use transaction = connection.BeginTransaction(deferred = false)
+
+                        let result =
+                            RelationalControlTarget.invoke
+                                connection
+                                transaction
+                                $"\"{sessionsTable ()}\""
+                                $"\"{inboxTable ()}\""
+                                $"\"{turnsTable ()}\""
+                                (controlTable ())
+                                false
+                                tenant
+                                sessionId
+                                (fun () -> database.UtcNow)
+                                ct
+                                operation
+
+                        ct.ThrowIfCancellationRequested()
+                        transaction.Commit()
+                        ct.ThrowIfCancellationRequested()
+                        result)
+            with :? SqliteException as ex ->
+                return raise (mapSql ex)
+        }
+
+    member internal _.MarkCompletionEraAsync
+        (tenant: TenantId, sessionId: SessionId, _cancellationToken: CancellationToken)
+        : Task =
+        task {
+            lock database.Gate (fun () ->
+                use connection = database.OpenConnection()
+                use command = connection.CreateCommand()
+
+                command.CommandText <-
+                    $"INSERT INTO \"%s{eraTable ()}\" (tenant, session_id, marked_at) VALUES ($tenant, $session, $now) ON CONFLICT (tenant, session_id) DO UPDATE SET marked_at = $now"
+
+                command.Parameters.AddWithValue("$tenant", tenant.Value) |> ignore
+                command.Parameters.AddWithValue("$session", sessionId.Value) |> ignore
+                command.Parameters.AddWithValue("$now", toIso database.UtcNow) |> ignore
+                command.ExecuteNonQuery() |> ignore)
+        }
+        :> Task
+
+    /// Reads whether the session is era-marked (issue 289): true once
+    /// marked, false for absent rows (pre-era quiet). Internal: the
+    /// registration closes the runtime's era gate over it.
+    member internal _.IsCompletionEraMarkedAsync
+        (tenant: TenantId, sessionId: SessionId, _cancellationToken: CancellationToken)
+        : Task<bool> =
+        task {
+            return
+                lock database.Gate (fun () ->
+                    use connection = database.OpenConnection()
+                    use command = connection.CreateCommand()
+
+                    command.CommandText <-
+                        $"SELECT 1 FROM \"%s{eraTable ()}\" WHERE tenant = $tenant AND session_id = $session LIMIT 1"
+
+                    command.Parameters.AddWithValue("$tenant", tenant.Value) |> ignore
+                    command.Parameters.AddWithValue("$session", sessionId.Value) |> ignore
+
+                    use reader = command.ExecuteReader()
+                    reader.Read())
+        }
+
+    interface ISessionAbortControlStore with
+        member _.TryRecoverControlTarget(tenant, sessionId, turn, owner, duration, ct) =
+            task {
+                try
+                    return
+                        lock database.Gate (fun () ->
+                            ct.ThrowIfCancellationRequested()
+                            use connection = database.OpenConnection()
+                            use transaction = connection.BeginTransaction(deferred = false)
+
+                            let result =
+                                RelationalControlTarget.recover
+                                    connection
+                                    transaction
+                                    $"\"{sessionsTable ()}\""
+                                    $"\"{inboxTable ()}\""
+                                    $"\"{turnsTable ()}\""
+                                    (controlTable ())
+                                    false
+                                    tenant
+                                    sessionId
+                                    (fun () -> database.UtcNow)
+                                    ct
+                                    turn
+                                    owner
+                                    duration
+
+                            ct.ThrowIfCancellationRequested()
+                            transaction.Commit()
+                            ct.ThrowIfCancellationRequested()
+                            result)
+                with :? SqliteException as ex ->
+                    return raise (mapSql ex)
+            }
+
+        member _.ReadAbortTarget(tenant, sessionId, ct) =
+            control tenant sessionId ct (fun context state -> ControlTargetProtocol.read context state, state)
+
+        member _.RequestHostAbort(tenant, sessionId, turn, cause, reason, ct) =
+            control tenant sessionId ct (fun context state ->
+                ControlTargetProtocol.request context state turn cause reason)
+
+        member _.BindControlTarget(tenant, sessionId, turn, position, claim, ct) =
+            control tenant sessionId ct (fun context state ->
+                ControlTargetProtocol.bind context state turn position claim)
+
+        member _.CheckControlTarget(tenant, sessionId, turn, position, claim, ct) =
+            control tenant sessionId ct (fun context state ->
+                ControlTargetProtocol.check context state turn position claim, state)
+
+        member _.TryDecideControlTarget(tenant, sessionId, turn, position, claim, id, status, cause, reason, ct) =
+            control tenant sessionId ct (fun context state ->
+                ControlTargetProtocol.decide context state turn position claim id status cause reason)
+
+        member _.RetireControlTarget(tenant, sessionId, turn, position, claim, id, ct) =
+            control tenant sessionId ct (fun context state ->
+                ControlTargetProtocol.retire context state turn position claim id)
+
     interface ISessionStore with
 
         member _.CreateSession(tenant, session, _) =
@@ -407,7 +579,7 @@ type SqliteSessionStore(database: SqliteDatabase) =
 
                             let now = database.UtcNow
                             let storedGrants = grantsOf session
-                            let optionsJson = SqliteJson.serialize session.Options
+                            let optionsJson = SessionOptionsPersistence.Serialize session.Options
                             let grantsJson = SqliteJson.serialize storedGrants
 
                             use insert = connection.CreateCommand()
@@ -442,6 +614,14 @@ type SqliteSessionStore(database: SqliteDatabase) =
                             insert.Parameters.AddWithValue("$options", optionsJson) |> ignore
                             insert.Parameters.AddWithValue("$grants", grantsJson) |> ignore
                             insert.ExecuteNonQuery() |> ignore
+
+                            RelationalControlTarget.initialize
+                                connection
+                                transaction
+                                (controlTable ())
+                                tenant
+                                session.Id
+
                             transaction.Commit()
 
                             { session with
@@ -483,6 +663,48 @@ type SqliteSessionStore(database: SqliteDatabase) =
                 | :? LegateException as ex -> return raise ex
                 | :? SqliteException as sql -> return raise (mapSql sql)
             }
+
+        member _.ListRecoveryCandidates(tenant, state, size, token, ct) =
+            ct.ThrowIfCancellationRequested()
+            RecoveryCandidateCursor.validate state size
+            let cursor = RecoveryCandidateCursor.decode tenant state token
+
+            lock database.Gate (fun () ->
+                use connection = database.OpenConnection()
+                use cmd = connection.CreateCommand()
+
+                cmd.CommandText <-
+                    $"WITH fence AS (SELECT COALESCE($upper, (SELECT MAX(id COLLATE BINARY) FROM \"%s{sessionsTable ()}\" WHERE tenant = $tenant)) AS upper_id) SELECT s.id, f.upper_id FROM \"%s{sessionsTable ()}\" s CROSS JOIN fence f WHERE s.tenant = $tenant AND s.state = $state AND s.current_turn_id IS NOT NULL AND s.id COLLATE BINARY > $last AND s.id COLLATE BINARY <= f.upper_id ORDER BY s.id COLLATE BINARY LIMIT $take"
+
+                cmd.Parameters.AddWithValue("$tenant", tenant.Value) |> ignore
+                cmd.Parameters.AddWithValue("$state", stateName state) |> ignore
+                cmd.Parameters.AddWithValue("$take", size + 1) |> ignore
+
+                cmd.Parameters.AddWithValue(
+                    "$upper",
+                    cursor
+                    |> Option.map (fun c -> box c.Upper)
+                    |> Option.defaultValue (box DBNull.Value)
+                )
+                |> ignore
+
+                cmd.Parameters.AddWithValue("$last", cursor |> Option.map (fun c -> c.Last) |> Option.defaultValue "")
+                |> ignore
+
+                ct.ThrowIfCancellationRequested()
+                use reader = cmd.ExecuteReader()
+                let mutable upper = ""
+
+                let rows =
+                    [
+                        while reader.Read() do
+                            ct.ThrowIfCancellationRequested()
+                            upper <- reader.GetString(1)
+                            yield reader.GetString(0)
+                    ]
+
+                RecoveryCandidateCursor.page tenant state size upper rows)
+            |> Task.FromResult
 
         member _.ListSessions(tenant, state, agentId, createdFrom, createdTo, pageSize, continuation, _) =
             task {
@@ -543,7 +765,7 @@ type SqliteSessionStore(database: SqliteDatabase) =
                             let hasMore = remaining.Length > page.Length
 
                             {
-                                Items = page :> IReadOnlyList<Session>
+                                SessionPage.Items = page :> IReadOnlyList<Session>
                                 Continuation =
                                     (match hasMore, List.tryLast page with
                                      | true, Some last -> tokenOf last
@@ -562,6 +784,14 @@ type SqliteSessionStore(database: SqliteDatabase) =
                             use connection = database.OpenConnection()
                             use transaction = connection.BeginTransaction()
                             let session = requireSessionRow connection transaction tenant sessionId
+
+                            ControlTargetProtocol.requireTransition
+                                sessionId
+                                state
+                                (RelationalControlTarget.load connection transaction (controlTable ()) tenant sessionId)
+
+                            if state = SessionState.Idle || state = SessionState.Closed then
+                                requireNoBinding connection transaction tenant sessionId
 
                             if session.State = SessionState.Closed && state <> SessionState.Closed then
                                 raise (
@@ -604,6 +834,7 @@ type SqliteSessionStore(database: SqliteDatabase) =
                             use connection = database.OpenConnection()
                             use transaction = connection.BeginTransaction()
                             let session = requireSessionRow connection transaction tenant sessionId
+                            requireNoBinding connection transaction tenant sessionId
 
                             if session.State = SessionState.Closed then
                                 transaction.Rollback()
@@ -798,11 +1029,24 @@ type SqliteSessionStore(database: SqliteDatabase) =
                             let now = database.UtcNow
                             let payloadJson = SqliteJson.serialize payload
 
+                            // Real-turn identity (issue 374): user messages
+                            // stamp a fresh durable TurnId at accept; replies
+                            // carry null (the default sentinel).
+                            let turnIdText: string | null =
+                                match payload with
+                                | :? UserMessagePayload -> TurnId.New().ToString()
+                                | _ -> null
+
+                            let turnId =
+                                match turnIdText with
+                                | null -> Unchecked.defaultof<TurnId>
+                                | text -> TurnId.Parse(text)
+
                             use insert = connection.CreateCommand()
                             insert.Transaction <- transaction
 
                             insert.CommandText <-
-                                $"INSERT INTO \"%s{inboxTable ()}\" (session_id, position, tenant, payload_json, delivery_mode, consumed, appended_at) VALUES ($session, $position, $tenant, $payload, $delivery, 0, $at)"
+                                $"INSERT INTO \"%s{inboxTable ()}\" (session_id, position, tenant, payload_json, delivery_mode, consumed, appended_at, turn_id) VALUES ($session, $position, $tenant, $payload, $delivery, 0, $at, $turn)"
 
                             insert.Parameters.AddWithValue("$session", sessionId.Value) |> ignore
                             insert.Parameters.AddWithValue("$position", position) |> ignore
@@ -810,6 +1054,12 @@ type SqliteSessionStore(database: SqliteDatabase) =
                             insert.Parameters.AddWithValue("$payload", payloadJson) |> ignore
                             insert.Parameters.AddWithValue("$delivery", deliveryName delivery) |> ignore
                             insert.Parameters.AddWithValue("$at", toIso now) |> ignore
+
+                            if isNull (box turnIdText) then
+                                insert.Parameters.AddWithValue("$turn", DBNull.Value) |> ignore
+                            else
+                                insert.Parameters.AddWithValue("$turn", turnIdText) |> ignore
+
                             insert.ExecuteNonQuery() |> ignore
                             transaction.Commit()
 
@@ -820,6 +1070,7 @@ type SqliteSessionStore(database: SqliteDatabase) =
                                 Delivery = delivery
                                 Consumed = false
                                 AppendedAt = now
+                                TurnId = turnId
                             })
                 with
                 | :? LegateException as ex -> return raise ex
@@ -837,7 +1088,7 @@ type SqliteSessionStore(database: SqliteDatabase) =
                             use command = connection.CreateCommand()
 
                             command.CommandText <-
-                                $"SELECT session_id, position, payload_json, delivery_mode, consumed, appended_at FROM \"%s{inboxTable ()}\" WHERE session_id = $session AND consumed = 0 ORDER BY position"
+                                $"SELECT session_id, position, payload_json, delivery_mode, consumed, appended_at, turn_id FROM \"%s{inboxTable ()}\" WHERE session_id = $session AND consumed = 0 ORDER BY position"
 
                             command.Parameters.AddWithValue("$session", sessionId.Value) |> ignore
 
@@ -899,6 +1150,7 @@ type SqliteSessionStore(database: SqliteDatabase) =
                             use transaction = connection.BeginTransaction()
                             requireSessionRow connection transaction tenant sessionId |> ignore
                             let now = database.UtcNow
+                            requireNoBinding connection transaction tenant sessionId
                             let expiresAt = now + leaseDuration
 
                             if liveClaimHeld connection transaction tenant sessionId then
@@ -909,7 +1161,7 @@ type SqliteSessionStore(database: SqliteDatabase) =
                                 let openTurn = openTurnRow connection transaction tenant sessionId
 
                                 match pending, openTurn with
-                                | Some(position, (:? ReplyPayload as _reply)), Some(turnId, attempt) ->
+                                | Some(position, (:? ReplyPayload as _reply), _), Some(turnId, attempt) ->
                                     consumePosition connection transaction sessionId position
                                     let nextAttempt = attempt + 1
                                     let token = mintToken ()
@@ -938,21 +1190,40 @@ type SqliteSessionStore(database: SqliteDatabase) =
                                     stampCurrentTurn connection transaction tenant sessionId (Some turnId) now
                                     transaction.Commit()
                                     TurnLeaseRenewed claim :> TurnLeaseState
-                                | Some(position, (:? UserMessagePayload as _message)), _ ->
+                                | Some(position, (:? UserMessagePayload as _message), stamped), _ ->
                                     consumePosition connection transaction sessionId position
+
+                                    // Real-turn identity (issue 374): claim
+                                    // under the entry's durable identity;
+                                    // legacy rows bind once here.
+                                    let isDefault = isNull (box stamped.Value)
+
+                                    let turnId = if isDefault then TurnId.New() else stamped
+
+                                    if isDefault then
+                                        use backfill = connection.CreateCommand()
+                                        backfill.Transaction <- transaction
+
+                                        backfill.CommandText <-
+                                            $"UPDATE \"%s{inboxTable ()}\" SET turn_id = $turn WHERE session_id = $session AND position = $position"
+
+                                        backfill.Parameters.AddWithValue("$turn", turnId.Value) |> ignore
+                                        backfill.Parameters.AddWithValue("$session", sessionId.Value) |> ignore
+                                        backfill.Parameters.AddWithValue("$position", position) |> ignore
+                                        backfill.ExecuteNonQuery() |> ignore
 
                                     // A stale open turn from a lapsed claim is abandoned.
                                     use clear = connection.CreateCommand()
                                     clear.Transaction <- transaction
 
                                     clear.CommandText <-
-                                        $"DELETE FROM \"%s{turnsTable ()}\" WHERE session_id = $session AND tenant = $tenant AND status IN (%s{nonTerminalFilter})"
+                                        $"DELETE FROM \"%s{turnsTable ()}\" WHERE session_id = $session AND tenant = $tenant AND status IN (%s{nonTerminalFilter}) AND turn_id <> $turn"
 
                                     clear.Parameters.AddWithValue("$session", sessionId.Value) |> ignore
                                     clear.Parameters.AddWithValue("$tenant", tenant.Value) |> ignore
+                                    clear.Parameters.AddWithValue("$turn", turnId.Value) |> ignore
                                     clear.ExecuteNonQuery() |> ignore
 
-                                    let turnId = TurnId.New()
                                     let token = mintToken ()
 
                                     let claim =
@@ -1183,6 +1454,8 @@ type SqliteSessionStore(database: SqliteDatabase) =
                             match resolveClaim connection transaction tenant claim with
                             | Live(sessionId, _, _, _, _) ->
                                 let outcomeJson =
+                                    requireNoBinding connection transaction tenant sessionId
+
                                     if isNull (box outcome) then
                                         null
                                     else
@@ -1259,6 +1532,7 @@ type SqliteSessionStore(database: SqliteDatabase) =
 
                             match resolveClaim connection transaction tenant claim with
                             | Live(sessionId, _, _, expiresAt, _) ->
+                                requireNoBinding connection transaction tenant sessionId
                                 let now = database.UtcNow
 
                                 use update = connection.CreateCommand()
@@ -1290,8 +1564,195 @@ type SqliteSessionStore(database: SqliteDatabase) =
                 | :? SqliteException as sql -> return raise (mapSql sql)
             }
 
-        member _.EnqueueCompletionOutbox(tenant, completion, _) =
+        member _.ConsumeInboxUnderClaim(tenant, claim, sessionId, positions, _) =
             task {
+                if isNull (box claim) then
+                    raise (ArgumentNullException(nameof claim))
+
+                if isNull (box positions) then
+                    raise (ArgumentNullException(nameof positions))
+
+                try
+                    return
+                        lock database.Gate (fun () ->
+                            use connection = database.OpenConnection()
+                            use transaction = connection.BeginTransaction()
+                            requireSessionRow connection transaction tenant sessionId |> ignore
+
+                            match resolveClaim connection transaction tenant claim with
+                            | Live(sid, _, _, expiresAt, attempt) when sid = sessionId && attempt = claim.Attempt ->
+                                for position in positions do
+                                    use update = connection.CreateCommand()
+                                    update.Transaction <- transaction
+
+                                    update.CommandText <-
+                                        $"UPDATE \"%s{inboxTable ()}\" SET consumed = 1 WHERE session_id = $session AND position = $position AND consumed = 0"
+
+                                    update.Parameters.AddWithValue("$session", sessionId.Value) |> ignore
+                                    update.Parameters.AddWithValue("$position", position) |> ignore
+                                    update.ExecuteNonQuery() |> ignore
+
+                                transaction.Commit()
+
+                                let live = { claim with ExpiresAt = expiresAt }
+
+                                TurnLeaseHeld live :> TurnLeaseState
+                            | Live(_, _, _, _, _) ->
+                                transaction.Rollback()
+                                TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState
+                            | TakenOver ->
+                                transaction.Rollback()
+                                TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState
+                            | Absent ->
+                                transaction.Rollback()
+                                TurnLeaseMissing claim.TurnId :> TurnLeaseState)
+                with
+                | :? LegateException as ex -> return raise ex
+                | :? SqliteException as sql -> return raise (mapSql sql)
+            }
+
+        member _.UpdateSessionStateUnderClaim(tenant, claim, sessionId, state, _) =
+            task {
+                if isNull (box claim) then
+                    raise (ArgumentNullException(nameof claim))
+
+                if state <> SessionState.Running && state <> SessionState.WaitingForInput then
+                    raise (
+                        InvalidSessionStateException(
+                            sessionId,
+                            nameof state,
+                            "Only execution-owned states (Running, WaitingForInput) update under a claim."
+                        )
+                    )
+
+                try
+                    return
+                        lock database.Gate (fun () ->
+                            use connection = database.OpenConnection()
+                            use transaction = connection.BeginTransaction()
+                            let session = requireSessionRow connection transaction tenant sessionId
+
+                            if session.State = SessionState.Closed then
+                                raise (
+                                    InvalidSessionStateException(
+                                        sessionId,
+                                        nameof session.State,
+                                        "A closed session cannot leave the Closed state."
+                                    )
+                                )
+
+                            match resolveClaim connection transaction tenant claim with
+                            | Live(sid, _, _, expiresAt, attempt) when sid = sessionId && attempt = claim.Attempt ->
+                                ControlTargetProtocol.requireTransition
+                                    sessionId
+                                    state
+                                    (RelationalControlTarget.load
+                                        connection
+                                        transaction
+                                        (controlTable ())
+                                        tenant
+                                        sessionId)
+
+                                let now = database.UtcNow
+
+                                use update = connection.CreateCommand()
+                                update.Transaction <- transaction
+
+                                update.CommandText <-
+                                    $"UPDATE \"%s{sessionsTable ()}\" SET state = $state, updated_at = $now WHERE id = $id AND tenant = $tenant"
+
+                                update.Parameters.AddWithValue("$state", stateName state) |> ignore
+                                update.Parameters.AddWithValue("$now", toIso now) |> ignore
+                                update.Parameters.AddWithValue("$id", sessionId.Value) |> ignore
+                                update.Parameters.AddWithValue("$tenant", tenant.Value) |> ignore
+                                update.ExecuteNonQuery() |> ignore
+                                transaction.Commit()
+
+                                let live = { claim with ExpiresAt = expiresAt }
+
+                                TurnLeaseHeld live :> TurnLeaseState
+                            | Live(_, _, _, _, _) ->
+                                transaction.Rollback()
+                                TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState
+                            | TakenOver ->
+                                transaction.Rollback()
+                                TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState
+                            | Absent ->
+                                transaction.Rollback()
+                                TurnLeaseMissing claim.TurnId :> TurnLeaseState)
+                with
+                | :? LegateException as ex -> return raise ex
+                | :? SqliteException as sql -> return raise (mapSql sql)
+            }
+
+        member _.GrantSessionToolUnderClaim(tenant, claim, sessionId, toolName, _) =
+            task {
+                if isNull (box claim) then
+                    raise (ArgumentNullException(nameof claim))
+
+                if String.IsNullOrWhiteSpace toolName then
+                    raise (ArgumentException("The tool name must be a non-empty string.", nameof toolName))
+
+                try
+                    return
+                        lock database.Gate (fun () ->
+                            use connection = database.OpenConnection()
+                            use transaction = connection.BeginTransaction()
+                            let session = requireSessionRow connection transaction tenant sessionId
+
+                            match resolveClaim connection transaction tenant claim with
+                            | Live(sid, _, _, expiresAt, attempt) when sid = sessionId && attempt = claim.Attempt ->
+                                if session.State = SessionState.Closed then
+                                    raise (
+                                        InvalidSessionStateException(
+                                            sessionId,
+                                            nameof session.State,
+                                            "A closed session carries no grant memory."
+                                        )
+                                    )
+
+                                let grants = grantsOf session
+
+                                if not (grants.Contains toolName) then
+                                    grants.Add toolName
+
+                                let now = database.UtcNow
+                                let grantsJson = SqliteJson.serialize grants
+
+                                use update = connection.CreateCommand()
+                                update.Transaction <- transaction
+
+                                update.CommandText <-
+                                    $"UPDATE \"%s{sessionsTable ()}\" SET permission_grants_json = $grants, updated_at = $now WHERE id = $id AND tenant = $tenant"
+
+                                update.Parameters.AddWithValue("$grants", grantsJson) |> ignore
+                                update.Parameters.AddWithValue("$now", toIso now) |> ignore
+                                update.Parameters.AddWithValue("$id", sessionId.Value) |> ignore
+                                update.Parameters.AddWithValue("$tenant", tenant.Value) |> ignore
+                                update.ExecuteNonQuery() |> ignore
+                                transaction.Commit()
+
+                                let live = { claim with ExpiresAt = expiresAt }
+
+                                TurnLeaseHeld live :> TurnLeaseState
+                            | Live(_, _, _, _, _) ->
+                                transaction.Rollback()
+                                TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState
+                            | TakenOver ->
+                                transaction.Rollback()
+                                TurnLeaseLost(claim.TurnId, "takenOver") :> TurnLeaseState
+                            | Absent ->
+                                transaction.Rollback()
+                                TurnLeaseMissing claim.TurnId :> TurnLeaseState)
+                with
+                | :? LegateException as ex -> return raise ex
+                | :? SqliteException as sql -> return raise (mapSql sql)
+            }
+
+        member _.EnqueueCompletionOutbox(tenant, destinationId, completion, _) =
+            task {
+                CompletionDestinationRules.Validate destinationId
+
                 if isNull (box completion) then
                     raise (ArgumentNullException(nameof completion))
 
@@ -1314,7 +1775,7 @@ type SqliteSessionStore(database: SqliteDatabase) =
                             check.Transaction <- transaction
 
                             check.CommandText <-
-                                $"SELECT idempotency_key, tenant, session_id, completion_json, created_at, delivered, delivered_at, lease_owner, lease_expires_at FROM \"%s{outboxTable ()}\" WHERE idempotency_key = $key"
+                                $"SELECT idempotency_key, tenant, session_id, completion_json, created_at, delivered, delivered_at, lease_owner, lease_expires_at, destination_id FROM \"%s{outboxTable ()}\" WHERE idempotency_key = $key"
 
                             check.Parameters.AddWithValue("$key", completion.IdempotencyKey) |> ignore
 
@@ -1322,6 +1783,12 @@ type SqliteSessionStore(database: SqliteDatabase) =
 
                             if reader.Read() then
                                 let entry = readOutboxEntry reader
+
+                                if entry.Tenant <> tenant || entry.SessionId <> completion.SessionId then
+                                    raise (
+                                        ArgumentException("The idempotency key belongs to another session or tenant.")
+                                    )
+
                                 transaction.Rollback()
                                 entry
                             else
@@ -1333,21 +1800,23 @@ type SqliteSessionStore(database: SqliteDatabase) =
                                 insert.Transaction <- transaction
 
                                 insert.CommandText <-
-                                    $"INSERT INTO \"%s{outboxTable ()}\" (idempotency_key, tenant, session_id, completion_json, created_at, delivered, delivered_at, lease_owner, lease_expires_at) VALUES ($key, $tenant, $session, $completion, $created, 0, NULL, NULL, NULL)"
+                                    $"INSERT INTO \"%s{outboxTable ()}\" (idempotency_key, tenant, session_id, completion_json, created_at, delivered, delivered_at, lease_owner, lease_expires_at, destination_id) VALUES ($key, $tenant, $session, $completion, $created, 0, NULL, NULL, NULL, $destination)"
 
                                 insert.Parameters.AddWithValue("$key", completion.IdempotencyKey) |> ignore
                                 insert.Parameters.AddWithValue("$tenant", tenant.Value) |> ignore
                                 insert.Parameters.AddWithValue("$session", completion.SessionId.Value) |> ignore
                                 insert.Parameters.AddWithValue("$completion", completionJson) |> ignore
                                 insert.Parameters.AddWithValue("$created", toIso now) |> ignore
+                                insert.Parameters.AddWithValue("$destination", destinationId) |> ignore
                                 insert.ExecuteNonQuery() |> ignore
                                 transaction.Commit()
 
                                 {
                                     Tenant = tenant
                                     SessionId = completion.SessionId
+                                    DestinationId = destinationId
                                     IdempotencyKey = completion.IdempotencyKey
-                                    Completion = completion
+                                    Completion = SqliteJson.deserialize<SessionCompletion> completionJson
                                     CreatedAt = now
                                     Delivered = false
                                     DeliveredAt = Nullable()
@@ -1382,7 +1851,7 @@ type SqliteSessionStore(database: SqliteDatabase) =
                             pick.Transaction <- transaction
 
                             pick.CommandText <-
-                                $"SELECT idempotency_key FROM \"%s{outboxTable ()}\" WHERE delivered = 0 AND (lease_owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= $now) ORDER BY created_at LIMIT $limit"
+                                $"SELECT idempotency_key FROM \"%s{outboxTable ()}\" WHERE delivered = 0 AND (lease_owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= $now) ORDER BY CASE WHEN lease_expires_at IS NULL THEN 0 ELSE 1 END, lease_expires_at, created_at, idempotency_key LIMIT $limit"
 
                             pick.Parameters.AddWithValue("$now", nowText) |> ignore
                             pick.Parameters.AddWithValue("$limit", maxBatch) |> ignore
@@ -1414,7 +1883,7 @@ type SqliteSessionStore(database: SqliteDatabase) =
                                 fetch.Transaction <- transaction
 
                                 fetch.CommandText <-
-                                    $"SELECT idempotency_key, tenant, session_id, completion_json, created_at, delivered, delivered_at, lease_owner, lease_expires_at FROM \"%s{outboxTable ()}\" WHERE idempotency_key = $key"
+                                    $"SELECT idempotency_key, tenant, session_id, completion_json, created_at, delivered, delivered_at, lease_owner, lease_expires_at, destination_id FROM \"%s{outboxTable ()}\" WHERE idempotency_key = $key"
 
                                 fetch.Parameters.AddWithValue("$key", key) |> ignore
 
@@ -1469,6 +1938,31 @@ type SqliteSessionStore(database: SqliteDatabase) =
                 | :? LegateException as ex -> return raise ex
                 | :? SqliteException as sql -> return raise (mapSql sql)
             }
+
+        member _.RenewCompletionClaim(tenant, key, owner, duration, ct) =
+            ct.ThrowIfCancellationRequested()
+
+            if duration <= TimeSpan.Zero then
+                raise (ArgumentOutOfRangeException(nameof duration))
+
+            lock database.Gate (fun () ->
+                use connection = database.OpenConnection()
+                use cmd = connection.CreateCommand()
+
+                cmd.CommandText <-
+                    $"UPDATE \"%s{outboxTable ()}\" SET lease_expires_at = $expires WHERE tenant = $tenant AND idempotency_key = $key AND delivered = 0 AND lease_owner = $owner AND lease_expires_at > $now"
+
+                cmd.Parameters.AddWithValue("$tenant", tenant.Value) |> ignore
+                cmd.Parameters.AddWithValue("$key", key) |> ignore
+                cmd.Parameters.AddWithValue("$owner", owner) |> ignore
+                cmd.Parameters.AddWithValue("$now", toIso database.UtcNow) |> ignore
+
+                cmd.Parameters.AddWithValue("$expires", toIso (database.UtcNow + duration))
+                |> ignore
+
+                ct.ThrowIfCancellationRequested()
+                cmd.ExecuteNonQuery() = 1)
+            |> Task.FromResult
 
         member _.MarkCompletionDelivered(tenant, idempotencyKey, owner, _) =
             task {

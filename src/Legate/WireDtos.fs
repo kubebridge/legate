@@ -58,6 +58,14 @@ module internal WireDtos =
     /// Wire form of SessionActorMessage.AbortSession: the typed stop cause
     /// and reason. The caller's token never crosses.
     type AbortSessionDto() =
+        /// Explicit targeted-control payload version; absent is unsupported.
+        member val ControlVersion: int = 0 with get, set
+        /// Trusted routing tenant, checked again by the receiving actor.
+        member val Tenant: TenantId = Unchecked.defaultof<TenantId> with get, set
+        /// Exact session scope.
+        member val SessionId: SessionId = Unchecked.defaultof<SessionId> with get, set
+        /// Stable real-entry target, not execution authority.
+        member val TargetTurnId: TurnId = Unchecked.defaultof<TurnId> with get, set
 
         /// Which abort-family stop cause won.
         member val Cause: StopCause = StopCause.ExplicitAbort with get, set
@@ -234,6 +242,11 @@ module internal WireDtos =
         /// The tool call that raised the request.
         member val PendingCall: FunctionCallContent = Unchecked.defaultof<FunctionCallContent> with get, set
 
+        /// The turn that suspended, as its canonical string (issue 289):
+        /// null on old payloads, which read back as the default turn id
+        /// and fall back to the turn cell at the settle choke points.
+        member val OriginTurnId: string = Unchecked.defaultof<string> with get, set
+
     /// Wire form of SuspendableActorMessage.SuspendableFinished: the entry,
     /// the completion with its suspension in wire form (null when the turn
     /// settled), the attempt, and the granted tool names as an array.
@@ -259,6 +272,11 @@ module internal WireDtos =
 
         /// Tool names the host already allowed for the session.
         member val Allowed: string[] = [||] with get, set
+
+        /// The turn the run executed, as its canonical string (issue 289):
+        /// null on old payloads, which read back as the default turn id
+        /// and fall back to the turn cell at the settle choke points.
+        member val TurnId: string = Unchecked.defaultof<string> with get, set
 
     /// Wire form of SuspendableActorMessage.SuspendableFaulted: the entry,
     /// the fault reason string, and the attempt. The live exception never
@@ -301,6 +319,14 @@ module internal WireDtos =
 
     /// Wire form of SuspendableActorMessage.SuspendableAbortSession.
     type SuspendableAbortSessionDto() =
+        /// Explicit targeted-control payload version; absent is unsupported.
+        member val ControlVersion: int = 0 with get, set
+        /// Tenant checked on receipt.
+        member val Tenant: TenantId = Unchecked.defaultof<TenantId> with get, set
+        /// Exact session scope.
+        member val SessionId: SessionId = Unchecked.defaultof<SessionId> with get, set
+        /// Exact real-entry target.
+        member val TargetTurnId: TurnId = Unchecked.defaultof<TurnId> with get, set
 
         /// Which abort-family stop cause won.
         member val Cause: StopCause = StopCause.ExplicitAbort with get, set
@@ -406,8 +432,15 @@ module internal WireDtos =
     /// follows NextCursor while EndOfStream is false.
     type EventBatchDto() =
 
+        /// The tenant the events belong to. Missing or non-canonical values
+        /// decode to the invalid default sentinel and are refused by routing.
+        member val Tenant: string = Unchecked.defaultof<string> with get, set
+
         /// The session the events belong to.
         member val SessionId: string = Unchecked.defaultof<string> with get, set
+
+        /// The subscriber token this batch answers.
+        member val SubscriberToken: string = Unchecked.defaultof<string> with get, set
 
         /// The events in sequence order; empty at end of stream.
         member val Events: SessionEvent[] = [||] with get, set
@@ -430,7 +463,64 @@ module internal WireDtos =
         /// The journaled event.
         member val Event: SessionEvent = Unchecked.defaultof<SessionEvent> with get, set
 
+    /// Current-only scoped ingress. Kind selects only the explicit fields below.
+    type ScopedRequestDto() =
+        member val Format = 2 with get, set
+        member val Address = "" with get, set
+        member val Scope = "" with get, set
+        member val Kind = 0 with get, set
+        member val Payload: InboxPayload = Unchecked.defaultof<_> with get, set
+        member val Reply: Reply = Unchecked.defaultof<_> with get, set
+        member val AgentId: Nullable<AgentId> = Nullable() with get, set
+        member val Hint: SuspendableAbortSessionDto = Unchecked.defaultof<_> with get, set
+        member val Subscribe: SubscribeDto = Unchecked.defaultof<_> with get, set
+        member val Unsubscribe: UnsubscribeDto = Unchecked.defaultof<_> with get, set
+
+    /// Current-only address-bound response. No runtime type-name dispatch.
+    type ScopedResponseDto() =
+        member val Format = 2 with get, set
+        member val Address = "" with get, set
+        member val Owner = "" with get, set
+        member val Kind = 0 with get, set
+        member val Entry: InboxEntry = Unchecked.defaultof<_> with get, set
+        member val State: SessionState = Unchecked.defaultof<_> with get, set
+        member val Session: Session = Unchecked.defaultof<_> with get, set
+        member val Snapshot: SnapshotDto = Unchecked.defaultof<_> with get, set
+        member val Compact: CompactCompletedDto = Unchecked.defaultof<_> with get, set
+        member val Batch: EventBatchDto = Unchecked.defaultof<_> with get, set
+        member val ReplyRejected: ReplyRejectedDto = Unchecked.defaultof<_> with get, set
+        member val Rejection: SessionScopeRejectionReason = SessionScopeRejectionReason.InvalidScope with get, set
+        member val SessionId: Nullable<SessionId> = Nullable() with get, set
+        member val Limit = 0 with get, set
+        member val Category = "" with get, set
+        /// Stable completion routing refusal category for kind 22.
+        member val RoutingReason: CompletionRoutingReason = CompletionRoutingReason.Unknown with get, set
+        /// Logical completion destination id for kind 22, or null when the format is unsupported.
+        member val DestinationId: string | null = null with get, set
+
     // ────────────────── Translation ──────────────────
+
+    /// The default-valued tenant is an invalid wire-only sentinel. It must
+    /// never reach a registry, store, route key, or hash-based lookup.
+    let private invalidWireTenant: TenantId = Unchecked.defaultof<TenantId>
+
+    /// Rebuilds a tenant only when the raw wire value is already canonical.
+    /// Missing, blank, padded, or otherwise invalid values stay at the
+    /// invalid sentinel so routing can return a typed refusal without
+    /// rebinding the sender to a concrete host tenant.
+    let private tenantOfWire (raw: string | null) : TenantId =
+        match raw with
+        | null -> invalidWireTenant
+        | raw when
+            String.IsNullOrWhiteSpace raw
+            || not (String.Equals(raw, raw.Trim(), StringComparison.Ordinal))
+            ->
+            invalidWireTenant
+        | raw ->
+            try
+                TenantId.Create raw
+            with :? ArgumentException ->
+                invalidWireTenant
 
     /// Maps a live exception to its wire reason string: the message, or the
     /// type name when the message was empty (the tool-call Error precedent:
@@ -476,6 +566,29 @@ module internal WireDtos =
         else
             raise (InvalidOperationException($"Unknown suspension kind '{kind}'. Expected permission or question."))
 
+    /// Maps a live turn id onto its wire string (issue 289): null for the
+    /// default id, so old readers never see a blank turn id.
+    /// <param name="turnId">The live turn id.</param>
+    /// <returns>The canonical string, or null for the default id.</returns>
+    let private turnIdToWire (turnId: TurnId) : string =
+        if turnId.Equals(Unchecked.defaultof<TurnId>) then
+            Unchecked.defaultof<string>
+        else
+            turnId.ToString()
+
+    /// Rebuilds a live turn id from its wire string (issue 289): null or
+    /// unparsable input reads as the default id, which the settle choke
+    /// points resolve through the turn-cell fallback.
+    /// <param name="value">The wire string, or null from old payloads.</param>
+    /// <returns>The live turn id, or the default id.</returns>
+    let private turnIdOfWire (value: string) : TurnId =
+        let mutable parsed = Unchecked.defaultof<TurnId>
+
+        if TurnId.TryParse(value, &parsed) then
+            parsed
+        else
+            Unchecked.defaultof<TurnId>
+
     /// Builds one DTO of the given class and sets it through the setter.
     /// <param name="set">Sets the fresh DTO's fields.</param>
     /// <returns>The built DTO.</returns>
@@ -512,6 +625,7 @@ module internal WireDtos =
 
         buildDto (fun (wire: SuspensionDto) ->
             wire.RequestId <- cursor.RequestId
+            wire.OriginTurnId <- turnIdToWire cursor.OriginTurnId
             wire.ToolName <- cursor.ToolName
             wire.ToolCallId <- cursor.ToolCallId
             wire.Kind <- kindToWire cursor.Kind
@@ -549,6 +663,7 @@ module internal WireDtos =
 
         {
             RequestId = wire.RequestId
+            OriginTurnId = turnIdOfWire wire.OriginTurnId
             ToolName = wire.ToolName
             ToolCallId = wire.ToolCallId
             Kind = kindOfWire wire.Kind
@@ -583,11 +698,13 @@ module internal WireDtos =
     /// <param name="result">The settled turn result. Must not be null.</param>
     /// <param name="hasPendingInjects">Whether Inject entries stayed pending.</param>
     /// <param name="suspension">The wire cursor, or null when the turn settled.</param>
+    /// <param name="turnId">The wire turn id, or null from old payloads.</param>
     /// <returns>The live completion.</returns>
     let private completionOfWire
         (result: TurnResult)
         (hasPendingInjects: bool)
         (suspension: SuspensionDto)
+        (turnId: string)
         : TurnLoop.TurnLoopCompletion =
         ArgumentNullException.ThrowIfNull(result)
 
@@ -599,6 +716,7 @@ module internal WireDtos =
 
         {
             Result = result
+            TurnId = turnIdOfWire turnId
             HasPendingInjects = hasPendingInjects
             Suspension = cursor
         }
@@ -675,11 +793,131 @@ module internal WireDtos =
     /// receiver re-attaches its own scope in ofWire.
     /// <param name="message">The live message. Must not be null.</param>
     /// <returns>The wire DTO.</returns>
-    let toWire (message: obj) : obj =
+    let rec toWire (message: obj) : obj =
         if isNull (box message) then
             raise (ArgumentNullException(nameof message))
 
-        if message :? SessionActorMessage then
+        if message :? SessionRouteRequest then
+            let request = message :?> SessionRouteRequest
+            let dto = ScopedRequestDto()
+            dto.Address <- request.Address
+            dto.Scope <- request.Scope
+
+            match request.Payload with
+            | :? SessionRouteProbe -> dto.Kind <- 1
+            | :? SessionActor.SuspendableActorMessage as value ->
+                match value with
+                | SessionActor.SessionReplyPayload reply ->
+                    dto.Kind <- 5
+                    dto.Reply <- reply
+                | SessionActor.SuspendableQueuePrompt(payload, _) ->
+                    dto.Kind <- 2
+                    dto.Payload <- payload
+                | SessionActor.SuspendableInjectPrompt(payload, _) ->
+                    dto.Kind <- 3
+                    dto.Payload <- payload
+                | SessionActor.SuspendableInterruptPrompt(payload, _) ->
+                    dto.Kind <- 4
+                    dto.Payload <- payload
+                | SessionActor.SuspendableGetSnapshot -> dto.Kind <- 6
+                | SessionActor.SuspendableCloseSession _ -> dto.Kind <- 7
+                | SessionActor.SuspendableCompactSession _ -> dto.Kind <- 8
+                | SessionActor.SuspendableSetAgent(agent, _) ->
+                    dto.Kind <- 9
+                    dto.AgentId <- agent
+                | SessionActor.SuspendableCheckInbox -> dto.Kind <- 10
+                | SessionActor.SuspendableObserveHostAbort _ ->
+                    dto.Kind <- 11
+                    dto.Hint <- toWire value :?> SuspendableAbortSessionDto
+                | _ -> invalidOp "Only admitted external commands can cross a scoped route."
+            | :? CrossNodeSubscriptions.CrossNodeSubscribeRequest as value ->
+                dto.Kind <- 12
+                dto.Subscribe <- toWire value :?> SubscribeDto
+            | :? CrossNodeSubscriptions.CrossNodeUnsubscribe as value ->
+                dto.Kind <- 13
+                dto.Unsubscribe <- toWire value :?> UnsubscribeDto
+            | _ -> invalidOp "Unknown scoped request operation."
+
+            dto :> obj
+        elif message :? SessionRouteResponse then
+            let response = message :?> SessionRouteResponse
+            let dto = ScopedResponseDto()
+            dto.Address <- response.Address
+            dto.Owner <- response.Owner
+
+            match response.Payload with
+            | :? SessionRouteAccepted -> dto.Kind <- 1
+            | :? SessionPromptReply as reply ->
+                match reply with
+                | PromptAccepted entry ->
+                    dto.Kind <- 2
+                    dto.Entry <- entry
+                | PromptRejected state ->
+                    dto.Kind <- 3
+                    dto.State <- state
+            | :? SessionActor.SessionReplyReply as reply ->
+                match reply with
+                | SessionActor.ReplyAccepted entry ->
+                    dto.Kind <- 4
+                    dto.Entry <- entry
+                | SessionActor.ReplyRejected _ ->
+                    dto.Kind <- 5
+                    dto.ReplyRejected <- toWire reply :?> ReplyRejectedDto
+            | :? SessionSnapshot as snapshot ->
+                dto.Kind <- 6
+                dto.Snapshot <- toWire snapshot :?> SnapshotDto
+            | :? Session as session ->
+                dto.Kind <- 7
+                dto.Session <- session
+            | :? SessionCompactReply as reply ->
+                match reply with
+                | CompactCompleted _ ->
+                    dto.Kind <- 8
+                    dto.Compact <- toWire reply :?> CompactCompletedDto
+                | CompactNotNeeded -> dto.Kind <- 9
+                | CompactDeferred -> dto.Kind <- 10
+                | CompactFenced -> dto.Kind <- 11
+                | CompactRejected state ->
+                    dto.Kind <- 12
+                    dto.State <- state
+            | :? SessionActor.SessionSetAgentReply as reply ->
+                match reply with
+                | SessionActor.SetAgentApplied session ->
+                    dto.Kind <- 13
+                    dto.Session <- session
+                | SessionActor.SetAgentPending session ->
+                    dto.Kind <- 14
+                    dto.Session <- session
+                | SessionActor.SetAgentRejected state ->
+                    dto.Kind <- 15
+                    dto.State <- state
+            | :? CrossNodeSubscriptions.CrossNodeEventBatch as batch ->
+                dto.Kind <- 16
+                dto.Batch <- toWire batch :?> EventBatchDto
+            | :? SessionScopeRejectedException as error ->
+                dto.Kind <- 17
+                dto.Rejection <- error.Reason
+            | :? SessionNotFoundException as error ->
+                dto.Kind <- 18
+                dto.SessionId <- error.SessionId
+            | :? InvalidSessionStateException as error ->
+                dto.Kind <- 19
+                dto.SessionId <- error.SessionId
+                dto.Category <- error.CurrentState
+            | :? SessionSubscriptionLimitExceededException as error ->
+                dto.Kind <- 20
+                dto.SessionId <- error.SessionId
+                dto.Limit <- error.Limit
+            | :? Exception -> dto.Kind <- 21
+            | :? CompletionRoutingRefused as refusal ->
+                dto.Kind <- 22
+                dto.SessionId <- Nullable refusal.SessionId
+                dto.DestinationId <- refusal.DestinationId
+                dto.RoutingReason <- refusal.Reason
+            | _ -> invalidOp "Unknown scoped response operation."
+
+            dto :> obj
+        elif message :? SessionActorMessage then
             match message :?> SessionActorMessage with
             | QueuePrompt(payload, _) ->
                 buildDto (fun (dto: QueuePromptDto) -> dto.Payload <- requirePayload payload) :> obj
@@ -688,11 +926,19 @@ module internal WireDtos =
             | InterruptPrompt(payload, _) ->
                 buildDto (fun (dto: InterruptPromptDto) -> dto.Payload <- requirePayload payload) :> obj
             | CloseSession _ -> CloseSessionDto() :> obj
-            | AbortSession(cause, reason, _) ->
+            | ObserveHostAbort(tenant, sessionId, target) ->
                 buildDto (fun (dto: AbortSessionDto) ->
-                    dto.Cause <- cause
-                    dto.Reason <- reason)
+                    dto.ControlVersion <- 2
+                    dto.Tenant <- tenant
+                    dto.SessionId <- sessionId
+                    dto.TargetTurnId <- target)
                 :> obj
+            | AbortSession _ ->
+                raise (
+                    InvalidOperationException(
+                        "Untargeted actor abort is local-only; legacy abort wire messages are unsupported."
+                    )
+                )
             | CompactSession _ -> CompactSessionDto() :> obj
             | GetSnapshot -> GetSnapshotDto() :> obj
             | SessionTurnSettled(entry, result) ->
@@ -707,6 +953,18 @@ module internal WireDtos =
                     dto.Entry <- requireEntry entry
                     dto.Reason <- reasonOf error)
                 :> obj
+            | LifecycleStoreCompleted _ ->
+                raise (
+                    InvalidOperationException(
+                        "Piped lifecycle store completions are actor-local; they never cross node boundaries."
+                    )
+                )
+            | LifecycleStoreTimeout _ ->
+                raise (
+                    InvalidOperationException(
+                        "Piped lifecycle store timeouts are actor-local; they never cross node boundaries."
+                    )
+                )
         elif message :? SessionActor.SuspendableActorMessage then
             match message :?> SessionActor.SuspendableActorMessage with
             | SessionActor.SuspendableQueuePrompt(payload, _) ->
@@ -724,6 +982,7 @@ module internal WireDtos =
                     dto.HasPendingInjects <- hasPendingInjects
                     dto.Suspension <- suspension
                     dto.Attempt <- attempt
+                    dto.TurnId <- turnIdToWire completion.TurnId
 
                     dto.Allowed <-
                         if isNull (box allowed) then
@@ -731,7 +990,7 @@ module internal WireDtos =
                         else
                             allowed |> Seq.filter (fun name -> not (isNull (box name))) |> Array.ofSeq)
                 :> obj
-            | SessionActor.SuspendableFaulted(entry, error, attempt) ->
+            | SessionActor.SuspendableFaulted(entry, error, attempt, _) ->
                 buildDto (fun (dto: SuspendableFaultedDto) ->
                     dto.Entry <- requireEntry entry
                     dto.Reason <- reasonOf error
@@ -739,19 +998,43 @@ module internal WireDtos =
                 :> obj
             | SessionActor.ReplyEntry entry ->
                 buildDto (fun (dto: ReplyEntryDto) -> dto.Entry <- requireEntry entry) :> obj
+            | SessionActor.SessionReplyPayload _ ->
+                raise (
+                    InvalidOperationException("Direct session replies are local-only; scoped route DTOs carry replies.")
+                )
             | SessionActor.SuspendableGetSnapshot -> SuspendableGetSnapshotDto() :> obj
             | SessionActor.SuspendTimedOut requestId ->
                 buildDto (fun (dto: SuspendTimedOutDto) -> dto.RequestId <- requestId) :> obj
             | SessionActor.SuspendableCloseSession _ -> SuspendableCloseSessionDto() :> obj
-            | SessionActor.SuspendableAbortSession(cause, reason, _) ->
+            | SessionActor.SuspendableObserveHostAbort(tenant, sessionId, target) ->
                 buildDto (fun (dto: SuspendableAbortSessionDto) ->
-                    dto.Cause <- cause
-                    dto.Reason <- reason)
+                    dto.ControlVersion <- 2
+                    dto.Tenant <- tenant
+                    dto.SessionId <- sessionId
+                    dto.TargetTurnId <- target)
                 :> obj
+            | SessionActor.SuspendableAbortSession _ ->
+                raise (
+                    InvalidOperationException(
+                        "Untargeted actor abort is local-only; legacy abort wire messages are unsupported."
+                    )
+                )
             | SessionActor.SuspendableCompactSession _ -> SuspendableCompactSessionDto() :> obj
             | SessionActor.SuspendableCheckInbox -> SuspendableCheckInboxDto() :> obj
             | SessionActor.SuspendableSetAgent(agentId, _) ->
                 buildDto (fun (dto: SuspendableSetAgentDto) -> dto.AgentId <- requireAgentId agentId) :> obj
+            | SessionActor.SuspendableStoreCompleted _ ->
+                raise (
+                    InvalidOperationException(
+                        "Piped lifecycle store completions are actor-local; they never cross node boundaries."
+                    )
+                )
+            | SessionActor.SuspendableStoreTimeout _ ->
+                raise (
+                    InvalidOperationException(
+                        "Piped lifecycle store timeouts are actor-local; they never cross node boundaries."
+                    )
+                )
         elif message :? SessionPromptReply then
             match message :?> SessionPromptReply with
             | PromptAccepted entry -> buildDto (fun (dto: PromptAcceptedDto) -> dto.Entry <- requireEntry entry) :> obj
@@ -822,7 +1105,9 @@ module internal WireDtos =
                     batch.Events |> Seq.filter (fun evt -> not (isNull (box evt))) |> Array.ofSeq
 
             buildDto (fun (dto: EventBatchDto) ->
+                dto.Tenant <- batch.Tenant.ToString()
                 dto.SessionId <- batch.SessionId.ToString()
+                dto.SubscriberToken <- batch.SubscriberToken
                 dto.Events <- events
                 dto.NextCursor <- batch.NextCursor
                 dto.EndOfStream <- batch.EndOfStream)
@@ -849,11 +1134,125 @@ module internal WireDtos =
     /// rebuild with no nested resume. Anything else raises.
     /// <param name="wire">The wire DTO. Must not be null.</param>
     /// <returns>The live message.</returns>
-    let ofWire (wire: obj) : obj =
+    let rec ofWire (wire: obj) : obj =
         if isNull (box wire) then
             raise (ArgumentNullException(nameof wire))
 
-        if wire :? QueuePromptDto then
+        if wire :? ScopedRequestDto then
+            let dto = wire :?> ScopedRequestDto
+
+            if dto.Format <> 2 then
+                invalidOp "Unsupported scoped request format."
+
+            let payload: obj =
+                match dto.Kind with
+                | 1 -> SessionRouteProbe :> obj
+                | 2 -> SessionActor.SuspendableQueuePrompt(dto.Payload, CancellationToken.None) :> obj
+                | 3 -> SessionActor.SuspendableInjectPrompt(dto.Payload, CancellationToken.None) :> obj
+                | 4 -> SessionActor.SuspendableInterruptPrompt(dto.Payload, CancellationToken.None) :> obj
+                | 5 -> SessionActor.SessionReplyPayload dto.Reply :> obj
+                | 6 -> SessionActor.SuspendableGetSnapshot :> obj
+                | 7 -> SessionActor.SuspendableCloseSession CancellationToken.None :> obj
+                | 8 -> SessionActor.SuspendableCompactSession CancellationToken.None :> obj
+                | 9 ->
+                    if not dto.AgentId.HasValue then
+                        raise (InvalidOperationException("The scoped set-agent request carries no agent id."))
+
+                    SessionActor.SuspendableSetAgent(dto.AgentId.Value, CancellationToken.None) :> obj
+                | 10 -> SessionActor.SuspendableCheckInbox :> obj
+                | 11 -> ofWire dto.Hint
+                | 12 -> ofWire dto.Subscribe
+                | 13 -> ofWire dto.Unsubscribe
+                | _ -> Unchecked.defaultof<obj>
+
+            {
+                Address = dto.Address
+                Scope = dto.Scope
+                Payload = payload
+            }
+            : SessionRouteRequest
+            :> obj
+        elif wire :? ScopedResponseDto then
+            let dto = wire :?> ScopedResponseDto
+
+            if dto.Format <> 2 then
+                invalidOp "Unsupported scoped response format."
+
+            let payload: obj =
+                match dto.Kind with
+                | 1 -> SessionRouteAccepted :> obj
+                | 2 -> PromptAccepted(requireEntry dto.Entry) :> obj
+                | 3 -> PromptRejected dto.State :> obj
+                | 4 -> SessionActor.ReplyAccepted(requireEntry dto.Entry) :> obj
+                | 5 -> ofWire dto.ReplyRejected
+                | 6 -> ofWire dto.Snapshot
+                | 7 -> dto.Session :> obj
+                | 8 -> ofWire dto.Compact
+                | 9 -> CompactNotNeeded :> obj
+                | 10 -> CompactDeferred :> obj
+                | 11 -> CompactFenced :> obj
+                | 12 -> CompactRejected dto.State :> obj
+                | 13 -> SessionActor.SetAgentApplied dto.Session :> obj
+                | 14 -> SessionActor.SetAgentPending dto.Session :> obj
+                | 15 -> SessionActor.SetAgentRejected dto.State :> obj
+                | 16 -> ofWire dto.Batch
+                | 17 -> SessionScopeRejectedException(dto.Rejection) :> obj
+                | 18 ->
+                    if not dto.SessionId.HasValue then
+                        raise (InvalidOperationException("The scoped refusal carries no session id."))
+
+                    SessionNotFoundException(dto.SessionId.Value, "No session exists in the authorized scope.") :> obj
+                | 19 ->
+                    if not dto.SessionId.HasValue then
+                        raise (InvalidOperationException("The scoped refusal carries no session id."))
+
+                    InvalidSessionStateException(
+                        dto.SessionId.Value,
+                        dto.Category,
+                        "The session cannot accept this operation."
+                    )
+                    :> obj
+                | 20 ->
+                    if not dto.SessionId.HasValue then
+                        raise (InvalidOperationException("The scoped refusal carries no session id."))
+
+                    SessionSubscriptionLimitExceededException(
+                        dto.SessionId.Value,
+                        dto.Limit,
+                        "The session subscriber limit was reached."
+                    )
+                    :> obj
+                | 21 -> InvalidOperationException("The receiving session operation failed.") :> obj
+                | 22 ->
+                    if not dto.SessionId.HasValue then
+                        raise (InvalidOperationException("The scoped routing refusal carries no session id."))
+
+                    if not (Enum.IsDefined(typeof<CompletionRoutingReason>, dto.RoutingReason)) then
+                        raise (InvalidOperationException("The scoped routing refusal carries an unknown reason."))
+
+                    let tenant =
+                        match SessionAddress.TryParse dto.Address with
+                        | Some address -> address.Tenant
+                        | None ->
+                            raise (InvalidOperationException("The scoped routing refusal carries no valid address."))
+
+                    {
+                        CompletionRoutingRefused.Tenant = tenant
+                        SessionId = dto.SessionId.Value
+                        DestinationId = dto.DestinationId
+                        Reason = dto.RoutingReason
+                    }
+                    :> obj
+                | _ -> invalidOp "Unknown scoped response operation."
+
+            {
+                Address = dto.Address
+                Owner = dto.Owner
+                Payload = payload
+            }
+            : SessionRouteResponse
+            :> obj
+        elif wire :? QueuePromptDto then
             QueuePrompt((wire :?> QueuePromptDto).Payload |> requirePayload, CancellationToken.None) :> obj
         elif wire :? InjectPromptDto then
             InjectPrompt((wire :?> InjectPromptDto).Payload |> requirePayload, CancellationToken.None) :> obj
@@ -863,7 +1262,16 @@ module internal WireDtos =
             CloseSession(CancellationToken.None) :> obj
         elif wire :? AbortSessionDto then
             let dto = wire :?> AbortSessionDto
-            AbortSession(dto.Cause, dto.Reason, CancellationToken.None) :> obj
+
+            if
+                dto.ControlVersion <> 2
+                || dto.SessionId = Unchecked.defaultof<SessionId>
+                || dto.TargetTurnId = Unchecked.defaultof<TurnId>
+                || dto.Tenant = Unchecked.defaultof<TenantId>
+            then
+                raise (InvalidOperationException("Unsupported targeted abort payload."))
+
+            ObserveHostAbort(dto.Tenant, dto.SessionId, dto.TargetTurnId) :> obj
         elif wire :? CompactSessionDto then
             CompactSession(CancellationToken.None) :> obj
         elif wire :? GetSnapshotDto then
@@ -917,7 +1325,8 @@ module internal WireDtos =
         elif wire :? SuspendableFinishedDto then
             let dto = wire :?> SuspendableFinishedDto
 
-            let completion = completionOfWire dto.Result dto.HasPendingInjects dto.Suspension
+            let completion =
+                completionOfWire dto.Result dto.HasPendingInjects dto.Suspension dto.TurnId
 
             let allowed =
                 if isNull (box dto.Allowed) then
@@ -928,7 +1337,7 @@ module internal WireDtos =
             SessionActor.SuspendableFinished(requireEntry dto.Entry, completion, dto.Attempt, allowed) :> obj
         elif wire :? SuspendableFaultedDto then
             let dto = wire :?> SuspendableFaultedDto
-            SessionActor.SuspendableFaulted(requireEntry dto.Entry, faultOf dto.Reason, dto.Attempt) :> obj
+            SessionActor.SuspendableFaulted(requireEntry dto.Entry, faultOf dto.Reason, dto.Attempt, None) :> obj
         elif wire :? ReplyEntryDto then
             SessionActor.ReplyEntry(requireEntry (wire :?> ReplyEntryDto).Entry) :> obj
         elif wire :? SuspendableGetSnapshotDto then
@@ -939,7 +1348,16 @@ module internal WireDtos =
             SessionActor.SuspendableCloseSession(CancellationToken.None) :> obj
         elif wire :? SuspendableAbortSessionDto then
             let dto = wire :?> SuspendableAbortSessionDto
-            SessionActor.SuspendableAbortSession(dto.Cause, dto.Reason, CancellationToken.None) :> obj
+
+            if
+                dto.ControlVersion <> 2
+                || dto.SessionId = Unchecked.defaultof<SessionId>
+                || dto.TargetTurnId = Unchecked.defaultof<TurnId>
+                || dto.Tenant = Unchecked.defaultof<TenantId>
+            then
+                raise (InvalidOperationException("Unsupported targeted abort payload."))
+
+            SessionActor.SuspendableObserveHostAbort(dto.Tenant, dto.SessionId, dto.TargetTurnId) :> obj
         elif wire :? SuspendableCompactSessionDto then
             SessionActor.SuspendableCompactSession(CancellationToken.None) :> obj
         elif wire :? SuspendableCheckInboxDto then
@@ -965,19 +1383,14 @@ module internal WireDtos =
         elif wire :? SubscribeDto then
             let dto = wire :?> SubscribeDto
 
-            if String.IsNullOrWhiteSpace dto.Tenant then
-                raise (InvalidOperationException("The subscribe request carries no tenant."))
-
             let mutable sessionId = Unchecked.defaultof<SessionId>
 
-            if not (SessionId.TryParse(dto.SessionId, &sessionId)) then
-                raise (InvalidOperationException("The subscribe request carries an invalid session id."))
+            SessionId.TryParse(dto.SessionId, &sessionId) |> ignore
 
-            if String.IsNullOrWhiteSpace dto.SubscriberToken then
-                raise (InvalidOperationException("The subscribe request carries no subscriber token."))
+            let tenant = tenantOfWire dto.Tenant
 
             ({
-                Tenant = TenantId.Create(dto.Tenant)
+                Tenant = tenant
                 SessionId = sessionId
                 FromSequence = dto.FromSequence
                 SubscriberToken = dto.SubscriberToken
@@ -987,19 +1400,14 @@ module internal WireDtos =
         elif wire :? UnsubscribeDto then
             let dto = wire :?> UnsubscribeDto
 
-            if String.IsNullOrWhiteSpace dto.Tenant then
-                raise (InvalidOperationException("The unsubscribe request carries no tenant."))
-
             let mutable sessionId = Unchecked.defaultof<SessionId>
 
-            if not (SessionId.TryParse(dto.SessionId, &sessionId)) then
-                raise (InvalidOperationException("The unsubscribe request carries an invalid session id."))
+            SessionId.TryParse(dto.SessionId, &sessionId) |> ignore
 
-            if String.IsNullOrWhiteSpace dto.SubscriberToken then
-                raise (InvalidOperationException("The unsubscribe request carries no subscriber token."))
+            let tenant = tenantOfWire dto.Tenant
 
             ({
-                Tenant = TenantId.Create(dto.Tenant)
+                Tenant = tenant
                 SessionId = sessionId
                 SubscriberToken = dto.SubscriberToken
             }
@@ -1010,8 +1418,9 @@ module internal WireDtos =
 
             let mutable sessionId = Unchecked.defaultof<SessionId>
 
-            if not (SessionId.TryParse(dto.SessionId, &sessionId)) then
-                raise (InvalidOperationException("The event batch carries an invalid session id."))
+            SessionId.TryParse(dto.SessionId, &sessionId) |> ignore
+
+            let tenant = tenantOfWire dto.Tenant
 
             let events =
                 if isNull (box dto.Events) then
@@ -1020,7 +1429,9 @@ module internal WireDtos =
                     dto.Events |> Array.filter (fun evt -> not (isNull (box evt))) :> IReadOnlyList<SessionEvent>
 
             ({
+                Tenant = tenant
                 SessionId = sessionId
+                SubscriberToken = dto.SubscriberToken
                 Events = events
                 NextCursor = dto.NextCursor
                 EndOfStream = dto.EndOfStream

@@ -114,7 +114,7 @@ type OpenAILlmBuilderExtensions =
         Registration.addPreset (builder, configuration, Presets.Anthropic, configure)
 
     /// Registers the Ollama Cloud preset (<c>ollamacloud</c>,
-    /// <c>https://ollama.com/v1</c>, <c>llama3.1</c>) bound from
+    /// <c>https://ollama.com/v1</c>, <c>gpt-oss:120b</c>) bound from
     /// <c>Legate:Llm:Providers:ollamacloud</c>. Local Ollama goes through
     /// <c>AddOpenAICompatible</c> with a loopback base URL instead.
     /// <param name="builder">The LLM builder receiving the provider.</param>

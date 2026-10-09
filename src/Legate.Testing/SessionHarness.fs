@@ -133,6 +133,24 @@ type internal ObservingEventStore(inner: ISessionEventStore, onAppended: Session
         member _.Replay(tenant, sessionId, fromSequence, limit, cancellationToken) =
             inner.Replay(tenant, sessionId, fromSequence, limit, cancellationToken)
 
+        member _.AppendHostEvents(tenant, sessionId, expectedUpdatedAt, events, cancellationToken) =
+            task {
+                let! outcome = inner.AppendHostEvents(tenant, sessionId, expectedUpdatedAt, events, cancellationToken)
+
+                match outcome with
+                | :? EventAppended as appended when not (isNull (box appended)) ->
+                    if not (isNull (box appended.Events)) then
+                        for event in appended.Events do
+                            if not (isNull (box event)) then
+                                try
+                                    onAppended event
+                                with _ ->
+                                    ()
+                | _ -> ()
+
+                return outcome
+            }
+
         member _.TryClaimCleanup(tenant, sessionId, owner, leaseDuration, cancellationToken) =
             inner.TryClaimCleanup(tenant, sessionId, owner, leaseDuration, cancellationToken)
 
@@ -418,38 +436,38 @@ type SessionHarness
                 // still drain first; a held live claim (or any prime
                 // failure) reads as None and the recorded rebind retries at
                 // the next quiescent boundary.
-                let reprime () : TurnClaim option =
-                    try
-                        let fresh = UserMessagePayload(UserMessage.Text "harness bootstrap") :> InboxPayload
+                let reprime () : Task<TurnClaim option> =
+                    task {
+                        try
+                            let fresh = UserMessagePayload(UserMessage.Text "harness bootstrap") :> InboxPayload
 
-                        store
-                            .AppendInboxMessage(
-                                resolved.Tenant,
-                                created.Id,
-                                fresh,
-                                DeliveryMode.Queue,
-                                CancellationToken.None
-                            )
-                            .GetAwaiter()
-                            .GetResult()
-                        |> ignore
+                            let! _ =
+                                store.AppendInboxMessage(
+                                    resolved.Tenant,
+                                    created.Id,
+                                    fresh,
+                                    DeliveryMode.Queue,
+                                    CancellationToken.None
+                                )
 
-                        match
-                            store.ClaimNextTurn(
-                                resolved.Tenant,
-                                created.Id,
-                                "harness",
-                                TimeSpan.FromHours 1.0,
-                                CancellationToken.None
-                            )
-                            |> fun task -> task.GetAwaiter().GetResult()
-                        with
-                        | :? TurnLeaseRenewed as renewed when not (isNull (box renewed)) -> Some renewed.Claim
-                        | :? TurnLeaseHeld as held when not (isNull (box held)) -> Some held.Claim
-                        | :? TurnLeaseExpiring as expiring when not (isNull (box expiring)) -> Some expiring.Claim
-                        | _ -> None
-                    with _ ->
-                        None
+                            match!
+                                store.ClaimNextTurn(
+                                    resolved.Tenant,
+                                    created.Id,
+                                    "harness",
+                                    TimeSpan.FromHours 1.0,
+                                    CancellationToken.None
+                                )
+                            with
+                            | :? TurnLeaseRenewed as renewed when not (isNull (box renewed)) ->
+                                return Some renewed.Claim
+                            | :? TurnLeaseHeld as held when not (isNull (box held)) -> return Some held.Claim
+                            | :? TurnLeaseExpiring as expiring when not (isNull (box expiring)) ->
+                                return Some expiring.Claim
+                            | _ -> return None
+                        with _ ->
+                            return None
+                    }
 
                 let noDrain () : IReadOnlyList<InboxEntry> =
                     ResizeArray<InboxEntry>() :> IReadOnlyList<InboxEntry>
@@ -457,7 +475,7 @@ type SessionHarness
                 let runner: SessionActor.SuspendableRunner =
                     // The harness journals through its own fenced observer,
                     // never the in-call marker: no marker hook on any path.
-                    fun entry _attempt allowed cursor reply seed runnerToken _ ->
+                    fun entry _attempt allowed cursor reply seed runnerToken _ _ _ turnId ->
                         task {
                             match cursor, reply with
                             | None, None ->
@@ -471,13 +489,13 @@ type SessionHarness
                                         loopOptions
                                         loopDelay
                                         runnerToken
-                                        (fun () -> true)
+                                        (fun () -> Legate.LeaseAdmission.check ())
                                         noDrain
                                         ignore
                                         ignore
                                         policy
                                         created.Id
-                                        (TurnId.New())
+                                        turnId
                                         None
                                         allowed
                             | Some live, Some(:? PermissionDecision as decision) ->
@@ -491,7 +509,7 @@ type SessionHarness
                                         loopOptions
                                         loopDelay
                                         runnerToken
-                                        (fun () -> true)
+                                        (fun () -> Legate.LeaseAdmission.check ())
                                         policy
                                         allowed
                             | Some live, Some(:? QuestionAnswer as answer) ->
@@ -505,12 +523,13 @@ type SessionHarness
                                         loopOptions
                                         loopDelay
                                         runnerToken
-                                        (fun () -> true)
+                                        (fun () -> Legate.LeaseAdmission.check ())
                                         policy
                                         allowed
                             | None, Some _ ->
                                 // Crash-rebuild shape: no live cursor, so
-                                // retry the turn from its inbox entry.
+                                // retry the turn from its inbox entry under
+                                // the supplied turn id.
                                 let history = historyOf entry seed
 
                                 return!
@@ -521,13 +540,13 @@ type SessionHarness
                                         loopOptions
                                         loopDelay
                                         runnerToken
-                                        (fun () -> true)
+                                        (fun () -> Legate.LeaseAdmission.check ())
                                         noDrain
                                         ignore
                                         ignore
                                         policy
                                         created.Id
-                                        (TurnId.New())
+                                        turnId
                                         None
                                         allowed
                             | _ ->
@@ -551,6 +570,7 @@ type SessionHarness
                 let baseProps: SessionActorProps =
                     {
                         Store = store
+                        Settlement = None
                         Tenant = resolved.Tenant
                         SessionId = created.Id
                         RunTurn = (fun _ _ -> Task.FromResult(unusedResult))
@@ -563,10 +583,11 @@ type SessionHarness
                         OnTurnSettled =
                             Some(fun result ->
                                 signals.ObserveSettled result
-                                PromptWaitHubs.ObserveSettled created.Id result)
+                                PromptWaitHubs.ObserveSettledScoped resolved.Tenant created.Id result)
                         OnInjectJournaled = None
                         Logger = null
                         Compact = None
+                        StorePipe = None
                     }
 
                 let deps: SessionActor.SuspendDeps =
@@ -575,10 +596,21 @@ type SessionHarness
                         Delay = askDelay
                         AskTimeout = resolved.AskTimeout
                         JournalToken = token
+                        PrimeClaim =
+                            match claimed with
+                            | :? TurnLeaseRenewed as lease -> Some lease.Claim
+                            | :? TurnLeaseHeld as lease -> Some lease.Claim
+                            | _ -> None
+                        Recovery = null
                         RunSuspendable = runner
                         ReprimeJournal = Some reprime
                         RefreshCompact = None
                         AgentStore = null
+                        // Completion era (issue 289): the live reader over
+                        // the harness database. Absent marks read false
+                        // (pre-era quiet); tests mark through
+                        // InMemoryCompletionEra.mark to opt in.
+                        EraMarked = InMemoryCompletionEra.isMarked database
                     }
 
                 let actor =

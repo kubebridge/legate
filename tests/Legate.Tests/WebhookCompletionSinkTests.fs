@@ -18,11 +18,12 @@ open Microsoft.Extensions.Logging
 open Microsoft.Extensions.Time.Testing
 open Xunit
 
-// Tests for the default webhook completion sink (issue 83). Every HTTP
+// Tests for the default webhook completion sink (issue 378). Every HTTP
 // test runs against a local loopback TCP server only: no external
 // network, no DNS (literal 127.0.0.1 answers the guard without a
-// resolver). Backoff and timeout tests run on the injected ILlmDelay
-// seam (RecordingDelay) and short bounds: never sleeps.
+// resolver). Timeout tests run on short bounds: never sleeps. One
+// NotifyAsync call is exactly one bounded HTTP attempt; durable redrive
+// owns retries.
 
 // ───────────────────────────────────────────────────────────────────────────
 // Doubles
@@ -340,7 +341,7 @@ let ``The wire payload carries the documented shape`` () =
     let delay = RecordingDelay()
     use sink = makeSink (makeOptions server) (allowLocal ()) delay clock logger
 
-    (sink :> ISessionCompletionSink).Notify(sampleCompletion ())
+    (sink :> ISessionCompletionSink).NotifyAsync(sampleCompletion (), CancellationToken.None).GetAwaiter().GetResult()
     waitFor "the delivery" (fun () -> server.RequestCount = 1)
 
     let request = server.Requests[0]
@@ -390,7 +391,7 @@ let ``The signature equals HMAC-SHA256 over the exact bytes with the sha256 pref
     let delay = RecordingDelay()
     use sink = makeSink (makeOptions server) (allowLocal ()) delay clock logger
 
-    (sink :> ISessionCompletionSink).Notify(sampleCompletion ())
+    (sink :> ISessionCompletionSink).NotifyAsync(sampleCompletion (), CancellationToken.None).GetAwaiter().GetResult()
     waitFor "the delivery" (fun () -> server.RequestCount = 1)
 
     let request = server.Requests[0]
@@ -423,7 +424,7 @@ let ``A null outcome falls back to the assistant text with a null wire outcome``
                 }
         }
 
-    (sink :> ISessionCompletionSink).Notify(completion)
+    (sink :> ISessionCompletionSink).NotifyAsync(completion, CancellationToken.None).GetAwaiter().GetResult()
     waitFor "the delivery" (fun () -> server.RequestCount = 1)
 
     use body = parseBody server.Requests[0].Body
@@ -440,7 +441,9 @@ let ``Abort and failure outcomes map their reasons to the summary`` () =
     let logger = TestLogger()
     let delay = RecordingDelay()
     use sink = makeSink (makeOptions server) (allowLocal ()) delay clock logger
-    let notify = (sink :> ISessionCompletionSink).Notify
+
+    let notify completion =
+        (sink :> ISessionCompletionSink).NotifyAsync(completion, CancellationToken.None).GetAwaiter().GetResult()
 
     notify
         { sampleCompletion () with
@@ -468,9 +471,9 @@ let ``Abort and failure outcomes map their reasons to the summary`` () =
                 }
         }
 
-    waitFor "the deliveries" (fun () -> server.RequestCount = 3)
+    server.RequestCount |> should equal 3
 
-    // One background delivery per Notify: arrival order is
+    // One awaited delivery per Notify: arrival order is
     // intentionally unordered (no cross-session ordering), so compare
     // as sets.
     let summaries =
@@ -490,93 +493,51 @@ let ``Abort and failure outcomes map their reasons to the summary`` () =
         ]
 
 // ───────────────────────────────────────────────────────────────────────────
-// Backoff, timeout, and attempts
+// Single attempt, timeout, and cancellation: durable redrive owns retries,
+// so one call is exactly one bounded HTTP attempt that faults on refusal.
 
 [<Fact>]
-let ``Retries back off exponentially over the delay seam`` () =
+let ``A refusal faults without retry: durable redrive owns retries`` () =
     use server = new ScriptedLoopbackServer([ 500; 500; 200 ])
     let clock = fixedClock ()
     let logger = TestLogger()
     let delay = RecordingDelay()
     use sink = makeSink (makeOptions server) (allowLocal ()) delay clock logger
 
-    (sink :> ISessionCompletionSink).Notify(sampleCompletion ())
-    waitFor "the retries" (fun () -> server.RequestCount = 3)
-
-    delay.Recorded
-    |> List.ofSeq
-    |> should
-        equal
-        [
-            TimeSpan.FromSeconds(2.0)
-            TimeSpan.FromSeconds(4.0)
-        ]
-
-    logger.Entries
-    |> List.exists (fun entry -> entry.Level = LogLevel.Error)
-    |> should equal false
-
-[<Fact>]
-let ``Exhausted retries log the attempt count and stop at the budget`` () =
-    use server = new ScriptedLoopbackServer([ 500 ])
-    let clock = fixedClock ()
-    let logger = TestLogger()
-    let delay = RecordingDelay()
-
-    let options = makeOptions server
-    options.MaxDeliveryAttempts <- 3
-    use sink = makeSink options (allowLocal ()) delay clock logger
-
-    (sink :> ISessionCompletionSink).Notify(sampleCompletion ())
-
-    waitFor "the permanent failure" (fun () ->
-        logger.Entries |> List.exists (fun entry -> entry.Level = LogLevel.Error))
-
-    server.RequestCount |> should equal (CompletionOptions().MaxDeliveryAttempts)
-    server.RequestCount |> should equal 3
-
-    delay.Recorded
-    |> List.ofSeq
-    |> should
-        equal
-        [
-            TimeSpan.FromSeconds(2.0)
-            TimeSpan.FromSeconds(4.0)
-        ]
-
-    let failure =
-        logger.Entries |> List.find (fun entry -> entry.Level = LogLevel.Error)
-
-    failure.Text.Contains("3 of 3") |> should equal true
-    failure.Text.Contains("01ARZ3NDEKTSV4RRFFQ69G5FAV") |> should equal true
-    failure.Text.Contains("delivery-1") |> should equal true
-
-[<Fact>]
-let ``A single attempt never waits`` () =
-    use server = new ScriptedLoopbackServer([ 500 ])
-    let clock = fixedClock ()
-    let logger = TestLogger()
-    let delay = RecordingDelay()
-
-    let options = makeOptions server
-    options.MaxDeliveryAttempts <- 1
-    use sink = makeSink options (allowLocal ()) delay clock logger
-
-    (sink :> ISessionCompletionSink).Notify(sampleCompletion ())
-
-    waitFor "the permanent failure" (fun () ->
-        logger.Entries |> List.exists (fun entry -> entry.Level = LogLevel.Error))
+    (fun () ->
+        (sink :> ISessionCompletionSink)
+            .NotifyAsync(sampleCompletion (), CancellationToken.None)
+            .GetAwaiter()
+            .GetResult()
+        |> ignore)
+    |> should throw typeof<InvalidOperationException>
 
     server.RequestCount |> should equal 1
     delay.Recorded.Count |> should equal 0
 
-    let failure =
-        logger.Entries |> List.find (fun entry -> entry.Level = LogLevel.Error)
+[<Fact>]
+let ``One attempt sends exactly once and preserves the idempotency key`` () =
+    use server = new ScriptedLoopbackServer([ 500 ])
+    let clock = fixedClock ()
+    let logger = TestLogger()
+    let delay = RecordingDelay()
 
-    failure.Text.Contains("1 of 1") |> should equal true
+    let options = makeOptions server
+    use sink = makeSink options (allowLocal ()) delay clock logger
+
+    (fun () ->
+        (sink :> ISessionCompletionSink)
+            .NotifyAsync(sampleCompletion (), CancellationToken.None)
+            .GetAwaiter()
+            .GetResult()
+        |> ignore)
+    |> should throw typeof<InvalidOperationException>
+
+    server.RequestCount |> should equal 1
+    delay.Recorded.Count |> should equal 0
 
 [<Fact>]
-let ``A silent endpoint fails bounded by the timeout`` () =
+let ``A silent endpoint faults bounded by the timeout`` () =
     use server =
         new ScriptedLoopbackServer([ 200 ], responseDelay = Timeout.InfiniteTimeSpan)
 
@@ -586,70 +547,59 @@ let ``A silent endpoint fails bounded by the timeout`` () =
 
     let options = makeOptions server
     options.Timeout <- TimeSpan.FromMilliseconds(250.0)
-    options.MaxDeliveryAttempts <- 1
     use sink = makeSink options (allowLocal ()) delay clock logger
 
-    (sink :> ISessionCompletionSink).Notify(sampleCompletion ())
+    (fun () ->
+        (sink :> ISessionCompletionSink)
+            .NotifyAsync(sampleCompletion (), CancellationToken.None)
+            .GetAwaiter()
+            .GetResult()
+        |> ignore)
+    |> should throw typeof<InvalidOperationException>
 
-    waitFor "the request" (fun () -> server.RequestCount = 1)
-
-    waitFor "the timeout failure" (fun () -> logger.Entries |> List.exists (fun entry -> entry.Level = LogLevel.Error))
-
+    server.RequestCount |> should equal 1
     delay.Recorded.Count |> should equal 0
 
-    let failure =
-        logger.Entries |> List.find (fun entry -> entry.Level = LogLevel.Error)
-
-    failure.Text.Contains("timed out") |> should equal true
-    failure.Text.Contains("1 of 1") |> should equal true
-
 [<Fact>]
-let ``A client error stops without retry`` () =
+let ``A client error faults without retry`` () =
     use server = new ScriptedLoopbackServer([ 400 ])
     let clock = fixedClock ()
     let logger = TestLogger()
     let delay = RecordingDelay()
     use sink = makeSink (makeOptions server) (allowLocal ()) delay clock logger
 
-    (sink :> ISessionCompletionSink).Notify(sampleCompletion ())
-
-    waitFor "the permanent failure" (fun () ->
-        logger.Entries |> List.exists (fun entry -> entry.Level = LogLevel.Error))
+    (fun () ->
+        (sink :> ISessionCompletionSink)
+            .NotifyAsync(sampleCompletion (), CancellationToken.None)
+            .GetAwaiter()
+            .GetResult()
+        |> ignore)
+    |> should throw typeof<InvalidOperationException>
 
     server.RequestCount |> should equal 1
     delay.Recorded.Count |> should equal 0
 
-    let failure =
-        logger.Entries |> List.find (fun entry -> entry.Level = LogLevel.Error)
-
-    failure.Text.Contains("400") |> should equal true
-    failure.Text.Contains("1 of 3") |> should equal true
-
 // ───────────────────────────────────────────────────────────────────────────
-// Non-blocking Notify
+// Cancellation
 
 [<Fact>]
-let ``Notify returns while the delivery is still in flight`` () =
-    use server =
-        new ScriptedLoopbackServer([ 200 ], responseDelay = Timeout.InfiniteTimeSpan)
-
+let ``Cancellation abandons the attempt before any delivery`` () =
+    use server = new ScriptedLoopbackServer([ 200 ])
     let clock = fixedClock ()
     let logger = TestLogger()
     let delay = RecordingDelay()
+    use sink = makeSink (makeOptions server) (allowLocal ()) delay clock logger
 
-    let options = makeOptions server
-    options.Timeout <- TimeSpan.FromMinutes(10.0)
-    use sink = makeSink options (allowLocal ()) delay clock logger
+    use cancelled = new CancellationTokenSource()
+    cancelled.Cancel()
 
-    let watch = Stopwatch.StartNew()
-    (sink :> ISessionCompletionSink).Notify(sampleCompletion ())
-    watch.Stop()
+    (fun () ->
+        (sink :> ISessionCompletionSink).NotifyAsync(sampleCompletion (), cancelled.Token).GetAwaiter().GetResult()
+        |> ignore)
+    |> should throw typeof<OperationCanceledException>
 
-    watch.Elapsed |> should be (lessThan (TimeSpan.FromSeconds(5.0)))
-
-    // The background delivery started after Notify already returned: the
-    // request arrives while the endpoint stays silent.
-    waitFor "the background delivery" (fun () -> server.RequestCount = 1)
+    // The abandoned attempt never reached the endpoint.
+    server.RequestCount |> should equal 0
 
 // ───────────────────────────────────────────────────────────────────────────
 // Unsigned delivery and secret hygiene
@@ -683,15 +633,14 @@ let ``Explicit unsigned opt-in sends with no signature header`` () =
 
     use sink = makeSink options (allowLocal ()) delay clock logger
 
-    (sink :> ISessionCompletionSink).Notify(sampleCompletion ())
-    waitFor "the delivery" (fun () -> server.RequestCount = 1)
+    (sink :> ISessionCompletionSink).NotifyAsync(sampleCompletion (), CancellationToken.None).GetAwaiter().GetResult()
 
     let request = server.Requests[0]
     request.Headers.ContainsKey("X-Legate-Signature") |> should equal false
     request.Headers["Idempotency-Key"] |> should equal "delivery-1"
 
 [<Fact>]
-let ``An SSRF denial sends nothing and never retries`` () =
+let ``An SSRF denial sends nothing and faults`` () =
     use server = new ScriptedLoopbackServer([ 200 ])
     let clock = fixedClock ()
     let logger = TestLogger()
@@ -699,33 +648,34 @@ let ``An SSRF denial sends nothing and never retries`` () =
     // No allow entry: loopback stays reserved-denied.
     use sink = makeSink (makeOptions server) (SsrfGuardOptions()) delay clock logger
 
-    (sink :> ISessionCompletionSink).Notify(sampleCompletion ())
-    waitFor "the denial" (fun () -> logger.Entries.Length > 0)
+    (fun () ->
+        (sink :> ISessionCompletionSink)
+            .NotifyAsync(sampleCompletion (), CancellationToken.None)
+            .GetAwaiter()
+            .GetResult()
+        |> ignore)
+    |> should throw typeof<InvalidOperationException>
 
     server.RequestCount |> should equal 0
     delay.Recorded.Count |> should equal 0
 
-    let failure =
-        logger.Entries |> List.find (fun entry -> entry.Level = LogLevel.Error)
-
-    failure.Text.Contains("1 of 3") |> should equal true
-    failure.Text.Contains("denied address") |> should equal true
-
 [<Fact>]
 let ``Secrets never reach logs, errors, or the wire`` () =
-    use server = new ScriptedLoopbackServer([ 500; 500 ])
+    use server = new ScriptedLoopbackServer([ 500 ])
     let clock = fixedClock ()
     let logger = TestLogger()
     let delay = RecordingDelay()
 
     let options = makeOptions server
-    options.MaxDeliveryAttempts <- 2
     use sink = makeSink options (allowLocal ()) delay clock logger
 
-    (sink :> ISessionCompletionSink).Notify(sampleCompletion ())
-
-    waitFor "the permanent failure" (fun () ->
-        logger.Entries |> List.exists (fun entry -> entry.Level = LogLevel.Error))
+    (fun () ->
+        (sink :> ISessionCompletionSink)
+            .NotifyAsync(sampleCompletion (), CancellationToken.None)
+            .GetAwaiter()
+            .GetResult()
+        |> ignore)
+    |> should throw typeof<InvalidOperationException>
 
     let secretText = Encoding.UTF8.GetString(secretBytes)
     let hexLower = Convert.ToHexString(secretBytes).ToLowerInvariant()
@@ -765,9 +715,6 @@ let ``Defaults are valid and carry the documented knobs`` () =
     Option.ofObj (options.Validate()) |> Option.isNone |> should equal true
     options.Timeout |> should equal WebhookCompletionSinkOptions.DefaultTimeout
     options.Timeout |> should equal (TimeSpan.FromSeconds(30.0))
-    options.BaseRetryDelay |> should equal (TimeSpan.FromSeconds(2.0))
-    options.MaxRetryDelay |> should equal (TimeSpan.FromSeconds(30.0))
-    options.MaxDeliveryAttempts |> should equal 0
     options.AllowUnsignedDelivery |> should equal false
 
 [<Fact>]
@@ -798,35 +745,3 @@ let ``Validate rejects a non-positive timeout`` () =
     options.Validate()
     |> Option.ofObj
     |> should equal (Some "Timeout must be positive.")
-
-[<Fact>]
-let ``Validate rejects a negative attempt budget`` () =
-    use server = new ScriptedLoopbackServer([ 200 ])
-    let options = makeOptions server
-    options.MaxDeliveryAttempts <- -1
-
-    options.Validate()
-    |> Option.ofObj
-    |> should
-        equal
-        (Some "MaxDeliveryAttempts must not be negative: 0 falls back to CompletionOptions.MaxDeliveryAttempts.")
-
-[<Fact>]
-let ``Validate rejects a negative base retry delay`` () =
-    use server = new ScriptedLoopbackServer([ 200 ])
-    let options = makeOptions server
-    options.BaseRetryDelay <- TimeSpan.FromSeconds(-1.0)
-
-    options.Validate()
-    |> Option.ofObj
-    |> should equal (Some "BaseRetryDelay must not be negative.")
-
-[<Fact>]
-let ``Validate rejects a cap below the base retry delay`` () =
-    use server = new ScriptedLoopbackServer([ 200 ])
-    let options = makeOptions server
-    options.MaxRetryDelay <- TimeSpan.FromSeconds(1.0)
-
-    options.Validate()
-    |> Option.ofObj
-    |> should equal (Some "MaxRetryDelay must not be less than BaseRetryDelay.")

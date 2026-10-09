@@ -51,6 +51,109 @@ type InMemorySessionEventStore(database: InMemoryDatabase) =
             && live.ExpiresAt > database.UtcNow
         | false, _ -> false
 
+    // Stamps one host-append event with its per-session sequence, building a
+    // new instance: the input event is not mutated. Preserves every TurnId
+    // as given, including the default (unstamped) host-operation sentinel
+    // and preserved history-copy ids. Mirrors the Append restamp kind for
+    // kind; unknown kinds raise like Append.
+    let stampHost (event: SessionEvent) (sequence: int64) : SessionEvent =
+        let stamped = Nullable sequence
+        let sessionId = event.SessionId
+        let turnId = event.TurnId
+        let timestamp = event.Timestamp
+
+        match event with
+        | :? TurnStartedEvent -> TurnStartedEvent(sessionId, turnId, stamped, timestamp) :> SessionEvent
+        | :? TextDeltaEvent as source ->
+            TextDeltaEvent(sessionId, turnId, stamped, timestamp, source.Text) :> SessionEvent
+        | :? ReasoningDeltaEvent as source ->
+            ReasoningDeltaEvent(sessionId, turnId, stamped, timestamp, source.Text) :> SessionEvent
+        | :? ToolCallStartedEvent as source ->
+            ToolCallStartedEvent(
+                sessionId,
+                turnId,
+                stamped,
+                timestamp,
+                source.ToolCallId,
+                source.ToolName,
+                source.ArgumentsJson
+            )
+            :> SessionEvent
+        | :? ToolCallOutputEvent as source ->
+            ToolCallOutputEvent(sessionId, turnId, stamped, timestamp, source.ToolCallId, source.Output) :> SessionEvent
+        | :? ToolCallCompletedEvent as source ->
+            ToolCallCompletedEvent(
+                sessionId,
+                turnId,
+                stamped,
+                timestamp,
+                source.ToolCallId,
+                source.Error,
+                source.ResultText
+            )
+            :> SessionEvent
+        | :? PermissionRequestedEvent as source ->
+            PermissionRequestedEvent(sessionId, turnId, stamped, timestamp, source.RequestId, source.ToolName)
+            :> SessionEvent
+        | :? PermissionResolvedEvent as source ->
+            PermissionResolvedEvent(sessionId, turnId, stamped, timestamp, source.RequestId, source.Decision)
+            :> SessionEvent
+        | :? QuestionAskedEvent as source ->
+            QuestionAskedEvent(sessionId, turnId, stamped, timestamp, source.QuestionId, source.Question)
+            :> SessionEvent
+        | :? QuestionAnsweredEvent as source ->
+            QuestionAnsweredEvent(sessionId, turnId, stamped, timestamp, source.QuestionId, source.Answer)
+            :> SessionEvent
+        | :? UsageEvent as source ->
+            UsageEvent(sessionId, turnId, stamped, timestamp, source.InputTokens, source.OutputTokens) :> SessionEvent
+        | :? CompactedEvent as source ->
+            CompactedEvent(
+                sessionId,
+                turnId,
+                stamped,
+                timestamp,
+                source.BeforeEstimate,
+                source.AfterEstimate,
+                source.Summary,
+                source.RetainedMessages,
+                source.FormatVersion
+            )
+            :> SessionEvent
+        | :? CompactionFailedEvent as source ->
+            CompactionFailedEvent(sessionId, turnId, stamped, timestamp, source.Reason) :> SessionEvent
+        | :? TurnCompletedEvent -> TurnCompletedEvent(sessionId, turnId, stamped, timestamp) :> SessionEvent
+        | :? TurnAbortedEvent as source ->
+            TurnAbortedEvent(sessionId, turnId, stamped, timestamp, source.Cause, source.Reason) :> SessionEvent
+        | :? TurnFailedEvent as source ->
+            TurnFailedEvent(sessionId, turnId, stamped, timestamp, source.Reason) :> SessionEvent
+        | :? SessionClosedEvent -> SessionClosedEvent(sessionId, turnId, stamped, timestamp) :> SessionEvent
+        | :? UserMessageEvent as source ->
+            UserMessageEvent(sessionId, turnId, stamped, timestamp, source.Message) :> SessionEvent
+        | :? ContextPrunedEvent as source ->
+            ContextPrunedEvent(
+                sessionId,
+                turnId,
+                stamped,
+                timestamp,
+                source.PrunedCount,
+                source.BeforeEstimate,
+                source.AfterEstimate
+            )
+            :> SessionEvent
+        | :? SkillInvalidEvent as source ->
+            SkillInvalidEvent(sessionId, turnId, stamped, timestamp, source.SkillName, source.Reason) :> SessionEvent
+        | :? SkillLoadedEvent as source ->
+            SkillLoadedEvent(sessionId, turnId, stamped, timestamp, source.SkillName, source.Companions) :> SessionEvent
+        | :? AgentInvalidEvent as source ->
+            AgentInvalidEvent(sessionId, turnId, stamped, timestamp, source.AgentName, source.Reason) :> SessionEvent
+        | :? AgentSwitchedEvent as source ->
+            AgentSwitchedEvent(sessionId, turnId, stamped, timestamp, source.PreviousAgentId, source.NewAgentId)
+            :> SessionEvent
+        | _ -> raise (ArgumentException("The event batch carries an unknown event kind.", "events"))
+
+    /// The shared database this journal fences through. Internal: settlement composition checks identity.
+    member internal _.Database = database
+
     interface ISessionEventStore with
 
         member _.Append(tenant, sessionId, claimToken, events, _) =
@@ -181,7 +284,8 @@ type InMemorySessionEventStore(database: InMemoryDatabase) =
                                         sequence,
                                         timestamp,
                                         source.ToolCallId,
-                                        source.ToolName
+                                        source.ToolName,
+                                        source.ArgumentsJson
                                     )
                                     :> SessionEvent
                                 | :? ToolCallOutputEvent as source ->
@@ -201,7 +305,8 @@ type InMemorySessionEventStore(database: InMemoryDatabase) =
                                         sequence,
                                         timestamp,
                                         source.ToolCallId,
-                                        source.Error
+                                        source.Error,
+                                        source.ResultText
                                     )
                                     :> SessionEvent
                                 | :? PermissionRequestedEvent as source ->
@@ -261,7 +366,10 @@ type InMemorySessionEventStore(database: InMemoryDatabase) =
                                         sequence,
                                         timestamp,
                                         source.BeforeEstimate,
-                                        source.AfterEstimate
+                                        source.AfterEstimate,
+                                        source.Summary,
+                                        source.RetainedMessages,
+                                        source.FormatVersion
                                     )
                                     :> SessionEvent
                                 | :? CompactionFailedEvent as source ->
@@ -355,6 +463,129 @@ type InMemorySessionEventStore(database: InMemoryDatabase) =
                     row.TotalBytes <- row.TotalBytes + (sizes |> List.sum |> int64)
 
                     EventAppended(stamped :> IReadOnlyList<SessionEvent>) :> EventAppendOutcome)
+            |> ok
+
+        member _.AppendHostEvents(tenant, sessionId, expectedUpdatedAt, events, _) =
+            if isNull (box events) then
+                raise (ArgumentNullException(nameof events))
+
+            if Seq.isEmpty events then
+                raise (ArgumentException("The event batch must not be empty.", nameof events))
+
+            for event in events do
+                if isNull (box event) then
+                    raise (ArgumentNullException(nameof events))
+
+            lock database.Gate (fun () ->
+                match database.Sessions.TryGetValue((tenant, sessionId)) with
+                | false, _ ->
+                    raise (
+                        SessionNotFoundException(
+                            sessionId,
+                            sprintf "No session %O exists in tenant %O." sessionId tenant
+                        )
+                    )
+                | true, session ->
+                    // Limit checks run before any part of the batch lands.
+                    let batchSize = Seq.length events
+
+                    let options = database.Options
+
+                    if options.MaxAppendBatchSize > 0 && batchSize > options.MaxAppendBatchSize then
+                        raise (
+                            EventLimitExceededException(
+                                "batchSize",
+                                int64 options.MaxAppendBatchSize,
+                                int64 batchSize,
+                                sprintf
+                                    "An append of %d events exceeds the batch-size limit %d."
+                                    batchSize
+                                    options.MaxAppendBatchSize
+                            )
+                        )
+
+                    let sizes = events |> Seq.map eventBytes |> Seq.toList
+
+                    for (_: SessionEvent), size in Seq.zip events sizes do
+                        if options.MaxEventBytes > 0L && size > float options.MaxEventBytes then
+                            raise (
+                                EventLimitExceededException(
+                                    "perEventBytes",
+                                    options.MaxEventBytes,
+                                    int64 size,
+                                    sprintf "An event exceeds the per-event byte limit %d." options.MaxEventBytes
+                                )
+                            )
+
+                    // The lifecycle fence: closed rejects, a moved version
+                    // rejects, both with zero writes. Exact-equality on the
+                    // UpdatedAt version stamp; the caller re-reads after a
+                    // rejection.
+                    if session.State = SessionState.Closed then
+                        EventAppendRejected(sessionId, "sessionClosed") :> EventAppendOutcome
+                    elif session.UpdatedAt <> expectedUpdatedAt then
+                        EventAppendRejected(sessionId, "staleLifecycle") :> EventAppendOutcome
+                    else
+                        let row = ensureJournal tenant sessionId
+
+                        let countAfter = row.Events.Count + batchSize
+
+                        if
+                            options.MaxEventsPerSession > 0L
+                            && int64 countAfter > options.MaxEventsPerSession
+                        then
+                            raise (
+                                EventLimitExceededException(
+                                    "perSessionCount",
+                                    options.MaxEventsPerSession,
+                                    int64 countAfter,
+                                    sprintf
+                                        "The journal would hold %d events, over the per-session limit %d."
+                                        countAfter
+                                        options.MaxEventsPerSession
+                                )
+                            )
+
+                        let bytesAfter = row.TotalBytes + (sizes |> List.sum |> int64)
+
+                        if
+                            options.MaxJournalBytesPerSession > 0L
+                            && bytesAfter > options.MaxJournalBytesPerSession
+                        then
+                            raise (
+                                EventLimitExceededException(
+                                    "perSessionBytes",
+                                    options.MaxJournalBytesPerSession,
+                                    bytesAfter,
+                                    sprintf
+                                        "The journal would hold %d bytes, over the per-session limit %d."
+                                        bytesAfter
+                                        options.MaxJournalBytesPerSession
+                                )
+                            )
+
+                        let mutable sequence = int64 row.Events.Count
+
+                        let stamped =
+                            events
+                            |> Seq.map (fun (event: SessionEvent) ->
+                                sequence <- sequence + 1L
+                                stampHost event sequence)
+                            |> Seq.toList
+
+                        for event in stamped do
+                            row.Events.Add event
+
+                        row.TotalBytes <- row.TotalBytes + (sizes |> List.sum |> int64)
+
+                        // A successful host append bumps the session version
+                        // stamp, so the next idle writer must re-read.
+                        database.Sessions[(tenant, sessionId)] <-
+                            { session with
+                                UpdatedAt = database.UtcNow
+                            }
+
+                        EventAppended(stamped :> IReadOnlyList<SessionEvent>) :> EventAppendOutcome)
             |> ok
 
         member _.Replay(tenant, sessionId, fromSequence, limit, _) =

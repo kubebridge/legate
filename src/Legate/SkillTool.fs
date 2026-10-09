@@ -352,6 +352,24 @@ type internal SkillFunction
         if isNull (box onLoaded) then
             raise (ArgumentNullException(nameof onLoaded))
 
+    /// The package store loads resolve against.
+    member internal _.Store: IAgentPackageStore = store
+
+    /// The tenant the agent belongs to.
+    member internal _.Tenant: TenantId = tenant
+
+    /// The agent whose skill loads.
+    member internal _.AgentId: AgentId = agentId
+
+    /// The session the load runs for.
+    member internal _.SessionId: SessionId = sessionId
+
+    /// The turn the load runs inside.
+    member internal _.TurnId: TurnId = turnId
+
+    /// The journal callback receiving each successful load's event.
+    member internal _.OnLoaded: Func<SkillLoadedEvent, Task> = onLoaded
+
     /// This tool's name for error text.
     override _.Name = SkillIdentity.name
 
@@ -457,3 +475,35 @@ type SkillTool private () =
 
         ToolNameRules.Validate(SkillTool.ToolName) |> ignore
         SkillFunction(store, tenant, agentId, sessionId, turnId, onLoaded) :> AIFunction
+
+    /// Rebinds a pre-built skill tool to the running turn's journal hook
+    /// (issue 321): when the tool is a SkillFunction and the journal hook
+    /// is present, returns a copy bound to the running turn whose callback
+    /// runs the original host callback then the fenced journal append, so
+    /// host logging is preserved and each successful load journals under
+    /// the turn claim; otherwise returns the tool untouched. The journal
+    /// re-keys the event under the running turn, so a stale turn id on the
+    /// pre-built tool never leaks into the journal.
+    /// <param name="tool">The pre-built tool, or null.</param>
+    /// <param name="turnId">The running turn the load runs inside.</param>
+    /// <param name="journal">The fenced journal callback, or null for no journal.</param>
+    /// <returns>The rebound tool, or the original when no rebinding applies.</returns>
+    static member internal TryBindJournalHook
+        (tool: AITool, turnId: TurnId, journal: Func<SkillLoadedEvent, Task> | null)
+        : AITool =
+        match box tool, box journal with
+        | null, _ -> tool
+        | _, null -> tool
+        | _ ->
+            match tool with
+            | :? SkillFunction as skill ->
+                let combined =
+                    Func<SkillLoadedEvent, Task>(fun loaded ->
+                        task {
+                            do! skill.OnLoaded.Invoke loaded
+                            do! journal.Invoke loaded
+                        }
+                        :> Task)
+
+                SkillFunction(skill.Store, skill.Tenant, skill.AgentId, skill.SessionId, turnId, combined) :> AITool
+            | _ -> tool

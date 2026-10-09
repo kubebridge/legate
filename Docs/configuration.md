@@ -35,6 +35,90 @@ Conventions:
 | `Pruning` | `ContextPruningOptions` | Context-window pruning reserve and markers |
 | `Schedules` | `ScheduleOptions` | Schedule evaluator sweep |
 
+## Tenant session host bindings
+
+### ASP.NET Core profile and finalized defaults
+
+`Legate.AspNetCore` adds `services.AddLegate(configuration)` and
+`services.AddLegate(configuration, Action<LegateBuilder>)`. Configuration is bound
+first, then code overrides; repeated adapter registration is idempotent. Core
+`AddLegate` remains available for Generic Host and CLI composition. Dispatcher,
+Pruning, Schedules and Artifacts sections are retained along with every other
+root section.
+
+| Adapter setting | Default | Meaning |
+|---|---|---|
+| `Legate:Hosting:Tenant` | `default` | Fixed application-authorized tenant; non-default needs a declared binding |
+| `ConfigureAspNetCore(...).ResolveTenant` | unset, code-only | Trusted request resolver selecting an already-declared graph |
+| Session/event stores | one InMemoryDatabase pair | Process-local metadata lost on restart; replace both halves together |
+| `Workspace:RootPath` | content-root `.legate/scratch` | Explicit override must be absolute |
+| Workspace runtime | Process | No sandbox; unsafe for untrusted agents; non-Process mode needs explicit runtime |
+
+StaticSeeds/Kubernetes reject adapter-created implicit stores/workspace, using
+actual node mode for every borrowed graph. An explicitly registered custom pair
+must provide atomic settlement compatibility; it is not certified durable or
+shared. Deployment of genuinely shared durable backends remains the host's duty.
+No allowlist, topology probe or boolean durability assertion is provided.
+
+Default model priority, privately finalized at startup for every graph:
+
+1. Nonblank `SessionClientOptions.DefaultModel`.
+2. Nonblank `Legate:Llm:DefaultModel`.
+3. A usable qualified default from exactly one graph-local `ILlmProvider`.
+4. Existing agent-file fallback for core and explicitly supplied chat clients.
+
+The adapter's generated chat client requires an unambiguous configured/inferred
+choice, while an explicit `IChatClient` retains its identity and existing disposal
+ownership. Custom clients need not expose metadata or an API key. Invalid winning
+references fail; a differing lower-priority value is not a mismatch error. Host
+options are untouched. All context default consumers use the same prepared copy;
+post-start mutation cannot retarget it. Explicit agent, title and compaction model
+overrides retain their existing priorities.
+
+`LegateBuilder.AddExecutionValidation(Action<IServiceProvider, ClusterMode>)`
+registers synchronous, read-only composition checks, once per returned binding
+provider before any context is published. Checks must not build scopes/providers,
+rerun Bind, retain request services, or emit raw exception secrets. The mode is the
+actual node mode, not the borrowed provider's local declaration. It returns no
+durability verdict. A later failing graph leaves all contexts unpublished.
+
+`ISessionClientFactory.GetClient(tenant)` is the background access path. Request
+`SessionClient` resolves only inside `UseLegate`. Runtime background services
+enumerate initialized contexts with frozen graph inputs; root services are not an
+execution fallback. Running recovery discovery sends bounded existing wakes and
+uses provider-minted recovery authority, never a request scope or dispatcher claim.
+
+For a multi-tenant node, construct one independent, long-lived provider graph
+per tenant in the host, then register one immutable `SessionHostBinding` for
+each graph with `AddLegateSessionBinding`. The descriptor contains the trusted
+tenant and a callback that returns that already-built singleton provider graph.
+The callback runs once before actor traffic. It must not build a provider,
+create a scope or resource, or return a request-scoped provider.
+
+Every explicit binding provider must contain `SessionClientOptions` for the
+same tenant, `ILlmProvider`, `IChatClient`, `ISessionStore` plus
+`ISessionAbortControlStore`, `ISessionEventStore`, `IWorkspaceRuntime`, and
+that tenant's tools, permission policy, model policy, and other execution
+dependencies. Providers are host-owned borrowed services and are not disposed
+by the node. The context assembler does not resolve or start unrelated hosted
+services from the binding provider.
+
+Explicit bindings suppress the default self-binding. The default is allowed
+only when no explicit bindings exist and the root has the complete execution
+dependency set. A receiving-only root can omit execution dependencies because
+it performs routing and non-activating admission only. `SessionHostBinding.Client`
+is unavailable before successful `StartAsync` and is a read-only lazy value.
+Binding and facade assembly perform no lazy writes.
+Bindings cannot be retargeted, added, removed, replaced, or reused after
+initialization. A restart requires fresh descriptors.
+
+Shutdown order is host-controlled: close admission, drain and quiesce actors
+and subscriptions, detach node subscriptions, dispose the provider event bus,
+then dispose borrowed providers exactly once. A timeout is not quiescence, so
+providers remain alive until completion or process exit. Static journal hooks
+detach idempotently and remain host-owned. Do not re-register borrowed
+disposables in the node container.
+
 ## `Legate:Sessions` (`SessionsOptions`)
 
 | Key | Default | Meaning |
@@ -129,11 +213,27 @@ package additionally binds named presets from
 
 | Key | Default | Meaning |
 |---|---|---|
-| `MaxDeliveryAttempts` | `3` | Delivery attempts per headless completion |
-| `RetryDelay` | `30s` | Wait between delivery attempts |
+| `MaxDeliveryAttempts` | `3` | Retained knob; durable redrive owns retries |
+| `RetryDelay` | `30s` | Re-drive cadence between passes |
 | `DeliveredRetention` | `7d` | How long delivered outbox rows are retained for idempotency |
 | `RedriveInterval` | `30s` | How often the re-drive service polls the outbox |
 | `ClaimLeaseDuration` | `60s` | Re-drive delivery lease before another owner may claim the row |
+| `AttemptTimeout` | `30s` | Total bound for one awaited completion acknowledgement, including custom sinks |
+
+Headless completion delivery is data-only. Sessions carry a
+`CompletionDestinationId` (null alone is sinkless); every participating
+host registers the same id for the same logical receiver in that tenant
+with `LegateBuilder.AddCompletionDestination`. The settlement step
+snapshots the id into the outbox row, and the redriver resolves the row's
+snapshot, awaits one bounded acknowledgement, then marks delivered under
+the same fenced owner. Unknown, missing, or unavailable routes stay
+pending; they are never rerouted, marked, or silently dropped.
+
+Breaking 0.1.0 change: persisted sessions and outbox rows written before
+this version use an unsupported format and are explicitly rejected.
+Start clean (fresh database) and register the same destination ids on
+every node; there are no compatibility shims, no legacy rebinding, and
+no mixed-version support.
 
 ## `Legate:AskUser` (`AskUserOptions`)
 
@@ -162,6 +262,11 @@ package additionally binds named presets from
 | `JoinTimeout` | `5s` | Seed-node join wait (`akka.cluster.seed-node-timeout`); also bounds the startup quorum wait |
 | `HostExitDeadline` | `60s` | Legate-level total bound on the cluster hosted service's stop; never rendered into HOCON |
 | `MinimumMembers` | `1` | Up members awaited before `StartAsync` completes |
+
+The session shard identity is the global session id qualified by the trusted
+tenant address `s2.<base64url(UTF-8 tenant)>.<canonical ULID>`. Callers do not
+choose the tenant through the route key. Authentication and authorization
+must establish tenant permission before a request is admitted.
 
 ## `Legate:Pruning` (`ContextPruningOptions`)
 

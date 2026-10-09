@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Add Legate to your .NET application | Legate</title>
+<meta name="description" content="Integrate Legate into a .NET host with C# examples, choose deployment components, configure application policies, and explore runnable samples.">
+<link rel="icon" type="image/svg+xml" sizes="any" href="logo/favicon.svg">
+<link rel="stylesheet" href="styles.css">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+</head>
+<body>
+<header class="nav">
+<div class="wrap">
+  <a class="brand" href="index.html" aria-label="Legate home">
+    <svg width="30" height="30" viewBox="0 0 32 32" style="display:block;flex:none" aria-hidden="true"><path d="M9 6h3v21H9Z" fill="var(--ink)"/><path d="M12 7H25L23.4 9.4H12Z" fill="var(--logo-b)"/><path d="M12 10.2H22.87L21.27 12.6H12Z" fill="var(--logo-b)"/><path d="M12 13.4H21.27L22.87 15.8H12Z" fill="var(--logo-b)"/><path d="M12 16.6H23.4L25 19H12Z" fill="var(--logo-b)"/></svg>
+    <span style="font-weight:700;letter-spacing:0.12em;font-size:14px">LEGATE</span>
+  </a>
+  <nav class="nav-links" aria-label="Main navigation">
+    <a href="index.html">Home</a>
+    <a href="overview.html">Overview</a>
+    <a href="sessions.html">Sessions</a>
+    <a href="durability.html">Durability</a>
+    <a class="active" href="build.html" aria-current="page">Build</a>
+  </nav>
+  <span class="ver-pill">v0.1.0</span>
+  <button class="theme-btn" type="button" aria-label="Switch color theme" title="Switch color theme"></button>
+  <a class="github-btn" href="https://github.com/kubebridge/legate">GitHub</a>
+</div>
+</header>
+
+<main>
+<div class="wrap hero">
+  <span class="kicker">03 / Build</span>
+  <h1 class="hero-title">Add Legate to your .NET application</h1>
+  <p class="lede">Register Legate in your .NET host, then open and prompt sessions from application code. Your application chooses the model provider, persistence, tools, and execution environment.</p>
+  <p class="lede">Use it in ASP.NET Core services, background workers, or a CLI. The F# runtime exposes a C#-friendly API with .NET tasks and async event streams.</p>
+  <nav class="resource-links" aria-label="On this page">
+    <a href="#integration">C# integration</a>
+    <a href="#storage">Deployment</a>
+    <a href="#policies">Application policies</a>
+    <a href="#packages">Packages</a>
+    <a href="#samples">Runnable samples</a>
+    <a href="#build-source">Build from source</a>
+  </nav>
+</div>
+
+<section class="block" aria-labelledby="integration"><div class="wrap content-stack">
+  <div class="sec-head">
+    <div><span class="sec-no cy">01 / Integration</span>
+      <h2 class="sec-title" id="integration">Connect your application in C#</h2></div>
+    <p class="sec-sub">Follow these steps in an ASP.NET Core application's <code>Program.cs</code>. Choose a provider and register an agent, bind the request pipeline, then use a session client in your handlers.</p>
+  </div>
+  <details class="card">
+    <summary>Before you begin: packages, credentials, and imports</summary>
+    <div class="content-stack">
+      <p class="body-copy">Use the .NET 10 Web SDK with <code>Legate.AspNetCore</code> and <code>Legate.Llm.OpenAI</code>. Set <code>Legate__Llm__Providers__openai__ApiKey</code> through your deployment's secret configuration. The snippets use the Web SDK's implicit imports plus these namespaces. For a key-free scripted version, run <a href="#samples">CSharpWebHost</a>.</p>
+<pre class="code" tabindex="0" aria-label="C# namespace imports"><code data-snippet="imports"><span class="k">using</span> Legate;
+<span class="k">using</span> Legate.AspNetCore;
+<span class="k">using</span> Legate.Llm.OpenAI;
+<span class="k">using</span> SessionOptions = Legate.SessionOptions;</code></pre>
+    </div>
+  </details>
+  <div class="card content-stack">
+    <h3 id="register-runtime">Register the runtime</h3>
+    <p class="body-copy">Bind configuration, choose OpenAI, and register the agent used below. Code configuration runs after the <code>Legate</code> section is bound.</p>
+<pre class="code" tabindex="0" aria-labelledby="register-runtime"><code data-snippet="register"><span class="k">var</span> builder = WebApplication.CreateBuilder(args);
+<span class="k">var</span> agentId = AgentId.Parse(<span class="s">"01ARZ3NDEKTSV4RRFFQ69G5FAV"</span>);
+builder.Services.<span class="f">AddLegate</span>(builder.Configuration, legate =&gt;
+{
+    legate.Llm.AddOpenAI(builder.Configuration);
+    legate.Agents.Add(<span class="s">"assistant"</span>, agent =&gt;
+    {
+        agent.Id = agentId;
+        agent.Model = ModelReference.Parse(<span class="s">"openai/gpt-4o-mini"</span>);
+        agent.SystemPrompt = <span class="s">"Answer briefly."</span>;
+        return agent;
+    });
+});</code></pre>
+    <p class="body-copy">The local profile pairs session and event stores in one in-memory database and uses a process workspace under the application's content root. Metadata is lost on restart. Process tools run without a sandbox and are unsafe for untrusted agents. <a href="#storage">Choose persistence and execution explicitly</a> for production.</p>
+  </div>
+  <div class="card content-stack">
+    <h3 id="wire-services">Bind the request pipeline</h3>
+    <p class="body-copy"><code>UseLegate</code> binds the request's tenant client. Your application still owns authentication, authorization, routing, and endpoints.</p>
+<pre class="code" tabindex="0" aria-labelledby="wire-services"><code data-snippet="pipeline"><span class="k">var</span> app = builder.Build();
+app.<span class="f">UseLegate</span>();</code></pre>
+    <p class="body-copy">This example is single-tenant with <code>TenantId.Default</code>. A multitenant application supplies a trusted resolver and complete declared bindings. Place this middleware after routing when the resolver needs endpoint metadata, after your authentication and authorization middleware, and before session handlers. Minimal hosting supplies routing automatically.</p>
+  </div>
+  <div class="card content-stack">
+    <h3 id="prompt-session">Open a session and prompt it</h3>
+    <p class="body-copy">Inject the request-bound client, open the registered agent's session, and prompt with plain text. Omitted delivery is Queue; omitted cancellation is None.</p>
+<pre class="code" tabindex="0" aria-labelledby="prompt-session"><code data-snippet="handler">app.MapPost(<span class="s">"/ask"</span>, <span class="k">async</span> (SessionClient client) =&gt;
+{
+    <span class="k">var</span> session = <span class="k">await</span> client.<span class="f">OpenSessionAsync</span>(agentId);
+    <span class="k">var</span> result = <span class="k">await</span> client.<span class="f">PromptAndWaitAsync</span>(
+        session.Id, <span class="s">"Hello, Legate!"</span>);
+    return Results.Ok(result.AssistantText);
+});</code></pre>
+<pre class="code" tabindex="0" aria-label="Run the application"><code data-snippet="run"><span class="k">await</span> app.RunAsync();</code></pre>
+    <p class="body-copy">Hosted services own startup and shutdown. Background workers use <code>ISessionClientFactory.GetClient(tenant)</code> after startup instead of resolving a request-scoped client.</p>
+  </div>
+  <div class="card content-stack">
+    <h3 id="session-controls">Choose event handling or explicit controls</h3>
+    <p class="body-copy">Within a handler, use <code>Subscribe</code> plus <code>ReplyAsync</code> for approval workflows. The stream defaults to exclusive cursor zero. Pass a cursor to reconnect.</p>
+<pre class="code" tabindex="0" aria-labelledby="session-controls"><code data-snippet="events"><span class="k">await foreach</span> (var evt in client.Subscribe(session.Id, cancellationToken))
+{
+    if (evt is PermissionRequestedEvent asked)
+        await client.ReplyAsync(session.Id,
+            new PermissionDecision(asked.RequestId, PermissionDecisionKind.AllowOnce),
+            cancellationToken);
+    if (evt is TurnCompletedEvent or TurnFailedEvent or TurnAbortedEvent)
+        break;
+}</code></pre>
+    <p class="body-copy"><code>PromptAsync</code> returns an <code>AcceptedOperation</code> receipt, not a completed result. Wait on that receipt to observe the committed outcome, including after a fast completion or reconnection within retention. Concurrent observers do not consume each other's results. <code>PromptAndWaitAsync</code> follows its own receipt but does not replace explicit suspension handling. The legacy <code>WaitForSettleAsync</code> still requires registration before prompting.</p>
+<pre class="code" tabindex="0" aria-label="Wait on the accepted operation"><code data-snippet="wait">var receipt = await client.PromptAsync(session.Id, <span class="s">"Continue"</span>);
+var observation = await client.WaitForOperationAsync(
+    receipt, TimeSpan.FromMinutes(5), CancellationToken.None);
+var result = observation.Result!;</code></pre>
+    <p class="body-copy">For explicit request control, pass the request token. Cancellation may prevent admission; after acceptance it abandons the supplied operation, not the turn. Aborting is a separate targeted control operation.</p>
+<pre class="code" tabindex="0" aria-label="Explicit prompt controls"><code data-snippet="controls">await client.PromptAsync(session.Id, <span class="s">"Continue"</span>,
+    DeliveryMode.Queue, context.RequestAborted);</code></pre>
+  </div>
+</div></section>
+
+<section class="block alt" aria-labelledby="storage"><div class="wrap">
+  <div class="sec-head">
+    <div><span class="sec-no cy">02 / Deployment</span>
+      <h2 class="sec-title" id="storage">Match persistence and execution to your host</h2></div>
+    <p class="sec-sub">The example above keeps data in memory and runs tools in the host process. For your deployment, choose how session state survives restarts and where tools can access files.</p>
+  </div>
+  <div class="grid c3">
+    <div class="card"><h3><span class="dsq" style="background:var(--c)" aria-hidden="true"></span>Local applications</h3><p>Use SQLite for sessions and events in a local database file. Use <code>Legate.Workspace.HostDirectory</code> when tools should work in a selected host directory.</p></div>
+    <div class="card"><h3><span class="dsq" style="background:var(--a)" aria-hidden="true"></span>Hosted services</h3><p>Use Postgres for shared session state and events. Add S3 for blobs and agent packages, and Docker workspaces when tool execution needs container isolation.</p></div>
+    <div class="card"><h3><span class="dsq" style="background:var(--vb)" aria-hidden="true"></span>Tests and experiments</h3><p>Use in-memory stores and a process workspace. This configuration requires no database server or container runtime. Its session data lasts for the process lifetime.</p></div>
+  </div>
+  <p class="body-copy">Local mode is the default. Cluster mode rejects the adapter's implicit local stores and workspace. Every node needs explicitly registered, compatible session and journal stores, a chosen execution runtime, and symmetric trusted tenant bindings, models, tools, and policies. Your deployment supplies genuinely shared durable storage; startup verifies wiring and atomic settlement compatibility, not backend durability or topology. Clustering does not automatically distribute local data or LLM admission. Redis is needed only when distributed admission is enabled. The <a href="https://github.com/kubebridge/legate/blob/main/Docs/getting-started-hosted.md">hosted-service guide</a> and <a href="https://github.com/kubebridge/legate/tree/main/samples/CSharpWebHost/cluster">adapter cluster sample</a> cover these choices.</p>
+</div></section>
+
+<section class="block" aria-labelledby="policies"><div class="wrap">
+  <div class="sec-head">
+    <div><span class="sec-no cy">03 / Application behavior</span>
+      <h2 class="sec-title" id="policies">Connect tools and policies</h2></div>
+    <p class="sec-sub">Once the runtime is registered, connect your application's admission rules, tool permissions, model selection, and usage reporting through these interfaces.</p>
+  </div>
+  <div class="card table-card" tabindex="0" role="region" aria-label="Host policy interfaces">
+    <table class="spec">
+      <thead><tr><th scope="col">Interface</th><th scope="col">What it controls</th></tr></thead>
+      <tbody>
+        <tr><td><code>ISessionAdmissionPolicy</code></td><td>Whether to accept a session open or prompt.</td></tr>
+        <tr><td><code>IPermissionPolicy</code></td><td>Whether a tool call is allowed, denied, or requires approval.</td></tr>
+        <tr><td><code>IModelPolicy</code></td><td>Which model to use for a call.</td></tr>
+        <tr><td><code>IToolSource</code></td><td>Which additional tools are available. The MCP integration uses this interface.</td></tr>
+        <tr><td><code>IUsageObserver</code></td><td>How your application records token-usage checkpoints and settled usage.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="content-stack">
+    <p class="body-copy">Register a workspace through <code>IWorkspaceRuntime</code> for the execution environment chosen above. Use <code>ISessionCompletionSink</code> for completion notifications and <code>IArtifactQuota</code> for artifact quotas.</p>
+    <p class="body-copy">Legate reports token counts for application metering or billing. See the <a href="https://github.com/kubebridge/legate/blob/main/Docs/configuration.md">configuration reference</a> for host options.</p>
+  </div>
+</div></section>
+
+<section class="block alt" aria-labelledby="packages"><div class="wrap">
+  <div class="sec-head">
+    <div><span class="sec-no cy">04 / Package reference</span>
+      <h2 class="sec-title" id="packages">Add the integrations you chose</h2></div>
+    <p class="sec-sub">Reference <code>Legate</code> for the session runtime, then add packages for your provider, storage, workspace, and tools. <code>Legate.Abstractions</code> supplies the public contracts without an Akka dependency.</p>
+  </div>
+  <div class="card table-card" tabindex="0" role="region" aria-label="Package selection">
+    <table class="spec">
+      <thead><tr><th scope="col">Area</th><th scope="col">Packages</th></tr></thead>
+      <tbody>
+        <tr><td>ASP.NET Core hosting</td><td><code>Legate.AspNetCore</code></td></tr>
+        <tr><td>Model providers</td><td><ul class="package-list"><li><code>Legate.Llm.OpenAI</code></li><li><code>Legate.Llm.Anthropic</code></li><li><code>Legate.Llm.Google</code></li></ul></td></tr>
+        <tr><td>Session storage</td><td><ul class="package-list"><li><code>Legate.Storage.Sqlite</code></li><li><code>Legate.Storage.Postgres</code></li><li><code>Legate.Storage.InMemory</code></li></ul></td></tr>
+        <tr><td>Blobs and agent packages</td><td><ul class="package-list"><li><code>Legate.Storage.FileSystem</code></li><li><code>Legate.Storage.S3</code></li></ul></td></tr>
+        <tr><td>Workspaces</td><td><ul class="package-list"><li><code>Legate.Workspace.HostDirectory</code></li><li><code>Legate.Workspace.Process</code></li><li><code>Legate.Workspace.Docker</code></li></ul></td></tr>
+        <tr><td>MCP tools</td><td><code>Legate.Mcp</code></td></tr>
+        <tr><td>Distributed LLM admission</td><td><code>Legate.Coordination.Redis</code></td></tr>
+        <tr><td>Kubernetes discovery</td><td><code>Legate.Cluster.Kubernetes</code></td></tr>
+        <tr><td>Test support</td><td><code>Legate.Testing</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+</div></section>
+
+<section class="block" aria-labelledby="samples"><div class="wrap content-stack">
+  <div class="sec-head">
+    <div><span class="sec-no cy">05 / Runnable examples</span>
+      <h2 class="sec-title" id="samples">Explore a complete host</h2></div>
+    <p class="sec-sub">Use these repository samples to see registration, session control, and event handling together. Choose the host closest to your application's execution model.</p>
+  </div>
+  <div class="card table-card" tabindex="0" role="region" aria-label="Application samples">
+    <table class="spec">
+      <thead><tr><th scope="col">Sample</th><th scope="col">What it demonstrates</th></tr></thead>
+      <tbody>
+        <tr><td><a href="https://github.com/kubebridge/legate/tree/main/samples/CSharpWebHost">CSharpWebHost</a></td><td>ASP.NET Core request DI, friendly APIs and application-owned endpoints with an offline scripted provider; an adapter cluster harness uses shared Postgres.</td></tr>
+        <tr><td><a href="https://github.com/kubebridge/legate/tree/main/samples/CSharpHost">CSharpHost</a></td><td>A C# Generic Host with event subscription and a tool-approval round trip, using scripted model responses.</td></tr>
+        <tr><td><a href="https://github.com/kubebridge/legate/tree/main/samples/MinimalHost">MinimalHost</a></td><td>An F#/Giraffe web server with HTTP session endpoints and an SSE stream that reconnects using <code>Last-Event-ID</code>.</td></tr>
+        <tr><td><a href="https://github.com/kubebridge/legate/tree/main/samples/Headless">Headless</a></td><td>An unattended session with automatic closure and a signed completion webhook.</td></tr>
+        <tr><td><a href="https://github.com/kubebridge/legate/tree/main/samples/cluster-compose">cluster-compose</a></td><td>Three nodes sharing Postgres and Redis, including a process-kill recovery test.</td></tr>
+        <tr><td><a href="https://github.com/kubebridge/legate/tree/main/samples/LegateCli">LegateCli</a></td><td>An interactive terminal with prompts, approval handling, and session commands, using in-memory storage.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <details class="card">
+    <summary>Run the C# sample without provider credentials</summary>
+    <div class="content-stack">
+      <p class="body-copy">From a repository checkout with the .NET 10 SDK installed, run the scripted C# host. It uses local model responses without provider keys or network calls.</p>
+<pre class="code" tabindex="0" aria-label="Run the C# host sample"><code>dotnet run --project samples/CSharpWebHost -- --urls http://127.0.0.1:5080
+dotnet run --project samples/CSharpHost -- --scripted</code></pre>
+      <p class="body-copy">For an HTTP host, follow the <a href="https://github.com/kubebridge/legate/blob/main/Docs/getting-started-hosted.md">hosted-service guide</a>. For an interactive terminal, follow the <a href="https://github.com/kubebridge/legate/blob/main/Docs/getting-started-cli.md">CLI guide</a>.</p>
+    </div>
+  </details>
+</div></section>
+
+<section class="block alt" aria-labelledby="build-source"><div class="wrap">
+  <div class="sec-head">
+    <div><span class="sec-no cy">06 / Source development</span>
+      <h2 class="sec-title" id="build-source">Build and test from source</h2></div>
+    <p class="sec-sub">To develop Legate itself or validate a source checkout, use the repository build targets. The core tests run without external services; provider integration suites use Postgres, Redis, S3-compatible storage, and Docker where needed.</p>
+  </div>
+<pre class="code" tabindex="0" aria-labelledby="build-source"><code>dotnet fsi build.fsx -- -t Build
+dotnet fsi build.fsx -- -t Test
+dotnet fsi build.fsx -- -t CheckFormat</code></pre>
+  <p class="body-copy">Legate is currently on the <code>0.x</code> release line. Public APIs may change between releases.</p>
+  <div class="resource-links">
+    <a href="https://github.com/kubebridge/legate/blob/main/Docs/getting-started-cli.md">CLI guide</a>
+    <a href="https://github.com/kubebridge/legate/blob/main/Docs/getting-started-hosted.md">Hosted-service guide</a>
+    <a href="https://github.com/kubebridge/legate/blob/main/Docs/configuration.md">Configuration reference</a>
+    <a href="https://github.com/kubebridge/legate">GitHub</a>
+  </div>
+  <div class="pager">
+    <a class="btn" href="durability.html">02 / Durability</a>
+    <a class="btn primary" href="overview.html">Overview</a>
+  </div>
+</div></section>
+</main>
+
+<footer><div class="wrap">
+  <a class="brand" href="index.html" style="font-size:12px"><svg width="20" height="20" viewBox="0 0 32 32" aria-hidden="true"><path d="M9 6h3v21H9Z" fill="var(--ink)"/><path d="M12 7H25L23.4 9.4H12Z" fill="var(--logo-b)"/><path d="M12 10.2H22.87L21.27 12.6H12Z" fill="var(--logo-b)"/><path d="M12 13.4H21.27L22.87 15.8H12Z" fill="var(--logo-b)"/><path d="M12 16.6H23.4L25 19H12Z" fill="var(--logo-b)"/></svg>LEGATE</a>
+  <span class="spacer">A <a href="https://kubebridge.com">Kubebridge</a> project · Apache 2.0</span>
+  <nav><a href="https://github.com/kubebridge/legate">GitHub</a><a href="https://www.nuget.org/packages/Legate">NuGet</a></nav>
+</div></footer>
+<script src="theme.js"></script>
+</body>
+</html>

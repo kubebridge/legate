@@ -109,7 +109,7 @@ let private stopQuietly (service: ClusterActorSystemService) : unit =
 
 /// Resolves one proxy and blocks for the map's reply.
 let private resolve (service: ClusterActorSystemService) (sessionId: string) =
-    (service :> ISessionResolver).ResolveSessionAsync(sessionId, CancellationToken.None).GetAwaiter().GetResult()
+    service.ResolveSessionAsync(sessionId, CancellationToken.None).GetAwaiter().GetResult()
 
 /// Builds a readiness check over a manually started service: the provider
 /// exposes the service as the hosted service the check resolves, and the
@@ -243,7 +243,7 @@ let ``HOCON publishes provider seeds roles and stamp for StaticSeeds`` () =
     |> List.ofSeq
     |> should equal [ "session" ]
 
-    config.GetString("akka.cluster.app-version") |> should equal "1.1.128"
+    config.GetString("akka.cluster.app-version") |> should equal "2.1.128"
 
 [<Fact>]
 let ``HOCON lists no seeds for Kubernetes and honors the port`` () =
@@ -268,7 +268,7 @@ let ``HOCON lists no seeds for Kubernetes and honors the port`` () =
     |> List.ofSeq
     |> should equal [ "session"; "api" ]
 
-    config.GetString("akka.cluster.app-version") |> should equal "1.2.32"
+    config.GetString("akka.cluster.app-version") |> should equal "2.2.32"
 
 [<Fact>]
 let ``HOCON keeps the loopback bind by default`` () =
@@ -450,7 +450,7 @@ let ``Drain wait settles immediately when no turns run`` () =
     work.Wait(TimeSpan.FromSeconds 10.0) |> should equal true
 
 [<Fact>]
-let ``Drain wait never exceeds the grace period`` () =
+let ``Drain wait surfaces the grace-period deadline`` () =
     let fake = FakeTimeProvider()
     let start = fake.GetTimestamp()
 
@@ -465,10 +465,12 @@ let ``Drain wait never exceeds the grace period`` () =
 
     work.IsCompleted |> should equal false
     fake.Advance(TimeSpan.FromSeconds 30.0)
-    work.Wait(TimeSpan.FromSeconds 10.0) |> should equal true
+
+    Assert.Throws<DeadlineExceededException>(fun () -> work.GetAwaiter().GetResult())
+    |> ignore
 
 [<Fact>]
-let ``Drain wait never exceeds the host exit deadline`` () =
+let ``Drain wait surfaces the host exit deadline`` () =
     let fake = FakeTimeProvider()
     let start = fake.GetTimestamp()
 
@@ -484,7 +486,9 @@ let ``Drain wait never exceeds the host exit deadline`` () =
 
     work.IsCompleted |> should equal false
     fake.Advance(TimeSpan.FromSeconds 10.0)
-    work.Wait(TimeSpan.FromSeconds 10.0) |> should equal true
+
+    Assert.Throws<DeadlineExceededException>(fun () -> work.GetAwaiter().GetResult())
+    |> ignore
 
 [<Fact>]
 let ``Drain wait wakes early when turns settle`` () =
@@ -652,11 +656,11 @@ type ClusterRuntimeTests() =
                         system
                         "guard"
                         (ClusterActorSystem.shardingVersionGuard
-                            "1.1.128"
+                            "2.1.128"
                             (fun () -> lock gate (fun () -> left <- left + 1))
                             listener)
 
-                guard.Tell(memberUp "1.1.128")
+                guard.Tell(memberUp "2.1.128")
                 expectNoMsg inbox (TimeSpan.FromSeconds(2.0))
                 left |> should equal 0
             finally
@@ -682,15 +686,15 @@ type ClusterRuntimeTests() =
                         system
                         "guard"
                         (ClusterActorSystem.shardingVersionGuard
-                            "1.1.128"
+                            "2.1.128"
                             (fun () -> lock gate (fun () -> left <- left + 1))
                             listener)
 
-                guard.Tell(memberUp "1.2.128")
+                guard.Tell(memberUp "2.2.128")
 
                 let report = expectMsg<ShardingVersionReport> inbox (TimeSpan.FromSeconds(10.0))
 
-                report |> should equal (VersionStampMismatch "1.2.128")
+                report |> should equal (VersionStampMismatch "2.2.128")
                 left |> should equal 1
             finally
                 system.Terminate().GetAwaiter().GetResult() |> ignore
@@ -896,6 +900,8 @@ type ClusterRuntimeTests() =
                 services,
                 ?configure =
                     Some(fun (builder: LegateBuilder) ->
+                        builder.Llm.AddProvider(BuilderTests.StubLlmProvider()) |> ignore
+                        builder.Workspace.UseRuntime(BuilderTests.StubWorkspaceRuntime()) |> ignore
                         builder.Storage.UseSessionStore(InMemorySessionStore(database)) |> ignore
 
                         builder.Tools.AddSource(new StaticToolSource(ResizeArray<AITool>([]) :> IReadOnlyList<AITool>))
@@ -921,9 +927,8 @@ type ClusterRuntimeTests() =
 
             cluster.RemotingPort <- port
 
-            let client = provider.GetRequiredService<SessionClient>()
-
             do! (cluster :> IHostedService).StartAsync(CancellationToken.None)
+            let client = provider.GetRequiredService<SessionClient>()
 
             try
                 do! awaitUp (requireSystem cluster) (TimeSpan.FromSeconds(30.0))
@@ -931,7 +936,8 @@ type ClusterRuntimeTests() =
                 let! created =
                     SessionClientOperations.OpenSessionAsync(client, AgentId.New(), null, CancellationToken.None)
 
-                let waiter = PromptWaitHubs.GetOrAdd(created.Id).EnqueueSettle()
+                let waiter =
+                    (PromptWaitHubs.GetOrAddScoped client.Tenant created.Id).EnqueueSettle()
 
                 let! entry =
                     SessionClientOperations.PromptAsync(
@@ -942,7 +948,7 @@ type ClusterRuntimeTests() =
                         CancellationToken.None
                     )
 
-                entry.Delivery |> should equal DeliveryMode.Queue
+                entry.Kind |> should equal OperationKind.Queue
                 entry.SessionId |> should equal created.Id
 
                 let! result = awaitWhat waiter.Task (TimeSpan.FromSeconds(90.0)) "the turn to settle"
@@ -958,14 +964,19 @@ type ClusterRuntimeTests() =
             let portA = freePort ()
             let portB = freePort ()
 
-            let nodeA =
-                startClusterOn portA (fun root ->
-                    root.Cluster.Mode <- ClusterMode.StaticSeeds
-                    root.Cluster.SeedNodes.Add($"127.0.0.1:%d{portA}") |> ignore
-                    root.Cluster.Roles.Add("session") |> ignore)
-
             // Records where each entity actually spawns.
             let placed = ConcurrentDictionary<string, Address>()
+
+            let nodeA =
+                ClusterActorSystemService(
+                    buildOptions (fun root ->
+                        root.Cluster.Mode <- ClusterMode.StaticSeeds
+                        root.Cluster.SeedNodes.Add($"127.0.0.1:%d{portA}") |> ignore
+                        root.Cluster.Roles.Add("session") |> ignore),
+                    TimeProvider.System
+                )
+
+            nodeA.RemotingPort <- portA
 
             // The entities spawn lazily on first contact, after the
             // factory lands here: no prompt has flowed yet.
@@ -973,6 +984,8 @@ type ClusterRuntimeTests() =
                 Some(fun sessionId context name ->
                     placed[sessionId] <- Cluster.Get(context.System).SelfAddress
                     LocalActorSystem.identitySpawn sessionId context name)
+
+            do! (nodeA :> IHostedService).StartAsync(CancellationToken.None)
 
             let nodeB =
                 startClusterOn portB (fun root ->
@@ -1009,7 +1022,7 @@ type ClusterRuntimeTests() =
         }
 
     [<Fact>]
-    member _.``Facade wires the entity factory on the mode-active service``() =
+    member _.``Facade freezes routing in the host context instead of mutating actor services``() =
         let chat =
             new ScriptedChatClient(ResizeArray<ScriptStep>([ ScriptStep.Text "done" ]) :> IReadOnlyList<ScriptStep>)
 
@@ -1021,6 +1034,8 @@ type ClusterRuntimeTests() =
                 services,
                 ?configure =
                     Some(fun (builder: LegateBuilder) ->
+                        builder.Llm.AddProvider(BuilderTests.StubLlmProvider()) |> ignore
+                        builder.Workspace.UseRuntime(BuilderTests.StubWorkspaceRuntime()) |> ignore
                         builder.Storage.UseSessionStore(InMemorySessionStore(database)) |> ignore
 
                         builder.Tools.AddSource(new StaticToolSource(ResizeArray<AITool>([]) :> IReadOnlyList<AITool>))
@@ -1051,8 +1066,15 @@ type ClusterRuntimeTests() =
                 | _ -> None)
 
         use localProvider = (createServices (buildSection [])).BuildServiceProvider()
+
+        localProvider
+            .GetRequiredService<ISessionHostContexts>()
+            .InitializeAsync(CancellationToken.None)
+            .GetAwaiter()
+            .GetResult()
+
         localProvider.GetRequiredService<SessionClient>() |> ignore
-        (pickLocal localProvider).SessionChildFactory.IsSome |> should equal true
+        (pickLocal localProvider).SessionChildFactory.IsNone |> should equal true
         (pickCluster localProvider).SessionEntityFactory.IsNone |> should equal true
 
         use clusterProvider =
@@ -1066,9 +1088,15 @@ type ClusterRuntimeTests() =
             ))
                 .BuildServiceProvider()
 
+        clusterProvider
+            .GetRequiredService<ISessionHostContexts>()
+            .InitializeAsync(CancellationToken.None)
+            .GetAwaiter()
+            .GetResult()
+
         clusterProvider.GetRequiredService<SessionClient>() |> ignore
         (pickLocal clusterProvider).SessionChildFactory.IsNone |> should equal true
-        (pickCluster clusterProvider).SessionEntityFactory.IsSome |> should equal true
+        (pickCluster clusterProvider).SessionEntityFactory.IsNone |> should equal true
 
     [<Fact>]
     member _.``AddLegate registers the cluster actor system hosted service``() =

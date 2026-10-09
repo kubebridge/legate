@@ -90,7 +90,9 @@ let private createServices (chatClient: ScriptedChatClient) (tools: StaticToolSo
         services,
         ?configure =
             Some(fun (builder: LegateBuilder) ->
+                builder.Llm.AddProvider(BuilderTests.StubLlmProvider()) |> ignore
                 builder.Storage.UseSessionStore(InMemorySessionStore(database)) |> ignore
+                builder.Workspace.UseRuntime(BuilderTests.StubWorkspaceRuntime()) |> ignore
                 builder.Tools.AddSource(tools) |> ignore)
     )
     |> ignore
@@ -117,13 +119,13 @@ let private stopQuietly (service: LocalActorSystemService) : Task =
             ()
     }
 
-/// Resolves the client (triggering the router wiring), starts the local
-/// actor system, runs the work, then stops the system.
+/// Starts the local actor system (which initializes the immutable host
+/// context), resolves the client, runs the work, then stops the system.
 let private withClient (provider: IServiceProvider) (work: SessionClient -> Task<'T>) : Task<'T> =
     task {
-        let client = provider.GetRequiredService<SessionClient>()
         let service = actorServiceOf provider
         do! (service :> IHostedService).StartAsync(CancellationToken.None)
+        let client = provider.GetRequiredService<SessionClient>()
 
         try
             let! outcome = work client
@@ -184,6 +186,281 @@ let private collectStream
 
 // ──────────────────────────────────────────────────────────────────────────
 // Open
+
+type private SwitchingProvider(first: IChatClient, second: IChatClient) =
+    interface ILlmProvider with
+        member _.Id = "switch-test"
+        member _.DefaultModel = "first"
+
+        member _.Capabilities =
+            {
+                Streaming = false
+                Reasoning = false
+                ToolCalling = true
+            }
+
+        member _.CreateChatClient(model, _) =
+            if model.Model = "second" then second else first
+
+[<Fact>]
+let ``SetAgent switches the actual provider client on the next prompt`` () : Task =
+    task {
+        let first = scripted [ ScriptStep.Text "first model" ]
+        let second = scripted [ ScriptStep.Text "second model" ]
+        let database = InMemoryDatabase()
+        let services = ServiceCollection()
+
+        services.AddLegate(
+            Action<LegateBuilder>(fun builder ->
+                builder.Llm.AddProvider(BuilderTests.StubLlmProvider()) |> ignore
+                builder.Workspace.UseRuntime(BuilderTests.StubWorkspaceRuntime()) |> ignore
+                builder.Storage.UseSessionStore(InMemorySessionStore(database)) |> ignore
+
+                builder.Agents.Add(
+                    "first",
+                    Func<Agent, Agent>(fun agent ->
+                        { agent with
+                            Model = ModelReference.Parse("switch-test/first")
+                        })
+                )
+                |> ignore
+
+                builder.Agents.Add(
+                    "second",
+                    Func<Agent, Agent>(fun agent ->
+                        { agent with
+                            Model = ModelReference.Parse("switch-test/second")
+                        })
+                )
+                |> ignore)
+        )
+        |> ignore
+
+        services.AddSingleton<ISessionEventStore>(InMemorySessionEventStore(database))
+        |> ignore
+
+        services.AddSingleton<IChatClient>(first) |> ignore
+        services.AddSingleton<ILlmProvider>(SwitchingProvider(first, second)) |> ignore
+
+        services.AddSingleton<Func<ModelReference, IChatClient>>(
+            Func<ModelReference, IChatClient>(fun model -> if model.Model = "second" then second else first)
+        )
+        |> ignore
+
+        use provider = services.BuildServiceProvider()
+        let! agents = provider.GetRequiredService<IAgentStore>().ListAgents(TenantId.Default, CancellationToken.None)
+
+        let agent name =
+            agents |> Seq.find (fun agent -> agent.Name = name)
+
+        do!
+            withClient provider (fun client ->
+                task {
+                    let! session =
+                        SessionClientOperations.OpenSessionAsync(
+                            client,
+                            (agent "first").Id,
+                            null,
+                            CancellationToken.None
+                        )
+
+                    let! result =
+                        SessionClientExtensions.PromptAndWaitAsync(
+                            client,
+                            session.Id,
+                            UserMessage.Text "hi",
+                            CancellationToken.None
+                        )
+
+                    result.AssistantText |> should equal "first model"
+
+                    let! _ =
+                        SessionClientOperations.SetAgentAsync(
+                            client,
+                            session.Id,
+                            (agent "second").Id,
+                            CancellationToken.None
+                        )
+
+                    let! changed =
+                        SessionClientExtensions.PromptAndWaitAsync(
+                            client,
+                            session.Id,
+                            UserMessage.Text "hi again",
+                            CancellationToken.None
+                        )
+
+                    changed.AssistantText |> should equal "second model"
+                })
+    }
+
+[<Fact>]
+let ``Registered providers do not bypass the host chat pipeline without opt-in`` () : Task =
+    task {
+        let hostClient =
+            scripted
+                [
+                    ScriptStep.Text "host middleware pipeline"
+                ]
+
+        let rawClient = scripted [ ScriptStep.Text "raw provider" ]
+        let database = InMemoryDatabase()
+        let services = ServiceCollection()
+
+        services.AddLegate(
+            Action<LegateBuilder>(fun builder ->
+                builder.Llm.AddProvider(BuilderTests.StubLlmProvider()) |> ignore
+                builder.Workspace.UseRuntime(BuilderTests.StubWorkspaceRuntime()) |> ignore
+                builder.Storage.UseSessionStore(InMemorySessionStore(database)) |> ignore
+
+                builder.Agents.Add(
+                    "host",
+                    Func<Agent, Agent>(fun agent ->
+                        { agent with
+                            Model = ModelReference.Parse("switch-test/first")
+                        })
+                )
+                |> ignore)
+        )
+        |> ignore
+
+        services.AddSingleton<ISessionEventStore>(InMemorySessionEventStore(database))
+        |> ignore
+
+        services.AddSingleton<IChatClient>(hostClient) |> ignore
+
+        services.AddSingleton<ILlmProvider>(SwitchingProvider(rawClient, rawClient))
+        |> ignore
+
+        use provider = services.BuildServiceProvider()
+        let! agents = provider.GetRequiredService<IAgentStore>().ListAgents(TenantId.Default, CancellationToken.None)
+
+        do!
+            withClient provider (fun client ->
+                task {
+                    let! session =
+                        SessionClientOperations.OpenSessionAsync(client, agents[0].Id, null, CancellationToken.None)
+
+                    let! result =
+                        SessionClientExtensions.PromptAndWaitAsync(
+                            client,
+                            session.Id,
+                            UserMessage.Text "hi",
+                            CancellationToken.None
+                        )
+
+                    result.AssistantText |> should equal "host middleware pipeline"
+                    rawClient.Calls |> should equal 0
+                })
+    }
+
+[<Fact>]
+let ``Catalog lookup propagates cancellation and abandons an unresponsive store`` () : Task =
+    task {
+        use cts = new CancellationTokenSource()
+
+        let never =
+            TaskCompletionSource<IReadOnlyList<Agent>>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+        let mutable received = CancellationToken.None
+
+        let store =
+            { new IAgentStore with
+                member _.ListAgents(_, token) =
+                    received <- token
+                    never.Task
+
+                member _.GetAgent(_, _, _) = failwith "unused"
+                member _.UpdateIfUnchanged(_, _, _, _) = failwith "unused"
+                member _.DeleteAgent(_, _, _) = failwith "unused"
+                member _.ListAgentsWithEnabledSchedules(_, _) = failwith "unused"
+                member _.TryConsumeScheduleOccurrence(_, _, _, _, _) = failwith "unused"
+            }
+
+        let pending =
+            SessionClientWiring.agentsForEntryAsync store TenantId.Default cts.Token
+
+        received |> should equal cts.Token
+        cts.Cancel()
+        let! _ = Assert.ThrowsAnyAsync<OperationCanceledException>(Func<Task>(fun () -> pending :> Task))
+        never.TrySetResult(Array.empty<Agent>) |> ignore
+    }
+
+[<Fact>]
+let ``Facade runs a delegated sub-agent and returns to its parent`` () : Task =
+    task {
+        let args = Dictionary<string, obj>()
+        args["subagent"] <- "explore"
+        args["task"] <- "inspect the workspace"
+
+        let chat =
+            scripted
+                [
+                    ScriptStep.ToolCall("delegate", "task", args)
+                    ScriptStep.Text "nested findings"
+                    ScriptStep.Text "parent summary"
+                ]
+
+        let database = InMemoryDatabase()
+        let services = ServiceCollection()
+
+        services.AddLegate(
+            Action<LegateBuilder>(fun builder ->
+                builder.Llm.AddProvider(BuilderTests.StubLlmProvider()) |> ignore
+                builder.Workspace.UseRuntime(BuilderTests.StubWorkspaceRuntime()) |> ignore
+                builder.Storage.UseSessionStore(InMemorySessionStore(database)) |> ignore
+                builder.Agents.Add("parent", Func<Agent, Agent>(id)) |> ignore
+
+                builder.Agents.Add(
+                    "explore",
+                    Func<Agent, Agent>(fun agent ->
+                        { agent with
+                            Description = "Read-only explorer"
+                            SystemPrompt = "Report findings."
+                        })
+                )
+                |> ignore)
+        )
+        |> ignore
+
+        services.AddSingleton<ISessionEventStore>(InMemorySessionEventStore(database))
+        |> ignore
+
+        services.AddSingleton<IChatClient>(chat) |> ignore
+        use provider = services.BuildServiceProvider()
+        let! agents = provider.GetRequiredService<IAgentStore>().ListAgents(TenantId.Default, CancellationToken.None)
+
+        do!
+            withClient provider (fun client ->
+                task {
+                    let parent = agents |> Seq.find (fun agent -> agent.Name = "parent")
+
+                    let! session =
+                        SessionClientOperations.OpenSessionAsync(client, parent.Id, null, CancellationToken.None)
+
+                    let! result =
+                        SessionClientExtensions.PromptAndWaitAsync(
+                            client,
+                            session.Id,
+                            UserMessage.Text "delegate",
+                            CancellationToken.None
+                        )
+
+                    result.Status |> should equal TurnStatus.Completed
+                    result.AssistantText |> should equal "parent summary"
+                    chat.Calls |> should equal 3
+
+                    let nestedResult =
+                        chat.ReceivedMessages
+                        |> Seq.collect (fun message -> message.Contents)
+                        |> Seq.choose (function
+                            | :? FunctionResultContent as result -> Some(string result.Result)
+                            | _ -> None)
+                        |> String.concat "\n"
+
+                    nestedResult.Contains("nested findings") |> should equal true
+                })
+    }
 
 [<Fact>]
 let ``Open creates an Idle session row with the agent and title`` () : Task =
@@ -251,13 +528,81 @@ let ``Prompt queues and settles through the DI runner`` () : Task =
                             CancellationToken.None
                         )
 
-                    entry.Delivery |> should equal DeliveryMode.Queue
+                    entry.Kind |> should equal OperationKind.Queue
                     entry.SessionId |> should equal created.Id
 
                     let! result = awaitWhat waiter.Task "the turn to settle"
                     result.Status |> should equal TurnStatus.Completed
                     result.AssistantText |> should equal "hello back"
                 })
+    }
+
+[<Fact>]
+let ``A settled turn can be prompted again without restarting the host`` () : Task =
+    task {
+        let chat =
+            scripted
+                [
+                    ScriptStep.Text "first"
+                    ScriptStep.Text "second"
+                ]
+
+        use provider = (createServices chat (sourced [])).BuildServiceProvider()
+        let service = actorServiceOf provider
+        do! (service :> IHostedService).StartAsync(CancellationToken.None)
+        let client = provider.GetRequiredService<SessionClient>()
+
+        try
+            let! created = openSession client
+            let firstWaiter = settleWaiter created.Id
+
+            let! _ =
+                awaitWhat
+                    (SessionClientOperations.PromptAsync(
+                        client,
+                        created.Id,
+                        UserMessage.Text "one",
+                        DeliveryMode.Queue,
+                        CancellationToken.None
+                    ))
+                    "the first prompt to land"
+
+            let! first = awaitWhat firstWaiter.Task "the first turn to settle"
+            first.Status |> should equal TurnStatus.Completed
+            first.AssistantText |> should equal "first"
+
+            // Settle barrier: the snapshot round-trips the mailbox after
+            // the finish handling completed, making the following row read
+            // exact without polling.
+            let! actor = client.Resolve(created.Id, CancellationToken.None)
+            let! _ = SessionActor.getSuspendSnapshotAsync actor CancellationToken.None
+
+            // The Completed-to-Idle settle released the prime, so the
+            // respawn below primes anew instead of falling back to a dead
+            // token against the still-live prime.
+            let! stored = storedOf client created.Id
+            stored.CurrentTurnId.HasValue |> should equal false
+
+            let secondWaiter = settleWaiter created.Id
+
+            let! _ =
+                awaitWhat
+                    (SessionClientOperations.PromptAsync(
+                        client,
+                        created.Id,
+                        UserMessage.Text "two",
+                        DeliveryMode.Queue,
+                        CancellationToken.None
+                    ))
+                    "the follow-up prompt to land"
+
+            let! second = awaitWhat secondWaiter.Task "the resumed turn to settle"
+            second.Status |> should equal TurnStatus.Completed
+            second.AssistantText |> should equal "second"
+
+            (settledOf created.Id).Count |> should equal 2
+        finally
+            stopQuietly service |> fun shutdown -> shutdown.GetAwaiter().GetResult()
     }
 
 [<Fact>]
@@ -309,7 +654,7 @@ let ``Prompt with Inject folds into the running turn`` () : Task =
                                 CancellationToken.None
                             )
 
-                        injected.Delivery |> should equal DeliveryMode.Inject
+                        injected.Kind |> should equal OperationKind.Inject
 
                         release.TrySetResult("unblocked") |> ignore
                         let! result = awaitWhat waiter.Task "the turn to settle"
@@ -414,7 +759,7 @@ let ``Prompt with Interrupt pre-empts and drains first`` () : Task =
                                 CancellationToken.None
                             )
 
-                        interrupted.Delivery |> should equal DeliveryMode.Interrupt
+                        interrupted.Kind |> should equal OperationKind.Interrupt
 
                         // Queue the second waiter before releasing the blocker:
                         // the hub is FIFO with no replay, so a waiter enqueued
@@ -503,7 +848,7 @@ let ``Reply resumes a suspended turn and Subscribe streams the lifecycle`` () : 
                 task {
                     let! created = openSession client
                     let waiter = settleWaiter created.Id
-                    let stream = collectStream client created.Id 0L 2
+                    let stream = collectStream client created.Id 0L 3
 
                     let prompt =
                         SessionClientOperations.PromptAsync(
@@ -578,7 +923,7 @@ let ``Reply with an unknown request id throws ReplyMismatch`` () : Task =
 // Abort
 
 [<Fact>]
-let ``Abort on Idle is a no-op`` () : Task =
+let ``Abort on Idle reports NoCurrentTurn`` () : Task =
     task {
         use provider =
             (createServices (scripted [ ScriptStep.Text "done" ]) (sourced [])).BuildServiceProvider()
@@ -588,14 +933,17 @@ let ``Abort on Idle is a no-op`` () : Task =
                 task {
                     let! created = openSession client
 
-                    do!
+                    let! receipt =
                         SessionClientOperations.AbortAsync(
                             client,
                             created.Id,
+                            TurnId.New(),
                             StopCause.ExplicitAbort,
                             "nothing runs",
                             CancellationToken.None
                         )
+
+                    receipt.Outcome |> should equal HostAbortOutcome.NoCurrentTurn
 
                     let! stored = storedOf client created.Id
                     stored.State |> should equal SessionState.Idle
@@ -643,14 +991,25 @@ let ``Abort while Running settles Aborted with zero loser effects`` () : Task =
                         let! _ = awaitWhat prompt "the prompt to land"
                         Assert.True(entered.Wait(waitBound))
 
-                        do!
+                        let! current =
+                            SessionClientOperations.ReadAbortTargetAsync(client, created.Id, CancellationToken.None)
+
+                        let target =
+                            match current with
+                            | null -> failwith "No current control target."
+                            | target -> target
+
+                        let! receipt =
                             SessionClientOperations.AbortAsync(
                                 client,
                                 created.Id,
+                                target.TurnId,
                                 StopCause.ExplicitAbort,
                                 "test-abort",
                                 CancellationToken.None
                             )
+
+                        receipt.Outcome |> should equal HostAbortOutcome.Accepted
 
                         // The loser reports back after the release, and the
                         // recorded stop maps its finish to Aborted.
@@ -679,7 +1038,7 @@ let ``Abort while Running settles Aborted with zero loser effects`` () : Task =
     }
 
 [<Fact>]
-let ``Abort while WaitingForInput is a no-op and Reply still resumes`` () : Task =
+let ``Abort while WaitingForInput refuses and Reply still resumes`` () : Task =
     task {
         let chat =
             scripted
@@ -711,7 +1070,7 @@ let ``Abort while WaitingForInput is a no-op and Reply still resumes`` () : Task
                         )
 
                     let! _ = awaitWhat prompt "the prompt to land"
-                    let! events = awaitWhat (collectStream client created.Id 0L 2) "the suspension"
+                    let! events = awaitWhat (collectStream client created.Id 0L 3) "the suspension"
 
                     let asked =
                         events
@@ -720,14 +1079,24 @@ let ``Abort while WaitingForInput is a no-op and Reply still resumes`` () : Task
                             | :? PermissionRequestedEvent as asked when not (isNull (box asked)) -> Some asked
                             | _ -> None)
 
-                    do!
-                        SessionClientOperations.AbortAsync(
-                            client,
-                            created.Id,
-                            StopCause.ExplicitAbort,
-                            "suspended",
-                            CancellationToken.None
-                        )
+                    let! current =
+                        SessionClientOperations.ReadAbortTargetAsync(client, created.Id, CancellationToken.None)
+
+                    let target =
+                        match current with
+                        | null -> failwith "No suspended control target."
+                        | target -> target
+
+                    let! _ =
+                        Assert.ThrowsAsync<InvalidSessionStateException>(fun () ->
+                            SessionClientOperations.AbortAsync(
+                                client,
+                                created.Id,
+                                target.TurnId,
+                                StopCause.ExplicitAbort,
+                                "suspended",
+                                CancellationToken.None
+                            ))
 
                     let! stored = storedOf client created.Id
                     stored.State |> should equal SessionState.WaitingForInput
@@ -759,6 +1128,7 @@ let ``Abort validates the session and the cause`` () : Task =
                             SessionClientOperations.AbortAsync(
                                 client,
                                 SessionId.New(),
+                                TurnId.New(),
                                 StopCause.ExplicitAbort,
                                 "gone",
                                 CancellationToken.None
@@ -773,6 +1143,7 @@ let ``Abort validates the session and the cause`` () : Task =
                             SessionClientOperations.AbortAsync(
                                 client,
                                 created.Id,
+                                TurnId.New(),
                                 StopCause.Deadline,
                                 "not abort-family",
                                 CancellationToken.None
@@ -1029,7 +1400,7 @@ let ``ReadEvents pages by cursor and limit`` () : Task =
                             CancellationToken.None
                         )
 
-                    let! events = awaitWhat (collectStream client created.Id 0L 2) "the suspension"
+                    let! events = awaitWhat (collectStream client created.Id 0L 3) "the suspension"
 
                     let asked =
                         events
@@ -1128,6 +1499,8 @@ let ``DI registers the client bus and suspend wiring`` () =
     let chat = scripted [ ScriptStep.Text "done" ]
     use provider = (createServices chat (sourced [])).BuildServiceProvider()
 
+    let service = actorServiceOf provider
+    (service :> IHostedService).StartAsync(CancellationToken.None).GetAwaiter().GetResult()
     let client = provider.GetRequiredService<SessionClient>()
     (isNull (box client)) |> should equal false
 
@@ -1135,11 +1508,10 @@ let ``DI registers the client bus and suspend wiring`` () =
     (isNull (box bus)) |> should equal false
     (bus.EventStore :? InMemorySessionEventStore) |> should equal true
 
-    let service = actorServiceOf provider
-    (service.SessionChildFactory.IsSome) |> should equal true
+    (service.SessionChildFactory.IsNone) |> should equal true
 
 [<Fact>]
-let ``Without a chat client the router keeps identity children`` () =
+let ``Without a chat client startup fails explicitly`` () =
     let database = InMemoryDatabase()
     let services = ServiceCollection() :> IServiceCollection
 
@@ -1147,7 +1519,9 @@ let ``Without a chat client the router keeps identity children`` () =
         services,
         ?configure =
             Some(fun (builder: LegateBuilder) ->
-                builder.Storage.UseSessionStore(InMemorySessionStore(database)) |> ignore)
+                builder.Storage.UseSessionStore(InMemorySessionStore(database)) |> ignore
+                builder.Llm.AddProvider(BuilderTests.StubLlmProvider()) |> ignore
+                builder.Workspace.UseRuntime(BuilderTests.StubWorkspaceRuntime()) |> ignore)
     )
     |> ignore
 
@@ -1155,12 +1529,10 @@ let ``Without a chat client the router keeps identity children`` () =
     |> ignore
 
     use provider = services.BuildServiceProvider()
-
-    let client = provider.GetRequiredService<SessionClient>()
-    (isNull (box client)) |> should equal false
-
     let service = actorServiceOf provider
-    (service.SessionChildFactory.IsNone) |> should equal true
+
+    (fun () -> (service :> IHostedService).StartAsync(CancellationToken.None).GetAwaiter().GetResult())
+    |> should throw typeof<InvalidOperationException>
 
 [<Fact>]
 let ``Invalid facade options fail client resolution`` () =
@@ -1193,7 +1565,9 @@ let private createServicesWithAgents
         services,
         ?configure =
             Some(fun (builder: LegateBuilder) ->
+                builder.Llm.AddProvider(BuilderTests.StubLlmProvider()) |> ignore
                 builder.Storage.UseSessionStore(InMemorySessionStore(database)) |> ignore
+                builder.Workspace.UseRuntime(BuilderTests.StubWorkspaceRuntime()) |> ignore
                 builder.Tools.AddSource(tools) |> ignore
                 builder.Agents.UseStore(agents) |> ignore)
     )
@@ -1259,6 +1633,39 @@ let private readAllEvents (client: SessionClient) (sessionId: SessionId) : Task<
                     paging <- false
 
         return List.ofSeq collected
+    }
+
+/// Waits for the settled turn's terminal completion row to land (issue
+/// 289): the settle waiter fires on the result observation, while the
+/// terminal event journals best-effort just after, so prefix reads must
+/// await it for deterministic counts (one terminal row per completed
+/// turn). Returns the full journal once the terminal lands.
+/// <param name="client">The session client.</param>
+/// <param name="sessionId">The session whose terminal row to await.</param>
+/// <returns>The journal with its terminal completion row.</returns>
+let private awaitTerminal (client: SessionClient) (sessionId: SessionId) : Task<SessionEvent list> =
+    task {
+        let deadline = DateTime.UtcNow + waitBound
+        let mutable events = List.empty<SessionEvent>
+        let mutable landed = false
+
+        while not landed && DateTime.UtcNow < deadline do
+            let! read = readAllEvents client sessionId
+            events <- read
+
+            landed <-
+                match List.tryLast read with
+                | Some(:? TurnCompletedEvent) -> true
+                | Some _ -> false
+                | None -> false
+
+            if not landed then
+                do! Task.Delay(25)
+
+        match List.tryLast events with
+        | Some(:? TurnCompletedEvent) -> return events
+        | Some _ -> return raise (TimeoutException("The test timed out waiting for the terminal completion row."))
+        | None -> return raise (TimeoutException("The test timed out waiting for the terminal completion row."))
     }
 
 /// The agent-switch events in a journal, in sequence order.
@@ -1554,7 +1961,7 @@ let ``Fork copies the prefix and references the source`` () : Task =
                         SessionClientOperations.OpenSessionAsync(client, agent, options, CancellationToken.None)
 
                     let waiter = settleWaiter created.Id
-                    let stream = collectStream client created.Id 0L 2
+                    let stream = collectStream client created.Id 0L 3
 
                     let! _ =
                         SessionClientOperations.PromptAsync(
@@ -1586,7 +1993,7 @@ let ``Fork copies the prefix and references the source`` () : Task =
                     first.Status |> should equal TurnStatus.Completed
                     first.AssistantText |> should equal "src"
 
-                    let! sourceEvents = readAllEvents client created.Id
+                    let! sourceEvents = awaitTerminal client created.Id
                     Assert.True(sourceEvents.Length > 0)
                     let prefixLength = int64 sourceEvents.Length
 
@@ -1657,7 +2064,7 @@ let ``Fork clamps beyond-tail and allows closed and empty prefixes`` () : Task =
                 task {
                     let! created = openSession client
                     let waiter = settleWaiter created.Id
-                    let stream = collectStream client created.Id 0L 2
+                    let stream = collectStream client created.Id 0L 3
 
                     let! _ =
                         SessionClientOperations.PromptAsync(
@@ -1687,7 +2094,7 @@ let ``Fork clamps beyond-tail and allows closed and empty prefixes`` () : Task =
 
                     let! _ = awaitWhat waiter.Task "the source turn to settle"
 
-                    let! sourceEvents = readAllEvents client created.Id
+                    let! sourceEvents = awaitTerminal client created.Id
                     Assert.True(sourceEvents.Length > 0)
 
                     let! _ = client.Store.CloseSession(client.Tenant, created.Id, CancellationToken.None)
@@ -2288,6 +2695,8 @@ let ``buildClient wires auto-title from Sessions options`` () =
     |> ignore
 
     use provider = services.BuildServiceProvider()
+    let service = actorServiceOf provider
+    (service :> IHostedService).StartAsync(CancellationToken.None).GetAwaiter().GetResult()
     let client = provider.GetRequiredService<SessionClient>()
 
     match client.AutoTitle with
@@ -2395,3 +2804,579 @@ let ``PromptAsync on a missing session throws and fires no title`` () : Task =
                     titleClient.Calls |> should equal 0
                 })
     }
+
+// ──────────────────────────────────────────────────────────────────────────
+// Completion era marking (issue 289)
+
+[<Fact>]
+let ``OpenSessionAsync marks the completion era`` () : Task =
+    task {
+        use provider =
+            (createServices (scripted [ ScriptStep.Text "done" ]) (sourced [])).BuildServiceProvider()
+
+        return!
+            withClient provider (fun client ->
+                task {
+                    let marked = ResizeArray<TenantId * SessionId>()
+
+                    client.CompletionEra <-
+                        Some(fun tenant sessionId _ ->
+                            marked.Add((tenant, sessionId))
+                            Task.CompletedTask)
+
+                    let! created = openSession client
+
+                    marked.Count |> should equal 1
+                    marked[0] |> should equal (client.Tenant, created.Id)
+                })
+    }
+
+[<Fact>]
+let ``ForkAsync marks the completion era`` () : Task =
+    task {
+        use provider =
+            (createServices (scripted [ ScriptStep.Text "done" ]) (sourced [])).BuildServiceProvider()
+
+        return!
+            withClient provider (fun client ->
+                task {
+                    let marked = ResizeArray<TenantId * SessionId>()
+
+                    client.CompletionEra <-
+                        Some(fun tenant sessionId _ ->
+                            marked.Add((tenant, sessionId))
+                            Task.CompletedTask)
+
+                    let! created = openSession client
+
+                    let! forked = SessionClientOperations.ForkAsync(client, created.Id, 0L, CancellationToken.None)
+
+                    marked.Count |> should equal 2
+                    marked[0] |> should equal (client.Tenant, created.Id)
+                    marked[1] |> should equal (client.Tenant, forked.Id)
+                })
+    }
+
+[<Fact>]
+let ``Public DI abort accepts without a started actor system or any route resolution`` () : Task =
+    task {
+        use provider =
+            (createServices (scripted [ ScriptStep.Text "must not run" ]) (sourced [])).BuildServiceProvider()
+
+        let contexts = provider.GetRequiredService<ISessionHostContexts>()
+        do! contexts.InitializeAsync(CancellationToken.None)
+        let client = provider.GetRequiredService<SessionClient>()
+        // Opening succeeds despite unavailable resolution; no host or actor system is started.
+        let! session = openSession client
+
+        let! _ =
+            Assert.ThrowsAsync<InvalidOperationException>(fun () -> client.Resolve(session.Id, CancellationToken.None))
+
+        let control = client.Store :?> ISessionAbortControlStore
+
+        let! _ =
+            client.Store.AppendInboxMessage(
+                client.Tenant,
+                session.Id,
+                UserMessagePayload(UserMessage.Text "prime"),
+                DeliveryMode.Queue,
+                CancellationToken.None
+            )
+
+        let! lease =
+            client.Store.ClaimNextTurn(
+                client.Tenant,
+                session.Id,
+                "test owner",
+                TimeSpan.FromMinutes 5.0,
+                CancellationToken.None
+            )
+
+        let claim =
+            match lease with
+            | :? TurnLeaseRenewed as lease -> lease.Claim
+            | _ -> failwith "No prime"
+
+        let! entry =
+            client.Store.AppendInboxMessage(
+                client.Tenant,
+                session.Id,
+                UserMessagePayload(UserMessage.Text "real"),
+                DeliveryMode.Queue,
+                CancellationToken.None
+            )
+
+        let turn = TurnId.New()
+
+        let! _ =
+            control.BindControlTarget(client.Tenant, session.Id, turn, entry.Position, claim, CancellationToken.None)
+
+        let! _ =
+            client.Store.UpdateSessionState(client.Tenant, session.Id, SessionState.Running, CancellationToken.None)
+
+        let! before = client.Store.ReadPendingInbox(client.Tenant, session.Id, CancellationToken.None)
+        let! receipt = client.AbortAsync(session.Id, turn, StopCause.HostShutdown, "durable", CancellationToken.None)
+        Assert.Equal(HostAbortOutcome.Accepted, receipt.Outcome)
+        let! current = client.ReadAbortTargetAsync(session.Id, CancellationToken.None)
+
+        match current with
+        | null -> failwith "Target missing"
+        | target -> Assert.Equal(turn, target.TurnId)
+
+        let! after = client.Store.ReadPendingInbox(client.Tenant, session.Id, CancellationToken.None)
+        Assert.Equal<int64>(before |> Seq.map _.Position, after |> Seq.map _.Position)
+        Assert.Empty((PromptWaitHubs.GetOrAddScoped client.Tenant session.Id).Settled)
+        let! stillOwned = client.Store.VerifyClaim(client.Tenant, claim, CancellationToken.None)
+        Assert.IsType<TurnLeaseHeld>(stillOwned) |> ignore
+    }
+
+[<Fact>]
+let ``OpenSessionAsync succeeds when the era marker fails`` () : Task =
+    task {
+        use provider =
+            (createServices (scripted [ ScriptStep.Text "done" ]) (sourced [])).BuildServiceProvider()
+
+        return!
+            withClient provider (fun client ->
+                task {
+                    // A marking failure degrades to pre-era (quiet) and
+                    // never fails the open.
+                    client.CompletionEra <-
+                        Some(fun _ _ _ -> Task.FromException(InvalidOperationException("era store down")))
+
+                    let! created = openSession client
+                    (isNull (box created)) |> should equal false
+                })
+    }
+
+// ──────────────────────────────────────────────────────────────────────────
+// Completion route gates (issue 378)
+
+/// A sink the tests register for exactly one tenant destination.
+type private GateSink() =
+
+    interface ISessionCompletionSink with
+        member _.NotifyAsync(_completion: SessionCompletion, _cancellationToken: CancellationToken) = Task.CompletedTask
+
+/// Stores a session row carrying the destination without facade
+/// validation: storage persists data, it never resolves host DI.
+let private storeRoutedSession (client: SessionClient) (destinationId: string) : Task<Session> =
+    task {
+        let options = SessionOptions()
+        options.CompletionDestinationId <- destinationId
+
+        let template =
+            {
+                Id = SessionId.New()
+                Tenant = client.Tenant
+                AgentId = AgentId.New()
+                Title = "routed"
+                State = SessionState.Idle
+                CurrentTurnId = Unchecked.defaultof<Nullable<TurnId>>
+                CreatedAt = DateTimeOffset.UtcNow
+                UpdatedAt = DateTimeOffset.UtcNow
+                ClosedAt = Unchecked.defaultof<Nullable<DateTimeOffset>>
+                WorkspaceBinding = null
+                Options = options
+                PermissionGrants = ResizeArray<string>() :> IReadOnlyList<string>
+            }
+
+        return! client.Store.CreateSession(client.Tenant, template, CancellationToken.None)
+    }
+
+[<Fact>]
+let ``OpenSessionAsync refuses unknown routes before persisting`` () : Task =
+    task {
+        use provider =
+            (createServices (scripted [ ScriptStep.Text "done" ]) (sourced [])).BuildServiceProvider()
+
+        return!
+            withClient provider (fun client ->
+                task {
+                    let options = SessionOptions()
+                    options.CompletionDestinationId <- "unknown-receiver"
+
+                    let! refusal =
+                        Assert.ThrowsAsync<CompletionRoutingException>(fun () ->
+                            SessionClientOperations.OpenSessionAsync(
+                                client,
+                                AgentId.New(),
+                                options,
+                                CancellationToken.None
+                            ))
+
+                    Assert.Equal(CompletionRoutingReason.Unknown, refusal.Reason)
+
+                    // Nothing persisted: the refusal preceded the store write.
+                    let! listed =
+                        client.Store.ListSessions(
+                            client.Tenant,
+                            Nullable(SessionState.Idle),
+                            Nullable<AgentId>(),
+                            Nullable<DateTimeOffset>(),
+                            Nullable<DateTimeOffset>(),
+                            100,
+                            null,
+                            CancellationToken.None
+                        )
+
+                    Assert.Empty(listed.Items)
+                })
+    }
+
+[<Fact>]
+let ``OpenSessionAsync accepts registered and sinkless routes`` () : Task =
+    task {
+        let services = createServices (scripted [ ScriptStep.Text "done" ]) (sourced [])
+
+        // The builder registration is covered in BuilderTests; here the
+        // exact tenant key carries the receiver the gate resolves.
+        services.AddKeyedSingleton<ISessionCompletionSink>(
+            box (TenantId.Default, "webhook"),
+            GateSink() :> ISessionCompletionSink
+        )
+        |> ignore
+
+        use provider = services.BuildServiceProvider()
+
+        return!
+            withClient provider (fun client ->
+                task {
+                    let options = SessionOptions()
+                    options.CompletionDestinationId <- "webhook"
+
+                    let! created =
+                        SessionClientOperations.OpenSessionAsync(
+                            client,
+                            AgentId.New(),
+                            options,
+                            CancellationToken.None
+                        )
+
+                    created.Options.CompletionDestinationId |> should equal "webhook"
+
+                    let! sinkless = openSession client
+                    (isNull sinkless.Options.CompletionDestinationId) |> should equal true
+                })
+    }
+
+[<Fact>]
+let ``PromptAsync refuses unknown routes before accepting work`` () : Task =
+    task {
+        use provider =
+            (createServices (scripted [ ScriptStep.Text "done" ]) (sourced [])).BuildServiceProvider()
+
+        return!
+            withClient provider (fun client ->
+                task {
+                    let! created = storeRoutedSession client "unknown-receiver"
+
+                    let! refusal =
+                        Assert.ThrowsAsync<CompletionRoutingException>(fun () ->
+                            SessionClientOperations.PromptAsync(
+                                client,
+                                created.Id,
+                                UserMessage.Text "hello",
+                                DeliveryMode.Queue,
+                                CancellationToken.None
+                            ))
+
+                    Assert.Equal(CompletionRoutingReason.Unknown, refusal.Reason)
+
+                    // No inbox mutation: the refusal preceded acceptance.
+                    let! pending = client.Store.ReadPendingInbox(client.Tenant, created.Id, CancellationToken.None)
+                    Assert.Empty(pending)
+                })
+    }
+
+[<Fact>]
+let ``ReplyAsync refuses unknown routes before consuming input`` () : Task =
+    task {
+        use provider =
+            (createServices (scripted [ ScriptStep.Text "done" ]) (sourced [])).BuildServiceProvider()
+
+        return!
+            withClient provider (fun client ->
+                task {
+                    let! created = storeRoutedSession client "unknown-receiver"
+
+                    let! refusal =
+                        Assert.ThrowsAsync<CompletionRoutingException>(fun () ->
+                            SessionClientOperations.ReplyAsync(
+                                client,
+                                created.Id,
+                                PermissionDecision("req-1", PermissionDecisionKind.AllowOnce),
+                                CancellationToken.None
+                            ))
+
+                    Assert.Equal(CompletionRoutingReason.Unknown, refusal.Reason)
+                })
+    }
+
+// ──────────────────────────────────────────────────────────────────────────
+// Replay-to-live handoff and lag recovery (issue 382)
+
+/// Appends journal events under the given turn claim on a facade-created
+/// session, so the test drives the public Subscribe path over journaled
+/// evidence without running a model turn.
+let private appendJournaled
+    (client: SessionClient)
+    (sessionId: SessionId)
+    (claim: TurnClaim)
+    (texts: string list)
+    (close: bool)
+    : Task =
+    task {
+        let events = client.EventBus.EventStore
+        let tenant = client.Tenant
+        let now = DateTimeOffset.UtcNow
+        let noSequence = Unchecked.defaultof<Nullable<int64>>
+
+        let batch =
+            [
+                for text in texts do
+                    TextDeltaEvent(sessionId, claim.TurnId, noSequence, now, text) :> SessionEvent
+                if close then
+                    SessionClosedEvent(sessionId, claim.TurnId, noSequence, now) :> SessionEvent
+            ]
+            :> IReadOnlyList<_>
+
+        let! written =
+            JournalWriter.appendWithTokenAsync events tenant sessionId claim.Token batch CancellationToken.None
+
+        match written with
+        | JournalWriter.JournalAppended _ -> ()
+        | _ -> failwith "expected the journal append to land"
+    }
+
+[<Fact>]
+let ``Subscribe overlaps append with replay keeping order and identity`` () : Task =
+    task {
+        use provider =
+            (createServices (scripted [ ScriptStep.Text "done" ]) (sourced [])).BuildServiceProvider()
+
+        return!
+            withClient provider (fun client ->
+                task {
+                    let! created = openSession client
+                    let tenant = client.Tenant
+                    let inbox = UserMessagePayload(UserMessage.Text("facade-sub")) :> InboxPayload
+
+                    let! _ =
+                        client.Store.AppendInboxMessage(
+                            tenant,
+                            created.Id,
+                            inbox,
+                            DeliveryMode.Queue,
+                            CancellationToken.None
+                        )
+
+                    let! claimed =
+                        client.Store.ClaimNextTurn(
+                            tenant,
+                            created.Id,
+                            "facade-owner",
+                            TimeSpan.FromMinutes 5.,
+                            CancellationToken.None
+                        )
+
+                    let claim = (claimed :?> TurnLeaseRenewed).Claim
+                    do! appendJournaled client created.Id claim [ "one"; "two" ] false
+
+                    // Overlap the tail append with the replay/attachment:
+                    // the collect runs while events three through five land.
+                    let collect = collectStream client created.Id 0L 5
+                    do! appendJournaled client created.Id claim [ "three"; "four" ] true
+                    let! received = awaitWhat collect "the overlapped subscription"
+
+                    // Complete unique event coverage after consumer-side
+                    // dedup on the durable identity: per-session order kept,
+                    // session identity preserved, the terminal event last.
+                    for evt in received do
+                        evt.SessionId |> should equal created.Id
+
+                    let unique =
+                        received
+                        |> Seq.map (fun evt -> evt.Sequence.Value)
+                        |> Seq.distinct
+                        |> Seq.sort
+                        |> Seq.toList
+
+                    unique |> should equal [ 1L; 2L; 3L; 4L; 5L ]
+
+                    let ordered = received |> Seq.map (fun evt -> evt.Sequence.Value) |> Seq.toList
+
+                    ordered |> should equal (List.sort ordered)
+                    (received[received.Length - 1] :? SessionClosedEvent) |> should equal true
+                })
+    }
+
+// ──────────────────────────────────────────────────────────────
+// Bounded per-session synchronization (issue 384)
+// ──────────────────────────────────────────────────────────────
+
+[<Fact>]
+let ``Sync entries carry the documented finite defaults`` () =
+    let client, _, _ = directTitleSetup ()
+
+    try
+        client.WaitPollInterval |> should equal (TimeSpan.FromMilliseconds 50.0)
+        client.MaxSyncSessions |> should equal 2048
+        client.TrackedSyncCount |> should equal 0
+
+        SessionsOptions().WaitPollInterval
+        |> should equal (TimeSpan.FromMilliseconds 50.0)
+    finally
+        (client :> IDisposable).Dispose()
+
+[<Fact>]
+let ``Sync bounds reject invalid values`` () =
+    let client, _, _ = directTitleSetup ()
+
+    try
+        Assert.Throws<ArgumentOutOfRangeException>(fun () -> client.MaxSyncSessions <- 0)
+        |> ignore
+
+        Assert.Throws<ArgumentOutOfRangeException>(fun () -> client.WaitPollInterval <- TimeSpan.Zero)
+        |> ignore
+    finally
+        (client :> IDisposable).Dispose()
+
+[<Fact>]
+let ``Many sessions track and release their sync entries`` () =
+    let client, _, _ = directTitleSetup ()
+
+    try
+        let ids = [ for _ in 1..25 -> SessionId.New() ]
+
+        for sessionId in ids do
+            client.SemaphoreFor(sessionId) |> ignore
+            client.ReleaseSlot(sessionId)
+
+        client.TrackedSyncCount |> should equal 25
+
+        for sessionId in ids do
+            client.ReleaseSession(sessionId) |> should equal true
+
+        client.TrackedSyncCount |> should equal 0
+        client.ReleaseSession(SessionId.New()) |> should equal false
+    finally
+        (client :> IDisposable).Dispose()
+
+[<Fact>]
+let ``Sync admission rejects past the cap unless an unheld entry evicts`` () =
+    let client, _, _ = directTitleSetup ()
+
+    try
+        client.MaxSyncSessions <- 2
+
+        let first = SessionId.New()
+        let second = SessionId.New()
+        let third = SessionId.New()
+
+        // Both slots stay held: nothing may evict them.
+        let firstSem = client.SemaphoreFor(first)
+        let secondSem = client.SemaphoreFor(second)
+
+        let rejected =
+            Assert.Throws<AdmissionRejectedException>(fun () -> client.SemaphoreFor(third) |> ignore)
+
+        rejected.Reason |> should equal "sessionSyncAtCapacity"
+        client.TrackedSyncCount |> should equal 2
+
+        // Releasing the first slot lets the third session evict it; held
+        // entries are never evicted, so the second gate is untouched.
+        client.ReleaseSlot(first)
+        let thirdSem = client.SemaphoreFor(third)
+        thirdSem.Wait(CancellationToken.None)
+        thirdSem.Release() |> ignore
+        client.ReleaseSlot(third)
+
+        Object.ReferenceEquals(secondSem, client.SemaphoreFor(second))
+        |> should equal true
+
+        client.ReleaseSlot(second)
+        client.ReleaseSlot(second)
+
+        client.ReleaseSession(first) |> should equal false
+        client.ReleaseSession(second) |> should equal true
+        client.ReleaseSession(third) |> should equal true
+
+        // The evicted entry stays gone: re-acquiring starts a fresh gate.
+        let revived = client.SemaphoreFor(first)
+        Object.ReferenceEquals(firstSem, revived) |> should equal false
+        client.ReleaseSlot(first)
+        client.ReleaseSession(first) |> should equal true
+    finally
+        (client :> IDisposable).Dispose()
+
+[<Fact>]
+let ``Sync reuse after release is safe`` () : Task =
+    task {
+        let client, _, _ = directTitleSetup ()
+
+        try
+            let sessionId = SessionId.New()
+            let first = client.SemaphoreFor(sessionId)
+            do! first.WaitAsync(CancellationToken.None)
+            first.Release() |> ignore
+            client.ReleaseSlot(sessionId)
+
+            client.ReleaseSession(sessionId) |> should equal true
+
+            let second = client.SemaphoreFor(sessionId)
+            Object.ReferenceEquals(first, second) |> should equal false
+            do! second.WaitAsync(CancellationToken.None)
+            second.Release() |> ignore
+            client.ReleaseSlot(sessionId)
+
+            client.ReleaseSession(sessionId) |> should equal true
+        finally
+            (client :> IDisposable).Dispose()
+    }
+
+[<Fact>]
+let ``Client disposal releases unheld entries and keeps held ones`` () =
+    let client, _, _ = directTitleSetup ()
+
+    let held = SessionId.New()
+    let idle = SessionId.New()
+
+    client.SemaphoreFor(held) |> ignore
+    client.SemaphoreFor(idle) |> ignore
+    client.ReleaseSlot(idle)
+
+    (client :> IDisposable).Dispose() |> ignore
+
+    // The held entry survives disposal; releasing its slot then
+    // disposing again drops it.
+    client.TrackedSyncCount |> should equal 1
+    client.ReleaseSlot(held)
+    (client :> IDisposable).Dispose() |> ignore
+    client.TrackedSyncCount |> should equal 0
+
+[<Fact>]
+let ``Auto-title tracker bounds markers and admits after release`` () =
+    let tracker = SessionAutoTitle.AutoTitleTracker(2)
+    let tenant = TenantId.Create "sync-bounds"
+    let first = SessionId.New()
+    let second = SessionId.New()
+    let third = SessionId.New()
+
+    tracker.TryMark(tenant, first) |> should equal true
+    tracker.TryMark(tenant, first) |> should equal false
+    tracker.TryMark(tenant, second) |> should equal true
+    tracker.TrackedCount |> should equal 2
+
+    // Past the cap new sessions skip titling until entries release.
+    tracker.TryMark(tenant, third) |> should equal false
+
+    tracker.Release(tenant, first)
+    tracker.TrackedCount |> should equal 1
+    tracker.TryMark(tenant, third) |> should equal true
+
+    Assert.Throws<ArgumentOutOfRangeException>(fun () -> tracker.MaxEntries <- 0)
+    |> ignore
+
+    tracker.MaxEntries <- 3
+    tracker.MaxEntries |> should equal 3

@@ -47,8 +47,24 @@
     <PackageVersion Include="YamlDotNet" Version="15.3.0" />
   </ItemGroup>
 
+  <!-- Issue 427 pinned exception (review by 2026-11-08): SixLabors.ImageSharp
+       3.1.12 carries five advisories (GHSA-gwg2-r3hj-4w44, GHSA-j3p4-wp97-rph4,
+       GHSA-j9gm-c75j-xc9q, GHSA-jjfr-hcj7-qf5w, GHSA-wmxv-xphr-5c9g). The only
+       advisory-clean line (4.1.2) enforces a build-time SixLaborsLicenseKey
+       that fails Release/Pack without a provisioned secret, so the bump is a
+       no-go for clean-machine/CI builds. Audit stays enabled for everything
+       else; this suppresses only the listed IDs. -->
+  <ItemGroup>
+    <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-gwg2-r3hj-4w44" />
+    <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-j3p4-wp97-rph4" />
+    <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-j9gm-c75j-xc9q" />
+    <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-jjfr-hcj7-qf5w" />
+    <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-wmxv-xphr-5c9g" />
+  </ItemGroup>
+
   <!-- Test-only packages. -->
   <ItemGroup>
+    <PackageVersion Include="Microsoft.AspNetCore.TestHost" Version="10.0.3" />
     <PackageVersion Include="FsCheck.Xunit" Version="2.16.6" />
     <PackageVersion Include="FsUnit.xUnit" Version="6.0.1" />
     <PackageVersion Include="Microsoft.Extensions.TimeProvider.Testing" Version="10.10.0" />

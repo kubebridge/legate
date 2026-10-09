@@ -9,6 +9,7 @@
   <ItemGroup>
     <Compile Include="AssemblyInfo.fs" />
     <Compile Include="Seams.fs" />
+    <Compile Include="CompletionDestinations.fs" />
     <Compile Include="SkillDiscovery.fs" />
     <Compile Include="PromptComposition.fs" />
     <Compile Include="Tools/FileTools.fs" />
@@ -17,11 +18,15 @@
     <Compile Include="Telemetry.fs" />
     <Compile Include="ClaimHeartbeat.fs" />
     <Compile Include="ClaimFence.fs" />
+    <Compile Include="CompletionEra.fs" />
     <Compile Include="JournalWriter.fs" />
     <Compile Include="LoggingScopes.fs" />
+    <Compile Include="ExecutionWorkTracker.fs" />
     <Compile Include="LlmCoordinator.fs" />
     <Compile Include="SessionArtifactEnrichment.fs" />
     <Compile Include="Transcripts.fs" />
+    <Compile Include="ConversationRecovery.fs" />
+    <Compile Include="BoundedReplay.fs" />
     <Compile Include="SessionEventBus.fs" />
     <Compile Include="SubscriptionRegistry.fs" />
     <Compile Include="LlmStreaming.fs" />
@@ -33,6 +38,9 @@
     <Compile Include="Artifacts.fs" />
     <Compile Include="SessionArtifactService.fs" />
     <Compile Include="SsrfGuard.fs" />
+    <Compile Include="ProviderFailureReason.fs" />
+    <Compile Include="ControlAdmission.fs" />
+    <Compile Include="LeaseAdmission.fs" />
     <Compile Include="TurnLoop.fs" />
     <Compile Include="AskUserTool.fs" />
     <Compile Include="SkillTool.fs" />
@@ -40,10 +48,15 @@
     <Compile Include="Compaction.fs" />
     <Compile Include="LegateOptionsBinding.fs" />
     <Compile Include="LegateDefaults.fs" />
-    <Compile Include="LegateStartupValidation.fs" />
     <Compile Include="PromptWaitHub.fs" />
+    <Compile Include="LifecyclePipe.fs" />
     <Compile Include="SessionActor.fs" />
+    <Compile Include="SessionRouteMessages.fs" />
     <Compile Include="SessionPermissions.fs" />
+    <Compile Include="SessionAddress.fs" />
+    <Compile Include="SessionHostContexts.fs" />
+    <Compile Include="SessionRouting.fs" />
+    <Compile Include="LegateStartupValidation.fs" />
     <Compile Include="ClusterSharding.fs" />
     <Compile Include="LocalActorSystem.fs" />
     <Compile Include="WireDtos.fs" />
@@ -65,6 +78,7 @@
     <Compile Include="ClusterHealth.fs" />
     <Compile Include="LlmCoordinationHealth.fs" />
     <Compile Include="SessionClientFacade.fs" />
+    <Compile Include="SessionHostBinding.fs" />
     <Compile Include="JournalArchiveOptions.fs" />
     <Compile Include="JournalArchiveWorker.fs" />
     <Compile Include="SessionExpiryService.fs" />

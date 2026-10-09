@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Run Millions of Agents on a single box | Legate</title>
+<meta name="description" content="Build durable, tool-using agents on a lightweight Akka.NET runtime. Start inside your .NET application and distribute sessions across a cluster as you grow.">
+<link rel="icon" type="image/svg+xml" sizes="any" href="logo/favicon.svg">
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="scale.css">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+</head>
+<body>
+<header class="nav">
+<div class="wrap">
+  <a class="brand" href="index.html" aria-label="Legate home">
+    <svg width="30" height="30" viewBox="0 0 32 32" aria-hidden="true"><path d="M9 6h3v21H9Z" fill="var(--ink)"/><path d="M12 7H25L23.4 9.4H12Z" fill="var(--logo-b)"/><path d="M12 10.2H22.87L21.27 12.6H12Z" fill="var(--logo-b)"/><path d="M12 13.4H21.27L22.87 15.8H12Z" fill="var(--logo-b)"/><path d="M12 16.6H23.4L25 19H12Z" fill="var(--logo-b)"/></svg>
+    <span>LEGATE</span>
+  </a>
+  <nav class="nav-links" aria-label="Main navigation">
+    <a class="active" href="index.html" aria-current="page">Home</a>
+    <a href="overview.html">Overview</a>
+    <a href="sessions.html">Sessions</a>
+    <a href="durability.html">Durability</a>
+    <a href="build.html">Build</a>
+  </nav>
+  <span class="ver-pill">v0.1.0</span>
+  <button class="theme-btn" type="button" aria-label="Switch color theme" title="Switch color theme"></button>
+  <a class="github-btn" href="https://github.com/kubebridge/legate">GitHub</a>
+</div>
+</header>
+
+<main>
+<section class="scale-hero" aria-labelledby="scale-title">
+  <canvas class="agent-field" id="agent-field" aria-hidden="true"></canvas>
+  <div class="wrap hero-content">
+    <div class="hero-eyebrow"><span class="signal-dot" aria-hidden="true"></span> THE AGENT RUNTIME FOR .NET</div>
+    <h1 class="scale-title" id="scale-title">
+      <span class="headline-lead">Run <span class="word-millions">Millions</span></span>
+      <span class="headline-agents">of Agents</span>
+      <span class="machine-line">on a <span class="machine-emphasis">single box</span></span>
+    </h1>
+    <p class="hero-description">An agent for every customer. Every project. Every workflow.<br>Durable sessions on a lightweight, message-driven runtime.</p>
+    <div class="resource-links hero-actions">
+      <a class="btn primary" href="build.html">Start building <span aria-hidden="true">↗</span></a>
+      <a class="btn" href="overview.html">Inside the runtime <span aria-hidden="true">→</span></a>
+    </div>
+    <div class="hero-bottom"><a class="scroll-cue" href="#scale-story"><span aria-hidden="true">↓</span> ONE SESSION IS JUST THE START</a><button class="motion-toggle" type="button" aria-pressed="false" hidden>Pause motion</button></div>
+  </div>
+</section>
+
+<div class="foundation-strip"><div class="wrap"><span>SMALL FOOTPRINT. BIG AMBITION.</span><ul aria-label="Built with"><li>.NET 10</li><li>Akka.NET</li><li>Apache 2.0</li></ul></div></div>
+
+<section class="scale-story wrap" id="scale-story" aria-labelledby="story-title">
+  <div class="story-copy">
+    <article class="story-step" data-stage="0">
+      <span class="sec-no">01 / START WITH ONE</span>
+      <h2 id="story-title">One agent.<br>A place to begin.</h2>
+      <p>Embed Legate in your .NET application. Give a session a model, tools, and a workspace. Send a prompt and follow the work.</p>
+      <code class="story-code">services.AddLegate(...);</code>
+      <a class="story-link" href="build.html">Build your first agent <span aria-hidden="true">↗</span></a>
+    </article>
+    <article class="story-step" data-stage="1">
+      <span class="sec-no">02 / GIVE EVERYONE THEIR OWN</span>
+      <h2>A thousand stories.<br>Each with its<br>own session.</h2>
+      <p>Keep customer conversations and project work separate. Each session has its own identity, inbox, and workspace binding, without a dedicated operating-system thread.</p>
+      <a class="story-link" href="sessions.html">Explore the session model <span aria-hidden="true">↗</span></a>
+    </article>
+    <article class="story-step" data-stage="2">
+      <span class="sec-no">03 / MAKE ROOM FOR MILLIONS</span>
+      <h2>More agents.<br>Same building<br>blocks.</h2>
+      <p>Move from one process to a cluster. Akka.NET sharding distributes session entities across nodes. Your application keeps the same session-facing API.</p>
+      <p class="story-aside">Agent population and active model calls are different scales. Admission limits keep running work within provider capacity.</p>
+      <a class="story-link" href="build.html">Choose your deployment <span aria-hidden="true">↗</span></a>
+    </article>
+  </div>
+  <div class="population-sticky">
+    <div class="population-panel" role="img" aria-label="Conceptual illustration: one session grows into a population distributed across three cluster nodes. Not a live benchmark.">
+      <div class="population-top"><span><i class="signal-dot" aria-hidden="true"></i> SESSION POPULATION</span><span>ILLUSTRATION</span></div>
+      <div class="population-count" aria-hidden="true">1<span class="count-unit">session</span></div>
+      <div class="population-visual"><canvas id="population-field" aria-hidden="true"></canvas><div class="node-dividers" aria-hidden="true"><span>NODE 01</span><span>NODE 02</span><span>NODE 03</span></div></div>
+      <div class="population-bottom"><span id="population-label">One identity. One inbox.</span><span class="population-phase" aria-hidden="true">01 / 03</span></div>
+    </div>
+    <p class="population-caption">Lightweight actors. Independently addressed sessions.</p>
+  </div>
+</section>
+
+<section class="block alt durable-section" aria-labelledby="durable"><div class="wrap">
+  <div class="sec-head" data-reveal>
+    <div><span class="sec-no cy">BUILT TO KEEP GOING</span><h2 class="sec-title" id="durable">The process can stop.<br><span>The session stays.</span></h2></div>
+    <p class="sec-sub">With SQLite or Postgres storage, sessions and their event journals survive process restarts. Recovery policies determine how interrupted turns resume or fail. Your application reconnects to the session and its history.</p>
+  </div>
+  <div class="continuity-track" data-reveal aria-label="A session continues across a process restart">
+    <div><span class="continuity-icon" aria-hidden="true">01</span><strong>Prompt</strong><code>message accepted</code></div><span class="continuity-connector" aria-hidden="true"></span>
+    <div><span class="continuity-icon" aria-hidden="true">02</span><strong>Persist</strong><code>progress journaled</code></div><span class="continuity-connector restart-connector" aria-hidden="true"><span>process restarts</span></span>
+    <div><span class="continuity-icon" aria-hidden="true">03</span><strong>Reconnect</strong><code>resume from cursor</code></div>
+  </div>
+  <div class="capability-grid">
+    <article data-reveal><span class="capability-number">01</span><h3>Continue the conversation</h3><p>Queue follow-up work, add instructions during a turn, or interrupt it when priorities change.</p></article>
+    <article data-reveal><span class="capability-number">02</span><h3>Keep a record of the work</h3><p>Stored inbox messages, turn claims, and journaled events record work accepted and progress made.</p></article>
+    <article data-reveal><span class="capability-number">03</span><h3>Pick up the event stream</h3><p>Read stored events from your last sequence number, then continue receiving live updates.</p></article>
+  </div>
+  <div class="resource-links"><a href="sessions.html">Work with sessions ↗</a><a href="durability.html">See how recovery works ↗</a></div>
+</div></section>
+
+<section class="build-invitation wrap" aria-labelledby="build-title">
+  <div data-reveal><span class="sec-no">YOUR APPLICATION. YOUR AGENTS.</span><h2 id="build-title">Think in millions.<br><span>Start with one.</span></h2><p>Bring your model. Connect your tools. Open a session.</p><a class="btn primary" href="build.html">Build your first agent <span aria-hidden="true">↗</span></a></div>
+  <div class="invitation-code" data-reveal><div class="code-heading"><span>YOUR NEXT COMMIT</span><span>C#</span></div><pre class="code"><code><span class="k">var</span> session = <span class="k">await</span> client.<span class="f">OpenSessionAsync</span>(
+    agentId, <span class="k">null</span>, ct);
+
+<span class="k">await</span> client.<span class="f">PromptAsync</span>(
+    session.Id,
+    UserMessage.Text(<span class="s">"Let's get to work."</span>),
+    DeliveryMode.Queue, ct);</code></pre><a href="build.html">Configure your host and get started <span aria-hidden="true">→</span></a></div>
+</section>
+
+</main>
+
+<footer><div class="wrap">
+  <a class="brand" href="index.html"><svg width="20" height="20" viewBox="0 0 32 32" aria-hidden="true"><path d="M9 6h3v21H9Z" fill="var(--ink)"/><path d="M12 7H25L23.4 9.4H12Z" fill="var(--logo-b)"/><path d="M12 10.2H22.87L21.27 12.6H12Z" fill="var(--logo-b)"/><path d="M12 13.4H21.27L22.87 15.8H12Z" fill="var(--logo-b)"/><path d="M12 16.6H23.4L25 19H12Z" fill="var(--logo-b)"/></svg>LEGATE</a>
+  <span class="spacer">A <a href="https://kubebridge.com">Kubebridge</a> project · Apache 2.0</span>
+  <nav><a href="https://github.com/kubebridge/legate">GitHub</a><a href="https://www.nuget.org/packages/Legate">NuGet</a></nav>
+</div></footer>
+<script src="theme.js"></script>
+<script src="scale.js"></script>
+</body>
+</html>

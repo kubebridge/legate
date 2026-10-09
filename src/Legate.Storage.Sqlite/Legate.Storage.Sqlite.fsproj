@@ -8,11 +8,15 @@
   <!-- Compile order is explicit: register every new file here, in dependency order. -->
   <ItemGroup>
     <Compile Include="AssemblyInfo.fs" />
+    <Compile Include="../Legate.Storage.InMemory/ControlTargetProtocol.fs" Link="ControlTargetProtocol.fs" />
+    <Compile Include="../Legate.Storage.InMemory/RecoveryCandidateCursor.fs" Link="RecoveryCandidateCursor.fs" />
+    <Compile Include="../Legate.Storage.InMemory/RelationalControlTarget.fs" Link="RelationalControlTarget.fs" />
     <Compile Include="SqliteExceptions.fs" />
     <Compile Include="SqliteStorageOptions.fs" />
     <Compile Include="SqliteDatabase.fs" />
     <Compile Include="SqliteSessionStore.fs" />
     <Compile Include="SqliteSessionEventStore.fs" />
+    <Compile Include="SqliteSessionSettlementStore.fs" />
     <Compile Include="SqliteAgentStore.fs" />
     <Compile Include="SqliteBlobStore.fs" />
     <Compile Include="SqliteAgentPackageStore.fs" />
@@ -21,6 +25,7 @@
 
   <ItemGroup>
     <ProjectReference Include="../Legate.Abstractions/Legate.Abstractions.fsproj" />
+    <ProjectReference Include="../Legate/Legate.fsproj" />
     <ProjectReference Include="../Legate.Storage.Migrations/Legate.Storage.Migrations.fsproj" />
   </ItemGroup>
 

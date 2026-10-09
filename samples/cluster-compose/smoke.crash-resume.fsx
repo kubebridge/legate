@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
-// Cluster crash-resume smoke for the compose harness (issue 145).
+// Cluster targeted-stop/crash smoke for the compose harness (issues 145 and 393).
+// The current control format blocks a durably stopped dormant target before
+// recovery priming. This smoke accepts canonical live-owner Aborted settlement
+// or an exact durable control-pending target, never inferred terminal completion.
 // Brings the stack up (sequenced by health gates), opens a session on
 // node 1, prompts it with the scripted transport, subscribes to the event
 // stream from node 2, stops node 1 mid-turn, and asserts the turn either
@@ -19,19 +22,23 @@
 // and the run still proves node-loss survival plus cross-node observation.
 // Either way the printed terminal payload names which path ran.
 //
-// Honest scope note: MinimalHost seeds no agents and opens sessions with a
-// fresh random agent id, so every turn fails fast at agent load (before
-// any LLM call, where the reply delay would hold it). The kill therefore
-// races dispatch/pickup rather than an in-LLM-call turn: what this proves
-// is cross-node inbox recovery (a survivor picks up the pending prompt),
-// exactly-once terminal settlement, a gapless subscriber stream, and
-// keep-majority survival. A deterministic mid-LLM-call kill needs a seeded
-// smoke agent plus open-with-agent-id (a sample-contract change, filed as
-// follow-up, not done here).
+// Mid-LLM-call guarantee: MinimalHost registers a code-defined `smoke`
+// agent under a stable id (HostWiring.fs, overridable via
+// LEGATE_SMOKE_AGENT_ID) and POST /sessions accepts that id, so the turn
+// opens against a resolvable agent, enters the LLM call (where the reply
+// delay below holds it), and the kill lands mid-call: the survivor must
+// resume (RetryTurn/ResumeAttempt) or fail (Fail/FailAttempt) per
+// Turns:CrashResume with no duplicated side effects and no subscriber
+// sequence gap. A TurnFailedEvent carrying the agent-load payload
+// ("No agent ...") means the kill raced dispatch instead and fails the
+// smoke loudly.
 //
 // The scripted reply delay makes the mid-turn kill deterministic: export
 // it before running so compose picks it up (compose reads the environment
-// at up time):
+// at up time). The smoke agent id rides the same path: export
+// LEGATE_SMOKE_AGENT_ID only to override the default both the host and
+// this script share (the host falls back to the default when the override
+// is absent or unparsable; compose defaults each node the same way):
 //
 //   LEGATE_MINIMALHOST_REPLY_DELAY_MS=10000 dotnet fsi samples/cluster-compose/smoke.crash-resume.fsx
 //
@@ -78,6 +85,16 @@ let node3 =
             v.Trim()
 
 let composeDir = Path.Combine(__SOURCE_DIRECTORY__, ".")
+
+// The stable smoke agent id shared with MinimalHost.HostWiring: the
+// default literal must match the host's, and an exported
+// LEGATE_SMOKE_AGENT_ID overrides both (compose defaults each node the
+// same way, so all three nodes serve the same identity).
+let smokeAgentId =
+    match Environment.GetEnvironmentVariable("LEGATE_SMOKE_AGENT_ID") with
+    | null -> "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+    | raw when String.IsNullOrWhiteSpace(raw) -> "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+    | raw -> raw.Trim()
 
 let json =
     JsonSerializerOptions(PropertyNamingPolicy = JsonNamingPolicy.CamelCase, PropertyNameCaseInsensitive = true)
@@ -178,10 +195,10 @@ match Environment.GetEnvironmentVariable("LEGATE_MINIMALHOST_REPLY_DELAY_MS") wi
 runCompose "up --build -d" 20
 waitReady 10.0
 
-info (sprintf "opening session on %s" node1)
+info (sprintf "opening session on %s with the stable smoke agent" node1)
 
 let openDoc =
-    postJson node1 "/sessions" """{"title":"smoke crash-resume"}"""
+    postJson node1 "/sessions" (sprintf """{"title":"smoke crash-resume","agentId":"%s"}""" smokeAgentId)
     |> Async.RunSynchronously
 
 let sessionId = openDoc.RootElement.GetProperty("sessionId").GetString()
@@ -252,42 +269,91 @@ let subscribeTask =
 
 info (sprintf "prompting session from %s (scripted reply)" node1)
 
-let promptTask =
-    postJson node1 (sprintf "/sessions/%s/prompt" sessionId) """{"text":"smoke mid-turn kill","delivery":"queue"}"""
-    |> Async.StartAsTask
+postJson node1 (sprintf "/sessions/%s/prompt" sessionId) """{"text":"smoke mid-turn kill","delivery":"queue"}"""
+|> Async.RunSynchronously
+|> ignore
 
-// Kill node 1 the moment the prompt appends: the turn has not run yet
-// (dispatch polls every few seconds), so a survivor must pick the pending
-// inbox entry up cross-node. Any sleep here only lets the victim process
-// the turn itself; the recovery path under test is survivor pickup.
-info "stopping legate-1 the moment the prompt appends"
-runCompose "stop legate-1" 5 |> ignore
+info "prompt append acknowledged"
 
-let promptResult =
-    try
-        promptTask.Wait(TimeSpan.FromSeconds(60.0)) |> ignore
+// Gate the kill on the turn entering the LLM call: TurnStartedEvent on
+// the node-2 subscriber proves the turn left dispatch, and the reply
+// delay holds the scripted call open past the kill point. A timeout fails
+// loudly instead of racing dispatch like the pre-271 script did.
+info "waiting for TurnStartedEvent before killing legate-1"
 
-        if promptTask.IsCompletedSuccessfully then
-            Some promptTask.Result
-        else
-            None
-    with _ ->
-        None
+let killDeadline = DateTimeOffset.UtcNow.AddMinutes(3.0)
+let mutable started = false
 
-match promptResult with
-| Some _ -> info "prompt append acknowledged"
-| None ->
-    info "prompt append did not acknowledge after the kill (node 1 was already down); continuing on the subscriber"
+while not started && DateTimeOffset.UtcNow < killDeadline do
+    Thread.Sleep(2000)
 
-// Observe from node 2 until a terminal turn event or the timeout.
-let deadline = DateTimeOffset.UtcNow.AddMinutes(4.0)
+    for name in seenEvents do
+        if name = "TurnStartedEvent" then
+            started <- true
+
+if not started then
+    fail "never observed TurnStartedEvent from node 2 within 3 minutes: the turn never entered the LLM call"
+
+// Accept on a different receiving host without activating or resolving the owner.
+let targetCode, targetBody =
+    getStatus node3 (sprintf "/sessions/%s/abort-target" sessionId)
+    |> Async.RunSynchronously
+
+if targetCode <> 200 then
+    fail (sprintf "target inspection failed: %d" targetCode)
+
+let targetDoc = JsonDocument.Parse(targetBody)
+let targetTurnId = targetDoc.RootElement.GetProperty("turnId").GetString()
+
+if String.IsNullOrWhiteSpace targetTurnId then
+    fail "no exact current target before kill"
+
+let originalPosition = targetDoc.RootElement.GetProperty("inboxPosition").GetInt64()
+
+let abortPayload =
+    sprintf """{"expectedTurnId":"%s","cause":"hostShutdown","reason":"cluster smoke targeted stop"}""" targetTurnId
+
+let accepted =
+    postJson node3 (sprintf "/sessions/%s/abort" sessionId) abortPayload
+    |> Async.RunSynchronously
+
+let outcomeNumber (document: JsonDocument) =
+    let value = document.RootElement.GetProperty("outcome")
+
+    if value.ValueKind = JsonValueKind.Number then
+        value.GetInt32()
+    else
+        match value.GetString() with
+        | "Accepted" -> 0
+        | "AlreadyAccepted" -> 1
+        | _ -> -1
+
+if outcomeNumber accepted <> 0 then
+    fail "host did not durably accept the exact target"
+
+let acceptedAt = accepted.RootElement.GetProperty("acceptedAt").GetString()
+info "targeted intent accepted on node 3: killing legate-1 mid-LLM-call"
+// SIGKILL, not `stop`: a graceful stop gives the victim its 10s SIGTERM
+// grace, which covers the 10s scripted reply delay, so the victim usually
+// completes the turn itself and the run proves nothing about survivor
+// recovery (vacuous pass). A crash-resume smoke must simulate a crash:
+// SIGKILL dies instantly mid-call, freezing the journal at the marker so
+// the survivor must settle past the claim-lease expiry.
+runCompose "kill legate-1" 5 |> ignore
+
+// A surviving genuine owner may settle; a dead owner leaves a durable barrier.
+let deadline = DateTimeOffset.UtcNow.AddMinutes(1.0)
 let mutable terminal: string option = None
 
 while terminal.IsNone && DateTimeOffset.UtcNow < deadline do
     Thread.Sleep(2000)
 
     for name in seenEvents do
-        if name = "TurnFailedEvent" || name = "TurnCompletedEvent" then
+        if
+            name = "TurnFailedEvent"
+            || name = "TurnCompletedEvent"
+            || name = "TurnAbortedEvent"
+        then
             terminal <- Some name
 
 match terminal with
@@ -300,11 +366,50 @@ match terminal with
     Thread.Sleep(5000)
 
     for name in seenEvents do
-        if name = "TurnFailedEvent" || name = "TurnCompletedEvent" then
+        if
+            name = "TurnFailedEvent"
+            || name = "TurnCompletedEvent"
+            || name = "TurnAbortedEvent"
+        then
             terminal <- Some name
 
 match terminal with
-| None -> fail "no TurnFailedEvent or TurnCompletedEvent observed from node 2 within the timeout"
+| None ->
+    let code, body =
+        getStatus node2 (sprintf "/sessions/%s/abort-target" sessionId)
+        |> Async.RunSynchronously
+
+    if code <> 200 then
+        fail "receiving host cannot inspect durable control pending"
+
+    use pending = JsonDocument.Parse(body)
+
+    if pending.RootElement.ValueKind = JsonValueKind.Null then
+        fail "target vanished without an observed canonical terminal event"
+
+    if pending.RootElement.GetProperty("turnId").GetString() <> targetTurnId then
+        fail "crash recovery replaced the stopped target"
+
+    if pending.RootElement.GetProperty("inboxPosition").GetInt64() <> originalPosition then
+        fail "crash recovery redirected control to another entry"
+
+    let stop = pending.RootElement.GetProperty("stop")
+
+    if
+        stop.ValueKind = JsonValueKind.Null
+        || stop.GetProperty("acceptedAt").GetString() <> acceptedAt
+    then
+        fail "receiving host lost durable intent"
+
+    if
+        seenEvents.ToArray() |> Array.filter ((=) "TurnStartedEvent") |> Array.length
+        <> 1
+    then
+        fail "stopped target restarted execution"
+
+    info "crash path: exact durable control pending, no resumed execution or fabricated terminal event"
+| Some name when name <> "TurnAbortedEvent" ->
+    fail (sprintf "accepted stop lost to noncanonical terminal report: %s" name)
 | Some name ->
     for (eventName, payload) in seenPayloads do
         if eventName = name then
@@ -316,14 +421,20 @@ match terminal with
         |> Option.map snd
         |> Option.defaultValue ""
 
-    if name = "TurnFailedEvent" then
-        if terminalPayload.Contains("No agent ") then
-            info
-                "turn failed at agent load (MinimalHost seeds no agents): the kill raced dispatch, proving cross-node pickup, not an LLM-mid-call resume"
-        else
-            info "crash path: Fail/FailAttempt (Turns:CrashResume=Fail default)"
-    else
-        info "crash path: RetryTurn/ResumeAttempt (per-session resume)"
+    if not (terminalPayload.Contains(targetTurnId)) then
+        fail "terminal event did not retain the exact target"
+
+    info "live-owner path: canonical Aborted under the accepted stop"
+
+let retried =
+    postJson node2 (sprintf "/sessions/%s/abort" sessionId) abortPayload
+    |> Async.RunSynchronously
+
+if
+    outcomeNumber retried <> 1
+    || retried.RootElement.GetProperty("acceptedAt").GetString() <> acceptedAt
+then
+    fail "fresh receiving-host retry did not retain the original immutable receipt"
 
 // No-gap, no-dup over the subscriber sequence.
 let ids = seenIds.ToArray()
@@ -355,15 +466,10 @@ info (
 // A resumed turn is one new attempt; a failed turn settles once.
 let terminals =
     seenEvents.ToArray()
-    |> Array.filter (fun n -> n = "TurnFailedEvent" || n = "TurnCompletedEvent")
+    |> Array.filter (fun n -> n = "TurnFailedEvent" || n = "TurnCompletedEvent" || n = "TurnAbortedEvent")
 
 if terminals.Length > 1 then
-    // One retry plus one settle can legitimately emit both across attempts;
-    // more than two terminal frames means a duplicated settle.
-    if terminals.Length > 2 then
-        fail (sprintf "too many terminal turn frames (possible duplicated settle): %A" terminals)
-    else
-        info (sprintf "note: both terminal frames observed across attempts: %A" terminals)
+    fail (sprintf "duplicated control settlement: %A" terminals)
 else
     info "single terminal turn frame: no duplicated settle"
 
@@ -402,7 +508,7 @@ let rec pollSurvivors () =
 Async.RunSynchronously(pollSurvivors ())
 
 let survivorOpen =
-    postJson node2 "/sessions" """{"title":"smoke survivor"}"""
+    postJson node2 "/sessions" (sprintf """{"title":"smoke survivor","agentId":"%s"}""" smokeAgentId)
     |> Async.RunSynchronously
 
 let survivorId = survivorOpen.RootElement.GetProperty("sessionId").GetString()

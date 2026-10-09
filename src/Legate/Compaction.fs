@@ -403,10 +403,52 @@ module internal Compaction =
         let replaceable = history.Count - startIndex
         replaceable > 0 && keepMessages < replaceable
 
+    /// Collects the issued function-call ids in a history message, in
+    /// order. Null messages, null contents, and null or empty ids
+    /// contribute nothing. Pure.
+    /// <param name="message">The history message to read. May be null.</param>
+    /// <returns>The call ids the message carries, in order.</returns>
+    let private callIdsOf (message: ChatMessage) : string list =
+        if isNull (box message) || isNull (box message.Contents) then
+            []
+        else
+            [
+                for content in message.Contents do
+                    match content with
+                    | :? FunctionCallContent as call when
+                        not (isNull (box call)) && not (String.IsNullOrEmpty call.CallId)
+                        ->
+                        yield call.CallId
+                    | _ -> ()
+            ]
+
+    /// Collects the function-result call ids in a history message, in
+    /// order. Null messages, null contents, and null or empty ids
+    /// contribute nothing. Pure.
+    /// <param name="message">The history message to read. May be null.</param>
+    /// <returns>The call ids the message answers, in order.</returns>
+    let private resultIdsOf (message: ChatMessage) : string list =
+        if isNull (box message) || isNull (box message.Contents) then
+            []
+        else
+            [
+                for content in message.Contents do
+                    match content with
+                    | :? FunctionResultContent as result when
+                        not (isNull (box result)) && not (String.IsNullOrEmpty result.CallId)
+                        ->
+                        yield result.CallId
+                    | _ -> ()
+            ]
+
     /// Plans the rewritten history: the leading system message when
     /// present, one user message carrying the marked summary, then the last
-    /// keepMessages messages. Returns None when nothing would be replaced,
-    /// so the caller skips the summariser call. Pure.
+    /// keepMessages messages, extended backward past any tool-result/call
+    /// split so every retained result keeps its call with its actual id
+    /// (boundary-crossing and multi-call exchanges stay paired; the suffix
+    /// shape already keeps every retained call's later results). Returns
+    /// None when nothing would be replaced, so the caller skips the
+    /// summariser call. Pure.
     /// <param name="history">The running history. Must not be null.</param>
     /// <param name="summary">The summary text. Must not be null.</param>
     /// <param name="keepMessages">How many of the most recent messages to keep. Must be at least 0.</param>
@@ -429,9 +471,39 @@ module internal Compaction =
             let replaceable = history.Count - startIndex
             let tailCount = min keepMessages replaceable
 
+            // Pairing-safe cut: the positional tail may start on a tool
+            // result whose call sits outside the tail. Extend backward one
+            // message at a time until the tail head's results all answer a
+            // retained call (or the whole replaceable region is retained),
+            // so the next model call carries complete pairings with actual
+            // identifiers and no invented or orphaned results.
+            let mutable cutIndex = history.Count - tailCount
+            let retainedCalls = HashSet<string>(StringComparer.Ordinal)
+
+            for index in cutIndex .. history.Count - 1 do
+                for id in callIdsOf history[index] do
+                    retainedCalls.Add id |> ignore
+
+            let mutable settled = false
+
+            // An empty tail keeps nothing, so there is no head to pair:
+            // the bound below also skips the loop then.
+            while not settled && cutIndex > startIndex && cutIndex < history.Count do
+                let uncovered =
+                    resultIdsOf history[cutIndex]
+                    |> List.exists (fun id -> not (retainedCalls.Contains id))
+
+                if uncovered then
+                    cutIndex <- cutIndex - 1
+
+                    for id in callIdsOf history[cutIndex] do
+                        retainedCalls.Add id |> ignore
+                else
+                    settled <- true
+
             let tail =
                 [
-                    for index in history.Count - tailCount .. history.Count - 1 -> history[index]
+                    for index in cutIndex .. history.Count - 1 -> history[index]
                 ]
 
             let summaryMessage = ChatMessage(ChatRole.User, SummaryMarker + "\n" + summary)
@@ -723,6 +795,47 @@ module internal Compaction =
                                     request.SessionId
                                     request.TurnId
 
+                            // The durable replacement tail: the planned
+                            // history without the system prefix and without
+                            // the summary message, copied so later
+                            // in-place rewrites never mutate the journaled
+                            // event.
+                            let prefixLength =
+                                if
+                                    request.History.Count > 0
+                                    && not (isNull (box request.History[0]))
+                                    && request.History[0].Role = ChatRole.System
+                                then
+                                    1
+                                else
+                                    0
+
+                            let tailStart = prefixLength + 1
+
+                            let retained =
+                                let copied = ResizeArray<ChatMessage>()
+
+                                for index in tailStart .. planned.Length - 1 do
+                                    let message = planned[index]
+
+                                    let contents =
+                                        if isNull (box message) || isNull (box message.Contents) then
+                                            ResizeArray<AIContent>() :> IList<AIContent>
+                                        else
+                                            let fresh = ResizeArray<AIContent>(message.Contents.Count)
+
+                                            for content in message.Contents do
+                                                fresh.Add(content)
+
+                                            fresh :> IList<AIContent>
+
+                                    if isNull (box message) then
+                                        copied.Add(null)
+                                    else
+                                        copied.Add(ChatMessage(message.Role, contents))
+
+                                copied :> IReadOnlyList<ChatMessage>
+
                             let compacted =
                                 CompactedEvent(
                                     request.SessionId,
@@ -730,28 +843,54 @@ module internal Compaction =
                                     Nullable<int64>(),
                                     DateTimeOffset.UtcNow,
                                     beforeEstimate,
-                                    afterEstimate
+                                    afterEstimate,
+                                    summary,
+                                    retained,
+                                    SessionEventContract.CompactedContextVersion
                                 )
                                 :> SessionEvent
 
-                            do! journalOrFence request.JournalAsync request.IsLeaseValid compacted
+                            // Durable success or explicit failure, never a
+                            // success marker with missing replacement
+                            // context: a fenced-out write raises like any
+                            // loser (zero effects), a failed persistence
+                            // journals a failure-continue instead of
+                            // rewriting, so the turn continues uncompacted.
+                            if not (request.IsLeaseValid()) then
+                                let lost = TurnLoop.TurnLeaseLostException()
+                                return raise lost
+                            else
+                                let! write = request.JournalAsync compacted
 
-                            applyRewrite request.History planned
+                                match write with
+                                | JournalWriter.JournalAppended _ ->
+                                    applyRewrite request.History planned
 
-                            let totalInput = request.InputTokens + summaryInput
-                            let totalOutput = request.OutputTokens + summaryOutput
+                                    let totalInput = request.InputTokens + summaryInput
+                                    let totalOutput = request.OutputTokens + summaryOutput
 
-                            reportCheckpoint
-                                request.Observer
-                                request.Tenant
-                                request.SessionId
-                                request.TurnId
-                                request.Attempt
-                                compactionRef
-                                totalInput
-                                totalOutput
+                                    reportCheckpoint
+                                        request.Observer
+                                        request.Tenant
+                                        request.SessionId
+                                        request.TurnId
+                                        request.Attempt
+                                        compactionRef
+                                        totalInput
+                                        totalOutput
 
-                            return Compacted(beforeEstimate, afterEstimate, totalInput, totalOutput)
+                                    return Compacted(beforeEstimate, afterEstimate, totalInput, totalOutput)
+                                | JournalWriter.JournalRejected _ ->
+                                    let lost = TurnLoop.TurnLeaseLostException()
+                                    return raise lost
+                                | JournalWriter.JournalFailed reason ->
+                                    let safe =
+                                        if String.IsNullOrWhiteSpace reason then
+                                            "The compacted context could not be persisted."
+                                        else
+                                            reason
+
+                                    return! journalFailureAsync request safe
         }
 
     /// Attempts one threshold-gated compaction pass: the TurnLoop boundary

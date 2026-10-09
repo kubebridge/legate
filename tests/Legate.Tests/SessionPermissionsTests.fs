@@ -3,6 +3,8 @@ module Legate.Tests.SessionPermissionsTests
 
 open System
 open System.Collections.Generic
+open System.IO
+open System.Text
 open System.Threading
 open System.Threading.Tasks
 open FsUnit.Xunit
@@ -103,6 +105,8 @@ let private startService
                 runner
                 (fun _ _ -> None)
                 null
+                (fun _ _ _ -> Task.FromResult false)
+                None
         )
 
     (service :> IHostedService).StartAsync(CancellationToken.None).GetAwaiter().GetResult()
@@ -166,6 +170,7 @@ let private collectJournal (journal: ISessionEventStore) (sessionId: SessionId) 
 /// Builds the production runner over a scripted client and stub tools.
 let private productionRunner
     (store: ISessionStore)
+    (journal: ISessionEventStore)
     (client: ScriptedChatClient)
     (tools: IReadOnlyDictionary<string, AITool>)
     (policy: IPermissionPolicy | null)
@@ -174,9 +179,12 @@ let private productionRunner
         (client :> IChatClient)
         store
         tenant
-        (fun _ -> (tools, TurnLoop.TurnLoopOptions.Default))
+        (fun _ _ -> Task.FromResult((tools, TurnLoop.TurnLoopOptions.Default)))
         (NeverDelay() :> ILlmDelay)
         policy
+        None
+        journal
+        SessionStreaming.defaultBounds
         None
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -205,7 +213,7 @@ let ``Ask suspends the live factory-spawned actor with the request journaled sto
         ScriptPolicy(Map.ofList [ "exec", PermissionVerdict.Ask ]) :> IPermissionPolicy
 
     let service =
-        startService store journal (productionRunner store client tools policy) (TimeSpan.FromHours 1.0)
+        startService store journal (productionRunner store journal client tools policy) (TimeSpan.FromHours 1.0)
 
     try
         let child = resolveChild service created.Id
@@ -273,7 +281,7 @@ let ``Deny on the live path skips the tool effect and continues the turn`` () =
         :> IPermissionPolicy
 
     let service =
-        startService store journal (productionRunner store client tools policy) (TimeSpan.FromHours 1.0)
+        startService store journal (productionRunner store journal client tools policy) (TimeSpan.FromHours 1.0)
 
     try
         let child = resolveChild service created.Id
@@ -315,7 +323,7 @@ let ``AllowOnce reply resumes the live turn and journals the resolve`` () =
         ScriptPolicy(Map.ofList [ "exec", PermissionVerdict.Ask ]) :> IPermissionPolicy
 
     let service =
-        startService store journal (productionRunner store client tools policy) (TimeSpan.FromHours 1.0)
+        startService store journal (productionRunner store journal client tools policy) (TimeSpan.FromHours 1.0)
 
     try
         let child = resolveChild service created.Id
@@ -382,6 +390,7 @@ let ``AllowForSession grants survive restart through the session store`` () =
             journal
             (productionRunner
                 store
+                journal
                 client1
                 (makeTools
                     [
@@ -439,6 +448,7 @@ let ``AllowForSession grants survive restart through the session store`` () =
             journal
             (productionRunner
                 store
+                journal
                 client2
                 (makeTools
                     [
@@ -486,7 +496,7 @@ let ``Closing the live session evicts the grant memory`` () =
         ScriptPolicy(Map.ofList [ "exec", PermissionVerdict.Ask ]) :> IPermissionPolicy
 
     let service =
-        startService store journal (productionRunner store client tools policy) (TimeSpan.FromHours 1.0)
+        startService store journal (productionRunner store journal client tools policy) (TimeSpan.FromHours 1.0)
 
     try
         let child = resolveChild service created.Id
@@ -552,7 +562,7 @@ let ``Permission events from the live path derive system cells`` () =
         ScriptPolicy(Map.ofList [ "exec", PermissionVerdict.Ask ]) :> IPermissionPolicy
 
     let service =
-        startService store journal (productionRunner store client tools policy) (TimeSpan.FromHours 1.0)
+        startService store journal (productionRunner store journal client tools policy) (TimeSpan.FromHours 1.0)
 
     try
         let child = resolveChild service created.Id
@@ -665,7 +675,7 @@ let ``Null policy runs the live turn with no gate`` () =
         startService
             store
             journal
-            (productionRunner store client tools Unchecked.defaultof<IPermissionPolicy>)
+            (productionRunner store journal client tools Unchecked.defaultof<IPermissionPolicy>)
             (TimeSpan.FromHours 1.0)
 
     try
@@ -686,12 +696,12 @@ let ``Null policy runs the live turn with no gate`` () =
 
 [<Fact>]
 let ``Crash seed carries the resumption note into the runner history input`` () =
-    let store, _ = createStores TimeProvider.System
+    let store, journal = createStores TimeProvider.System
     let created = createSession store
     let client = scripted [ textStep "done" ]
 
     let runner =
-        productionRunner store client (makeTools []) Unchecked.defaultof<IPermissionPolicy>
+        productionRunner store journal client (makeTools []) Unchecked.defaultof<IPermissionPolicy>
 
     let entry: InboxEntry =
         {
@@ -701,6 +711,7 @@ let ``Crash seed carries the resumption note into the runner history input`` () 
             Delivery = DeliveryMode.Queue
             Consumed = false
             AppendedAt = DateTimeOffset.UtcNow
+            TurnId = TurnId.New()
         }
 
     let seed =
@@ -713,7 +724,7 @@ let ``Crash seed carries the resumption note into the runner history input`` () 
         :> IList<ChatMessage>
 
     let fresh =
-        runner entry 1 (HashSet<string>()) None None (Some seed) CancellationToken.None None
+        runner entry 1 (HashSet<string>()) None None (Some seed) CancellationToken.None None None None (TurnId.New())
         |> fun task -> task.GetAwaiter().GetResult()
 
     fresh.Result.AssistantText |> should equal "done"
@@ -721,7 +732,7 @@ let ``Crash seed carries the resumption note into the runner history input`` () 
     let rebuildClient = scripted [ textStep "done" ]
 
     let rebuildRunner =
-        productionRunner store rebuildClient (makeTools []) Unchecked.defaultof<IPermissionPolicy>
+        productionRunner store journal rebuildClient (makeTools []) Unchecked.defaultof<IPermissionPolicy>
 
     let rebuild =
         rebuildRunner
@@ -733,6 +744,9 @@ let ``Crash seed carries the resumption note into the runner history input`` () 
             (Some seed)
             CancellationToken.None
             None
+            None
+            None
+            (TurnId.New())
         |> fun task -> task.GetAwaiter().GetResult()
 
     rebuild.Result.AssistantText |> should equal "done"
@@ -766,9 +780,12 @@ let ``spawnSuspendFactory rejects invalid wiring`` () =
     let _, journal = createStores TimeProvider.System
 
     let runner: SessionActor.SuspendableRunner =
-        fun _ _ _ _ _ _ _ _ -> Task.FromResult(Unchecked.defaultof<TurnLoop.TurnLoopCompletion>)
+        fun _ _ _ _ _ _ _ _ _ _ _ -> Task.FromResult(Unchecked.defaultof<TurnLoop.TurnLoopCompletion>)
 
     let store = InMemorySessionStore(InMemoryDatabase()) :> ISessionStore
+
+    let eraMarked: TenantId -> SessionId -> CancellationToken -> Task<bool> =
+        fun _ _ _ -> Task.FromResult false
 
     (fun () ->
         SessionActor.spawnSuspendFactory
@@ -782,6 +799,8 @@ let ``spawnSuspendFactory rejects invalid wiring`` () =
             runner
             (fun _ _ -> None)
             null
+            eraMarked
+            None
         |> ignore)
     |> should throw typeof<ArgumentNullException>
 
@@ -797,6 +816,8 @@ let ``spawnSuspendFactory rejects invalid wiring`` () =
             runner
             (fun _ _ -> None)
             null
+            eraMarked
+            None
         |> ignore)
     |> should throw typeof<ArgumentException>
 
@@ -812,6 +833,8 @@ let ``spawnSuspendFactory rejects invalid wiring`` () =
             runner
             (fun _ _ -> None)
             null
+            eraMarked
+            None
         |> ignore)
     |> should throw typeof<ArgumentOutOfRangeException>
 
@@ -827,5 +850,248 @@ let ``spawnSuspendFactory rejects invalid wiring`` () =
             runner
             Unchecked.defaultof<SessionId -> string -> CompactDeps option>
             null
+            eraMarked
+            None
         |> ignore)
     |> should throw typeof<ArgumentNullException>
+
+    (fun () ->
+        SessionActor.spawnSuspendFactory
+            store
+            tenant
+            journal
+            (NeverDelay() :> ILlmDelay)
+            (TimeSpan.FromMinutes 5.0)
+            "production"
+            (TimeSpan.FromHours 1.0)
+            runner
+            (fun _ _ -> None)
+            null
+            Unchecked.defaultof<TenantId -> SessionId -> CancellationToken -> Task<bool>>
+            None
+        |> ignore)
+    |> should throw typeof<ArgumentNullException>
+
+// ──────────────────────────────────────────────────────────────────────────
+// Usage checkpoints (issue 321): facade turns journal cumulative totals
+
+[<Fact>]
+let ``Facade turns journal cumulative UsageEvents replayable after resume`` () =
+    let store, journal = createStores TimeProvider.System
+    let created = createSession store
+    let invocations = ref []
+
+    let tools =
+        makeTools
+            [
+                "exec", stubTool "exec" "out" invocations
+            ]
+
+    let firstCalls =
+        ResizeArray<ScriptToolCall>([| ScriptToolCall("c1", "exec") |]) :> IReadOnlyList<ScriptToolCall>
+
+    let client =
+        scripted
+            [
+                ScriptStep.ToolCalls(firstCalls, 10L, 5L)
+                ScriptStep.Text("done", 3L, 2L)
+            ]
+
+    let service =
+        startService store journal (productionRunner store journal client tools null) (TimeSpan.FromHours 1.0)
+
+    try
+        let child = resolveChild service created.Id
+        promptLive store created.Id child "run"
+
+        let settled =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () -> (storedOf store created.Id).State = SessionState.Idle)
+
+        settled |> should equal true
+        invocations.Value.Length |> should equal 1
+        client.Calls |> should equal 2
+
+        let events = collectJournal journal created.Id
+
+        let usages =
+            events
+            |> Seq.choose (fun event ->
+                match event with
+                | :? UsageEvent as usage when not (isNull (box usage)) -> Some usage
+                | _ -> None)
+            |> List.ofSeq
+
+        // One boundary checkpoint plus one settle checkpoint, cumulative.
+        usages.Length |> should equal 2
+        (usages[0].InputTokens, usages[0].OutputTokens) |> should equal (10L, 5L)
+        (usages[1].InputTokens, usages[1].OutputTokens) |> should equal (13L, 7L)
+
+        // Simulated resume in a fresh reader over the same store: replay
+        // alone yields the real totals, with no in-process accumulation.
+        let fresh = collectJournal journal created.Id
+
+        let freshUsages =
+            fresh
+            |> Seq.choose (fun event ->
+                match event with
+                | :? UsageEvent as usage when not (isNull (box usage)) -> Some usage
+                | _ -> None)
+            |> List.ofSeq
+
+        freshUsages.Length |> should equal 2
+
+        let last = freshUsages[freshUsages.Length - 1]
+        (last.InputTokens, last.OutputTokens) |> should equal (13L, 7L)
+    finally
+        stopService service
+
+// ──────────────────────────────────────────────────────────────────────────
+// Skill loads (issue 321 revision): facade turns journal through rebinding
+
+/// Builds an async package-entry sequence from path/text pairs.
+let private packageEntries (pairs: (string * string) list) : IAsyncEnumerable<AgentPackageEntry> =
+    let prepared =
+        pairs
+        |> List.map (fun (path, text) -> AgentPackageEntry(path, new MemoryStream(Encoding.UTF8.GetBytes text)))
+        |> List.toArray
+
+    { new IAsyncEnumerable<AgentPackageEntry> with
+        member _.GetAsyncEnumerator(_: CancellationToken) =
+            let mutable index = -1
+
+            { new IAsyncEnumerator<AgentPackageEntry> with
+                member _.MoveNextAsync() =
+                    index <- index + 1
+                    ValueTask<bool>(index < prepared.Length)
+
+                member _.Current: AgentPackageEntry = prepared[index]
+
+                member _.DisposeAsync() : ValueTask = ValueTask()
+            }
+    }
+
+[<Fact>]
+let ``Facade turns journal SkillLoadedEvents through the rebound skill tool`` () =
+    let store, journal = createStores TimeProvider.System
+    let created = createSession store
+
+    // One skill package for this session's agent: the pre-built tool binds
+    // a stale turn id on purpose, so the journaled event proves the runner
+    // re-keyed it under the running turn.
+    let packages =
+        InMemoryStoreFactory.packageStore (InMemoryDatabase(TimeProvider.System))
+
+    packages
+        .UploadPackage(
+            tenant,
+            created.AgentId,
+            "1.0.0",
+            "permissions-skill-tests",
+            packageEntries
+                [
+                    ".agent/skills/deploy/SKILL.md", "# Deploy\nDeploys things.\n"
+                    ".agent/skills/deploy/refs/api.md", "api"
+                ],
+            CancellationToken.None
+        )
+        .GetAwaiter()
+        .GetResult()
+    |> ignore
+
+    let hostSeen = ResizeArray<SkillLoadedEvent>()
+
+    let hostOnLoaded =
+        Func<SkillLoadedEvent, Task>(fun loaded ->
+            hostSeen.Add(loaded)
+            Task.CompletedTask)
+
+    let staleTurnId = TurnId.New()
+
+    let skillTool =
+        SkillTool.Create(packages, tenant, created.AgentId, created.Id, staleTurnId, hostOnLoaded)
+
+    let tools = makeTools [ SkillTool.ToolName, skillTool ]
+
+    let args = Dictionary<string, obj>() :> IDictionary<string, obj>
+    args["name"] <- "deploy" :> obj
+
+    let skillCalls =
+        ResizeArray<ScriptToolCall>(
+            [|
+                ScriptToolCall("c1", SkillTool.ToolName, args)
+            |]
+        )
+        :> IReadOnlyList<ScriptToolCall>
+
+    let client =
+        scripted
+            [
+                ScriptStep.ToolCalls(skillCalls)
+                ScriptStep.Text("done")
+            ]
+
+    let service =
+        startService store journal (productionRunner store journal client tools null) (TimeSpan.FromHours 1.0)
+
+    try
+        let child = resolveChild service created.Id
+        promptLive store created.Id child "run"
+
+        let settled =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () -> (storedOf store created.Id).State = SessionState.Idle)
+
+        settled |> should equal true
+        client.Calls |> should equal 2
+
+        // The host callback still ran through the chained rebinding.
+        hostSeen.Count |> should equal 1
+        hostSeen[0].SkillName |> should equal "deploy"
+
+        let events = collectJournal journal created.Id
+
+        let skills =
+            events
+            |> Seq.choose (fun event ->
+                match event with
+                | :? SkillLoadedEvent as skill when not (isNull (box skill)) -> Some skill
+                | _ -> None)
+            |> List.ofSeq
+
+        skills.Length |> should equal 1
+        skills[0].SkillName |> should equal "deploy"
+        skills[0].SessionId |> should equal created.Id
+
+        skills[0].Companions
+        |> List.ofSeq
+        |> should equal [ ".agent/skills/deploy/refs/api.md" ]
+
+        // Re-keyed under the running turn, never the stale tool bind.
+        skills[0].TurnId |> should not' (equal staleTurnId)
+
+        let markers =
+            events
+            |> Seq.choose (fun event ->
+                match event with
+                | :? TurnStartedEvent as marker when not (isNull (box marker)) -> Some marker
+                | _ -> None)
+            |> List.ofSeq
+
+        markers.Length |> should equal 1
+        skills[0].TurnId |> should equal markers[0].TurnId
+
+        // Fresh reader over the same store (the simulated resume): replay
+        // alone surfaces the skill load.
+        let fresh = collectJournal journal created.Id
+
+        let freshSkills =
+            fresh
+            |> Seq.choose (fun event ->
+                match event with
+                | :? SkillLoadedEvent as skill when not (isNull (box skill)) -> Some skill
+                | _ -> None)
+            |> List.ofSeq
+
+        freshSkills.Length |> should equal 1
+        freshSkills[0].SkillName |> should equal "deploy"
+    finally
+        stopService service

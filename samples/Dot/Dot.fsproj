@@ -1,0 +1,56 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>Dot</RootNamespace>
+    <Description>Dot host with durable SQLite sessions: transcripts survive process exit for resume and list.</Description>
+    <IsPackable>false</IsPackable>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+  </PropertyGroup>
+
+  <!-- Compile order is explicit: register every new file here, in dependency order. -->
+  <ItemGroup>
+    <Compile Include="DotConfig.fs" />
+    <Compile Include="DotContext.fs" />
+    <Compile Include="DotSkills.fs" />
+    <Compile Include="DotTemplates.fs" />
+    <Compile Include="DotExport.fs" />
+    <Compile Include="DotDedup.fs" />
+    <Compile Include="ReplEngine.fs" />
+    <Compile Include="CodingTools.fs" />
+    <Compile Include="DotMcp.fs" />
+    <Compile Include="DotPicker.fs" />
+    <Compile Include="DotModels.fs" />
+    <Compile Include="DotMarkdown.fs" />
+    <Compile Include="DotShell.fs" />
+    <Compile Include="DotInput.fs" />
+    <Compile Include="DotRender.fs" />
+    <Compile Include="DotTuiMode.fs" />
+    <Compile Include="DotTuiRouting.fs" />
+    <Compile Include="DotTui.fs" />
+    <Compile Include="Program.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../src/Legate/Legate.fsproj" />
+    <ProjectReference Include="../../src/Legate.Llm.Google/Legate.Llm.Google.fsproj" />
+    <ProjectReference Include="../../src/Legate.Llm.OpenAI/Legate.Llm.OpenAI.fsproj" />
+    <ProjectReference Include="../../src/Legate.Mcp/Legate.Mcp.fsproj" />
+    <ProjectReference Include="../../src/Legate.Storage.Sqlite/Legate.Storage.Sqlite.fsproj" />
+    <ProjectReference Include="../../src/Legate.Workspace.HostDirectory/Legate.Workspace.HostDirectory.fsproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="FSharp.Core" />
+    <PackageReference Include="Microsoft.Extensions.AI.Abstractions" />
+    <PackageReference Include="Microsoft.Extensions.Configuration" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.EnvironmentVariables" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" />
+    <PackageReference Include="Microsoft.Extensions.Hosting" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
+    <PackageReference Include="YamlDotNet" />
+  </ItemGroup>
+
+</Project>

@@ -282,6 +282,193 @@ type private SubscribeEnumerable
                     cancellationToken
                 )
 
+// A node owns the lifetime of the enumerations it creates, while the
+// provider-owned event bus remains alive.  The wrapper deliberately tracks
+// enumerators rather than installing another journal callback: closing one
+// node therefore cannot detach subscriptions belonging to another consumer
+// of the same borrowed bus.
+type internal SessionSubscriptionLifetime() =
+    let cancellation = new CancellationTokenSource()
+    let gate = obj ()
+    let callbacks = ResizeArray<int * (unit -> Task)>()
+
+    let closeCompletion =
+        TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+    let mutable nextCallback = 0
+    let mutable closed = 0
+    let mutable closeStarted = 0
+
+    member _.Token = cancellation.Token
+
+    member _.IsClosed = Volatile.Read(&closed) = 1
+
+    member _.Register(dispose: unit -> Task) : IDisposable =
+        ArgumentNullException.ThrowIfNull(dispose)
+
+        let callbackId =
+            lock gate (fun () ->
+                let id = nextCallback
+                nextCallback <- nextCallback + 1
+                id)
+
+        let invokeNow =
+            lock gate (fun () ->
+                if Volatile.Read(&closed) = 1 then
+                    true
+                else
+                    callbacks.Add(callbackId, dispose)
+                    false)
+
+        if invokeNow then
+            try
+                dispose () |> ignore
+            with _ ->
+                ()
+
+        { new IDisposable with
+            member _.Dispose() =
+                lock gate (fun () ->
+                    let mutable index = -1
+
+                    for i = 0 to callbacks.Count - 1 do
+                        if fst callbacks[i] = callbackId then
+                            index <- i
+
+                    if index >= 0 then
+                        callbacks.RemoveAt(index))
+        }
+
+    member this.BeginClose() : unit =
+        if Interlocked.Exchange(&closed, 1) = 0 then
+            cancellation.Cancel()
+
+            let pending =
+                lock gate (fun () ->
+                    let copy = callbacks |> Seq.map snd |> Seq.toArray
+                    callbacks.Clear()
+                    copy)
+
+            if Interlocked.Exchange(&closeStarted, 1) = 0 then
+                task {
+                    try
+                        try
+                            let pendingTasks =
+                                pending
+                                |> Array.map (fun dispose ->
+                                    try
+                                        let started = dispose ()
+
+                                        if isNull (box started) then
+                                            Task.FromException(
+                                                InvalidOperationException("Subscription cleanup returned no task.")
+                                            )
+                                        else
+                                            started
+                                    with error ->
+                                        Task.FromException(error))
+
+                            do! Task.WhenAll pendingTasks
+                            closeCompletion.TrySetResult(()) |> ignore
+                        with error ->
+                            closeCompletion.TrySetException(error) |> ignore
+                    finally
+                        cancellation.Dispose()
+                }
+                |> ignore
+
+    member this.CloseAsync
+        (bound: TimeSpan)
+        (timeProvider: TimeProvider)
+        (cancellationToken: CancellationToken)
+        : Task =
+        this.BeginClose()
+        NodeBoundedWait.awaitTask "SessionSubscriptions" closeCompletion.Task bound timeProvider cancellationToken
+
+    member this.Close() : unit = this.BeginClose()
+
+    member this.Dispose() = this.BeginClose()
+
+    interface IDisposable with
+        member this.Dispose() = this.Close()
+
+    /// Wraps one provider-owned stream in this node's lifetime. A linked
+    /// token combines the original Subscribe token, the enumerator token,
+    /// and this node's token. The inner enumerator is disposed exactly once.
+    member this.Wrap
+        (subscribeToken: CancellationToken, factory: CancellationToken -> IAsyncEnumerable<SessionEvent>)
+        : IAsyncEnumerable<SessionEvent> =
+        ArgumentNullException.ThrowIfNull(factory)
+
+        { new IAsyncEnumerable<SessionEvent> with
+            member _.GetAsyncEnumerator(cancellationToken: CancellationToken) =
+                lock gate (fun () ->
+                    if Volatile.Read(&closed) = 1 then
+                        raise (SessionScopeRejectedException(SessionScopeRejectionReason.NodeStopping))
+
+                    let linked =
+                        CancellationTokenSource.CreateLinkedTokenSource(this.Token, subscribeToken, cancellationToken)
+
+                    try
+                        let inner = (factory linked.Token).GetAsyncEnumerator(linked.Token)
+                        let disposalGate = obj ()
+                        let mutable disposal: Task option = None
+                        let mutable registration: IDisposable option = None
+
+                        let dispose () : Task =
+                            lock disposalGate (fun () ->
+                                match disposal with
+                                | Some pending -> pending
+                                | None ->
+                                    let pending: Task =
+                                        task {
+                                            try
+                                                do! inner.DisposeAsync().AsTask()
+                                            finally
+                                                registration |> Option.iter (fun value -> value.Dispose())
+                                                linked.Dispose()
+                                        }
+
+                                    disposal <- Some pending
+                                    pending)
+
+                        let registrationId = nextCallback
+                        nextCallback <- nextCallback + 1
+
+                        callbacks.Add(registrationId, dispose)
+
+                        registration <-
+                            Some(
+                                { new IDisposable with
+                                    member _.Dispose() =
+                                        lock gate (fun () ->
+                                            let mutable index = -1
+
+                                            for i = 0 to callbacks.Count - 1 do
+                                                if fst callbacks[i] = registrationId then
+                                                    index <- i
+
+                                            if index >= 0 then
+                                                callbacks.RemoveAt(index))
+                                }
+                            )
+
+                        { new IAsyncEnumerator<SessionEvent> with
+                            member _.Current = inner.Current
+                            member _.MoveNextAsync() = inner.MoveNextAsync()
+                            member _.DisposeAsync() = ValueTask(dispose ())
+                        }
+                    with error ->
+                        linked.Dispose()
+                        raise error)
+
+        }
+
+    /// Wraps a stream without an outer Subscribe token. Kept for the direct
+    /// unit-level lifetime seam; production wiring uses the overload above.
+    member this.Wrap(factory: CancellationToken -> IAsyncEnumerable<SessionEvent>) =
+        this.Wrap(CancellationToken.None, factory)
+
 /// The replay-then-live event hub: the JournalWriter publishes its stamped
 /// batches here, and hosts read them back through ReadEvents and Subscribe.
 /// Per (tenant, session) hubs with bounded per-subscriber channels (slow
@@ -394,7 +581,10 @@ type SessionEventBus
 
             logBus tenant sessionId "The bus published events to live subscribers."
 
-    do JournalWriter.Published.Add(fun (tenant, sessionId, stamped) -> publishToHub tenant sessionId stamped)
+    let journalSubscription =
+        JournalWriter.Published.Subscribe(fun (tenant, sessionId, stamped) ->
+            if not (isDisposed ()) then
+                publishToHub tenant sessionId stamped)
 
     /// Constructs the hub over the given journal with default subscription
     /// options (512 subscribers per session, 128 buffered events each).
@@ -468,9 +658,14 @@ type SessionEventBus
 
     /// Subscribes to the session's events from the cursor: replays the
     /// journal via <see cref="M:Legate.ISessionEventStore.Replay*" /> up to
-    /// the live position, then yields live publishes gap-free with no
-    /// duplicates across the handoff. Events published during the replay
-    /// land in both paths and deduplicate by sequence. Unknown session
+    /// the live position, then yields live publishes gap-free with
+    /// best-effort sequence dedup across the handoff. Events published
+    /// during the replay land in both paths and deduplicate by sequence,
+    /// so the common case surfaces each event once; any repeated delivery
+    /// carries the identical durable identity (session id plus stamped
+    /// per-session sequence) and never represents a second append.
+    /// Resume from the last observed sequence to recover after lag,
+    /// disconnect, or restart while the journal is retained. Unknown session
     /// throws <see cref="T:Legate.SessionNotFoundException" /> and an
     /// expired journal throws
     /// <see cref="T:Legate.SessionJournalExpiredException" /> on the first
@@ -540,6 +735,8 @@ type SessionEventBus
     /// ObjectDisposedException, and live readers observe completion.
     member _.Dispose() : unit =
         if Interlocked.Exchange(&disposed, 1) = 0 then
+            journalSubscription.Dispose()
+
             for entry in hubs do
                 lock entry.Value.Gate (fun () ->
                     for subscriber in entry.Value.Subscribers do

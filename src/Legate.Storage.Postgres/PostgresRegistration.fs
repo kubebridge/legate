@@ -3,6 +3,8 @@ namespace Legate.Storage
 
 open System
 open System.Runtime.CompilerServices
+open System.Threading
+open System.Threading.Tasks
 open Legate
 open Legate.Storage.Migrations
 open Legate.Storage.Postgres
@@ -90,6 +92,15 @@ module internal PostgresRegistration =
         |> ignore
 
         services.Replace(
+            ServiceDescriptor.Singleton<ISessionSettlementStore>(
+                Func<IServiceProvider, ISessionSettlementStore>(fun provider ->
+                    PostgresSessionSettlementStore(resolveOptions provider, resolveClock provider)
+                    :> ISessionSettlementStore)
+            )
+        )
+        |> ignore
+
+        services.Replace(
             ServiceDescriptor.Singleton<IAgentStore>(
                 Func<IServiceProvider, IAgentStore>(fun provider ->
                     PostgresAgentStore(resolveOptions provider, resolveClock provider) :> IAgentStore)
@@ -101,6 +112,40 @@ module internal PostgresRegistration =
             ServiceDescriptor.Singleton<IAgentCustomToolStore>(
                 Func<IServiceProvider, IAgentCustomToolStore>(fun provider ->
                     PostgresAgentStore(resolveOptions provider, resolveClock provider) :> IAgentCustomToolStore)
+            )
+        )
+        |> ignore
+
+        // Completion era (issue 289): close the runtime's era gate over
+        // the registered session store, degrading to pre-era quiet when
+        // the store is not the PostgreSQL one or the table is missing. A
+        // singleton factory defers the cast to first resolve, so
+        // registration order never matters.
+        services.Replace(
+            ServiceDescriptor.Singleton<CompletionEra.CompletionEraGate>(
+                Func<IServiceProvider, CompletionEra.CompletionEraGate>(fun provider ->
+                    match provider.GetRequiredService<ISessionStore>() with
+                    | :? PostgresSessionStore as concrete ->
+                        {
+                            Reader =
+                                fun tenant sessionId ct ->
+                                    task {
+                                        try
+                                            return! concrete.IsCompletionEraMarkedAsync(tenant, sessionId, ct)
+                                        with _ ->
+                                            return false
+                                    }
+                            Marker =
+                                fun tenant sessionId ct ->
+                                    task {
+                                        try
+                                            do! concrete.MarkCompletionEraAsync(tenant, sessionId, ct)
+                                        with _ ->
+                                            ()
+                                    }
+                                    :> Task
+                        }
+                    | _ -> CompletionEra.preEraGate)
             )
         )
         |> ignore

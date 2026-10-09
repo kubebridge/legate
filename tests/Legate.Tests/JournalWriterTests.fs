@@ -100,6 +100,10 @@ type private CountingEventStore(inner: ISessionEventStore) =
             calls <- calls + 1
             inner.Append(tenant, sessionId, token, events, cancellationToken)
 
+        member _.AppendHostEvents(tenant, sessionId, expectedUpdatedAt, events, cancellationToken) =
+            calls <- calls + 1
+            inner.AppendHostEvents(tenant, sessionId, expectedUpdatedAt, events, cancellationToken)
+
         member _.Replay(tenant, sessionId, cursor, limit, cancellationToken) =
             inner.Replay(tenant, sessionId, cursor, limit, cancellationToken)
 
@@ -128,6 +132,14 @@ type private FlakyEventStore(inner: ISessionEventStore, failures: int, failure: 
             else
                 inner.Append(tenant, sessionId, token, events, cancellationToken)
 
+        member _.AppendHostEvents(tenant, sessionId, expectedUpdatedAt, events, cancellationToken) =
+            calls <- calls + 1
+
+            if calls <= failures then
+                Task.FromException<EventAppendOutcome>(failure)
+            else
+                inner.AppendHostEvents(tenant, sessionId, expectedUpdatedAt, events, cancellationToken)
+
         member _.Replay(tenant, sessionId, cursor, limit, cancellationToken) =
             inner.Replay(tenant, sessionId, cursor, limit, cancellationToken)
 
@@ -145,6 +157,12 @@ type private FlakyEventStore(inner: ISessionEventStore, failures: int, failure: 
 type private CancelHonoringStore() =
     interface ISessionEventStore with
         member _.Append(_, _, _, _, cancellationToken) =
+            task {
+                cancellationToken.ThrowIfCancellationRequested()
+                return Unchecked.defaultof<EventAppendOutcome>
+            }
+
+        member _.AppendHostEvents(_, _, _, _, cancellationToken) =
             task {
                 cancellationToken.ThrowIfCancellationRequested()
                 return Unchecked.defaultof<EventAppendOutcome>
@@ -286,7 +304,8 @@ let ``Every text-bearing kind redacts`` () =
              ToolCallOutputEvent(sessionId, turnId, noSequence, startInstant, "c1", "pwd=hunter2") :> SessionEvent,
              fun event -> (event :?> ToolCallOutputEvent).Output)
             ("Error",
-             ToolCallCompletedEvent(sessionId, turnId, noSequence, startInstant, "c1", "pwd=hunter2") :> SessionEvent,
+             ToolCallCompletedEvent(sessionId, turnId, noSequence, startInstant, "c1", "pwd=hunter2", "result")
+             :> SessionEvent,
              fun event -> (event :?> ToolCallCompletedEvent).Error)
             ("Question",
              QuestionAskedEvent(sessionId, turnId, noSequence, startInstant, "q1", "pwd=hunter2") :> SessionEvent,
@@ -341,7 +360,7 @@ let ``Every text-bearing kind redacts`` () =
     kept.OutputTokens |> should equal 5L
 
     let started =
-        ToolCallStartedEvent(sessionId, turnId, noSequence, startInstant, "c1", "exec") :> SessionEvent
+        ToolCallStartedEvent(sessionId, turnId, noSequence, startInstant, "c1", "exec", "{}") :> SessionEvent
 
     let keptStarted = JournalWriter.sanitizeEvent started :?> ToolCallStartedEvent
     keptStarted.ToolName |> should equal "exec"
@@ -368,7 +387,7 @@ let ``Null text fields stay null`` () =
     (isNull (box kept.Text)) |> should equal true
 
     let completed =
-        ToolCallCompletedEvent(sessionId, turnId, noSequence, startInstant, "c1", nullText) :> SessionEvent
+        ToolCallCompletedEvent(sessionId, turnId, noSequence, startInstant, "c1", nullText, "result") :> SessionEvent
 
     let keptCompleted = JournalWriter.sanitizeEvent completed :?> ToolCallCompletedEvent
     (isNull (box keptCompleted.Error)) |> should equal true
@@ -878,6 +897,7 @@ let private testCursor (requestId: string) (question: string) : TurnLoop.TurnLoo
 
     {
         RequestId = requestId
+        OriginTurnId = Unchecked.defaultof<TurnId>
         ToolName = TurnLoop.AskUserToolName
         ToolCallId = "c1"
         Kind = TurnLoop.QuestionSuspension
@@ -906,6 +926,7 @@ let private suspendedOn (cursor: TurnLoop.TurnLoopSuspension) : TurnLoop.TurnLoo
                     }
                 Outcome = null
             }
+        TurnId = cursor.OriginTurnId
         HasPendingInjects = false
         Suspension = Some cursor
     }
@@ -933,6 +954,7 @@ let private spawnWriterActor
     let baseProps: SessionActorProps =
         {
             Store = store
+            Settlement = None
             Tenant = tenant
             SessionId = sessionId
             RunTurn = (fun _ _ -> Task.FromResult(unusedResult))
@@ -940,10 +962,11 @@ let private spawnWriterActor
             OnInjectJournaled = None
             Logger = null
             Compact = None
+            StorePipe = None
         }
 
     let runner: SessionActor.SuspendableRunner =
-        fun _ _ _ _ _ _ _ _ -> Task.FromResult(completion)
+        fun _ _ _ _ _ _ _ _ _ _ _ -> Task.FromResult(completion)
 
     let deps: SessionActor.SuspendDeps =
         {
@@ -951,10 +974,13 @@ let private spawnWriterActor
             Delay = TurnLoopTests.NeverDelay() :> ILlmDelay
             AskTimeout = TimeSpan.FromMinutes 5.0
             JournalToken = token
+            PrimeClaim = None
+            Recovery = null
             RunSuspendable = runner
             ReprimeJournal = None
             RefreshCompact = None
             AgentStore = null
+            EraMarked = (fun _ _ _ -> Task.FromResult false)
         }
 
     spawn system $"journal-{Guid.NewGuid():N}" (SessionActor.behaviorWithSuspend baseProps deps)
@@ -1208,3 +1234,25 @@ let ``Scoped token append redacts fixture secrets from captured logs`` () =
     for entry in entries do
         entry.Text.Contains(secret) |> should equal false
         entry.Text.Contains(JournalWriter.RedactedText) |> should equal true
+
+[<Fact>]
+let ``Terminal completion events pass sanitizing unchanged`` () =
+    // Text-free terminal rows (issue 289) ride the catch-all: no text to
+    // redact and no byte-fit impact.
+    let sessionId = SessionId.New()
+    let turnId = TurnId.New()
+    let stamp = DateTimeOffset.UtcNow
+    let noSequence = Unchecked.defaultof<Nullable<int64>>
+
+    let completed =
+        TurnCompletedEvent(sessionId, turnId, noSequence, stamp) :> SessionEvent
+
+    let keptCompleted = JournalWriter.sanitizeEvent completed :?> TurnCompletedEvent
+    keptCompleted.SessionId |> should equal sessionId
+    keptCompleted.TurnId |> should equal turnId
+
+    let failed =
+        TurnFailedEvent(sessionId, turnId, noSequence, stamp, "settled") :> SessionEvent
+
+    let keptFailed = JournalWriter.sanitizeEvent failed :?> TurnFailedEvent
+    keptFailed.TurnId |> should equal turnId

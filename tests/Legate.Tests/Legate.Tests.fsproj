@@ -21,6 +21,7 @@
     <Compile Include="TurnTests.fs" />
     <Compile Include="LlmStreamingTests.fs" />
     <Compile Include="TurnLoopTests.fs" />
+    <Compile Include="ProviderFailureReasonTests.fs" />
     <Compile Include="ExecToolTests.fs" />
     <Compile Include="TestClockTests.fs" />
     <Compile Include="InMemoryDatabaseTests.fs" />
@@ -48,6 +49,8 @@
     <Compile Include="TranscriptsTests.fs" />
     <Compile Include="ContextPruningTests.fs" />
     <Compile Include="SessionsStoreTests.fs" />
+    <Compile Include="SqliteTestFixture.fs" />
+    <Compile Include="SessionSettlementTests.fs" />
     <Compile Include="SessionEventStoreTests.fs" />
     <Compile Include="AgentStoreTests.fs" />
     <Compile Include="AgentPackagesTests.fs" />
@@ -55,6 +58,11 @@
     <Compile Include="LegateOptionsBindingTests.fs" />
     <Compile Include="BuilderTests.fs" />
     <Compile Include="ActorSystemColdStartTests.fs" />
+    <Compile Include="SessionAddressTests.fs" />
+    <Compile Include="SessionHostBindingTests.fs" />
+    <Compile Include="ProductionSessionHostBindingTests.fs" />
+    <Compile Include="SessionHostLifetimeTests.fs" />
+    <Compile Include="ExecutionWorkTrackerTests.fs" />
     <Compile Include="ClusterShardingTests.fs" />
     <Compile Include="ClusterActorSystemTests.fs" />
     <Compile Include="ClusterHealthTests.fs" />
@@ -111,6 +119,7 @@
     <Compile Include="CustomToolSourceTests.fs" />
     <Compile Include="WebhookCompletionSinkTests.fs" />
     <Compile Include="CompletionRedriverTests.fs" />
+    <Compile Include="CompletionEraTests.fs" />
     <Compile Include="SessionExpiryTests.fs" />
     <Compile Include="DispatcherTests.fs" />
     <Compile Include="ScheduleEvaluatorTests.fs" />
@@ -119,12 +128,42 @@
     <Compile Include="PromptWaitHubTests.fs" />
     <Compile Include="PromptAndWaitTests.fs" />
     <Compile Include="SessionClientFacadeTests.fs" />
+    <Compile Include="ProductionSetupCancellationTests.fs" />
+    <Compile Include="OperationReceiptsTests.fs" />
+    <Compile Include="OperationWaitTests.fs" />
+    <Compile Include="ConversationEvidenceTests.fs" />
     <Compile Include="LegateCliSmokeTests.fs" />
+    <Compile Include="../../samples/Dot/DotConfig.fs" Link="DotConfigUnderTest.fs" />
+    <Compile Include="DotReplSmokeTests.fs" />
+    <Compile Include="../../samples/Dot/DotPicker.fs" Link="DotPickerUnderTest.fs" />
+    <Compile Include="DotPickerTests.fs" />
+    <Compile Include="../../samples/Dot/DotMarkdown.fs" Link="DotMarkdownUnderTest.fs" />
+    <Compile Include="../../samples/Dot/DotShell.fs" Link="DotShellUnderTest.fs" />
+    <Compile Include="DotShellTests.fs" />
+    <Compile Include="../../samples/Dot/DotInput.fs" Link="DotInputUnderTest.fs" />
+    <Compile Include="DotInputTests.fs" />
+    <Compile Include="../../samples/Dot/DotDedup.fs" Link="DotDedupUnderTest.fs" />
+    <Compile Include="../../samples/Dot/DotRender.fs" Link="DotRenderUnderTest.fs" />
+    <Compile Include="DotRenderTests.fs" />
+    <Compile Include="../../samples/Dot/DotTuiMode.fs" Link="DotTuiModeUnderTest.fs" />
+    <Compile Include="DotTuiModeTests.fs" />
+    <Compile Include="../../samples/Dot/DotTuiRouting.fs" Link="DotTuiRoutingUnderTest.fs" />
+    <Compile Include="DotTuiRoutingTests.fs" />
+    <Compile Include="../../samples/Dot/DotContext.fs" Link="DotContextUnderTest.fs" />
+    <Compile Include="../../samples/Dot/DotSkills.fs" Link="DotSkillsUnderTest.fs" />
+    <Compile Include="../../samples/Dot/DotTemplates.fs" Link="DotTemplatesUnderTest.fs" />
+    <Compile Include="../../samples/Dot/DotExport.fs" Link="DotExportUnderTest.fs" />
+    <Compile Include="../../samples/Dot/ReplEngine.fs" Link="ReplEngineUnderTest.fs" />
+    <Compile Include="DotAttachmentTests.fs" />
     <Compile Include="MigrationTests.fs" />
-    <Compile Include="SqliteTestFixture.fs" />
+    <Compile Include="TenantRemotingAcceptanceTests.fs" />
+    <Compile Include="TenantRoutingDuplicateTests.fs" />
     <Compile Include="SqliteSessionStoreTests.fs" />
+    <Compile Include="SqliteOperationWaitTests.fs" />
+    <Compile Include="ControlActorProtocolTests.fs" />
     <Compile Include="SqliteSessionListTests.fs" />
     <Compile Include="SqliteSessionEventStoreTests.fs" />
+    <Compile Include="SqliteContentionEnvelopeTests.fs" />
     <Compile Include="SqliteAgentStoreTests.fs" />
     <Compile Include="SqliteBlobStoreTests.fs" />
     <Compile Include="SqliteAgentPackageStoreTests.fs" />
@@ -139,6 +178,19 @@
     <Compile Include="WireSerializationGoldenTests.fs" />
     <Compile Include="CrossNodeSubscriptionTests.fs" />
     <Compile Include="TurnInCallMarkerTests.fs" />
+    <Compile Include="LegacyRejectionRecoveryTests.fs" />
+    <Compile Include="IdleAuthorityTests.fs" />
+    <Compile Include="RealTurnOwnershipTests.fs" />
+    <Compile Include="ProductionTurnRenewalTests.fs" />
+    <Compile Include="NonterminalFenceTests.fs" />
+    <Compile Include="ToolAdmissionFenceTests.fs" />
+    <Compile Include="ProductionStreamingTests.fs" />
+    <Compile Include="OrdinaryHistoryTests.fs" />
+    <Compile Include="ProductionCompactionTests.fs" />
+    <Compile Include="CompactedContextTests.fs" />
+    <Compile Include="BoundedReplayTests.fs" />
+    <Compile Include="BoundedContextTests.fs" />
+    <Compile Include="LifecyclePipeTests.fs" />
   </ItemGroup>
 
   <ItemGroup>

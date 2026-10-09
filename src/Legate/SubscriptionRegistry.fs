@@ -67,8 +67,14 @@ module internal CrossNodeSubscriptions =
     /// nothing more past the cursor right now.
     type CrossNodeEventBatch =
         {
+            /// The tenant the events belong to. The receiver validates this
+            /// before exposing any event to a subscriber.
+            Tenant: TenantId
             /// The session the events belong to.
             SessionId: SessionId
+            /// The subscriber token this batch answers. The receiver must
+            /// reject a batch for another live subscription.
+            SubscriberToken: string
             /// The events in sequence order; empty at end of stream.
             Events: IReadOnlyList<SessionEvent>
             /// The cursor to resume from: the greatest streamed sequence,
@@ -143,6 +149,12 @@ module internal CrossNodeSubscriptions =
         member _.Detach(token: string) : unit =
             if not (String.IsNullOrWhiteSpace token) then
                 lock gate (fun () -> subscribers.Remove(token) |> ignore)
+
+        /// Detaches every subscriber owned by a stopping node.  The hub is
+        /// not disposed: a provider-owned cluster entity may reuse it after
+        /// a node lifetime is rebuilt.
+        member _.DetachAll() : unit =
+            lock gate (fun () -> subscribers.Clear())
 
         /// Appends stamped events to the bounded replay cache, evicting
         /// oldest first past the bound. Null events never land.
@@ -222,10 +234,16 @@ module internal CrossNodeSubscriptions =
     /// Serves one cross-node batch from the cache with a store fallback:
     /// cached events past the cursor stream first; when the cache misses
     /// (empty cache or a cursor at or behind the cache floor) the store
-    /// replay fills the page. Unknown session and expired journal resolve
+    /// replay fills the page. A cursor behind the cache floor must never
+    /// serve the cached tail alone: the evicted prefix would skip
+    /// silently, so it falls back to the store replay covering the whole
+    /// range past the cursor. Unknown session and expired journal resolve
     /// to their branches; oversized events refuse before crossing.
     /// At-least-once throughout: evicted cache entries redeliver from the
-    /// store with duplicates allowed and no gaps.
+    /// store with duplicates allowed and no gaps. A repeated delivery
+    /// always carries the identical durable identity (session id plus
+    /// stamped per-session sequence) and never represents a second append
+    /// or a second logical tool result.
     /// <param name="eventStore">The journal to fall back to. Must not be null.</param>
     /// <param name="hub">The entity hub. Must not be null.</param>
     /// <param name="tenant">The tenant the session belongs to.</param>
@@ -255,7 +273,18 @@ module internal CrossNodeSubscriptions =
             let bound = max 1 maxBatch
             let cached = hub.ReadCached(fromSequence, bound)
 
-            if cached.Count > 0 then
+            // A cursor behind the cache floor means the bounded cache has
+            // evicted events past the cursor: serving the cached tail alone
+            // would skip the evicted prefix silently and jump the consumer
+            // past it. Fall back to the store replay instead, which covers
+            // the whole range past the cursor (duplicates allowed, no gaps)
+            // while the journal is retained.
+            let behindFloor =
+                match hub.CacheFloor() with
+                | Some floor -> fromSequence < floor
+                | None -> false
+
+            if cached.Count > 0 && not behindFloor then
                 let mutable oversized: (int64 * int) option = None
 
                 for evt in cached do
@@ -286,7 +315,9 @@ module internal CrossNodeSubscriptions =
 
                     let batch =
                         {
+                            Tenant = tenant
                             SessionId = sessionId
+                            SubscriberToken = ""
                             Events = cached
                             NextCursor = next
                             EndOfStream = cached.Count < bound
@@ -351,7 +382,9 @@ module internal CrossNodeSubscriptions =
 
                             let batch =
                                 {
+                                    Tenant = tenant
                                     SessionId = sessionId
+                                    SubscriberToken = ""
                                     Events = events
                                     NextCursor = next
                                     EndOfStream = events.Count < bound
@@ -362,7 +395,9 @@ module internal CrossNodeSubscriptions =
                     | :? EventReplayEndOfStream ->
                         let batch =
                             {
+                                Tenant = tenant
                                 SessionId = sessionId
+                                SubscriberToken = ""
                                 Events = Array.Empty<SessionEvent>() :> IReadOnlyList<SessionEvent>
                                 NextCursor = fromSequence
                                 EndOfStream = true

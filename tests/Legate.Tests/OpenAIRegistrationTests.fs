@@ -114,7 +114,7 @@ let ``AddOllamaCloud registers the cloud preset`` () =
         registerSingle (fun builder -> builder.Llm.AddOllamaCloud(config) |> ignore)
 
     provider.Id |> should equal "ollamacloud"
-    provider.DefaultModel |> should equal "llama3.1"
+    provider.DefaultModel |> should equal "gpt-oss:120b"
 
 [<Fact>]
 let ``AddOpenAICompatible registers a named endpoint`` () =

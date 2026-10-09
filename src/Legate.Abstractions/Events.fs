@@ -4,6 +4,7 @@ namespace Legate
 open System
 open System.Collections.Generic
 open System.Text.Json.Serialization
+open Microsoft.Extensions.AI
 
 // Session event contracts. A SessionEvent is one entry of the fine-grained,
 // ordered, journaled stream a session emits while a turn runs: what hosts
@@ -29,6 +30,10 @@ open System.Text.Json.Serialization
 /// them. Serialises polymorphically with System.Text.Json: every concrete
 /// event carries a stable <c>$type</c> discriminator on the wire, mirroring
 /// <see cref="T:Legate.TurnOutcome" /> and <see cref="T:Legate.Reply" />.
+/// Durable identity: the (session, sequence) pair names one journaled
+/// append. Cross-node redelivery repeats the identical pair and never a
+/// second logical event, so consumers deduplicate on it; the sequence is
+/// empty only while the event is in flight.
 /// The discriminator set is a wire contract:
 /// <list type="table">
 /// <item><term>turnStarted</term><description>a turn began running.</description></item>
@@ -142,12 +147,16 @@ and [<Sealed>] ReasoningDeltaEvent
 /// id on its ToolCallId: the call's own output and completion events, the
 /// permission request it raised, and every event raised inside a sub-agent
 /// turn the call spawned, so hosts can nest them under this call.
+/// Provider replay pairs this start with its completion: the arguments here
+/// plus the completion's result text rebuild the call, so a null or missing
+/// arguments payload never replays as a valid call (recovery rejects it).
 /// <param name="sessionId">The session the event belongs to.</param>
 /// <param name="turnId">The turn calling the tool.</param>
 /// <param name="sequence">The event's per-session sequence number, or empty while in flight.</param>
 /// <param name="timestamp">When the event was raised.</param>
 /// <param name="toolCallId">The id of the tool call that began.</param>
 /// <param name="toolName">The name of the tool being called.</param>
+/// <param name="argumentsJson">The JSON object string of the call's arguments, verbatim. Null only on journals written before issue 380; recovery rejects those explicitly.</param>
 and [<Sealed>] ToolCallStartedEvent
     (
         sessionId: SessionId,
@@ -155,7 +164,8 @@ and [<Sealed>] ToolCallStartedEvent
         sequence: Nullable<int64>,
         timestamp: DateTimeOffset,
         toolCallId: string,
-        toolName: string
+        toolName: string,
+        argumentsJson: string | null
     ) =
     inherit SessionEvent(sessionId, turnId, sequence, timestamp)
 
@@ -164,6 +174,11 @@ and [<Sealed>] ToolCallStartedEvent
 
     /// The name of the tool being called.
     member _.ToolName = toolName
+
+    /// The JSON object string of the call's arguments, verbatim. Null only
+    /// on journals written before issue 380; recovery rejects those
+    /// explicitly instead of replaying a fabricated call.
+    member _.ArgumentsJson: string | null = argumentsJson
 
 /// Tool output arrived. Output streams through deltas exactly like
 /// assistant text; the arguments never appear here (they are journaled with
@@ -194,12 +209,18 @@ and [<Sealed>] ToolCallOutputEvent
 
 /// A tool call settled. Tool errors surface here as a non-null reason;
 /// they do not fail the turn (the model sees the error and continues).
+/// Provider replay pairs this completion with its start: the start's call
+/// id, name, and arguments plus the result text here rebuild the call, so
+/// a success (null error) with a null result never replays as valid state
+/// (recovery rejects it); a failure (non-null error) may carry partial
+/// result text or none.
 /// <param name="sessionId">The session the event belongs to.</param>
 /// <param name="turnId">The turn whose tool call settled.</param>
 /// <param name="sequence">The event's per-session sequence number, or empty while in flight.</param>
 /// <param name="timestamp">When the event was raised.</param>
 /// <param name="toolCallId">The id of the tool call that settled.</param>
 /// <param name="error">Why the call failed, or null when it succeeded. Never contains secrets or tool arguments.</param>
+/// <param name="resultText">The paired provider result content text, or null when the call produced none (an error-only failure). Null on a success never replays as valid state; recovery rejects it.</param>
 and [<Sealed>] ToolCallCompletedEvent
     (
         sessionId: SessionId,
@@ -207,7 +228,8 @@ and [<Sealed>] ToolCallCompletedEvent
         sequence: Nullable<int64>,
         timestamp: DateTimeOffset,
         toolCallId: string,
-        error: string | null
+        error: string | null,
+        resultText: string | null
     ) =
     inherit SessionEvent(sessionId, turnId, sequence, timestamp)
 
@@ -217,6 +239,12 @@ and [<Sealed>] ToolCallCompletedEvent
     /// Why the call failed, or null when it succeeded. Never contains
     /// secrets or tool arguments.
     member _.Error: string | null = error
+
+    /// The paired provider result content text, or null when the call
+    /// produced none (an error-only failure). Null on a success never
+    /// replays as valid state; recovery rejects it instead of fabricating
+    /// result content.
+    member _.ResultText: string | null = resultText
 
 /// A tool call needs a decision the configured policy could not make alone:
 /// the turn suspends until the host answers. Mirrors
@@ -348,12 +376,20 @@ and [<Sealed>] UsageEvent
 /// The conversation was summarised by compaction: the summary replaced
 /// everything between the system message and the last kept messages. The
 /// estimates bound the size the compaction changed, not exact token counts.
+/// Carries the durable replacement context (issue 387): the summary text
+/// plus the retained current-format tail in complete provider-valid form,
+/// so later turns and fresh-process reopen rebuild the same compacted
+/// model input without replaying superseded history. The audit transcript
+/// is unchanged: this event still produces no transcript cell.
 /// <param name="sessionId">The session the event belongs to.</param>
 /// <param name="turnId">The turn that performed the compaction.</param>
 /// <param name="sequence">The event's per-session sequence number, or empty while in flight.</param>
 /// <param name="timestamp">When the event was raised.</param>
 /// <param name="beforeEstimate">The estimated token count of the conversation before compaction.</param>
 /// <param name="afterEstimate">The estimated token count after compaction, summary included.</param>
+/// <param name="summary">The durable summary text, without the display marker. Null only on journals written before issue 387; recovery rejects those explicitly.</param>
+/// <param name="retainedMessages">The retained current-format tail in complete provider-valid form, in conversational order, excluding the system message and the summary. Null only on journals written before issue 387; recovery rejects those explicitly.</param>
+/// <param name="formatVersion">The compacted-context format version. Must equal <see cref="F:Legate.SessionEventContract.CompactedContextVersion" /> for supported state; any other value rejects explicitly.</param>
 and [<Sealed>] CompactedEvent
     (
         sessionId: SessionId,
@@ -361,7 +397,10 @@ and [<Sealed>] CompactedEvent
         sequence: Nullable<int64>,
         timestamp: DateTimeOffset,
         beforeEstimate: int64,
-        afterEstimate: int64
+        afterEstimate: int64,
+        summary: string,
+        retainedMessages: IReadOnlyList<ChatMessage>,
+        formatVersion: int
     ) =
     inherit SessionEvent(sessionId, turnId, sequence, timestamp)
 
@@ -370,6 +409,23 @@ and [<Sealed>] CompactedEvent
 
     /// The estimated token count after compaction, summary included.
     member _.AfterEstimate = afterEstimate
+
+    /// The durable summary text, without the display marker. Null only on
+    /// journals written before issue 387; recovery rejects those
+    /// explicitly instead of replaying a marker without content.
+    member _.Summary: string = summary
+
+    /// The retained current-format tail in complete provider-valid form,
+    /// in conversational order, excluding the system message and the
+    /// summary. Null only on journals written before issue 387; recovery
+    /// rejects those explicitly instead of fabricating retained context.
+    member _.RetainedMessages: IReadOnlyList<ChatMessage> = retainedMessages
+
+    /// The compacted-context format version. Must equal
+    /// <see cref="F:Legate.SessionEventContract.CompactedContextVersion" />
+    /// for supported state; any other value rejects explicitly with a
+    /// clean start.
+    member _.FormatVersion = formatVersion
 
 /// Compaction failed but the turn continues without compaction: the model
 /// denied the summariser call, the provider errored, or the summary came
@@ -629,3 +685,26 @@ and [<Sealed>] AgentSwitchedEvent
 
     /// The agent the session converses with from now on.
     member _.NewAgentId = newAgentId
+
+/// The current conversation/event wire version carrying complete
+/// provider-required tool evidence (issue 380): tool starts carry their
+/// JSON arguments and completions carry their paired result text. Journals
+/// persisting this version round-trip those fields; older versions without
+/// them are unsupported and recovery rejects them explicitly instead of
+/// fabricating arguments, results, or valid state.
+module SessionEventContract =
+
+    /// The current event wire version. Readers accept current only;
+    /// older versions without tool arguments/result content are rejected
+    /// explicitly with a clean start, never migrated.
+    [<Literal>]
+    let CurrentVersion = 2
+
+    /// The current compacted-context format version (issue 387): the
+    /// summary plus the retained current-format tail a
+    /// <see cref="T:Legate.CompactedEvent" /> carries. Readers accept
+    /// current only; a CompactedEvent with any other version, a null or
+    /// empty summary, or a null retained tail rejects explicitly with a
+    /// clean start, never migrated or fabricated.
+    [<Literal>]
+    let CompactedContextVersion = 1

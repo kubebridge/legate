@@ -1,0 +1,1386 @@
+// SPDX-License-Identifier: Apache-2.0
+module Legate.Tests.DotRenderTests
+
+open System
+open System.Collections.Generic
+open Legate
+open Microsoft.Extensions.AI
+open Dot.DotRender
+open Dot.DotDedup
+open FsUnit.Xunit
+open Xunit
+
+// Streaming renderer proofs (issue 333): the pure DotRender fold over the
+// same Subscribe stream the REPL prints (delta accumulation, tool cards,
+// inline approval/question widgets, lifecycle markers, truncation with
+// expansion) plus the information-parity table over every SessionEvent
+// subtype and engine line() prefix. TTY-free: every case runs against pure
+// state inputs, so cards, prompts, lifecycle, and truncation are proven
+// headlessly without a terminal. The linked DotRender.fs compiles here
+// without referencing the Dot exe.
+
+let private stamp = DateTimeOffset.UtcNow
+
+let private at (sequence: int) : Nullable<int64> = Nullable<int64>(int64 sequence)
+
+let private sid () : SessionId = SessionId.New()
+let private tid () : TurnId = TurnId.New()
+
+let private started (s: SessionId) (t: TurnId) : SessionEvent =
+    TurnStartedEvent(s, t, at 1, stamp) :> SessionEvent
+
+let private delta (s: SessionId) (t: TurnId) (text: string) : SessionEvent =
+    TextDeltaEvent(s, t, at 2, stamp, text) :> SessionEvent
+
+let private reasoning (s: SessionId) (t: TurnId) (text: string) : SessionEvent =
+    ReasoningDeltaEvent(s, t, at 3, stamp, text) :> SessionEvent
+
+let private callStarted (s: SessionId) (t: TurnId) (id: string) (name: string) : SessionEvent =
+    ToolCallStartedEvent(s, t, at 4, stamp, id, name, "{}") :> SessionEvent
+
+let private callOutput (s: SessionId) (t: TurnId) (id: string) (text: string) : SessionEvent =
+    ToolCallOutputEvent(s, t, at 5, stamp, id, text) :> SessionEvent
+
+let private callCompleted (s: SessionId) (t: TurnId) (id: string) (error: string | null) : SessionEvent =
+    ToolCallCompletedEvent(s, t, at 6, stamp, id, error, "result") :> SessionEvent
+
+let private deltaAt (s: SessionId) (t: TurnId) (sequence: int) (text: string) : SessionEvent =
+    TextDeltaEvent(s, t, at sequence, stamp, text) :> SessionEvent
+
+let private startedAt (s: SessionId) (t: TurnId) (sequence: int) : SessionEvent =
+    TurnStartedEvent(s, t, at sequence, stamp) :> SessionEvent
+
+let private completedAt (s: SessionId) (t: TurnId) (sequence: int) : SessionEvent =
+    TurnCompletedEvent(s, t, at sequence, stamp) :> SessionEvent
+
+let private reasoningAt (s: SessionId) (t: TurnId) (sequence: int) (text: string) : SessionEvent =
+    ReasoningDeltaEvent(s, t, at sequence, stamp, text) :> SessionEvent
+
+let private callOutputAt (s: SessionId) (t: TurnId) (sequence: int) (id: string) (text: string) : SessionEvent =
+    ToolCallOutputEvent(s, t, at sequence, stamp, id, text) :> SessionEvent
+
+let private failedAt (s: SessionId) (t: TurnId) (sequence: int) (reason: string) : SessionEvent =
+    TurnFailedEvent(s, t, at sequence, stamp, reason) :> SessionEvent
+
+let private abortedAt (s: SessionId) (t: TurnId) (sequence: int) (reason: string) : SessionEvent =
+    TurnAbortedEvent(s, t, at sequence, stamp, StopCause.ExplicitAbort, reason) :> SessionEvent
+
+/// One settlement envelope as the engine prints it: the RESULT status
+/// line, the settlement text lines, and the END-RESULT marker.
+let private settleLines (status: string) (textLines: string list) : string list =
+    [ $"RESULT {status}" ] @ textLines @ [ "END-RESULT" ]
+
+/// The human-facing assistant blocks in conversation order.
+let private assistantBlocks (state: RendererState) : string list =
+    state.Display
+    |> List.choose (function
+        | AssistantText text -> Some text
+        | _ -> None)
+
+[<Fact>]
+let ``response progress animates below the last cell only while running`` () =
+    let cells = addUserMessage empty "hello" |> toSessionCells
+    let first = withResponseProgress SessionState.Running 0L cells
+    let next = withResponseProgress SessionState.Running 1L cells
+    Assert.Equal<Dot.DotShell.SessionCell list>(cells, first |> List.take cells.Length)
+    Assert.Contains("Waiting for response", (List.last first).Text)
+    Assert.NotEqual<string>((List.last first).Text, (List.last next).Text)
+
+    for state in
+        [
+            SessionState.Idle
+            SessionState.WaitingForInput
+            SessionState.Closed
+        ] do
+        Assert.Equal<Dot.DotShell.SessionCell list>(cells, withResponseProgress state 2L cells)
+
+[<Fact>]
+let ``nested calls sharing the parent id render independently without settling the parent`` () =
+    let s, parent, child = sid (), tid (), tid ()
+
+    let initial =
+        applyAll
+            empty
+            [
+                started s parent
+                delta s parent "Delegating"
+                callStarted s parent "task-1" "task"
+            ]
+
+    let events: SessionEvent list =
+        [
+            ToolCallStartedEvent(s, child, at 5, stamp, "task-1", "read_file", "{}")
+            ToolCallOutputEvent(s, child, at 6, stamp, "task-1", "file contents")
+            ToolCallCompletedEvent(s, child, at 7, stamp, "task-1", null, "file contents")
+            ToolCallStartedEvent(s, child, at 8, stamp, "task-1", "grep", "{}")
+            ToolCallCompletedEvent(s, child, at 9, stamp, "task-1", "not found", null)
+        ]
+
+    let nested = applyAll initial events
+    Assert.Equal(Running, nested.Tools["task-1"].Status)
+    Assert.Equal("", nested.Tools["task-1"].Output)
+    Assert.Equal(initial.ActiveTurn, nested.ActiveTurn)
+    Assert.Equal("Delegating", nested.TurnStreamed)
+    Assert.Equal(3, nested.Tools.Count)
+    Assert.Equal(nested, applyAll nested events)
+    let cells = toSessionCells nested
+    let tools = cells |> List.filter (fun cell -> cell.Style = Dot.DotShell.Tool)
+    Assert.Single tools |> ignore
+    Assert.Contains("  [tool read_file done]", tools.Head.Text)
+    Assert.Contains("  [tool grep failed]", tools.Head.Text)
+    Assert.Contains("file contents", tools.Head.Text)
+
+    let finished =
+        apply
+            nested
+            (ToolCallCompletedEvent(s, parent, at 10, stamp, "task-1", null, "<task_result>summary</task_result>"))
+
+    Assert.Equal(Succeeded, finished.Tools["task-1"].Status)
+    Assert.Contains("summary", finished.Tools["task-1"].Output)
+    Assert.Equal(3, finished.Tools.Count)
+
+[<Fact>]
+let ``interleaved sub-agents keep their names outputs and failures separate`` () =
+    let s, parent, childA, childB = sid (), tid (), tid (), tid ()
+
+    let events: SessionEvent list =
+        [
+            TurnStartedEvent(s, parent, at 1, stamp)
+            ToolCallStartedEvent(s, parent, at 2, stamp, "a", "task", """{"subagent":"explore"}""")
+            ToolCallStartedEvent(s, parent, at 3, stamp, "b", "task", """{"subagent":"general"}""")
+            ToolCallStartedEvent(s, childA, at 4, stamp, "a", "read_file", "{}")
+            ToolCallStartedEvent(s, childB, at 5, stamp, "b", "exec", "{}")
+            ToolCallOutputEvent(s, childA, at 6, stamp, "a", "source code")
+            ToolCallCompletedEvent(s, childB, at 7, stamp, "b", "command failed", null)
+            ToolCallCompletedEvent(s, childA, at 8, stamp, "a", null, "source code")
+        ]
+
+    let state = applyAll empty events
+
+    let cards =
+        toSessionCells state |> List.filter (fun cell -> cell.Style = Dot.DotShell.Tool)
+
+    Assert.Equal(2, cards.Length)
+    Assert.Contains("task · explore running", cards[0].Text)
+    Assert.Contains("source code", cards[0].Text)
+    Assert.DoesNotContain("command failed", cards[0].Text)
+    Assert.Contains("task · general running", cards[1].Text)
+    Assert.Contains("command failed", cards[1].Text)
+    Assert.DoesNotContain("source code", cards[1].Text)
+
+[<Fact>]
+let ``production child-first observations reconcile under the eventual parent task`` () =
+    let s, parent, child = sid (), tid (), tid ()
+
+    let initial =
+        applyAll
+            empty
+            [
+                started s parent
+                delta s parent "Delegating"
+            ]
+
+    let children: SessionEvent list =
+        [
+            ToolCallStartedEvent(s, child, at 3, stamp, "task-1", "read_file", "{}")
+            ToolCallOutputEvent(s, child, at 4, stamp, "task-1", "first contents")
+            ToolCallCompletedEvent(s, child, at 5, stamp, "task-1", null, "first contents")
+            ToolCallStartedEvent(s, child, at 6, stamp, "task-1", "grep", "{}")
+            ToolCallOutputEvent(s, child, at 7, stamp, "task-1", "second contents")
+            ToolCallCompletedEvent(s, child, at 8, stamp, "task-1", null, "second contents")
+        ]
+
+    let pending = applyAll initial children
+    Assert.Equal(3, pending.Tools.Count)
+    Assert.Equal(Running, pending.Tools["task-1"].Status)
+    Assert.Equal(initial.ActiveTurn, pending.ActiveTurn)
+    Assert.Equal("Delegating", pending.TurnStreamed)
+
+    let parents: SessionEvent list =
+        [
+            ToolCallStartedEvent(s, parent, at 9, stamp, "task-1", "task", """{"subagent":"explore"}""")
+            ToolCallOutputEvent(s, parent, at 10, stamp, "task-1", "summary")
+            ToolCallCompletedEvent(s, parent, at 11, stamp, "task-1", null, "summary")
+        ]
+
+    let finished = applyAll pending parents
+
+    let cards =
+        toSessionCells finished
+        |> List.filter (fun cell -> cell.Style = Dot.DotShell.Tool)
+
+    Assert.Single cards |> ignore
+    Assert.Equal(3, finished.Tools.Count)
+    Assert.Contains("[tool task · explore done]", cards.Head.Text)
+    Assert.Contains("  [tool read_file done]", cards.Head.Text)
+    Assert.Contains("  [tool grep done]", cards.Head.Text)
+    Assert.Equal("summary", finished.Tools["task-1"].Output)
+
+    let childCards =
+        finished.ToolParents
+        |> Map.toList
+        |> List.map (fun (key, _) -> finished.Tools[key])
+
+    Assert.Contains(childCards, fun card -> card.Name = "read_file" && card.Output = "first contents")
+    Assert.Contains(childCards, fun card -> card.Name = "grep" && card.Output = "second contents")
+    Assert.Equal(finished, applyAll finished (children @ parents))
+
+[<Fact>]
+let ``interleaved child-first tasks keep independent provisional parents`` () =
+    let s, parent, childA, childB = sid (), tid (), tid (), tid ()
+
+    let events: SessionEvent list =
+        [
+            TurnStartedEvent(s, parent, at 1, stamp)
+            ToolCallStartedEvent(s, childA, at 2, stamp, "a", "read_file", "{}")
+            ToolCallStartedEvent(s, childB, at 3, stamp, "b", "exec", "{}")
+            ToolCallCompletedEvent(s, childA, at 4, stamp, "a", null, "source code")
+            ToolCallCompletedEvent(s, childB, at 5, stamp, "b", "command failed", null)
+            ToolCallStartedEvent(s, parent, at 6, stamp, "b", "task", """{"subagent":"general"}""")
+            ToolCallCompletedEvent(s, parent, at 7, stamp, "b", null, "handled error")
+            ToolCallStartedEvent(s, parent, at 8, stamp, "a", "task", """{"subagent":"explore"}""")
+            ToolCallCompletedEvent(s, parent, at 9, stamp, "a", null, "summary")
+        ]
+
+    let state = applyAll empty events
+
+    let cards =
+        toSessionCells state |> List.filter (fun cell -> cell.Style = Dot.DotShell.Tool)
+
+    Assert.Equal(4, state.Tools.Count)
+    Assert.Equal(2, cards.Length)
+    Assert.Contains("task · explore done", cards[0].Text)
+    Assert.Contains("source code", cards[0].Text)
+    Assert.DoesNotContain("command failed", cards[0].Text)
+    Assert.Contains("task · general done", cards[1].Text)
+    Assert.Contains("command failed", cards[1].Text)
+    Assert.DoesNotContain("source code", cards[1].Text)
+
+/// A test-only unknown event subtype: proves unsupported shapes fail
+/// clearly (a system notice) without fabricating assistant content.
+type private BogusEvent(sessionId: SessionId, turnId: TurnId, sequence: Nullable<int64>) =
+    inherit SessionEvent(sessionId, turnId, sequence, DateTimeOffset.UtcNow)
+
+let private allEvents (s: SessionId) (t: TurnId) : SessionEvent list =
+    [
+        started s t
+        delta s t "hello"
+        reasoning s t "thinking"
+        callStarted s t "call-1" "read_file"
+        callOutput s t "call-1" "file-bytes"
+        callCompleted s t "call-1" null
+        PermissionRequestedEvent(s, t, at 7, stamp, "req-1", "exec") :> SessionEvent
+        PermissionResolvedEvent(s, t, at 8, stamp, "req-1", PermissionDecisionKind.AllowOnce) :> SessionEvent
+        QuestionAskedEvent(s, t, at 9, stamp, "q-1", "continue?") :> SessionEvent
+        QuestionAnsweredEvent(s, t, at 10, stamp, "q-1", "yes") :> SessionEvent
+        UsageEvent(s, t, at 11, stamp, 10L, 20L) :> SessionEvent
+        CompactedEvent(
+            s,
+            t,
+            at 12,
+            stamp,
+            100L,
+            40L,
+            "kept facts",
+            ResizeArray<ChatMessage>() :> IReadOnlyList<ChatMessage>,
+            SessionEventContract.CompactedContextVersion
+        )
+        :> SessionEvent
+        CompactionFailedEvent(s, t, at 13, stamp, "busy") :> SessionEvent
+        TurnCompletedEvent(s, t, at 14, stamp) :> SessionEvent
+        TurnAbortedEvent(s, t, at 15, stamp, StopCause.ExplicitAbort, "aborted") :> SessionEvent
+        TurnFailedEvent(s, t, at 16, stamp, "boom") :> SessionEvent
+        SessionClosedEvent(s, t, at 17, stamp) :> SessionEvent
+        UserMessageEvent(s, t, at 18, stamp, UserMessage.Text("fold me")) :> SessionEvent
+        ContextPrunedEvent(s, t, at 19, stamp, 2, 100L, 40L) :> SessionEvent
+        SkillInvalidEvent(s, t, at 20, stamp, "review", "no SKILL.md") :> SessionEvent
+        SkillLoadedEvent(
+            s,
+            t,
+            at 21,
+            stamp,
+            "review",
+            ResizeArray<string>([| "helper.md" |]) :> System.Collections.Generic.IReadOnlyList<string>
+        )
+        :> SessionEvent
+        AgentInvalidEvent(s, t, at 22, stamp, "helper", "missing description") :> SessionEvent
+        AgentSwitchedEvent(s, t, at 23, stamp, AgentId.New(), AgentId.New()) :> SessionEvent
+    ]
+
+// ──────────────────────────────────────────────────────────────────────────
+// Fold: Subscribe events into viewport blocks
+
+[<Fact>]
+let ``Display keeps streaming text and tool cards in conversation order`` () =
+    let s, t = sid (), tid ()
+
+    let state =
+        addLine empty "> inspect this"
+        |> fun state ->
+            applyAll
+                state
+                [
+                    startedAt s t 1
+                    deltaAt s t 2 "Before"
+                    callStarted s t "read-1" "read_file"
+                    deltaAt s t 7 "After"
+                    callCompleted s t "read-1" null
+                ]
+
+    let lines = toDisplayLines state
+    let before = lines |> List.findIndex ((=) "Before")
+    let tool = lines |> List.findIndex (fun line -> line.Contains("read_file"))
+    let after = lines |> List.findIndex ((=) "After")
+    Assert.True(before < tool && tool < after)
+    lines.Head |> should equal "> inspect this"
+
+[<Fact>]
+let ``Streamed result is not duplicated by the REPL result envelope`` () =
+    let s, t = sid (), tid ()
+    let state = applyAll empty [ started s t; delta s t "hello" ]
+
+    let state =
+        addLines
+            state
+            [
+                "RESULT Completed"
+                "hello"
+                "END-RESULT"
+            ]
+
+    toDisplayLines state
+    |> List.filter ((=) "hello")
+    |> List.length
+    |> should equal 1
+
+    let fallback =
+        addLines
+            empty
+            [
+                "RESULT Completed"
+                "hello"
+                "END-RESULT"
+            ]
+
+    toSessionCells fallback
+    |> should
+        equal
+        [
+            {
+                Dot.DotShell.Style = Dot.DotShell.Assistant
+                Dot.DotShell.Text = "hello"
+            }
+        ]
+
+[<Fact>]
+let ``User reasoning and assistant retain distinct session cell styles`` () =
+    let s, t = sid (), tid ()
+
+    let state =
+        addUserMessage empty "hi\n  keep my indentation"
+        |> fun state ->
+            applyAll
+                state
+                [
+                    started s t
+                    reasoningAt s t 3 "Considering "
+                    reasoningAt s t 4 "the request.\n\nReady."
+                    deltaAt s t 5 "Hello!"
+                ]
+
+    let cells = toSessionCells state
+
+    cells
+    |> List.map (fun cell -> cell.Style)
+    |> should
+        equal
+        [
+            Dot.DotShell.User
+            Dot.DotShell.Reasoning
+            Dot.DotShell.Assistant
+        ]
+
+    cells[0].Text |> should equal "hi\n  keep my indentation"
+    cells[1].Text |> should equal "Considering the request.\n\nReady."
+    cells[2].Text |> should equal "Hello!"
+
+[<Fact>]
+let ``Non-streamed results preserve paragraphs and code indentation`` () =
+    let state =
+        addLines
+            empty
+            [
+                "RESULT Completed"
+                "First paragraph."
+                ""
+                "    code"
+                "END-RESULT"
+            ]
+
+    let cells = toSessionCells state
+    cells.Length |> should equal 1
+    cells.Head.Style |> should equal Dot.DotShell.Assistant
+    cells.Head.Text |> should equal "First paragraph.\n\n    code"
+
+[<Fact>]
+let ``Turn errors are separate error cells`` () =
+    let s, t = sid (), tid ()
+
+    let state =
+        addUserMessage empty "hi"
+        |> fun state -> apply state (TurnFailedEvent(s, t, at 2, stamp, "unavailable"))
+
+    let cells = toSessionCells state
+
+    cells
+    |> List.map (fun cell -> cell.Style)
+    |> should
+        equal
+        [
+            Dot.DotShell.User
+            Dot.DotShell.Error
+        ]
+
+[<Fact>]
+let ``Text deltas accumulate into one assistant block`` () =
+    let s, t = sid (), tid ()
+
+    let state =
+        empty
+        |> fun current -> apply current (deltaAt s t 2 "hel")
+        |> fun next -> apply next (deltaAt s t 3 "lo")
+
+    state.Assistant |> should equal "hello"
+
+    let lines = toViewportLines state
+
+    lines
+    |> List.exists (fun line -> line.Contains("hello", StringComparison.Ordinal))
+    |> should equal true
+
+[<Fact>]
+let ``Null events and null deltas never throw`` () =
+    let s, t = sid (), tid ()
+    let state = apply empty Unchecked.defaultof<SessionEvent>
+
+    state |> should equal empty
+
+    let nullDelta =
+        TextDeltaEvent(s, t, at 2, stamp, Unchecked.defaultof<string>) :> SessionEvent
+
+    let next = apply empty nullDelta
+    next.Assistant |> should equal ""
+
+[<Fact>]
+let ``Tool started output completed correlate by id`` () =
+    let s, t = sid (), tid ()
+
+    let state =
+        empty
+        |> fun current -> apply current (callStarted s t "call-9" "exec")
+        |> fun current -> apply current (callOutputAt s t 5 "call-9" "out-")
+        |> fun current -> apply current (callOutputAt s t 7 "call-9" "bytes")
+        |> fun current -> apply current (callCompleted s t "call-9" null)
+
+    state.Order |> should equal [ "call-9" ]
+
+    match state.Tools.TryFind "call-9" with
+    | None -> failwith "expected card call-9"
+    | Some card ->
+        card.Name |> should equal "exec"
+        card.Output |> should equal "out-bytes"
+        card.Status |> should equal Succeeded
+        card.Overflow |> should equal 0
+
+    let lines = toViewportLines state
+
+    lines
+    |> List.exists (fun line -> line.Contains("exec", StringComparison.Ordinal))
+    |> should equal true
+
+    lines
+    |> List.exists (fun line -> line.Contains("done", StringComparison.Ordinal))
+    |> should equal true
+
+[<Fact>]
+let ``Permission request opens an inline widget and resolve clears it`` () =
+    let s, t = sid (), tid ()
+
+    let asked =
+        PermissionRequestedEvent(s, t, at 7, stamp, "req-7", "exec") :> SessionEvent
+
+    let pending = apply empty asked
+
+    hasPendingPermission pending |> should equal true
+
+    firstPermission pending
+    |> should
+        equal
+        (Some
+            {
+                RequestId = "req-7"
+                ToolName = "exec"
+            })
+
+    let lines = toViewportLines pending
+
+    lines
+    |> List.exists (fun line -> line.Contains("req-7", StringComparison.Ordinal))
+    |> should equal true
+
+    lines
+    |> List.exists (fun line -> line.Contains("[permission]", StringComparison.Ordinal))
+    |> should equal true
+
+    let resolved =
+        PermissionResolvedEvent(s, t, at 8, stamp, "req-7", PermissionDecisionKind.Deny) :> SessionEvent
+
+    let settled = apply pending resolved
+    hasPendingPermission settled |> should equal false
+
+[<Fact>]
+let ``Question asked opens an answer field and answered clears it`` () =
+    let s, t = sid (), tid ()
+
+    let asked =
+        QuestionAskedEvent(s, t, at 9, stamp, "q-7", "continue?") :> SessionEvent
+
+    let pending = apply empty asked
+
+    hasPendingQuestion pending |> should equal true
+
+    firstQuestion pending
+    |> should
+        equal
+        (Some
+            {
+                QuestionId = "q-7"
+                Question = "continue?"
+            })
+
+    let lines = toViewportLines pending
+
+    lines
+    |> List.exists (fun line -> line.Contains("continue?", StringComparison.Ordinal))
+    |> should equal true
+
+    lines
+    |> List.exists (fun line -> line.Contains("[answer]", StringComparison.Ordinal))
+    |> should equal true
+
+    let answered =
+        QuestionAnsweredEvent(s, t, at 10, stamp, "q-7", "yes") :> SessionEvent
+
+    let settled = apply pending answered
+    hasPendingQuestion settled |> should equal false
+
+// ──────────────────────────────────────────────────────────────────────────
+// Markdown-lite plus truncation model
+
+[<Fact>]
+let ``Headings code fences and lists keep readable structure`` () =
+    renderMarkdownLite "# Title" |> should equal [ "Title" ]
+    renderMarkdownLite "## Section" |> should equal [ "Section" ]
+    renderMarkdownLite "```fsharp" |> should equal [ "```fsharp" ]
+    renderMarkdownLite "- item" |> should equal [ "• item" ]
+    renderMarkdownLite "* item" |> should equal [ "• item" ]
+    renderMarkdownLite "1. item" |> should equal [ "1. item" ]
+    renderMarkdownLite "plain" |> should equal [ "plain" ]
+    (renderMarkdownLite null |> List.isEmpty) |> should equal true
+    (renderMarkdownLite "" |> List.isEmpty) |> should equal true
+
+[<Fact>]
+let ``Huge tool output truncates with an expansion affordance`` () =
+    let s, t = sid (), tid ()
+    let huge = String.replicate (maxToolOutputChars + 500) "x"
+
+    let state =
+        empty
+        |> fun current -> apply current (callStarted s t "big" "exec")
+        |> fun current -> apply current (callOutput s t "big" huge)
+
+    match state.Tools.TryFind "big" with
+    | None -> failwith "expected card big"
+    | Some card ->
+        card.Output.Length |> should equal maxToolOutputChars
+        (card.Overflow > 0) |> should equal true
+
+    let lines = toViewportLines state
+
+    lines
+    |> List.exists (fun line -> line.Contains("truncated", StringComparison.Ordinal))
+    |> should equal true
+
+    lines
+    |> List.exists (fun line -> line.Contains("Ctrl+T", StringComparison.Ordinal))
+    |> should equal true
+
+    let expanded = toggleExpanded state "big"
+
+    match expanded.Tools.TryFind "big" with
+    | None -> failwith "expected card big"
+    | Some card -> card.Expanded |> should equal true
+
+[<Fact>]
+let ``Huge assistant deltas cap instead of growing without bound`` () =
+    let s, t = sid (), tid ()
+    let huge = String.replicate (maxAssistantChars + 100) "y"
+    let state = apply empty (delta s t huge)
+
+    state.Assistant.Length |> should equal maxAssistantChars
+    state.AssistantTruncated |> should equal true
+
+    let lines = toViewportLines state
+
+    lines
+    |> List.exists (fun line -> line.Contains("truncated", StringComparison.Ordinal))
+    |> should equal true
+
+[<Fact>]
+let ``Meta lines keep a tail window`` () =
+    let mutable state = empty
+
+    for n in 1 .. (maxMetaLines + 50) do
+        state <- addLine state $"LINE {n}"
+
+    state.Diagnostics.Length |> should equal maxMetaLines
+    state.Diagnostics |> List.head |> should equal $"LINE 51"
+
+    let lines = toViewportLines state
+
+    lines
+    |> List.exists (fun line -> line = $"LINE {maxMetaLines + 50}")
+    |> should equal true
+
+    lines |> List.exists (fun line -> line = "LINE 1") |> should equal false
+
+// ──────────────────────────────────────────────────────────────────────────
+// Tool-call cards
+
+[<Fact>]
+let ``Running completed and failed states paint distinctly`` () =
+    let running: ToolCard =
+        {
+            Id = "a"
+            Name = "exec"
+            Status = Running
+            Output = ""
+            Overflow = 0
+            Expanded = false
+        }
+
+    let doneCard = { running with Status = Succeeded }
+    let failedCard = { running with Status = Failed "boom" }
+
+    renderToolCard running |> List.head |> should equal "[tool exec running] id=a"
+    renderToolCard doneCard |> List.head |> should equal "[tool exec done] id=a"
+
+    let failedLines = renderToolCard failedCard
+    failedLines |> List.head |> should equal "[tool exec failed] id=a"
+
+    failedLines
+    |> List.exists (fun line -> line.Contains("boom", StringComparison.Ordinal))
+    |> should equal true
+
+[<Fact>]
+let ``Unknown tool output still cards by id`` () =
+    let s, t = sid (), tid ()
+    let state = apply empty (callOutput s t "orphan" "bytes")
+
+    match state.Tools.TryFind "orphan" with
+    | None -> failwith "expected orphan card"
+    | Some card ->
+        card.Name |> should equal "unknown"
+        card.Output |> should equal "bytes"
+
+// ──────────────────────────────────────────────────────────────────────────
+// Turn lifecycle and parity checklist
+
+[<Fact>]
+let ``Lifecycle markers name running settled aborted and failed in place`` () =
+    let s, t = sid (), tid ()
+
+    let state =
+        empty
+        |> fun current -> apply current (started s t)
+        |> fun current -> apply current (TurnCompletedEvent(s, t, at 14, stamp) :> SessionEvent)
+        |> fun current ->
+            apply current (TurnAbortedEvent(s, t, at 15, stamp, StopCause.ExplicitAbort, "nope") :> SessionEvent)
+        |> fun current -> apply current (TurnFailedEvent(s, t, at 16, stamp, "boom") :> SessionEvent)
+        |> fun current -> apply current (SessionClosedEvent(s, t, at 17, stamp) :> SessionEvent)
+
+    let lines = toViewportLines state
+
+    lines
+    |> List.exists (fun line -> line.Contains("turn running", StringComparison.Ordinal))
+    |> should equal true
+
+    lines
+    |> List.exists (fun line -> line.Contains("turn completed", StringComparison.Ordinal))
+    |> should equal true
+
+    lines
+    |> List.exists (fun line -> line.Contains("nope", StringComparison.Ordinal))
+    |> should equal true
+
+    lines
+    |> List.exists (fun line -> line.Contains("boom", StringComparison.Ordinal))
+    |> should equal true
+
+    lines
+    |> List.exists (fun line -> line.Contains("session closed", StringComparison.Ordinal))
+    |> should equal true
+
+[<Fact>]
+let ``Compaction prune usage skill and agent notices are retained`` () =
+    let s, t = sid (), tid ()
+    let state = applyAll empty (allEvents s t)
+    let lines = toViewportLines state
+    let joined = String.Join("\n", lines)
+
+    joined.Contains("compacted before=100 after=40", StringComparison.Ordinal)
+    |> should equal true
+
+    joined.Contains("compaction failed: busy", StringComparison.Ordinal)
+    |> should equal true
+
+    joined.Contains("usage input-tokens=10 output-tokens=20", StringComparison.Ordinal)
+    |> should equal true
+
+    joined.Contains("pruned 2", StringComparison.Ordinal) |> should equal true
+    joined.Contains("review", StringComparison.Ordinal) |> should equal true
+    joined.Contains("agent switched", StringComparison.Ordinal) |> should equal true
+    joined.Contains("user-message", StringComparison.Ordinal) |> should equal true
+
+[<Fact>]
+let ``Every SessionEvent subtype is covered by the viewport`` () =
+    let s, t = sid (), tid ()
+
+    for evt in allEvents s t do
+        coversEvent evt |> should equal true
+
+    coversEvent Unchecked.defaultof<SessionEvent> |> should equal false
+
+[<Fact>]
+let ``Parity tokens name the REPL detail for every subtype`` () =
+    let s, t = sid (), tid ()
+
+    for evt in allEvents s t do
+        let tokens = parityTokens evt
+        (tokens.IsEmpty) |> should equal false
+
+    (parityTokens Unchecked.defaultof<SessionEvent> |> List.isEmpty)
+    |> should equal true
+
+[<Fact>]
+let ``Engine diagnostic lines are retained for parity`` () =
+    let prefixes =
+        [
+            "RESULT Completed"
+            "END-RESULT"
+            "DEADLINE timed out"
+            "ERROR boom"
+            "COMPACT completed 1->2"
+            "ABORTED"
+            "SESSION abc title"
+            "SESSIONS 2"
+            "TREE 3 events"
+            "FORKED abc from def up-to 3"
+            "RESUMED abc"
+            "RESUME-FAILED nope"
+            "MODEL scripted/scripted"
+            "MODEL-SWITCHED anthropic/claude"
+            "TEMPLATE review"
+            "TEMPLATES review, commit"
+            "UNKNOWN-COMMAND /nope"
+            "EXPORTED 3 events to out.jsonl"
+            "PERMISSION tool=exec id=req-1 [a]llow once"
+            "QUESTION id=q-1: continue?"
+            "ANSWER:"
+            "Dot REPL (SQLite session store"
+            "Commands: /new"
+            "> "
+        ]
+
+    let state = addLines empty prefixes
+    let lines = toViewportLines state
+
+    for prefix in prefixes do
+        let trimmed = prefix.Trim()
+
+        if trimmed <> "" then
+            lines
+            |> List.exists (fun line -> line.Contains(trimmed, StringComparison.Ordinal))
+            |> should equal true
+
+    addLine empty null |> should equal empty
+    addLine empty "   " |> should equal empty
+
+// ──────────────────────────────────────────────────────────────────────────
+// Inline permission prompts owning the #332 deferral
+
+[<Fact>]
+let ``Permission keys map a session deny without typing`` () =
+    let key (value: char) : ConsoleKeyInfo =
+        ConsoleKeyInfo(value, ConsoleKey.A, false, false, false)
+
+    decisionForKey (key 'a') |> should equal (Some PermissionDecisionKind.AllowOnce)
+    decisionForKey (key 'A') |> should equal (Some PermissionDecisionKind.AllowOnce)
+
+    decisionForKey (key 's')
+    |> should equal (Some PermissionDecisionKind.AllowForSession)
+
+    decisionForKey (key 'S')
+    |> should equal (Some PermissionDecisionKind.AllowForSession)
+
+    decisionForKey (key 'd') |> should equal (Some PermissionDecisionKind.Deny)
+    decisionForKey (key 'D') |> should equal (Some PermissionDecisionKind.Deny)
+    decisionForKey (key 'x') |> should equal None
+
+    decisionForKey (ConsoleKeyInfo('\u0000', ConsoleKey.Enter, false, false, false))
+    |> should equal None
+
+[<Fact>]
+let ``Permission text matches the REPL console reader exactly`` () =
+    decisionForText "s" |> should equal PermissionDecisionKind.AllowForSession
+    decisionForText "session" |> should equal PermissionDecisionKind.AllowForSession
+    decisionForText "d" |> should equal PermissionDecisionKind.Deny
+    decisionForText "deny" |> should equal PermissionDecisionKind.Deny
+    decisionForText "a" |> should equal PermissionDecisionKind.AllowOnce
+    decisionForText "" |> should equal PermissionDecisionKind.AllowOnce
+    decisionForText null |> should equal PermissionDecisionKind.AllowOnce
+    decisionForText "anything-else" |> should equal PermissionDecisionKind.AllowOnce
+
+// ──────────────────────────────────────────────────────────────────────────
+// Inline question prompts
+
+[<Fact>]
+let ``Question answers resume verbatim like the REPL`` () =
+    answerForSubmit "yes" |> should equal "yes"
+    answerForSubmit "" |> should equal ""
+    answerForSubmit null |> should equal ""
+    answerForSubmit "  spaced  " |> should equal "  spaced  "
+
+// ──────────────────────────────────────────────────────────────────────────
+// Viewport and loop wiring
+
+[<Fact>]
+let ``Viewport blocks paint inside the DotShell frame budget`` () =
+    let s, t = sid (), tid ()
+
+    let state =
+        empty
+        |> fun current -> apply current (delta s t "# Title")
+        |> fun current -> apply current (callStarted s t "call-1" "exec")
+        |> fun current -> apply current (PermissionRequestedEvent(s, t, at 7, stamp, "req-1", "exec") :> SessionEvent)
+
+    let viewport = toViewportLines state
+    (viewport.IsEmpty) |> should equal false
+
+    let frame =
+        Dot.DotShell.renderFrameWithInput
+            80
+            24
+            false
+            viewport
+            "session abc | model scripted/scripted | WaitingForInput"
+            [ "> " ]
+
+    frame.Contains("assistant:", StringComparison.Ordinal) |> should equal true
+
+    frame.Contains("[tool exec running]", StringComparison.Ordinal)
+    |> should equal true
+
+    frame.Contains("[permission]", StringComparison.Ordinal) |> should equal true
+
+[<Fact>]
+let ``Colorless viewport strips every escape`` () =
+    let s, t = sid (), tid ()
+    let state = apply empty (delta s t "hello")
+
+    let frame =
+        Dot.DotShell.renderFrameWithInput 80 24 false (toViewportLines state) "status" [ "> " ]
+
+    frame.Contains("\u001b") |> should equal false
+
+[<Fact>]
+let ``Toggling an unknown card keeps state`` () =
+    toggleExpanded empty "missing" |> should equal empty
+    toggleExpanded empty null |> should equal empty
+
+// ──────────────────────────────────────────────────────────────────────────
+// TUI ring fold and long-running progress (issue 334): the drain ring
+// drops only live EVENT lines (they duplicate the OnEvent journal fold);
+// TREE lines and every other diagnostic fold into the viewport, and
+// /compact plus /export paint start markers before their completion
+// lines land.
+
+[<Fact>]
+let ``Only live EVENT lines duplicate the journal fold`` () =
+    isJournalDuplicate "EVENT seq=1 TurnStartedEvent" |> should equal true
+    isJournalDuplicate "TREE 3 events" |> should equal false
+    isJournalDuplicate "TREE seq=1 TurnStartedEvent" |> should equal false
+    isJournalDuplicate "RESULT Completed" |> should equal false
+    isJournalDuplicate "COMPACT completed 1->2" |> should equal false
+    isJournalDuplicate "EXPORTED 3 events to out.jsonl" |> should equal false
+    isJournalDuplicate "" |> should equal false
+    isJournalDuplicate null |> should equal false
+
+[<Fact>]
+let ``Tree output folds into the viewport`` () =
+    let state =
+        addLines
+            empty
+            [
+                "TREE 2 events"
+                "TREE seq=1 TurnStartedEvent"
+            ]
+
+    let lines = toViewportLines state
+
+    lines
+    |> List.exists (fun line -> line.Contains("TREE 2 events", StringComparison.Ordinal))
+    |> should equal true
+
+    lines
+    |> List.exists (fun line -> line.Contains("TREE seq=1", StringComparison.Ordinal))
+    |> should equal true
+
+[<Fact>]
+let ``Compact progress paints before its completion line`` () =
+    let state = markCompactRunning empty
+    let lines = toViewportLines state
+
+    lines
+    |> List.exists (fun line -> line.Contains("compact running", StringComparison.Ordinal))
+    |> should equal true
+
+[<Fact>]
+let ``Export progress names its target`` () =
+    let state = markExportRunning empty "out.jsonl"
+    let lines = toViewportLines state
+
+    lines
+    |> List.exists (fun line -> line.Contains("export running... out.jsonl", StringComparison.Ordinal))
+    |> should equal true
+
+    let bare = markExportRunning empty null
+    let bareLines = toViewportLines bare
+
+    bareLines
+    |> List.exists (fun line -> line.Contains("export running...", StringComparison.Ordinal))
+    |> should equal true
+
+    let blank = markExportRunning empty "   "
+    let blankLines = toViewportLines blank
+
+    blankLines
+    |> List.exists (fun line -> line = "export running...")
+    |> should equal true
+
+[<Fact>]
+let ``Progress markers keep the diagnostics tail window`` () =
+    let mutable state = empty
+
+    for _ in 1 .. (maxMetaLines + 50) do
+        state <- markCompactRunning state
+
+    state.Diagnostics.Length |> should equal maxMetaLines
+
+// ──────────────────────────────────────────────────────────────────────────
+// Consumer deduplication (issue 385): every logical assistant content
+// segment renders once across duplicate delivery, replay-to-live overlap,
+// reconnect, and settlement, in both Dot modes. The apply fold is the
+// fullscreen OnEvent path; the addLine RESULT envelope is the shared
+// settlement path the plain REPL prints and the fullscreen ring folds.
+
+[<Fact>]
+let ``Settlement suffix strips only the streamed prefix`` () =
+    settlementSuffix "" "hello" |> should equal "hello"
+    settlementSuffix null "hello" |> should equal "hello"
+    settlementSuffix "hel" "hello" |> should equal "lo"
+    settlementSuffix "hello" "hello" |> should equal ""
+    settlementSuffix "hello" "hel" |> should equal ""
+    settlementSuffix "" "" |> should equal ""
+    settlementSuffix "hel" "" |> should equal ""
+    settlementSuffix null null |> should equal ""
+    // Event/settlement races never suppress valid output.
+    settlementSuffix "abc" "xyz" |> should equal "xyz"
+    settlementSuffix "abc" "xabc" |> should equal "xabc"
+
+[<Fact>]
+let ``Duplicate delivery of a committed event folds once`` () =
+    let s, t = sid (), tid ()
+    let once = deltaAt s t 2 "hello"
+
+    let state = applyAll empty [ startedAt s t 1; once; once ]
+
+    state.Assistant |> should equal "hello"
+    assistantBlocks state |> should equal [ "hello" ]
+
+[<Fact>]
+let ``Replay-to-live overlap renders only the genuinely new suffix`` () =
+    let s, t = sid (), tid ()
+
+    let replay = [ startedAt s t 1; deltaAt s t 2 "hel" ]
+
+    let live =
+        [
+            startedAt s t 1
+            deltaAt s t 2 "hel"
+            deltaAt s t 3 "lo"
+        ]
+
+    let state = applyAll (applyAll empty replay) live
+
+    state.Assistant |> should equal "hello"
+    assistantBlocks state |> should equal [ "hello" ]
+
+[<Fact>]
+let ``Distinct events with identical text stay distinct`` () =
+    let s, t = sid (), tid ()
+
+    let state =
+        applyAll
+            empty
+            [
+                startedAt s t 1
+                deltaAt s t 2 "hi"
+                deltaAt s t 3 "hi"
+            ]
+
+    state.Assistant |> should equal "hihi"
+    assistantBlocks state |> should equal [ "hihi" ]
+
+[<Fact>]
+let ``Streamed-then-success renders the unrendered suffix once`` () =
+    let s, t = sid (), tid ()
+
+    let state =
+        applyAll
+            empty
+            [
+                startedAt s t 1
+                deltaAt s t 2 "hel"
+                deltaAt s t 3 "lo "
+            ]
+        |> fun current -> addLines current (settleLines "Completed" [ "hello world" ])
+
+    assistantBlocks state |> should equal [ "hello world" ]
+
+    toDisplayLines state
+    |> List.filter (fun line -> line.Contains("hello world", StringComparison.Ordinal))
+    |> List.length
+    |> should equal 1
+
+[<Fact>]
+let ``Exact settlement repeats render nothing new`` () =
+    let s, t = sid (), tid ()
+
+    let state =
+        applyAll
+            empty
+            [
+                startedAt s t 1
+                deltaAt s t 2 "hello"
+            ]
+        |> fun current -> addLines current (settleLines "Completed" [ "hello" ])
+
+    assistantBlocks state |> should equal [ "hello" ]
+
+[<Fact>]
+let ``Settlement-only content renders fully`` () =
+    let state = addLines empty (settleLines "Completed" [ "hello" ])
+
+    assistantBlocks state |> should equal [ "hello" ]
+
+[<Fact>]
+let ``Partial-then-failure keeps the partial once with no invented text`` () =
+    let s, t = sid (), tid ()
+
+    let state =
+        applyAll
+            empty
+            [
+                startedAt s t 1
+                deltaAt s t 2 "hel"
+                failedAt s t 4 "boom"
+            ]
+        |> fun current -> addLines current (settleLines "Failed" [ "hello" ])
+
+    assistantBlocks state |> should equal [ "hel" ]
+
+    toDisplayLines state
+    |> List.exists (fun line -> line.Contains("hello", StringComparison.Ordinal))
+    |> should equal false
+
+    toDisplayLines state
+    |> List.exists (fun line -> line.Contains("boom", StringComparison.Ordinal))
+    |> should equal true
+
+[<Fact>]
+let ``Partial-then-abort keeps the partial once with the truthful terminal`` () =
+    let s, t = sid (), tid ()
+
+    let state =
+        applyAll
+            empty
+            [
+                startedAt s t 1
+                deltaAt s t 2 "hel"
+                abortedAt s t 4 "stopped"
+            ]
+        |> fun current -> addLines current (settleLines "Aborted" [ "hello" ])
+
+    assistantBlocks state |> should equal [ "hel" ]
+
+    toDisplayLines state
+    |> List.exists (fun line -> line.Contains("stopped", StringComparison.Ordinal))
+    |> should equal true
+
+[<Fact>]
+let ``Settlement-only failure invents no success text`` () =
+    let s, t = sid (), tid ()
+
+    let state =
+        applyAll
+            empty
+            [
+                startedAt s t 1
+                failedAt s t 4 "boom"
+            ]
+        |> fun current -> addLines current (settleLines "Failed" [ "oops" ])
+
+    (assistantBlocks state |> List.isEmpty) |> should equal true
+
+    toDisplayLines state
+    |> List.exists (fun line -> line.Contains("boom", StringComparison.Ordinal))
+    |> should equal true
+
+[<Fact>]
+let ``Mismatched settlement races render fully`` () =
+    let s, t = sid (), tid ()
+
+    let state =
+        applyAll empty [ startedAt s t 1; deltaAt s t 2 "abc" ]
+        |> fun current -> addLines current (settleLines "Completed" [ "xyz" ])
+
+    let blocks = assistantBlocks state
+    // Both segments stay visible in order; nothing valid is suppressed.
+    blocks |> should equal [ "abc\nxyz" ]
+
+    toDisplayLines state
+    |> List.exists (fun line -> line.Contains("xyz", StringComparison.Ordinal))
+    |> should equal true
+
+[<Fact>]
+let ``Unseen fallback deltas never suppress the plain settlement`` () =
+    // Issue 412: the fallback journals the full answer as deltas the plain
+    // EVENT line never shows, so the scoped prefix stays empty and the
+    // settlement below renders the sole visible copy fully (not zero).
+    visibleFragment false "dot scripted answer" |> should equal ""
+    visibleFragment false null |> should equal ""
+    // The hooked fullscreen fold still renders delta text progressively, so
+    // visibly rendered fragments keep their prefix and the suffix rule still
+    // suppresses the already-rendered repeat there (not twice).
+    visibleFragment true "dot scripted answer" |> should equal "dot scripted answer"
+
+    settlementSuffix (visibleFragment false "dot scripted answer") "dot scripted answer"
+    |> should equal "dot scripted answer"
+
+    settlementSuffix (visibleFragment true "dot scripted answer") "dot scripted answer"
+    |> should equal ""
+
+[<Fact>]
+let ``Tool-then-text fallback settles the answer exactly once`` () =
+    // Issue 412 combined path: tool calls (no text) then one fallback delta
+    // carrying the answer, over the real-turn settlement.
+    let s, t = sid (), tid ()
+
+    let folded =
+        applyAll
+            empty
+            [
+                startedAt s t 1
+                callStarted s t "call-1" "scripted-echo"
+                callOutput s t "call-1" "scripted tool ok"
+                callCompleted s t "call-1" null
+                deltaAt s t 7 "dot scripted answer"
+            ]
+
+    folded.Assistant |> should equal "dot scripted answer"
+
+    // Duplicate transport delivery of the fallback delta folds nothing new.
+    let redelivered = applyAll folded [ deltaAt s t 7 "dot scripted answer" ]
+
+    redelivered.Assistant |> should equal "dot scripted answer"
+
+    // The plain settlement channel (never visibly streamed) renders the
+    // answer fully and exactly once.
+    let settlement =
+        settlementSuffix (visibleFragment false redelivered.Assistant) "dot scripted answer"
+
+    settlement |> should equal "dot scripted answer"
+
+    [
+        "RESULT Completed"
+        settlement
+        "END-RESULT"
+    ]
+    |> List.filter (fun line -> line.Contains("dot scripted answer", StringComparison.Ordinal))
+    |> List.length
+    |> should equal 1
+
+[<Fact>]
+let ``Repeated identical text across turns stays distinct`` () =
+    let s = sid ()
+    let first, second = tid (), tid ()
+
+    let state =
+        applyAll
+            empty
+            [
+                startedAt s first 1
+                deltaAt s first 2 "hi"
+                startedAt s second 3
+                deltaAt s second 4 "hi"
+            ]
+
+    state.Assistant |> should equal "hihi"
+    assistantBlocks state |> should equal [ "hi"; "hi" ]
+
+[<Fact>]
+let ``Queued turns never cross-render or cross-dedupe`` () =
+    let s = sid ()
+    let first, second = tid (), tid ()
+
+    let state =
+        applyAll
+            empty
+            [
+                startedAt s first 1
+                deltaAt s first 2 "aaa"
+            ]
+        |> fun current -> addLines current (settleLines "Completed" [ "aaa" ])
+        |> fun current -> apply current (startedAt s second 3)
+        |> fun current -> apply current (deltaAt s second 4 "bbb")
+        |> fun current -> addLines current (settleLines "Completed" [ "bbbccc" ])
+
+    assistantBlocks state |> should equal [ "aaa"; "bbbccc" ]
+
+[<Fact>]
+let ``Session switching never cross-renders or cross-dedupes`` () =
+    let a, b = sid (), sid ()
+    let ta, tb = tid (), tid ()
+
+    let state =
+        applyAll
+            empty
+            [
+                startedAt a ta 1
+                deltaAt a ta 2 "aaa"
+                startedAt b tb 1
+                deltaAt b tb 2 "aaa"
+            ]
+        |> fun current -> addLines current (settleLines "Completed" [ "aaa" ])
+
+    // The settlement matches the active (switched) session prefix, so it
+    // renders nothing new; both sessions' streamed prefixes stay visible.
+    assistantBlocks state |> should equal [ "aaa"; "aaa" ]
+
+[<Fact>]
+let ``A new TurnStarted isolates the streamed prefix`` () =
+    let s = sid ()
+    let first, second = tid (), tid ()
+
+    let state =
+        applyAll
+            empty
+            [
+                startedAt s first 1
+                deltaAt s first 2 "aaa"
+                startedAt s second 3
+            ]
+        |> fun current -> addLines current (settleLines "Completed" [ "aaa" ])
+
+    // The settlement belongs to the earlier turn, not the active one: it
+    // renders fully rather than being mistaken for a duplicate.
+    assistantBlocks state |> should equal [ "aaa\naaa" ]
+
+[<Fact>]
+let ``Duplicate reasoning deltas fold once with tool rules unchanged`` () =
+    let s, t = sid (), tid ()
+    let once = reasoning s t "thinking"
+
+    let state =
+        applyAll
+            empty
+            [
+                startedAt s t 1
+                once
+                once
+                callStarted s t "call-1" "read_file"
+                callOutput s t "call-1" "bytes"
+                callOutput s t "call-1" "bytes"
+                ToolCallOutputEvent(s, t, at 8, stamp, "call-1", "-more") :> SessionEvent
+                callCompleted s t "call-1" null
+            ]
+
+    state.Reasoning |> should equal "thinking"
+
+    // The repeated output delivery carries the identical identity, so it
+    // folds once; the card still accumulates the genuinely new fragment.
+    match state.Tools.TryFind "call-1" with
+    | None -> failwith "expected card call-1"
+    | Some card -> card.Output |> should equal "bytes-more"
+
+[<Fact>]
+let ``Unsupported event shapes fail clearly without fabricated content`` () =
+    let s, t = sid (), tid ()
+    let state = apply empty (BogusEvent(s, t, at 30) :> SessionEvent)
+
+    (assistantBlocks state |> List.isEmpty) |> should equal true
+    state.Assistant |> should equal ""
+
+    toViewportLines state
+    |> List.exists (fun line -> line.Contains("BogusEvent", StringComparison.Ordinal))
+    |> should equal true
+
+[<Fact>]
+let ``Fullscreen ring keeps parity through the shared fold`` () =
+    let s, t = sid (), tid ()
+
+    let state =
+        applyAll
+            empty
+            [
+                startedAt s t 1
+                deltaAt s t 2 "hel"
+                deltaAt s t 3 "lo"
+            ]
+
+    // The ring drops live EVENT lines (they duplicate the OnEvent fold)
+    // and folds everything else, including the RESULT envelope, through
+    // the same prefix-aware path as the plain REPL prints.
+    let mutable view = state
+
+    for line in
+        [
+            "EVENT seq=2 TextDeltaEvent"
+            "TREE 2 events"
+            "RESULT Completed"
+            "hello"
+            "END-RESULT"
+        ] do
+        if not (isJournalDuplicate line) then
+            view <- addLine view line
+
+    assistantBlocks view |> should equal [ "hello" ]
+
+    toViewportLines view
+    |> List.exists (fun line -> line.Contains("TREE 2 events", StringComparison.Ordinal))
+    |> should equal true
+
+    toViewportLines view
+    |> List.exists (fun line -> line.Contains("EVENT seq=2", StringComparison.Ordinal))
+    |> should equal false

@@ -76,15 +76,67 @@ module internal TurnLoop =
     /// turn id; resume and post-nested continuations never refire it.
     type TurnStartedHook = TurnId -> CancellationToken -> Task<unit>
 
+    /// Cumulative usage-checkpoint hook (issue 321): invoked with the turn's
+    /// accumulated input/output totals at iteration boundaries and at settle,
+    /// carrying the iteration's linked token for cancellation. The session
+    /// actor journals a fenced UsageEvent here, so journal replay alone
+    /// yields real token totals after a simulated resume in a fresh process;
+    /// None on TurnLoopOptions journals nothing. A hook failure propagates:
+    /// a fenced-out loser raises TurnLeaseLostException instead of calling
+    /// the model, mirroring OnTurnStarted. Checkpoints are cumulative with
+    /// last-wins summation, so duplicates from crash-resume or nested folds
+    /// stay at-least-once tolerant. Fires only in runSuspendableAsync (the
+    /// facade-driven path); the harness-only runAsync path journals nothing.
+    /// Resume and post-nested continuations carry it (unlike OnTurnStarted,
+    /// which never refires), so post-resume work checkpoints; nested runs
+    /// inherit it and fold their spend into the parent's totals.
+    type UsageCheckpointHook = int64 -> int64 -> CancellationToken -> Task<unit>
+
+    /// Skill-load journal hook (issue 321): the fenced journal callback the
+    /// runner binds as SkillTool's onLoaded, so each successful load lands a
+    /// SkillLoadedEvent observable via Subscribe and replay, not just the
+    /// host log. The skill bypass path triggers it indirectly: the loop
+    /// invokes the skill tool, the tool calls this hook with the loaded
+    /// event, and the hook journals it under the turn claim; None journals
+    /// nothing (hosts keep log-only onLoaded). A hook failure propagates
+    /// like OnTurnStarted, so a fenced-out loser stops with zero effects.
+    /// Carries the iteration's linked token for cancellation; the claim
+    /// token rides the closure, mirroring OnTurnStarted.
+    type SkillLoadedHook = SkillLoadedEvent -> CancellationToken -> Task<unit>
+
+    /// Progressive assistant-text hook (issue 379): invoked synchronously
+    /// with each non-empty text chunk as the provider streams it, in chunk
+    /// order. The production runner binds the per-attempt streaming
+    /// journaler's coalescing callback here, so deltas journal progressively
+    /// instead of discarding with ignore; None emits nothing. The fallback
+    /// single-delta shape for non-streaming providers is preserved: the
+    /// accumulated text still arrives as one call. Carries no token: the
+    /// callback buffers synchronously and chains bounded appends under the
+    /// running claim without blocking, so cancellation propagates at the
+    /// next loop check.
+    type TextDeltaHook = string -> unit
+
+    /// Progressive provider-surfaced reasoning hook (issue 379): invoked
+    /// synchronously with each non-empty reasoning chunk the provider
+    /// surfaces, mirroring TextDeltaHook. Only surfaced reasoning is
+    /// emitted: nothing is inferred or fabricated, and reasoning never
+    /// reaches AssistantText.
+    type ReasoningDeltaHook = string -> unit
+
     /// What one settled tool invocation looked like: the name the model
     /// called it by, the call id the result answers, the appended result
     /// text, and the failure when the invocation raised instead of
     /// returning. Error is Some only when the invocation raised (an
     /// unknown or non-invokable tool counts as raised); denials carry
     /// their denial text with no error, and suspensions never observe:
-    /// a suspended call has not settled. The nested task-tool runner
-    /// journals these observations as the sub-agent execution markers the
-    /// transcript read links back to the parent call.
+    /// a suspended call has not settled. ArgumentsJson carries the JSON
+    /// object string of the settling call's arguments (null when the call
+    /// carried none): the production top-level journaling sink (issue 366)
+    /// carries it verbatim into ToolCallStartedEvent.ArgumentsJson so
+    /// ordinary-turn recovery rebuilds the exact call, never a hardcoded
+    /// placeholder. The nested task-tool runner journals these observations
+    /// as the sub-agent execution markers the transcript read links back
+    /// to the parent call.
     type ToolCallObservation =
         {
             /// The name the model called the tool by.
@@ -95,7 +147,29 @@ module internal TurnLoop =
             Text: string
             /// Why the invocation raised, or None when it returned.
             Error: string option
+            /// The JSON object string of the settling call's arguments, or
+            /// null when the call carried none.
+            ArgumentsJson: string | null
         }
+
+    /// Serializes one settled call's argument table to the JSON object
+    /// string the journal carries verbatim. Null arguments read as null
+    /// (recovery rejects those explicitly instead of replaying a fabricated
+    /// call); an empty table reads as the empty object; a serialization
+    /// failure reads as null rather than a wrong object, so a later replay
+    /// rejects explicitly instead of pairing a fabricated call.
+    /// <param name="call">The settled call. Null reads as null.</param>
+    /// <returns>The arguments JSON object string, or null.</returns>
+    let argumentsJsonOf (call: FunctionCallContent) : string | null =
+        if isNull (box call) || isNull (box call.Arguments) then
+            null
+        elif call.Arguments.Count = 0 then
+            "{}"
+        else
+            try
+                JsonSerializer.Serialize(call.Arguments)
+            with _ ->
+                null
 
     /// Internal loop tuning: the tool-result char limit plus the effective
     /// per-turn budget, with the optional last-moment claim fence. The
@@ -146,6 +220,25 @@ module internal TurnLoop =
             /// nothing. Fires once before the first provider call of a fresh
             /// run; continuations never refire it (see runSuspendableAsync).
             OnTurnStarted: TurnStartedHook option
+            /// The cumulative usage-checkpoint hook (issue 321), or None to
+            /// journal nothing. Fires at iteration boundaries with the
+            /// current totals and at settle with the final totals; resumes
+            /// carry it so post-resume work checkpoints.
+            OnUsageCheckpoint: UsageCheckpointHook option
+            /// The skill-load journal hook (issue 321), or None to journal
+            /// nothing. Bound by the runner as SkillTool's onLoaded; the
+            /// skill bypass path triggers it indirectly via the tool
+            /// invocation. Resumes carry it so post-resume loads journal.
+            OnSkillLoaded: SkillLoadedHook option
+            /// The progressive assistant-text hook (issue 379), or None to
+            /// emit nothing. Bound by the production runner to the
+            /// per-attempt streaming journaler; resumes and nested
+            /// continuations carry it so post-resume streams journal.
+            OnTextDelta: TextDeltaHook option
+            /// The progressive reasoning hook (issue 379), or None to emit
+            /// nothing. Carried like OnTextDelta; only provider-surfaced
+            /// reasoning is emitted.
+            OnReasoningDelta: ReasoningDeltaHook option
             /// The task-tool nested runner, or None when the turn offers no
             /// task tool.
             TaskNested: TaskNestedRun option
@@ -178,6 +271,10 @@ module internal TurnLoop =
                 AskUser = None
                 OnToolCall = None
                 OnTurnStarted = None
+                OnUsageCheckpoint = None
+                OnSkillLoaded = None
+                OnTextDelta = None
+                OnReasoningDelta = None
                 TaskNested = None
                 StructuredOutcome = false
                 Logger = null
@@ -621,6 +718,11 @@ module internal TurnLoop =
             /// a permission suspension with it, a QuestionAnswer answers a
             /// question suspension with it as the question id.
             RequestId: string
+            /// The turn that suspended: echoed by the resume continuations
+            /// as the continued run's id, so the settled completion carries
+            /// the origin turn id (issue 289). Internal: the module is
+            /// internal, so no public-surface change.
+            OriginTurnId: TurnId
             /// The tool whose call raised the request (ask_user for questions).
             ToolName: string
             /// The tool-call id that raised the request.
@@ -675,6 +777,11 @@ module internal TurnLoop =
         {
             /// The settled turn result.
             Result: TurnResult
+            /// The turn this run executed: the actor-supplied loop-run id
+            /// (issue 289). The settle choke points journal the terminal
+            /// event under this id. Internal: the module is internal, so
+            /// no public-surface change.
+            TurnId: TurnId
             /// True when Inject entries stayed pending past a would-complete
             /// turn and the actor must start a new turn to act on them.
             HasPendingInjects: bool
@@ -863,6 +970,7 @@ module internal TurnLoop =
                     ToolCallId = callId
                     Text = if isNull text then "" else text
                     Error = error
+                    ArgumentsJson = argumentsJsonOf call
                 }
         | None -> Task.FromResult(())
 
@@ -1120,6 +1228,7 @@ module internal TurnLoop =
                                 }
                             Outcome = null
                         }
+                TurnId = Unchecked.defaultof<TurnId>
                 HasPendingInjects = hasPendingInjects ()
                 Suspension = None
             }
@@ -1127,6 +1236,7 @@ module internal TurnLoop =
         let failedCompletion iterations inputTokens outputTokens reason : TurnLoopCompletion =
             {
                 Result = failedResult iterations inputTokens outputTokens reason
+                TurnId = Unchecked.defaultof<TurnId>
                 HasPendingInjects = false
                 Suspension = None
             }
@@ -1146,7 +1256,7 @@ module internal TurnLoop =
                 | call :: rest ->
                     cancellationToken.ThrowIfCancellationRequested()
 
-                    if not (isLeaseValid ()) then
+                    if not (ControlAdmission.check () && isLeaseValid ()) then
                         raise (TurnLeaseLostException())
 
                     if timeoutCts.IsCancellationRequested then
@@ -1193,6 +1303,7 @@ module internal TurnLoop =
                                     Some(
                                         {
                                             Result = finishedResult roundIterations roundInput roundOutput summary
+                                            TurnId = Unchecked.defaultof<TurnId>
                                             HasPendingInjects = hasPendingInjects ()
                                             Suspension = None
                                         }
@@ -1231,6 +1342,7 @@ module internal TurnLoop =
                                     Some(
                                         {
                                             Result = failedResult roundIterations roundInput roundOutput error
+                                            TurnId = Unchecked.defaultof<TurnId>
                                             HasPendingInjects = false
                                             Suspension = None
                                         }
@@ -1267,7 +1379,7 @@ module internal TurnLoop =
             task {
                 cancellationToken.ThrowIfCancellationRequested()
 
-                if not (isLeaseValid ()) then
+                if not (ControlAdmission.check () && isLeaseValid ()) then
                     return! Task.FromException<TurnLoopCompletion>(TurnLeaseLostException())
                 elif iterations >= options.MaxIterations then
                     logLoop MaxIterationsExceededMessage
@@ -1336,11 +1448,23 @@ module internal TurnLoop =
                                     logLoop TimeoutExceededMessage
                                     return timedOut
                                 | None -> return! loop nextIterations nextInput nextOutput
-                    with :? OperationCanceledException when isTimeout () ->
+                    with
+                    | :? OperationCanceledException when isTimeout () ->
                         // In-flight provider or tool work died to the
                         // deadline alone: the hard-deadline stop cause.
                         logLoop TimeoutExceededMessage
                         return failedCompletion iterations inputTokens outputTokens TimeoutExceededMessage
+                    | :? ProviderException as providerFailure ->
+                        // Provider failure (issue 349): settle Failed with
+                        // the shaped provider id + status + message instead
+                        // of propagating to the actor fault fallback, so a
+                        // 401 bad key, a 404 bad model, and a network
+                        // failure stay distinguishable. Secrets never
+                        // travel: the formatter reads the structured
+                        // properties only, and the log line is redacted.
+                        let reason = ProviderFailureReason.formatProviderFailure providerFailure
+                        logLoop reason
+                        return failedCompletion iterations inputTokens outputTokens reason
             }
 
         task {
@@ -1597,6 +1721,7 @@ module internal TurnLoop =
                         }
                     Outcome = null
                 }
+            TurnId = suspension.OriginTurnId
             HasPendingInjects = false
             Suspension = Some suspension
         }
@@ -1729,6 +1854,21 @@ module internal TurnLoop =
         let chatOptions = ChatOptions()
         chatOptions.Tools <- ResizeArray<AITool>(tools.Values) :> IList<AITool>
 
+        let log = LoggingScopes.resolveLogger options.Logger
+
+        let scope =
+            if isNull (box options.LogScope) then
+                LoggingScopes.createScope null null null null 0 null
+            else
+                options.LogScope
+
+        /// Logs one loop point under the six canonical scopes, scoped to
+        /// the synchronous block only. Text travels redacted.
+        /// <param name="message">The fixed message.</param>
+        let logLoop (message: string) : unit =
+            use _scope = LoggingScopes.beginScope log scope
+            log.LogInformation("{Message}", LoggingScopes.redactForLog message)
+
         let foldInjects () =
             let pending = selectInjects (drainInjected ())
 
@@ -1760,6 +1900,7 @@ module internal TurnLoop =
                                 }
                             Outcome = null
                         }
+                TurnId = turnId
                 HasPendingInjects = hasPendingInjects ()
                 Suspension = None
             }
@@ -1767,6 +1908,7 @@ module internal TurnLoop =
         let failedCompletion iterations inputTokens outputTokens reason : TurnLoopCompletion =
             {
                 Result = failedResult iterations inputTokens outputTokens reason
+                TurnId = turnId
                 HasPendingInjects = false
                 Suspension = None
             }
@@ -1786,6 +1928,7 @@ module internal TurnLoop =
             let suspension =
                 {
                     RequestId = requestId
+                    OriginTurnId = turnId
                     ToolName = toolName
                     ToolCallId = call.CallId
                     Kind = kind
@@ -1890,6 +2033,7 @@ module internal TurnLoop =
             : TurnLoopSuspension =
             {
                 RequestId = mintId ()
+                OriginTurnId = turnId
                 ToolName = cursor.ToolName
                 ToolCallId = taskCall.CallId
                 Kind = cursor.Kind
@@ -1996,10 +2140,15 @@ module internal TurnLoop =
                 | call :: rest ->
                     cancellationToken.ThrowIfCancellationRequested()
 
-                    if not (isLeaseValid ()) then
+                    if not (ControlAdmission.check () && isLeaseValid ()) then
                         raise (TurnLeaseLostException())
 
                     if timeoutCts.IsCancellationRequested then
+                        match options.OnUsageCheckpoint with
+                        | Some hook when roundInput <> 0L || roundOutput <> 0L ->
+                            do! hook roundInput roundOutput linkedToken
+                        | _ -> ()
+
                         return Some(failedCompletion roundIterations roundInput roundOutput TimeoutExceededMessage)
                     else
                         match options.VerifyClaim with
@@ -2029,10 +2178,16 @@ module internal TurnLoop =
                                 appendToolResult history call.CallId summary
                                 do! observeToolCallAsync options call summary None
 
+                                match options.OnUsageCheckpoint with
+                                | Some hook when roundInput <> 0L || roundOutput <> 0L ->
+                                    do! hook roundInput roundOutput linkedToken
+                                | _ -> ()
+
                                 return
                                     Some(
                                         {
                                             Result = finishedResult roundIterations roundInput roundOutput summary
+                                            TurnId = turnId
                                             HasPendingInjects = hasPendingInjects ()
                                             Suspension = None
                                         }
@@ -2057,10 +2212,16 @@ module internal TurnLoop =
                                 appendToolResult history call.CallId error
                                 do! observeToolCallAsync options call error None
 
+                                match options.OnUsageCheckpoint with
+                                | Some hook when roundInput <> 0L || roundOutput <> 0L ->
+                                    do! hook roundInput roundOutput linkedToken
+                                | _ -> ()
+
                                 return
                                     Some(
                                         {
                                             Result = failedResult roundIterations roundInput roundOutput error
+                                            TurnId = turnId
                                             HasPendingInjects = false
                                             Suspension = None
                                         }
@@ -2107,6 +2268,11 @@ module internal TurnLoop =
                                     do! observeToolCallAsync options call canned None
                                     return! runTools roundIterations roundInput roundOutput rest
                                 | _ ->
+                                    match options.OnUsageCheckpoint with
+                                    | Some hook when roundInput <> 0L || roundOutput <> 0L ->
+                                        do! hook roundInput roundOutput linkedToken
+                                    | _ -> ()
+
                                     return
                                         Some(
                                             failedCompletion
@@ -2116,6 +2282,11 @@ module internal TurnLoop =
                                                 AskUserCannedMissingMessage
                                         )
                             | Some _ ->
+                                match options.OnUsageCheckpoint with
+                                | Some hook when roundInput <> 0L || roundOutput <> 0L ->
+                                    do! hook roundInput roundOutput linkedToken
+                                | _ -> ()
+
                                 return
                                     Some(
                                         failedCompletion
@@ -2187,6 +2358,7 @@ module internal TurnLoop =
                                     let suspension =
                                         {
                                             RequestId = requestId
+                                            OriginTurnId = turnId
                                             ToolName = toolName
                                             ToolCallId = call.CallId
                                             Kind = PermissionSuspension
@@ -2216,11 +2388,23 @@ module internal TurnLoop =
             task {
                 cancellationToken.ThrowIfCancellationRequested()
 
-                if not (isLeaseValid ()) then
+                if not (ControlAdmission.check () && isLeaseValid ()) then
                     return! Task.FromException<TurnLoopCompletion>(TurnLeaseLostException())
                 elif iterations >= options.MaxIterations then
+                    // Settle checkpoint (issue 321): journal the final totals
+                    // before settling, skipping zero-zero (absence reads zero).
+                    match options.OnUsageCheckpoint with
+                    | Some hook when inputTokens <> 0L || outputTokens <> 0L ->
+                        do! hook inputTokens outputTokens linkedToken
+                    | _ -> ()
+
                     return failedCompletion iterations inputTokens outputTokens MaxIterationsExceededMessage
                 elif timeoutCts.IsCancellationRequested then
+                    match options.OnUsageCheckpoint with
+                    | Some hook when inputTokens <> 0L || outputTokens <> 0L ->
+                        do! hook inputTokens outputTokens linkedToken
+                    | _ -> ()
+
                     return failedCompletion iterations inputTokens outputTokens TimeoutExceededMessage
                 else
                     foldInjects ()
@@ -2234,6 +2418,16 @@ module internal TurnLoop =
                         | None -> Task.FromResult((inputTokens, outputTokens))
 
                     try
+                        // Usage boundary checkpoint (issue 321): cumulative
+                        // totals at each iteration boundary, skipping
+                        // zero-zero. Inside the try so a deadline firing
+                        // mid-append settles as the timeout like an
+                        // in-flight provider call.
+                        match options.OnUsageCheckpoint with
+                        | Some hook when compactedInput <> 0L || compactedOutput <> 0L ->
+                            do! hook compactedInput compactedOutput linkedToken
+                        | _ -> ()
+
                         // In-call marker (issue 284): once, before the first
                         // provider call of a fresh run. Inside the try so a
                         // deadline firing mid-append settles as the timeout
@@ -2246,14 +2440,37 @@ module internal TurnLoop =
                             | Some hook -> do! hook turnId linkedToken
                             | None -> ()
 
+                        // Progressive deltas (issue 379): fan each
+                        // non-empty text/reasoning chunk out to the
+                        // per-attempt streaming journaler as it arrives;
+                        // None journals nothing (the harness-only
+                        // ignore-ignore shape). The fallback single-delta
+                        // for non-streaming providers is preserved by
+                        // LlmStreaming, and cancellation propagates from
+                        // the linked token through the enumeration.
+                        let onText =
+                            match options.OnTextDelta with
+                            | Some hook -> hook
+                            | None -> ignore
+
+                        let onReasoning =
+                            match options.OnReasoningDelta with
+                            | Some hook -> hook
+                            | None -> ignore
+
                         let! response =
-                            LlmStreaming.streamResponseAsync client history chatOptions linkedToken ignore ignore
+                            LlmStreaming.streamResponseAsync client history chatOptions linkedToken onText onReasoning
 
                         let nextIterations = iterations + 1
                         let mutable nextInput = compactedInput
                         let mutable nextOutput = compactedOutput
 
                         if isNull response then
+                            match options.OnUsageCheckpoint with
+                            | Some hook when nextInput <> 0L || nextOutput <> 0L ->
+                                do! hook nextInput nextOutput linkedToken
+                            | _ -> ()
+
                             return completedCompletion nextIterations nextInput nextOutput ""
                         else
                             addUsage &nextInput &nextOutput response.Usage
@@ -2272,6 +2489,11 @@ module internal TurnLoop =
                             if calls.IsEmpty then
                                 let assistantText = if isNull response.Text then "" else response.Text
 
+                                match options.OnUsageCheckpoint with
+                                | Some hook when nextInput <> 0L || nextOutput <> 0L ->
+                                    do! hook nextInput nextOutput linkedToken
+                                | _ -> ()
+
                                 return completedCompletion nextIterations nextInput nextOutput assistantText
                             else
                                 let! toolOutcome = runTools nextIterations nextInput nextOutput calls
@@ -2279,8 +2501,25 @@ module internal TurnLoop =
                                 match toolOutcome with
                                 | Some suspended -> return suspended
                                 | None -> return! loop nextIterations nextInput nextOutput
-                    with :? OperationCanceledException when isTimeout () ->
+                    with
+                    | :? OperationCanceledException when isTimeout () ->
+                        match options.OnUsageCheckpoint with
+                        | Some hook when inputTokens <> 0L || outputTokens <> 0L ->
+                            do! hook inputTokens outputTokens linkedToken
+                        | _ -> ()
+
                         return failedCompletion iterations inputTokens outputTokens TimeoutExceededMessage
+                    | :? ProviderException as providerFailure ->
+                        // Provider failure (issue 349): settle Failed with
+                        // the shaped provider id + status + message instead
+                        // of propagating to the actor fault fallback, so a
+                        // 401 bad key, a 404 bad model, and a network
+                        // failure stay distinguishable. Secrets never
+                        // travel: the formatter reads the structured
+                        // properties only, and the log line is redacted.
+                        let reason = ProviderFailureReason.formatProviderFailure providerFailure
+                        logLoop reason
+                        return failedCompletion iterations inputTokens outputTokens reason
             }
 
         task {
@@ -2373,7 +2612,7 @@ module internal TurnLoop =
             match decision with
             | PermissionDecisionKind.Deny -> ()
             | _ ->
-                if not (isLeaseValid ()) then
+                if not (ControlAdmission.check () && isLeaseValid ()) then
                     raise (TurnLeaseLostException())
 
                 match options.VerifyClaim with
@@ -2389,7 +2628,7 @@ module internal TurnLoop =
                 appendToolResult history suspension.ToolCallId text
 
             let sessionId = Unchecked.defaultof<SessionId>
-            let turnId = Unchecked.defaultof<TurnId>
+            let turnId = suspension.OriginTurnId
 
             let! continued =
                 runSuspendableAsync
@@ -2488,7 +2727,7 @@ module internal TurnLoop =
             appendToolResult history suspension.ToolCallId text
 
             let sessionId = Unchecked.defaultof<SessionId>
-            let turnId = Unchecked.defaultof<TurnId>
+            let turnId = suspension.OriginTurnId
 
             let! continued =
                 runSuspendableAsync

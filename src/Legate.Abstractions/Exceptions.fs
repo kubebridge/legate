@@ -1,8 +1,76 @@
 // SPDX-License-Identifier: Apache-2.0
 namespace Legate
 
+/// Stable reason a receiving node refused a session scope before execution.
+type SessionScopeRejectionReason =
+    /// The request supplied no valid current session address or trusted scope.
+    | InvalidScope = 0
+    /// The addressed session and the carried scope disagree.
+    | AddressMismatch = 1
+    /// The receiving node has no authorized host binding for the tenant.
+    | ScopeUnavailable = 2
+    /// A response does not belong to the addressed session.
+    | ResponseMismatch = 3
+    /// The operation is not an externally admitted session command.
+    | UnsupportedOperation = 4
+    /// The node is no longer admitting session traffic.
+    | NodeStopping = 5
+
+/// A receiving node refused session routing before activation or mutation.
+[<Sealed>]
+type SessionScopeRejectedException(reason: SessionScopeRejectionReason) =
+    inherit LegateException("The receiving node refused the session scope: " + reason.ToString() + ".")
+
+    /// The stable rejection reason. The message contains no session data.
+    member _.Reason = reason
+
 open System
 open System.Collections.Generic
+
+/// Safe category for a completion destination or persistence-format refusal.
+type CompletionRoutingReason =
+    /// The destination identifier does not match the supported syntax.
+    | Invalid = 0
+    /// This tenant has no registration for the destination.
+    | Unknown = 1
+    /// The registered destination could not be constructed or validated.
+    | Unavailable = 2
+    /// The options or delivery record requires an unsupported format.
+    | UnsupportedFormat = 3
+
+/// A fail-closed routing refusal, without factory exceptions, endpoints or payloads.
+/// <param name="tenant">The tenant, when known.</param>
+/// <param name="sessionId">The session, when known.</param>
+/// <param name="destinationId">A valid bounded logical destination identifier, or null.</param>
+/// <param name="reason">The safe refusal category.</param>
+[<Sealed>]
+type CompletionRoutingException
+    (
+        tenant: Nullable<TenantId>,
+        sessionId: Nullable<SessionId>,
+        destinationId: string | null,
+        reason: CompletionRoutingReason
+    ) =
+    inherit
+        LegateException(
+            $"Completion routing refused ({reason}); configure the tenant destination or use a supported clean-start format."
+        )
+
+    /// The tenant, when known.
+    member _.Tenant = tenant
+
+    /// The session, when known.
+    member _.SessionId = sessionId
+
+    /// The logical identifier, or null. Invalid input is never retained.
+    member _.DestinationId =
+        match destinationId with
+        | null -> null
+        | id when System.Text.RegularExpressions.Regex.IsMatch(id, "\\A[A-Za-z0-9][A-Za-z0-9._-]{0,127}\\z") -> id
+        | _ -> null
+
+    /// The safe refusal category.
+    member _.Reason = reason
 
 // The typed exception family the public API throws. Control-plane
 // precondition failures throw these; anything after a turn is accepted is a

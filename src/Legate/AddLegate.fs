@@ -36,6 +36,20 @@ open Microsoft.Extensions.DependencyInjection.Extensions
 [<Sealed; AbstractClass; Extension>]
 type LegateServiceCollectionExtensions =
 
+    /// Adds a trusted, immutable tenant execution binding to this node.
+    /// The callback returns an existing host-owned provider, never a request scope.
+    /// <param name="services">The node's service collection.</param>
+    /// <param name="binding">A descriptor retained by the host to access its bound client.</param>
+    /// <returns>The same service collection.</returns>
+    [<Extension>]
+    static member AddLegateSessionBinding
+        (services: IServiceCollection, binding: SessionHostBinding)
+        : IServiceCollection =
+        ArgumentNullException.ThrowIfNull(services)
+        ArgumentNullException.ThrowIfNull(binding)
+        services.AddSingleton(binding) |> ignore
+        services
+
     /// Registers the Legate runtime in <paramref name="services" /> and
     /// applies the host's builder configuration: sub-builders for providers,
     /// storage, workspaces, tools, policies, agents, and permissions, plus
@@ -85,7 +99,16 @@ type LegateServiceCollectionExtensions =
         | _ -> ()
 
         LegateDefaultRegistration.register services
+        services.TryAddSingleton<CompletionDestinations>() |> ignore
+
+        services.TryAddSingleton<ISessionHostContexts, SessionHostContextRegistry>()
+        |> ignore
+
+        services.TryAddSingleton<ISessionClientFactory, SessionClientFactory>()
+        |> ignore
+
         LegateStartupChecks.register services
+        CompletionEraRegistration.register services
         SessionArtifactRegistration.register services
         LocalActorSystemRegistration.register services
         ClusterActorSystemRegistration.register services

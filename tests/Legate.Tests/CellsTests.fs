@@ -330,12 +330,20 @@ let ``Reasoning deltas produce no cells`` () =
 let ``A tool call derives a tool call cell immediately and a result cell on completion`` () =
     let events =
         [
-            ToolCallStartedEvent(sessionId, turnId, noSequence, stamp, "call-1", "read_file") :> SessionEvent
+            ToolCallStartedEvent(sessionId, turnId, noSequence, stamp, "call-1", "read_file", "{}") :> SessionEvent
             ToolCallOutputEvent(sessionId, turnId, noSequence, stamp.AddMilliseconds 5.0, "call-1", "line one")
             :> SessionEvent
             ToolCallOutputEvent(sessionId, turnId, noSequence, stamp.AddMilliseconds 6.0, "call-1", "\nline two")
             :> SessionEvent
-            ToolCallCompletedEvent(sessionId, turnId, noSequence, stamp.AddMilliseconds 7.0, "call-1", nullString)
+            ToolCallCompletedEvent(
+                sessionId,
+                turnId,
+                noSequence,
+                stamp.AddMilliseconds 7.0,
+                "call-1",
+                nullString,
+                "result"
+            )
             :> SessionEvent
         ]
 
@@ -363,9 +371,10 @@ let ``A tool call derives a tool call cell immediately and a result cell on comp
 let ``A failed tool call with output keeps the output and sets is error`` () =
     let events =
         [
-            ToolCallStartedEvent(sessionId, turnId, noSequence, stamp, "call-1", "read_file") :> SessionEvent
+            ToolCallStartedEvent(sessionId, turnId, noSequence, stamp, "call-1", "read_file", "{}") :> SessionEvent
             ToolCallOutputEvent(sessionId, turnId, noSequence, stamp, "call-1", "partial output") :> SessionEvent
-            ToolCallCompletedEvent(sessionId, turnId, noSequence, stamp, "call-1", "exit code 1") :> SessionEvent
+            ToolCallCompletedEvent(sessionId, turnId, noSequence, stamp, "call-1", "exit code 1", "result")
+            :> SessionEvent
         ]
 
     let cells = foldEvents events
@@ -379,8 +388,9 @@ let ``A failed tool call with output keeps the output and sets is error`` () =
 let ``A failed tool call with no output falls back to the error reason`` () =
     let events =
         [
-            ToolCallStartedEvent(sessionId, turnId, noSequence, stamp, "call-1", "read_file") :> SessionEvent
-            ToolCallCompletedEvent(sessionId, turnId, noSequence, stamp, "call-1", "exit code 1") :> SessionEvent
+            ToolCallStartedEvent(sessionId, turnId, noSequence, stamp, "call-1", "read_file", "{}") :> SessionEvent
+            ToolCallCompletedEvent(sessionId, turnId, noSequence, stamp, "call-1", "exit code 1", "result")
+            :> SessionEvent
         ]
 
     let cells = foldEvents events
@@ -396,7 +406,7 @@ let ``A call started but never completed yields no result cell`` () =
     // exists for the call.
     let events =
         [
-            ToolCallStartedEvent(sessionId, turnId, noSequence, stamp, "call-1", "read_file") :> SessionEvent
+            ToolCallStartedEvent(sessionId, turnId, noSequence, stamp, "call-1", "read_file", "{}") :> SessionEvent
             ToolCallOutputEvent(sessionId, turnId, noSequence, stamp, "call-1", "partial") :> SessionEvent
         ]
 
@@ -493,7 +503,18 @@ let ``Progress markers produce no cells and do not break a delta run`` () =
             TurnStartedEvent(sessionId, turnId, noSequence, stamp) :> SessionEvent
             TextDeltaEvent(sessionId, turnId, noSequence, stamp, "Hel") :> SessionEvent
             UsageEvent(sessionId, turnId, noSequence, stamp, 10L, 2L) :> SessionEvent
-            CompactedEvent(sessionId, turnId, noSequence, stamp, 100L, 20L) :> SessionEvent
+            CompactedEvent(
+                sessionId,
+                turnId,
+                noSequence,
+                stamp,
+                100L,
+                20L,
+                "kept facts",
+                ResizeArray<ChatMessage>() :> IReadOnlyList<ChatMessage>,
+                SessionEventContract.CompactedContextVersion
+            )
+            :> SessionEvent
             TextDeltaEvent(sessionId, turnId, noSequence, stamp, "lo") :> SessionEvent
             TurnCompletedEvent(sessionId, turnId, noSequence, stamp) :> SessionEvent
         ]
@@ -516,17 +537,17 @@ let ``A golden full turn folds into the exact documented cell sequence`` () =
             TextDeltaEvent(sessionId, turnId, noSequence, stamp, "I will ") :> SessionEvent
             TextDeltaEvent(sessionId, turnId, noSequence, stamp, "check.") :> SessionEvent
             ReasoningDeltaEvent(sessionId, turnId, noSequence, stamp, "hmm") :> SessionEvent
-            ToolCallStartedEvent(sessionId, turnId, noSequence, stamp, "call-1", "list_dir") :> SessionEvent
+            ToolCallStartedEvent(sessionId, turnId, noSequence, stamp, "call-1", "list_dir", "{}") :> SessionEvent
             ToolCallOutputEvent(sessionId, turnId, noSequence, stamp, "call-1", "a.txt") :> SessionEvent
             ToolCallOutputEvent(sessionId, turnId, noSequence, stamp, "call-1", "\nb.txt") :> SessionEvent
-            ToolCallCompletedEvent(sessionId, turnId, noSequence, stamp, "call-1", nullString) :> SessionEvent
+            ToolCallCompletedEvent(sessionId, turnId, noSequence, stamp, "call-1", nullString, "result") :> SessionEvent
             PermissionRequestedEvent(sessionId, turnId, noSequence, stamp, "req-1", "rm") :> SessionEvent
             PermissionResolvedEvent(sessionId, turnId, noSequence, stamp, "req-1", PermissionDecisionKind.Deny)
             :> SessionEvent
             QuestionAskedEvent(sessionId, turnId, noSequence, stamp, "q-1", "proceed without rm?") :> SessionEvent
             QuestionAnsweredEvent(sessionId, turnId, noSequence, stamp, "q-1", "yes") :> SessionEvent
-            ToolCallStartedEvent(sessionId, turnId, noSequence, stamp, "call-2", "list_dir") :> SessionEvent
-            ToolCallCompletedEvent(sessionId, turnId, noSequence, stamp, "call-2", nullString) :> SessionEvent
+            ToolCallStartedEvent(sessionId, turnId, noSequence, stamp, "call-2", "list_dir", "{}") :> SessionEvent
+            ToolCallCompletedEvent(sessionId, turnId, noSequence, stamp, "call-2", nullString, "result") :> SessionEvent
             TextDeltaEvent(sessionId, turnId, noSequence, stamp, "Done.") :> SessionEvent
             UsageEvent(sessionId, turnId, noSequence, stamp, 100L, 20L) :> SessionEvent
             TurnCompletedEvent(sessionId, turnId, noSequence, stamp) :> SessionEvent
@@ -599,10 +620,10 @@ let ``Two tool calls in one iteration share its number`` () =
     let events =
         [
             TextDeltaEvent(sessionId, turnId, noSequence, stamp, "checking both") :> SessionEvent
-            ToolCallStartedEvent(sessionId, turnId, noSequence, stamp, "call-1", "list_dir") :> SessionEvent
-            ToolCallStartedEvent(sessionId, turnId, noSequence, stamp, "call-2", "read_file") :> SessionEvent
-            ToolCallCompletedEvent(sessionId, turnId, noSequence, stamp, "call-1", nullString) :> SessionEvent
-            ToolCallCompletedEvent(sessionId, turnId, noSequence, stamp, "call-2", nullString) :> SessionEvent
+            ToolCallStartedEvent(sessionId, turnId, noSequence, stamp, "call-1", "list_dir", "{}") :> SessionEvent
+            ToolCallStartedEvent(sessionId, turnId, noSequence, stamp, "call-2", "read_file", "{}") :> SessionEvent
+            ToolCallCompletedEvent(sessionId, turnId, noSequence, stamp, "call-1", nullString, "result") :> SessionEvent
+            ToolCallCompletedEvent(sessionId, turnId, noSequence, stamp, "call-2", nullString, "result") :> SessionEvent
             ReasoningDeltaEvent(sessionId, turnId, noSequence, stamp, "done thinking") :> SessionEvent
             TextDeltaEvent(sessionId, turnId, noSequence, stamp, "Both done") :> SessionEvent
         ]
@@ -642,13 +663,13 @@ let ``Two tool calls in one iteration share its number`` () =
 let ``Model activity after a completed call advances the iteration`` () =
     let events =
         [
-            ToolCallStartedEvent(sessionId, turnId, noSequence, stamp, "call-1", "list_dir") :> SessionEvent
-            ToolCallCompletedEvent(sessionId, turnId, noSequence, stamp, "call-1", nullString) :> SessionEvent
+            ToolCallStartedEvent(sessionId, turnId, noSequence, stamp, "call-1", "list_dir", "{}") :> SessionEvent
+            ToolCallCompletedEvent(sessionId, turnId, noSequence, stamp, "call-1", nullString, "result") :> SessionEvent
             ReasoningDeltaEvent(sessionId, turnId, noSequence, stamp, "thinking") :> SessionEvent
             TextDeltaEvent(sessionId, turnId, noSequence, stamp, "Found it") :> SessionEvent
-            ToolCallStartedEvent(sessionId, turnId, noSequence, stamp, "call-2", "read_file") :> SessionEvent
+            ToolCallStartedEvent(sessionId, turnId, noSequence, stamp, "call-2", "read_file", "{}") :> SessionEvent
             ToolCallOutputEvent(sessionId, turnId, noSequence, stamp, "call-2", "body") :> SessionEvent
-            ToolCallCompletedEvent(sessionId, turnId, noSequence, stamp, "call-2", nullString) :> SessionEvent
+            ToolCallCompletedEvent(sessionId, turnId, noSequence, stamp, "call-2", nullString, "result") :> SessionEvent
             TextDeltaEvent(sessionId, turnId, noSequence, stamp, "Here it is") :> SessionEvent
         ]
 
@@ -685,8 +706,9 @@ let ``Events from other turns are ignored`` () =
     let events =
         [
             TextDeltaEvent(sessionId, otherTurn, noSequence, stamp, "sub-agent text") :> SessionEvent
-            ToolCallStartedEvent(sessionId, otherTurn, noSequence, stamp, "call-1", "list_dir") :> SessionEvent
-            ToolCallCompletedEvent(sessionId, otherTurn, noSequence, stamp, "call-1", nullString) :> SessionEvent
+            ToolCallStartedEvent(sessionId, otherTurn, noSequence, stamp, "call-1", "list_dir", "{}") :> SessionEvent
+            ToolCallCompletedEvent(sessionId, otherTurn, noSequence, stamp, "call-1", nullString, "result")
+            :> SessionEvent
         ]
 
     let cells = foldEvents events
@@ -781,12 +803,14 @@ let ``The fold classifies a bare event of every kind per the mapped rule`` () =
             | "reasoningDelta" ->
                 fun () -> ReasoningDeltaEvent(sessionId, turnId, noSequence, stamp, "x") :> SessionEvent
             | "toolCallStarted" ->
-                fun () -> ToolCallStartedEvent(sessionId, turnId, noSequence, stamp, "call", "tool") :> SessionEvent
+                fun () ->
+                    ToolCallStartedEvent(sessionId, turnId, noSequence, stamp, "call", "tool", "{}") :> SessionEvent
             | "toolCallOutput" ->
                 fun () -> ToolCallOutputEvent(sessionId, turnId, noSequence, stamp, "call", "out") :> SessionEvent
             | "toolCallCompleted" ->
                 fun () ->
-                    ToolCallCompletedEvent(sessionId, turnId, noSequence, stamp, "call", nullString) :> SessionEvent
+                    ToolCallCompletedEvent(sessionId, turnId, noSequence, stamp, "call", nullString, "result")
+                    :> SessionEvent
             | "permissionRequested" ->
                 fun () -> PermissionRequestedEvent(sessionId, turnId, noSequence, stamp, "req", "tool") :> SessionEvent
             | "permissionResolved" ->
@@ -805,7 +829,20 @@ let ``The fold classifies a bare event of every kind per the mapped rule`` () =
             | "questionAnswered" ->
                 fun () -> QuestionAnsweredEvent(sessionId, turnId, noSequence, stamp, "q", "because") :> SessionEvent
             | "usage" -> fun () -> UsageEvent(sessionId, turnId, noSequence, stamp, 1L, 2L) :> SessionEvent
-            | "compacted" -> fun () -> CompactedEvent(sessionId, turnId, noSequence, stamp, 10L, 2L) :> SessionEvent
+            | "compacted" ->
+                fun () ->
+                    CompactedEvent(
+                        sessionId,
+                        turnId,
+                        noSequence,
+                        stamp,
+                        10L,
+                        2L,
+                        "kept facts",
+                        ResizeArray<ChatMessage>() :> IReadOnlyList<ChatMessage>,
+                        SessionEventContract.CompactedContextVersion
+                    )
+                    :> SessionEvent
             | "compactionFailed" ->
                 fun () -> CompactionFailedEvent(sessionId, turnId, noSequence, stamp, "model denied") :> SessionEvent
             | "turnCompleted" -> fun () -> TurnCompletedEvent(sessionId, turnId, noSequence, stamp) :> SessionEvent

@@ -7,7 +7,7 @@ open Legate.Storage.Sqlite
 open Legate.Testing
 
 // Shared helpers for the SQLite-backed tests: isolated temp-file databases
-// (no external services) plus best-effort cleanup of the file and the
+// (no external services) plus checked cleanup of the file and the
 // engine and guard sidecars beside it.
 
 /// <summary>
@@ -28,7 +28,7 @@ let openTestDatabase (clock: TestClock) : SqliteDatabase * string =
 
 /// <summary>
 /// Deletes the database file and its sidecars (the lock guard plus the
-/// engine WAL files), ignoring failures: cleanup must never fail a test.
+/// engine WAL files). Cleanup failures fail the test rather than leaking files silently.
 /// </summary>
 /// <param name="path">The database file path.</param>
 let deleteDatabaseFiles (path: string) : unit =
@@ -40,7 +40,4 @@ let deleteDatabaseFiles (path: string) : unit =
             "-shm"
             "-journal"
         ] do
-        try
-            File.Delete(path + suffix)
-        with _ ->
-            ()
+        File.Delete(path + suffix)

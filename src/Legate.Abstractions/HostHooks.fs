@@ -68,7 +68,10 @@ type ISessionCompletionSink =
 
     /// Receives one completion delivery for the session.
     /// <param name="completion">The session's structured completion, carrying the idempotency key sinks deduplicate on.</param>
-    abstract Notify: completion: SessionCompletion -> unit
+    /// <param name="cancellationToken">Cancels this bounded delivery attempt.</param>
+    /// <returns>Completes after receiver acceptance or durable responsibility only.
+    /// Failure or cancellation is not acknowledgement; preserve the original idempotency key.</returns>
+    abstract NotifyAsync: completion: SessionCompletion * cancellationToken: CancellationToken -> Task
 
 /// How hosts observe agent changes for audit: an optional asynchronous hook
 /// invoked by hosts that manage agents through Legate's

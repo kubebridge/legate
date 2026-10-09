@@ -151,7 +151,8 @@ module internal LocalActorSystem =
 /// resolve no system and no router here.
 /// Stop bounds coordinated shutdown by
 /// <c>Cluster:ShutdownGraceSeconds</c>.
-type internal LocalActorSystemService(options: IOptions<LegateOptions>, timeProvider: TimeProvider) as this =
+type internal LocalActorSystemService
+    (options: IOptions<LegateOptions>, timeProvider: TimeProvider, provider: IServiceProvider | null) as this =
 
     do ArgumentNullException.ThrowIfNull(options)
     do ArgumentNullException.ThrowIfNull(timeProvider)
@@ -159,6 +160,16 @@ type internal LocalActorSystemService(options: IOptions<LegateOptions>, timeProv
     let mutable system: Akka.Actor.ActorSystem | null = null
     let mutable router: IActorRef | null = null
     let mutable lastColdStart: TimeSpan = TimeSpan.Zero
+    let mutable started = false
+
+    let mutable sessionChildFactory: (string -> IActorContext -> string -> IActorRef) option =
+        None
+
+    let hubs =
+        System.Collections.Concurrent.ConcurrentDictionary<TenantId * string, CrossNodeSubscriptions.SubscriptionHub>()
+
+    new(options: IOptions<LegateOptions>, timeProvider: TimeProvider) =
+        LocalActorSystemService(options, timeProvider, null)
 
     /// The running actor system, or null when the host runs clustered or
     /// has not started.
@@ -180,7 +191,15 @@ type internal LocalActorSystemService(options: IOptions<LegateOptions>, timeProv
     /// client facade owns setting this once it can supply the store and
     /// turn runner; until then resolving an id stays observable either
     /// way. Set before StartAsync.
-    member val SessionChildFactory: (string -> IActorContext -> string -> IActorRef) option = None with get, set
+    member _.SessionChildFactory
+        with get () = sessionChildFactory
+        and set value =
+            if not (isNull (box provider)) then
+                invalidOp "SessionChildFactory is a unit-test seam and is unavailable with a production context."
+            elif started then
+                invalidOp "SessionChildFactory cannot be changed after StartAsync."
+            else
+                sessionChildFactory <- value
 
     /// Resolves the session child for a session id: the same id returns
     /// the same actor, distinct ids return distinct actors.
@@ -208,6 +227,11 @@ type internal LocalActorSystemService(options: IOptions<LegateOptions>, timeProv
                     CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token)
 
                 let! child = routerRef.Ask<IActorRef>(ResolveSession sessionId, linkedCts.Token)
+
+                if not (isNull (box provider)) then
+                    let! _ = child.Ask<SessionRouteAccepted>(SessionRouteProbe, linkedCts.Token)
+                    ()
+
                 return child
             }
 
@@ -220,20 +244,48 @@ type internal LocalActorSystemService(options: IOptions<LegateOptions>, timeProv
         this.resolveInner sessionId cancellationToken
 
     interface ISessionResolver with
-        member this.ResolveSessionAsync(sessionId, cancellationToken) =
-            this.resolveInner sessionId cancellationToken
+        member this.ResolveSessionAsync(address, cancellationToken) =
+            this.resolveInner address.Key cancellationToken
 
     interface IHostedService with
-        member _.StartAsync(_cancellationToken: CancellationToken) =
+        member _.StartAsync(cancellationToken: CancellationToken) =
             task {
+                started <- true
+
                 if options.Value.Cluster.Mode = ClusterMode.Local then
+                    let contexts =
+                        match provider with
+                        | null -> None
+                        | root -> root.GetService<ISessionHostContexts>() |> Option.ofObj
+
+                    match contexts with
+                    | Some contexts ->
+                        contexts.OpenAdmission()
+                        do! contexts.InitializeAsync cancellationToken
+                    | None -> ()
+
                     let startTimestamp = timeProvider.GetTimestamp()
                     let created = LocalActorSystem.createSystem ()
 
                     let routerRef =
-                        match this.SessionChildFactory with
-                        | Some spawnSession -> LocalActorSystem.spawnRouterWith created spawnSession
-                        | None -> LocalActorSystem.spawnRouter created
+                        match contexts with
+                        | Some contexts ->
+                            LocalActorSystem.spawnRouterWith created (fun key context name ->
+                                match SessionAddress.TryParse key with
+                                | None ->
+                                    raise (SessionScopeRejectedException(SessionScopeRejectionReason.InvalidScope))
+                                | Some address ->
+                                    let guard = SessionRouting.spawnGate contexts hubs key context (name + "-guard")
+
+                                    spawn
+                                        context
+                                        name
+                                        (SessionRouting.boundProxy address (fun request sender ->
+                                            guard.Tell(request, sender))))
+                        | None ->
+                            match this.SessionChildFactory with
+                            | Some spawnSession -> LocalActorSystem.spawnRouterWith created spawnSession
+                            | None -> LocalActorSystem.spawnRouter created
 
                     system <- created
                     router <- routerRef
@@ -246,24 +298,51 @@ type internal LocalActorSystemService(options: IOptions<LegateOptions>, timeProv
 
         member _.StopAsync(cancellationToken: CancellationToken) =
             task {
+                let contexts =
+                    match provider with
+                    | null -> None
+                    | root when options.Value.Cluster.Mode = ClusterMode.Local ->
+                        root.GetService<ISessionHostContexts>() |> Option.ofObj
+                    | _ -> None
+
+                match contexts with
+                | None -> ()
+                | Some current ->
+                    current.CloseAdmission()
+                    do! current.DrainAsync(options.Value.Cluster.ShutdownGraceSeconds, timeProvider, cancellationToken)
+
+                for entry in hubs do
+                    entry.Value.DetachAll()
+
+                hubs.Clear()
+
                 match system with
                 | null -> ()
                 | created ->
                     let gracePeriod = options.Value.Cluster.ShutdownGraceSeconds
 
-                    try
-                        // Termination drives coordinated shutdown (the local
-                        // HOCON keeps run-by-actor-system-terminate on); the
-                        // wait bounds the drain by the configured grace. A
-                        // null from-phase runs every shutdown phase.
-                        let shutdown =
-                            CoordinatedShutdown.Get(created).Run(CoordinatedShutdown.ClrExitReason.Instance, null)
+                    // A timeout or cancellation is a real shutdown failure.
+                    // Keep the live references until Akka confirms complete
+                    // termination so borrowed providers cannot be torn down
+                    // while actors still hold them.
+                    let shutdown =
+                        CoordinatedShutdown.Get(created).Run(CoordinatedShutdown.ClrExitReason.Instance, null)
 
-                        let! _ = shutdown.WaitAsync(gracePeriod, cancellationToken)
-                        ()
-                    with
-                    | :? TimeoutException -> ()
-                    | :? OperationCanceledException -> ()
+                    do!
+                        NodeBoundedWait.awaitTask
+                            "LocalActorSystemShutdown"
+                            shutdown
+                            gracePeriod
+                            timeProvider
+                            cancellationToken
+
+                    do!
+                        NodeBoundedWait.awaitTask
+                            "LocalActorSystemTermination"
+                            created.WhenTerminated
+                            gracePeriod
+                            timeProvider
+                            cancellationToken
 
                     system <- null
                     router <- null

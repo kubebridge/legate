@@ -70,9 +70,11 @@ module SessionHarnessTests =
             Assert.Equal("done", collected.Result.AssistantText)
             Assert.Equal(1, collected.Result.Iterations)
 
-            // The suspendable actor journals only suspend, resolve, and
-            // timeout events: a plain turn leaves the journal empty.
-            Assert.Empty(collected.Events)
+            // The suspendable actor journals suspend, resolve, and timeout
+            // events plus one terminal completion row per settled turn
+            // (issue 289): a plain turn leaves exactly the completion.
+            let completed = Assert.Single(collected.Events)
+            Assert.IsType<TurnCompletedEvent>(completed) |> ignore
 
             Assert.Equal(1, harness.SettledResults.Count)
 
@@ -297,9 +299,12 @@ module SessionHarnessTests =
             | :? TurnFailed as failed -> Assert.Equal(TurnLoop.AskUserHeadlessFailMessage, failed.Reason)
             | _ -> Assert.Fail("The failed turn carries no TurnFailed outcome.")
 
-            // Nothing suspended, so the journal holds no question events.
+            // Nothing suspended, so the journal holds no question events:
+            // only the terminal failure row (issue 289).
             let! events = harness.CollectEventsAsync(CancellationToken.None)
-            Assert.Empty(events)
+            let failed = Assert.Single(events)
+            let failedEvent = Assert.IsType<TurnFailedEvent>(failed)
+            Assert.Equal(TurnLoop.AskUserHeadlessFailMessage, failedEvent.Reason)
 
             Assert.Equal(1, harness.SettledResults.Count)
         }
@@ -320,13 +325,15 @@ module SessionHarnessTests =
             use! harness = SessionHarness.CreateAsync(client, sourced [ AskUserTool.Create() ], options)
 
             // The canned answer resumes the turn without any host reply.
+            // The settled turn leaves exactly its terminal completion
+            // row (issue 289).
             let! result = harness.PromptAndSettleAsync("run", CancellationToken.None)
 
             Assert.Equal(TurnStatus.Completed, result.Status)
             Assert.Equal("done", result.AssistantText)
 
             let! events = harness.CollectEventsAsync(CancellationToken.None)
-            Assert.Empty(events)
+            Assert.IsType<TurnCompletedEvent>(Assert.Single(events)) |> ignore
 
             Assert.Equal(1, harness.SettledResults.Count)
         }
