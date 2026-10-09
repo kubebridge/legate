@@ -302,7 +302,14 @@ let runSpikeAsync
                             state
                             engine.LastOperationText
 
-                    let key = (width, height, input.Editor, input.Picker, view, status, scrollOffset)
+                    let progressFrame =
+                        if state = SessionState.Running then
+                            Environment.TickCount64 / 100L
+                        else
+                            0L
+
+                    let key =
+                        (width, height, input.Editor, input.Picker, view, status + string progressFrame, scrollOffset)
 
                     if lastPaintKey <> Some key then
                         let slash =
@@ -327,7 +334,11 @@ let runSpikeAsync
                                 // The welcome screen documents shortcuts; keep the composer quiet.
                                 rows |> List.take (max 1 (rows.Length - 1)), cursor
 
-                        let welcome = view.Display.IsEmpty && view.Lifecycle.IsEmpty && view.Order.IsEmpty
+                        let welcome =
+                            view.Display.IsEmpty
+                            && view.Lifecycle.IsEmpty
+                            && view.Order.IsEmpty
+                            && state <> SessionState.Running
 
                         let transcript =
                             if welcome then
@@ -340,6 +351,8 @@ let runSpikeAsync
                                     })
                             else
                                 DotRender.toSessionCells view
+
+                        let transcript = DotRender.withResponseProgress state progressFrame transcript
 
                         let status =
                             if scrollOffset > 0 then

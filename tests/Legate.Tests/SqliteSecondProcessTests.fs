@@ -46,9 +46,8 @@ let ``A second opener of the same file receives the typed locked error`` () =
     let clock = TestClock()
     let database, path = SqliteTestFixture.openTestDatabase clock
 
-    use first = database
-
     try
+        use first = database
         // The first database works before the second opener arrives.
         let tenant = TenantId.Create "second-process"
         let store = SqliteStoreFactory.sessionStore first

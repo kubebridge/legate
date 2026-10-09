@@ -49,6 +49,7 @@
     <Compile Include="TranscriptsTests.fs" />
     <Compile Include="ContextPruningTests.fs" />
     <Compile Include="SessionsStoreTests.fs" />
+    <Compile Include="SqliteTestFixture.fs" />
     <Compile Include="SessionSettlementTests.fs" />
     <Compile Include="SessionEventStoreTests.fs" />
     <Compile Include="AgentStoreTests.fs" />
@@ -155,7 +156,6 @@
     <Compile Include="../../samples/Dot/ReplEngine.fs" Link="ReplEngineUnderTest.fs" />
     <Compile Include="DotAttachmentTests.fs" />
     <Compile Include="MigrationTests.fs" />
-    <Compile Include="SqliteTestFixture.fs" />
     <Compile Include="TenantRemotingAcceptanceTests.fs" />
     <Compile Include="TenantRoutingDuplicateTests.fs" />
     <Compile Include="SqliteSessionStoreTests.fs" />

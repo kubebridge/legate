@@ -372,10 +372,7 @@ type SqliteOperationReadTests() =
             finally
                 (database :> IDisposable).Dispose()
 
-                try
-                    System.IO.File.Delete path
-                with _ ->
-                    ()
+                SqliteTestFixture.deleteDatabaseFiles path
         }
         :> Task
 
@@ -456,10 +453,7 @@ type SqliteOperationReadTests() =
             finally
                 (reopened :> IDisposable).Dispose()
 
-                try
-                    System.IO.File.Delete path
-                with _ ->
-                    ()
+                SqliteTestFixture.deleteDatabaseFiles path
         }
         :> Task
 

@@ -313,10 +313,7 @@ type SqliteSessionSettlementTests() =
             finally
                 (database :> IDisposable).Dispose()
 
-                try
-                    System.IO.File.Delete path
-                with _ ->
-                    ()
+                SqliteTestFixture.deleteDatabaseFiles path
         }
         :> Task
 
@@ -354,9 +351,6 @@ type SqliteSessionSettlementTests() =
             finally
                 (database :> IDisposable).Dispose()
 
-                try
-                    System.IO.File.Delete path
-                with _ ->
-                    ()
+                SqliteTestFixture.deleteDatabaseFiles path
         }
         :> Task
