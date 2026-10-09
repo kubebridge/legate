@@ -383,18 +383,23 @@ CREATE TABLE IF NOT EXISTS "%s{archive}" (
     // ── lifecycle ──
 
     /// <summary>
-    /// Releases the single-process guard. Stores must not be used after
+    /// Clears this database's connection pool and releases the single-process guard. Stores must not be used after
     /// the database is disposed.
     /// </summary>
     interface IDisposable with
-        member _.Dispose() =
-            if not disposed then
-                disposed <- true
+        member this.Dispose() =
+            lock gate (fun () ->
+                if not disposed then
+                    disposed <- true
 
-                try
-                    lockStream.Dispose()
-                with _ ->
-                    ()
+                    try
+                        // Disposed connections remain open in the provider pool.
+                        // Close this file's pool before another owner can acquire
+                        // the guard, checkpointing WAL and releasing file handles.
+                        use poolKey = new SqliteConnection(this.ConnectionString)
+                        SqliteConnection.ClearPool(poolKey)
+                    finally
+                        lockStream.Dispose())
 
     /// <summary>
     /// Formats an instant as ISO-8601 text: the portable TEXT column form
