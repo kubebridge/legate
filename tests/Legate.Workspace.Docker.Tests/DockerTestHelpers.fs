@@ -49,10 +49,20 @@ type internal FakeDockerCommandRunner(handler: IReadOnlyList<string> -> DockerCl
 
 module internal DockerTestHelpers =
 
-    /// A fresh host root per test, under the system temp directory.
+    /// A fresh host root per test: under RUNNER_TEMP when set, otherwise
+    /// the system temp directory. RUNNER_TEMP lives under the Actions
+    /// work directory, which the self-hosted runner shares with its DinD
+    /// sidecar through the runner-work mount; the DinD image mounts a
+    /// private tmpfs over /tmp, so bind sources under Path.GetTempPath
+    /// are invisible to the daemon there (issue 245).
     let freshRoot () =
-        let root =
-            Path.Combine(Path.GetTempPath(), "legate-docker-tests", Ulid.NewUlid().ToString())
+        let baseDir =
+            match Environment.GetEnvironmentVariable "RUNNER_TEMP" with
+            | null
+            | "" -> Path.GetTempPath()
+            | temp -> temp
+
+        let root = Path.Combine(baseDir, "legate-docker-tests", Ulid.NewUlid().ToString())
 
         Directory.CreateDirectory root |> ignore
         root
