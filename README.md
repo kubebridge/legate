@@ -5,6 +5,8 @@
 
 > A durable Akka.NET runtime for tool-using AI agents.
 
+Documentation: [kubebridge.github.io/legate](https://kubebridge.github.io/legate).
+
 Legate is an **agent harness** for .NET. You register it in a host (ASP.NET
 Core, a generic host, or a CLI), point it at one or more LLM providers, hand it
 tools (MCP servers, `AIFunction`s, built-ins), and it runs **sessions**:
