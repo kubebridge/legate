@@ -43,6 +43,12 @@
     <PackageVersion Include="OpenTelemetry.Api" Version="1.19.1" />
     <PackageVersion Include="SixLabors.ImageSharp" Version="3.1.12" />
     <PackageVersion Include="StackExchange.Redis" Version="2.12.8" />
+    <!-- Direct pin: FluentMigrator resolves System.Security.Cryptography.Pkcs
+         9.0.0 transitively, which NuGet audit flags (GHSA-2fmv-rv2c-59x7,
+         GHSA-846f-f764-76mx, published 2026-10-13). The patched 9.0.21 is a
+         same-major servicing bump; the storage packages reference it
+         directly and no source file touches Pkcs types. -->
+    <PackageVersion Include="System.Security.Cryptography.Pkcs" Version="9.0.21" />
     <PackageVersion Include="Ulid" Version="1.4.1" />
     <PackageVersion Include="YamlDotNet" Version="15.3.0" />
   </ItemGroup>
