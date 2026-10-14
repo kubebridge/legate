@@ -35,6 +35,7 @@
     <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" />
     <PackageReference Include="Microsoft.Extensions.Options" />
     <PackageReference Include="Npgsql" />
+    <PackageReference Include="System.Security.Cryptography.Pkcs" />
     <PackageReference Include="Ulid" />
   </ItemGroup>
 
