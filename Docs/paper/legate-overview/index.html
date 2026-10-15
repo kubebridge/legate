@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Legate · Architecture Guide</title>
+  <meta name="description" content="An architecture guide to the durable agent harness for .NET">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&amp;family=JetBrains+Mono:wght@400;500;600&amp;family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400;1,6..72,500&amp;display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="theme.css">
+  <link rel="stylesheet" href="c4.css">
+  <script defer src="document.js"></script>
+  <script defer src="model.js"></script>
+  <script defer src="c4.js"></script>
+  <script defer src="c4-ui.js"></script>
+</head>
+<body data-doc-id="legate-overview">
+  <a class="skip-link" href="#main">Skip to content</a>
+  <nav class="nav" aria-label="Document sections">
+    <div class="wrap">
+      <div class="brand">Legate <em>· Architecture Guide</em></div>
+      <div class="nav-links"><a href="#overview">Overview</a><a href="#concepts">Core concepts</a><a href="#architecture">Architecture</a><a href="#usage">How it works</a><a href="#operations">Operations and limits</a><a href="#references">Sources and open questions</a></div>
+      <button class="btn sm" data-notes-toggle aria-pressed="false">Hide notes</button>
+    </div>
+    <div class="progress" data-progress aria-hidden="true"></div>
+  </nav>
+  <header class="hero" id="top">
+    <div class="wrap">
+      <div class="mast-top"><span>Documentation</span><span>2026-10-15</span><span>Working draft</span></div>
+      <div class="mast-title">
+        <div class="kick">Documentation · Working draft</div>
+        <h1 class="compact-title">Legate</h1>
+        <p class="lede">A durable Akka.NET runtime for tool-using AI agents, packaged as .NET libraries a host registers with <code>AddLegate(...)</code>.</p>
+      </div>
+      <div class="mast-grid">
+        <div>
+          <ul class="facts">
+            <li><span class="k">Purpose</span><span>Explain what Legate is, how it runs, and how to host it</span></li>
+            <li><span class="k">Audience</span><span>Developers evaluating or hosting an agent harness</span></li>
+            <li><span class="k">Format</span><span>Portable HTML, open directly in a browser</span></li>
+            <li><span class="k">Status</span><span>Pre-release, 0.1.0 preview on NuGet</span></li>
+          </ul>
+        </div>
+        <div class="agenda">
+          <div class="stage"><div class="roman">I.</div><h3>Overview</h3><p>Purpose, reader, scope, and release status.</p></div><div class="stage"><div class="roman">II.</div><h3>Core concepts</h3><p>Sessions, turns, events, and the lifecycle.</p></div><div class="stage"><div class="roman">III.</div><h3>Architecture</h3><p>Runtime, storage, workspaces, and tools.</p></div>
+        </div>
+      </div>
+    </div>
+  </header>
+  <main id="main">
+    <section class="s" id="overview">
+      <div class="wrap">
+        <div class="eyebrow"><span class="n">1</span>Overview</div>
+        <h2>An agent harness, not an agent</h2>
+        <p class="sub">Legate runs the conversation; the host owns the product around it.</p>
+        <div class="prose">
+          <p>Legate is an open-source (Apache 2.0) <strong>agent harness for .NET</strong>: a durable Akka.NET runtime for tool-using AI agents, written in F# with a C#-friendly public surface. A host registers it with <code>AddLegate(...)</code>, configures LLM providers, tools, and storage, and gets <strong>sessions</strong> it can prompt at any time, steer mid-turn, abort, resume after a crash, and replay.</p>
+          <p>The mental model is the backend of an agentic CLI: a session, one primary verb (the user sends a message), a stream of events back, and the ability to answer, steer, or abort while the agent works. Two hosts are first-class: a <strong>CLI harness</strong> (single process, no database server, tools on the working directory, approval prompts) and a <strong>hosted multi-tenant service</strong> (clustered, Postgres and S3, sandboxed workspaces, headless sessions with webhooks).</p>
+          <p>Status: pre-release scaffolding. <code>Legate</code> <code>0.1.0</code> is published to nuget.org as a preview; expect breaking changes between <code>0.x</code> releases. <code>Docs/ARCHITECTURE.md</code> in the repository is the normative target the implementation is converging on.</p>
+        </div>
+      </div>
+    </section>
+    <section class="s" id="concepts">
+      <div class="wrap">
+        <div class="eyebrow"><span class="n">2</span>Core concepts</div>
+        <h2>Sessions, turns, and events</h2>
+        <p class="sub">Seven terms cover most of the model.</p>
+        <div class="table-scroll">
+          <table class="t">
+            <thead><tr><th scope="col">Term</th><th scope="col">Meaning</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">Agent</th><td>A definition: model config, system prompt, tool set, skills, sub-agents, permission defaults.</td></tr>
+              <tr><th scope="row">Session</th><td>A conversation with one agent (switchable per turn). Has an id, tenant, title, state, transcript, inbox, and workspace binding. Lives until closed or expired.</td></tr>
+              <tr><th scope="row">UserMessage</th><td>What the user sent. The only thing that starts a turn, journaled before it is acted on.</td></tr>
+              <tr><th scope="row">Reply</th><td>The host answer to something the agent waits on: a permission decision or a question answer. Resumes a suspended turn, never starts one.</td></tr>
+              <tr><th scope="row">Turn</th><td>One run of the ReAct loop. Ends when the model stops calling tools, the host aborts, or the budget runs out; suspends while waiting on a reply. The lease and claim unit.</td></tr>
+              <tr><th scope="row">SessionEvent</th><td>Fine-grained, ordered, journaled stream out of a session (turn started, text delta, tool call started, permission requested, turn completed, and more). Hosts render these.</td></tr>
+              <tr><th scope="row">SessionCell</th><td>The coarse transcript (user, assistant, tool call, tool result, system), derived from events, kept for replay and UI.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="prose">
+          <p>Session lifecycle: <code>Idle</code> to <code>Running</code> to (<code>Idle</code>, <code>WaitingForInput</code>, or <code>Closed</code>). Every side effect on behalf of a turn checks the turn claim token at the last moment; a correlation id is evidence, not authority.</p>
+        </div>
+      </div>
+    </section>
+    <section class="s" id="architecture">
+      <div class="wrap">
+        <div class="eyebrow"><span class="n">3</span>Interactive model</div>
+        <h2>One runtime, three deployment shapes</h2>
+        <p class="sub">Inspect a box for its responsibility, drill from context to containers to the turn loop, then play the prompt flow.</p>
+        <div data-c4="legate" data-view="context"><p class="card">The interactive model loads with JavaScript. The architecture summary below remains available without it.</p></div>
+        <p class="small muted mt">Verified against the repository at main, October 2026. Everything points inward to Legate.Abstractions; the Abstractions package depends on nothing else in the solution.</p>
+        <div class="prose">
+          <p><strong>Context.</strong> A developer builds a host application on Legate libraries, wires LLM providers and tool servers, and serves end users. The harness itself is in-process libraries plus an Akka.NET actor system, not a separate service to deploy.</p>
+          <p><strong>Containers.</strong> The session runtime (actors, dispatcher, ReAct loop) executes turns; the event journal (SQLite locally, Postgres hosted) persists the ordered event stream for resume and replay; the workspace runtime (HostDirectory, Process, Docker) gives tools a filesystem with confinement; the LLM layer (OpenAI-compatible, Anthropic, Google providers) serves model calls with admission control; the tool gateway (built-ins, MCP servers, sub-agents) executes calls behind the permission policy.</p>
+          <p><strong>Turn loop.</strong> Claim the turn, run the ReAct loop, fence every side effect on the claim, journal every event, settle exactly once with an operation receipt, and notify observers. Compaction keeps model input bounded; transcripts stay complete.</p>
+        </div>
+      </div>
+    </section>
+    <section class="s" id="usage">
+      <div class="wrap">
+        <div class="eyebrow"><span class="n">4</span>How it works</div>
+        <h2>One prompt, end to end</h2>
+        <p class="sub">Follow a user message from inbox to receipt.</p>
+        <div class="prose">
+          <ol>
+            <li><strong>Prompt.</strong> The host appends a user message to the session inbox and asks for a turn, receiving an accepted-operation receipt for durable observation.</li>
+            <li><strong>Claim.</strong> The session actor drains the entry and claims the turn (lease-protected, fenced against takeovers and crash orphans).</li>
+            <li><strong>Loop.</strong> The ReAct loop calls the model, executes tool calls through the workspace, and streams text, reasoning, and tool events to the journal as they happen.</li>
+            <li><strong>Gate.</strong> A tool call the policy cannot decide alone suspends the turn with a permission request (or an agent question); the host reply resumes exactly that turn.</li>
+            <li><strong>Settle.</strong> When the model stops calling tools, the turn settles once: outcome recorded, observers notified by operation identity (never next-result FIFO), transcript cells derived.</li>
+            <li><strong>Observe and steer.</strong> Hosts render the event stream live, answer pending prompts, steer or abort mid-turn, and later resume or replay from any sequence number.</li>
+          </ol>
+          <p>Failure paths keep the same shape: aborts, budget exhaustion, and loop faults settle explicitly; crash recovery rebuilds from the journal and continuation resumes under a fresh claim.</p>
+        </div>
+      </div>
+    </section>
+    <section class="s" id="operations">
+      <div class="wrap">
+        <div class="eyebrow"><span class="n">5</span>Operations and limits</div>
+        <h2>Running it and knowing the edges</h2>
+        <p class="sub">Prerequisites, storage choices, recovery, and current limitations.</p>
+        <div class="grid g2">
+          <article class="card"><h3>Prerequisites</h3><p>.NET 10 SDK. Provider API keys from environment (<code>ANTHROPIC_API_KEY</code>, <code>OPENAI_API_KEY</code>, <code>GOOGLE_API_KEY</code>) or configuration. Docker only for container workspaces and the cluster smoke harness.</p></article>
+          <article class="card"><h3>Storage</h3><p>SQLite file for single-process hosts (resume works across processes). Postgres plus S3 for the hosted service, with shared versioned migrations. In-memory stores exist for tests.</p></article>
+          <article class="card"><h3>Recovery</h3><p>Leases expire, claims fence takeovers, the journal replays from any sequence, and settlement is idempotent. A restarted host reopens sessions and continues turns without duplicating effects.</p></article>
+          <article class="card o"><h3>Limits</h3><p>Pre-release: breaking changes across <code>0.x</code>. No old-format migration shims; unsupported journals are rejected with a clean start. Samples are hosts, not supported products.</p></article>
+        </div>
+        <details class="qa"><summary>Which sample should I run first?</summary><div class="a"><p><code>samples/Dot</code> is the interactive CLI with a full-screen transcript UI. <code>samples/MinimalHost</code> shows minimal wiring; <code>samples/Headless</code> runs sessions without a UI; <code>samples/CSharpWebHost</code> shows ASP.NET Core hosting.</p></div></details>
+        <details class="qa"><summary>How do sub-agents work?</summary><div class="a"><p>The <code>task</code> tool runs a named sub-agent (for example <code>explore</code> with read-only tools, or <code>general</code>) as a nested turn sharing the session workspace and journal, with its own filtered tool pool.</p></div></details>
+      </div>
+    </section>
+    <section class="s" id="references">
+      <div class="wrap">
+        <div class="eyebrow"><span class="n">6</span>Sources and open questions</div>
+        <h2>Where this came from</h2>
+        <p class="sub">Every structural claim traces to these paths.</p>
+        <div class="prose">
+          <ol>
+            <li><code>Docs/ARCHITECTURE.md</code>: normative model, package boundaries, session lifecycle.</li>
+            <li><code>src/Legate.Abstractions</code>: contracts (sessions, events, tools, workspaces, policies).</li>
+            <li><code>src/Legate</code>: runtime (actors, dispatcher, turn loop, built-ins, hosting).</li>
+            <li><code>src/Legate.Storage.*</code>: InMemory, Sqlite, Postgres, S3, FileSystem, Migrations.</li>
+            <li><code>src/Legate.Workspace.*</code>: HostDirectory, Process, Docker workspaces.</li>
+            <li><code>src/Legate.Llm.*</code>: OpenAI, Anthropic, Google providers; <code>src/Legate.Mcp</code>: tool servers.</li>
+            <li><code>samples/Dot</code>, <code>samples/MinimalHost</code>, <code>samples/Headless</code>: host shapes.</li>
+            <li>Repository: <code>github.com/kubebridge/legate</code>. Published docs: <code>kubebridge.github.io/legate</code>. Package: <code>nuget.org/packages/Legate</code> (0.1.0 preview).</li>
+          </ol>
+          <p><strong>Open questions.</strong> First stable release scope and date are not stated in the sources above; neither is hosted-service pricing or availability. Treat any such claim as unknown until the maintainers publish it.</p>
+        </div>
+      </div>
+    </section>
+  </main>
+  <footer><div class="wrap"><b>Legate · Architecture Guide</b> · Working draft, October 2026.<br><span class="small">Portable document. Keep the whole folder together when sharing.</span></div></footer>
+  <a class="btn toTop" href="#top" aria-label="Back to top">↑</a>
+</body>
+</html>

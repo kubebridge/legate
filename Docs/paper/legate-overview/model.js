@@ -1,0 +1,110 @@
+/* Sourced model: verified against Docs/ARCHITECTURE.md and the repository at main, October 2026. */
+window.PAPER_DOC_MODELS = {
+  legate: {
+    name: 'Legate agent harness',
+    description: 'Durable Akka.NET runtime for tool-using AI agents, shipped as .NET libraries.',
+    status: 'Working draft',
+    date: '2026-10-15',
+    initialView: 'context',
+    tags: {
+      core: { label: 'Request path', color: '#23477a' },
+      persist: { label: 'Durability', color: '#8a6200' },
+      background: { label: 'Background work', color: '#2f6b4f' },
+    },
+    elements: {
+      developer: { kind: 'person', name: 'Host developer', desc: 'Registers AddLegate, configures providers, tools, and storage.', tags: ['core'] },
+      user: { kind: 'person', name: 'End user', desc: 'Prompts sessions and answers permission prompts and questions.', tags: ['core'] },
+      legate: {
+        kind: 'system', name: 'Legate', desc: 'Durable runtime for tool-using agent sessions, running in the host process.',
+        tags: ['core'],
+        facts: ['Apache 2.0, F# with a C# friendly surface', 'Pre-release, 0.1.0 preview on NuGet'],
+        notes: { why: 'A library, not a service: the host keeps its own deployment shape.' },
+      },
+      llm: { kind: 'system', external: true, name: 'LLM providers', tech: 'HTTPS API', desc: 'OpenAI-compatible, Anthropic, and Google models.', tags: ['core'] },
+      mcp: { kind: 'system', external: true, name: 'MCP servers', tech: 'MCP protocol', desc: 'External tool servers the agent calls through the gateway.', tags: ['core'] },
+      managed: { kind: 'system', external: true, supporting: true, name: 'Managed stores', tech: 'Postgres / S3', desc: 'Relational journal and blob storage for the hosted service.', tags: ['persist'] },
+      runtime: {
+        kind: 'app', parent: 'legate', name: 'Session runtime', tech: 'F# / Akka.NET', desc: 'Actors, dispatcher, and ReAct loop that execute turns.',
+        tags: ['core'],
+        facts: ['Turn is the lease and claim unit', 'Idle to Running to Idle, WaitingForInput, or Closed'],
+      },
+      journal: {
+        kind: 'store', parent: 'legate', name: 'Event journal', tech: 'SQLite / Postgres', desc: 'Ordered, replayable session event stream.',
+        tags: ['core', 'persist'],
+        facts: ['Subscribe resumes from any sequence number'],
+      },
+      workspaces: { kind: 'app', parent: 'legate', name: 'Workspaces', tech: 'HostDirectory / Process / Docker', desc: 'Confined filesystems tools act through, including container bind mounts.', tags: ['core'] },
+      llmcoord: { kind: 'app', parent: 'legate', name: 'LLM coordination', tech: 'F#', desc: 'Provider calls with admission control and bounded input.', tags: ['core'] },
+      tools: { kind: 'app', parent: 'legate', name: 'Tool gateway', tech: 'F#', desc: 'Built-ins, MCP clients, and sub-agent runs behind the permission policy.', tags: ['core'] },
+      turnloop: {
+        kind: 'component', parent: 'runtime', name: 'ReAct loop', tech: 'F#', desc: 'Model call, tool call, observe, repeat until stop, abort, or budget.',
+        tags: ['core'],
+        files: ['src/Legate/TurnLoop.fs'],
+      },
+      claims: {
+        kind: 'component', parent: 'runtime', name: 'Turn claims', tech: 'F#', desc: 'Lease-protected ownership fencing every side effect.',
+        tags: ['core'],
+        notes: { why: 'A correlation id is evidence, not authority: only the claim permits effects.' },
+      },
+      settle: {
+        kind: 'component', parent: 'runtime', name: 'Settlement', tech: 'F#', desc: 'Exactly-once turn outcomes with operation receipts for observers.',
+        tags: ['core', 'persist'],
+      },
+      compact: {
+        kind: 'component', parent: 'runtime', name: 'Compaction', tech: 'F# / summarizer model', desc: 'Keeps model input bounded while transcripts stay complete.',
+        tags: ['background'],
+      },
+    },
+    rels: [
+      { from: 'developer', to: 'legate', label: 'Hosts and configures', tech: 'AddLegate / options', only: ['context'] },
+      { from: 'user', to: 'legate', label: 'Prompts, answers, steers, aborts', tech: 'Session client', only: ['context'] },
+      { from: 'user', to: 'runtime', label: 'Prompts sessions and replies to prompts', tech: 'Session client', only: ['containers'] },
+      { from: 'runtime', to: 'journal', label: 'Journals every turn event', tech: 'Ordered append', async: true },
+      { from: 'journal', to: 'managed', label: 'Persists hosted journals', tech: 'SQL / TLS', async: true },
+      { from: 'runtime', to: 'llmcoord', label: 'Requests model output', tech: 'In-process call' },
+      { from: 'llmcoord', to: 'llm', label: 'Calls chat completions', tech: 'HTTPS / JSON', async: true },
+      { from: 'runtime', to: 'tools', label: 'Invokes tool calls', tech: 'In-process call' },
+      { from: 'tools', to: 'mcp', label: 'Runs server tools', tech: 'MCP protocol', async: true },
+      { from: 'tools', to: 'workspaces', label: 'Reads and writes files', tech: 'Confined paths' },
+      { from: 'turnloop', to: 'claims', label: 'Runs under a held claim', tech: 'In-process call' },
+      { from: 'turnloop', to: 'llmcoord', label: 'Streams model deltas', tech: 'In-process call' },
+      { from: 'turnloop', to: 'tools', label: 'Executes gated calls', tech: 'In-process call' },
+      { from: 'turnloop', to: 'settle', label: 'Settles the turn once', tech: 'In-process call' },
+      { from: 'settle', to: 'journal', label: 'Records the outcome', tech: 'Ordered append', async: true },
+      { from: 'compact', to: 'llmcoord', label: 'Bounds next model input', tech: 'In-process call' },
+    ],
+    views: {
+      context: {
+        level: 1, scope: 'legate', title: 'System context', ipTitle: 'System context', crumb: 'Context',
+        layout: { developer: [0, 60], user: [0, 420], legate: [450, 240], llm: [900, 60], mcp: [900, 240], managed: [900, 420, 'sm'] },
+        drill: { legate: 'containers' }, labelT: { 'user>legate': 0.4 },
+      },
+      containers: {
+        level: 2, scope: 'legate', title: 'Containers', ipTitle: 'Runtime and stores', crumb: 'Containers', parent: 'context',
+        layout: { user: [-400, 280], runtime: [0, 280], journal: [450, 280], llmcoord: [0, 620], tools: [450, 620], workspaces: [900, 620], llm: [0, 960, 'sm'], mcp: [450, 960, 'sm'], managed: [900, 960, 'sm'] },
+        drill: { runtime: 'turn_loop' }, labels: 'select',
+        curves: { 'journal>managed': 60, 'runtime>tools': -40 },
+      },
+      turn_loop: {
+        level: 3, scope: 'runtime', title: 'Turn loop', ipTitle: 'Turn loop components', crumb: 'Turn loop', parent: 'containers',
+        layout: { turnloop: [0, 100], claims: [0, 420], settle: [450, 100], compact: [900, 100], journal: [450, 420], llmcoord: [900, 420], tools: [0, 700] },
+        curves: { 'settle>journal': 50, 'turnloop>llmcoord': -70 },
+        labelT: { 'turnloop>llmcoord': 0.78 },
+      },
+    },
+    flows: [
+      {
+        id: 'prompt', name: 'Prompt a session', view: 'containers',
+        steps: [
+          { from: 'user', to: 'runtime', text: 'The user prompts the session; the actor drains the entry and claims the turn.' },
+          { from: 'runtime', to: 'llmcoord', text: 'The loop requests model output through admission control.' },
+          { from: 'llmcoord', to: 'llm', text: 'The coordinator calls the configured provider.' },
+          { from: 'runtime', to: 'tools', text: 'The loop executes the requested tool calls behind the permission policy.' },
+          { from: 'tools', to: 'workspaces', text: 'File tools act through the confined workspace.' },
+          { view: 'turn_loop', from: 'turnloop', to: 'settle', text: 'Inside the runtime, the loop settles the turn exactly once.' },
+          { view: 'turn_loop', from: 'settle', to: 'journal', text: 'Settlement records the outcome; observers read it by operation identity.' },
+        ],
+      },
+    ],
+  },
+};
