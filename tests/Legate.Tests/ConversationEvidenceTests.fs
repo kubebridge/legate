@@ -25,9 +25,10 @@ open Xunit
 // continuation/report dedupe and transient reasoning, store JSON payload
 // fidelity (Sqlite/Postgres persist JSON text, so STJ round-trip plus the
 // shared conformance suite cover Restamp), and public DI facade coverage
-// through Subscribe/replay-adjacent reads. Production suspendable Inject
-// folds still journal nothing (SessionPermissions hardcodes ignore); that
-// gap is the PR's stated residual risk, covered here at the event level.
+// through Subscribe/replay-adjacent reads. The live permission-gated
+// runner threads the fenced Inject journal hook (issue 409), so folds
+// journal once each under the running claim; the event-level coverage
+// here stands alongside the live-path facts proving it.
 
 let private sessionId = SessionId.Parse "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 let private turnId = TurnId.Parse "01ARZ3NDEKTSV4RRFFQ69G5FAX"

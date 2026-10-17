@@ -188,6 +188,292 @@ let private productionRunner
         None
 
 // ──────────────────────────────────────────────────────────────────────────
+// Folded Inject evidence (issue 409)
+
+/// A tool that blocks until released, holding the live turn in flight.
+let private gatedTool (calls: string list ref) (release: TaskCompletionSource<string>) : AIFunction =
+    let method =
+        Func<Task<string>>(fun () ->
+            calls.Value <- calls.Value @ [ "gated" ]
+            release.Task)
+
+    AIFunctionFactory.Create(
+        method,
+        "gated",
+        Unchecked.defaultof<string>,
+        Unchecked.defaultof<System.Text.Json.JsonSerializerOptions>
+    )
+
+/// The joined text parts of one user message.
+let private userText (message: UserMessage) : string =
+    message.Parts
+    |> Seq.choose (function
+        | :? TextContent as text when not (isNull (box text)) -> Some text.Text
+        | _ -> None)
+    |> String.concat "\n"
+
+/// The journaled user messages with the given text, in journal order.
+let private usersWith (journal: ISessionEventStore) (sessionId: SessionId) (text: string) : UserMessageEvent list =
+    let events = collectJournal journal sessionId
+
+    events
+    |> Seq.choose (function
+        | :? UserMessageEvent as user when not (isNull (box user)) -> Some user
+        | _ -> None)
+    |> Seq.filter (fun user -> userText user.Message = text)
+    |> List.ofSeq
+
+[<Fact>]
+let ``Live stale loser folds nothing after takeover`` () =
+    let clock = TestClock()
+    let store, journal = createStores clock
+    let created = createSession store
+
+    let calls = ref []
+    let release = TaskCompletionSource<string>()
+
+    let client =
+        new ScriptedChatClient(
+            ResizeArray<ScriptStep>(
+                [|
+                    ScriptStep.ToolCall("t1", "gated")
+                    ScriptStep.Text "done"
+                |]
+            )
+        )
+
+    let tools = makeTools [ "gated", gatedTool calls release ]
+
+    let service =
+        startService store journal (productionRunner store journal client tools null) (TimeSpan.FromMinutes 5.0)
+
+    try
+        let child = resolveChild service created.Id
+        promptLive store created.Id child "run"
+
+        let blocked = waitFor (TimeSpan.FromSeconds 10.0) (fun () -> calls.Value.Length = 1)
+
+        blocked |> should equal true
+
+        SessionActor.injectSuspendableAsync
+            store
+            tenant
+            created.Id
+            child
+            (UserMessage.Text "steer")
+            CancellationToken.None
+        |> fun task -> task.GetAwaiter().GetResult()
+        |> ignore
+
+        // The drain lease lapses and the winner renews the running turn
+        // through #374 attribution: the loser's fold must journal nothing.
+        // (A fresh ClaimNextTurn is refused while the loser's control
+        // binding stands; recovery re-fences the same turn instead.)
+        clock.Advance(TimeSpan.FromMinutes 6.0)
+
+        let runTurn =
+            match usersWith journal created.Id "run" with
+            | [ run ] -> run.TurnId
+            | _ -> failwith "Expected the initial entry journaled exactly once."
+
+        let control = store :?> ISessionAbortControlStore
+
+        let recovered =
+            control.TryRecoverControlTarget(
+                tenant,
+                created.Id,
+                runTurn,
+                "winner",
+                TimeSpan.FromMinutes 5.0,
+                CancellationToken.None
+            )
+            |> fun task -> task.GetAwaiter().GetResult()
+
+        recovered.Outcome |> should equal ControlOperationOutcome.Applied
+
+        let winnerClaim = unbox<TurnClaim> (box recovered.Claim)
+
+        if isNull (box winnerClaim) then
+            failwith "Expected the winner claim."
+
+        release.TrySetResult("ok") |> ignore
+
+        // A snapshot round-trip proves the actor processed the fault: the
+        // row still names the winner's live turn, so the session reads
+        // Running with nothing settled and nothing observed.
+        SessionActor.getSuspendSnapshotAsync child CancellationToken.None
+        |> fun task -> task.GetAwaiter().GetResult()
+        |> ignore
+
+        let stored = storedOf store created.Id
+        stored.State |> should equal SessionState.Running
+        stored.CurrentTurnId.Value |> should equal runTurn
+
+        (PromptWaitHubs.GetOrAddScoped tenant created.Id).Settled.Count
+        |> should equal 0
+
+        // Zero loser effects: the folded Inject never journaled...
+        let steers = usersWith journal created.Id "steer"
+        steers |> should be Empty
+
+        // ...the Inject entry stays pending for a later boundary...
+        let pending =
+            store.ReadPendingInbox(tenant, created.Id, CancellationToken.None).GetAwaiter().GetResult()
+
+        pending.Count |> should equal 1
+
+        match pending[0].Payload with
+        | :? UserMessagePayload as waiting when not (isNull (box waiting)) ->
+            userText waiting.Message |> should equal "steer"
+        | _ -> failwith "Expected the steer entry to stay pending."
+
+        // ...and the winner's claim survives.
+        match
+            store.VerifyClaim(tenant, winnerClaim, CancellationToken.None)
+            |> fun task -> task.GetAwaiter().GetResult()
+        with
+        | :? TurnLeaseHeld -> ()
+        | other -> failwithf "Expected the winner claim to stay live, got %O." other
+
+        // Once all leases lapse, a restart retries the interrupted entry
+        // through #374 attribution: the preserved Inject folds into the
+        // retried turn exactly once, so the fault neither lost nor
+        // damaged it.
+        clock.Advance(TimeSpan.FromMinutes 10.0)
+    finally
+        stopService service
+
+    let service2 =
+        startService store journal (productionRunner store journal client tools null) (TimeSpan.FromMinutes 5.0)
+
+    try
+        let _child2 = resolveChild service2 created.Id
+
+        let drained =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () -> (storedOf store created.Id).State = SessionState.Idle)
+
+        drained |> should equal true
+
+        let retried = usersWith journal created.Id "steer"
+        retried.Length |> should equal 1
+
+        let rerunTurn =
+            match usersWith journal created.Id "run" with
+            | [ run ] -> run.TurnId
+            | _ -> failwith "Expected the initial entry journaled exactly once."
+
+        retried[0].TurnId |> should equal rerunTurn
+    finally
+        stopService service2
+
+[<Fact>]
+let ``Live folded Inject survives crash rebuild journaled exactly once`` () =
+    let clock = TestClock()
+    let store, journal = createStores clock
+    let created = createSession store
+
+    let calls = ref []
+    let release = TaskCompletionSource<string>()
+
+    let client =
+        new ScriptedChatClient(
+            ResizeArray<ScriptStep>(
+                [|
+                    ScriptStep.ToolCall("t1", "gated")
+                    ScriptStep.ToolCall("t2", "gated")
+                    ScriptStep.Text "done"
+                |]
+            )
+        )
+
+    let tools = makeTools [ "gated", gatedTool calls release ]
+
+    let service1 =
+        startService store journal (productionRunner store journal client tools null) (TimeSpan.FromMinutes 5.0)
+
+    try
+        let child1 = resolveChild service1 created.Id
+        promptLive store created.Id child1 "run"
+
+        // The first attempt blocks in the gated tool: inject before
+        // the crash so the fold lands on the retried attempt.
+        let blocked = waitFor (TimeSpan.FromSeconds 10.0) (fun () -> calls.Value.Length = 1)
+
+        blocked |> should equal true
+
+        SessionActor.injectSuspendableAsync
+            store
+            tenant
+            created.Id
+            child1
+            (UserMessage.Text "steer")
+            CancellationToken.None
+        |> fun task -> task.GetAwaiter().GetResult()
+        |> ignore
+    finally
+        stopService service1
+
+    // The drain lease lapses: the restart renews genuine authority
+    // through #374 attribution and retries the interrupted entry.
+    clock.Advance(TimeSpan.FromMinutes 6.0)
+
+    let service2 =
+        startService store journal (productionRunner store journal client tools null) (TimeSpan.FromMinutes 5.0)
+
+    try
+        let _child2 = resolveChild service2 created.Id
+
+        // The retried attempt blocks in the gated tool again: release
+        // it so the boundary folds the Inject and the turn completes.
+        let rerun = waitFor (TimeSpan.FromSeconds 10.0) (fun () -> calls.Value.Length = 2)
+
+        rerun |> should equal true
+
+        release.TrySetResult("ok") |> ignore
+
+        // The terminal journal write lands after the row settles, so
+        // poll for the evidence rather than asserting it the moment
+        // the row reads Idle.
+        let finished =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () ->
+                (storedOf store created.Id).State = SessionState.Idle
+                && (usersWith journal created.Id "steer").Length = 1)
+
+        finished |> should equal true
+
+        // The Inject folded exactly once, under the retried turn, after
+        // the restart: the rebuild neither lost nor duplicated it, and
+        // the initial entry journaled exactly once too.
+        let runs = usersWith journal created.Id "run"
+        let steers = usersWith journal created.Id "steer"
+
+        runs.Length |> should equal 1
+        steers.Length |> should equal 1
+        steers[0].TurnId |> should equal runs[0].TurnId
+
+        let terminalSettled =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () ->
+                (collectJournal journal created.Id
+                 |> Seq.choose (function
+                     | :? TurnCompletedEvent as terminal when not (isNull (box terminal)) -> Some terminal
+                     | _ -> None)
+                 |> List.ofSeq)
+                    .Length = 1)
+
+        terminalSettled |> should equal true
+
+        let terminals =
+            collectJournal journal created.Id
+            |> Seq.choose (function
+                | :? TurnCompletedEvent as terminal when not (isNull (box terminal)) -> Some terminal
+                | _ -> None)
+            |> List.ofSeq
+
+        terminals[0].TurnId |> should equal runs[0].TurnId
+    finally
+        stopService service2
+
+// ──────────────────────────────────────────────────────────────────────────
 // Production spawn wiring: Ask suspends the live actor (Tasks 1+3)
 
 [<Fact>]

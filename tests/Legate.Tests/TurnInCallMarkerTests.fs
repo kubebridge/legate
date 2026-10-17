@@ -406,6 +406,126 @@ let ``Takeover loser journals nothing and never reaches the provider`` () : Task
     }
 
 // ──────────────────────────────────────────────────────────────────────────
+// Folded Inject evidence (issue 409): the live permission-gated runner
+// journals each folded Inject once under the running turn through the
+// fenced hook, so facade transcripts carry the folded user cells.
+
+/// A tool that blocks until released, holding the turn in flight so an
+/// Inject arrives before the next iteration boundary.
+let private gatedTool (entered: ManualResetEventSlim) (release: TaskCompletionSource<string>) : AITool =
+    let method =
+        Func<Task<string>>(fun () ->
+            entered.Set() |> ignore
+            release.Task)
+
+    AIFunctionFactory.Create(method, "gated", Unchecked.defaultof<string>, Unchecked.defaultof<JsonSerializerOptions>)
+    :> AITool
+
+/// The joined text parts of one user message.
+let private userText (message: UserMessage) : string =
+    message.Parts
+    |> Seq.choose (function
+        | :? TextContent as text when not (isNull (box text)) -> Some text.Text
+        | _ -> None)
+    |> String.concat "\n"
+
+[<Fact>]
+let ``Live folded Inject journals once with real-turn attribution`` () : Task =
+    task {
+        use entered = new ManualResetEventSlim(false)
+        let release = TaskCompletionSource<string>()
+
+        let scripted =
+            new ScriptedChatClient(
+                ResizeArray<ScriptStep>(
+                    [|
+                        ScriptStep.ToolCall("c1", "gated")
+                        ScriptStep.Text "done"
+                    |]
+                )
+            )
+
+        use provider =
+            (createServices (scripted :> IChatClient) [ gatedTool entered release ] null (TimeSpan.FromHours 1.0))
+                .BuildServiceProvider()
+
+        return!
+            withClient provider (fun client ->
+                task {
+                    let! created = openSmoke client
+
+                    let! _ =
+                        SessionClientOperations.PromptAsync(
+                            client,
+                            created.Id,
+                            UserMessage.Text "run",
+                            DeliveryMode.Queue,
+                            CancellationToken.None
+                        )
+
+                    // The turn blocks in the gated tool: inject mid-turn so
+                    // the next iteration boundary folds it.
+                    entered.Wait(waitBound) |> should equal true
+
+                    let! _ =
+                        SessionClientOperations.PromptAsync(
+                            client,
+                            created.Id,
+                            UserMessage.Text "steer",
+                            DeliveryMode.Inject,
+                            CancellationToken.None
+                        )
+
+                    release.TrySetResult("ok") |> ignore
+
+                    let settled =
+                        waitFor waitBound (fun () ->
+                            let stored =
+                                client.Store
+                                    .GetSession(client.Tenant, created.Id, CancellationToken.None)
+                                    .GetAwaiter()
+                                    .GetResult()
+
+                            match stored with
+                            | null -> false
+                            | row -> row.State = SessionState.Idle)
+
+                    settled |> should equal true
+
+                    // The fold journaled the Inject exactly once, in order
+                    // after the initial entry, under the same real turn.
+                    let! journal = collectJournal client created.Id
+
+                    let users =
+                        journal
+                        |> List.choose (function
+                            | :? UserMessageEvent as user when not (isNull (box user)) -> Some user
+                            | _ -> None)
+
+                    users.Length |> should equal 2
+
+                    (users |> List.map (fun user -> userText user.Message))
+                    |> should equal [ "run"; "steer" ]
+
+                    let turn = users[0].TurnId
+                    turn |> should not' (equal (Unchecked.defaultof<TurnId>))
+                    users[1].TurnId |> should equal turn
+
+                    // The facade transcript carries both user cells in order.
+                    let! cells =
+                        SessionClientOperations.ReadTranscriptAsync(client, created.Id, CancellationToken.None)
+
+                    let userCells =
+                        cells
+                        |> Seq.filter (fun cell -> not (isNull (box cell)) && cell.Kind = SessionCellKind.User)
+                        |> Seq.map (fun cell -> cell.Content)
+                        |> List.ofSeq
+
+                    userCells |> should equal [ "run"; "steer" ]
+                })
+    }
+
+// ──────────────────────────────────────────────────────────────────────────
 // Observability: the subscriber sees the marker pre-settle
 
 [<Fact>]
