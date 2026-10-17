@@ -283,7 +283,7 @@ points at a clean start. The gate runs before execution or further work on
 every open/resume/recovery path: the session client (`OpenSession`, `Prompt`,
 `Reply`, `SetAgent`, `Compact`, `Fork`, `PromptAndWait`), the dispatcher
 sweeps (unsupported sessions are skipped, never dispatched), the actor
-activation prime, and the store deserializers.
+activation chain (which mints no claim), and the store deserializers.
 
 Rejection is fail-closed and non-destructive: it consumes no inbox input,
 rebinds no sink or agent, manufactures no turn identities, conversation,
@@ -325,23 +325,27 @@ cannot claim a turn, consume inbox input, or settle one, so stale execution
 cannot borrow it to consume winner input, alter lifecycle or agent, or
 close the session.
 
-Execution writes fence on the ambient prime claim (`Append` under the turn
+Execution writes fence on per-turn drain claims (`Append` under the turn
 claim token) while attributing to the real durable turn: every accepted user
 message carries a stable `TurnId` stamped at accept on its `InboxEntry`, and
 `ClaimNextTurn` claims under that stamped identity (never a fresh synthetic
 bootstrap), so distinct queued entries yield distinct durable `TurnId`s.
-`Session.CurrentTurnId` plus the turn row own execution, suspension, resume,
-restart, takeover, and settlement through the existing claim-token fence with
-the #363 committed outcome; execution journal events carry the real `TurnId`.
-Reply entries carry the default sentinel and resume the suspended real turn
-with attempt+1, never starting one. The prime, its re-prime, and the
-claim-fenced settlement boundary in `SessionSettlement` are unchanged here
-as the handoff #400 removes the prime onto: #400 re-anchors execution
-fencing from the prime claim onto these real-turn claims without changing
-the attribution defined here. Crash-path terminal writes for interrupted
-turns stay claim-fenced for the same reason: only the token proves the writer
-is no takeover loser. Suspension is not idle authority: a suspended turn still
-owns the history, so on-demand compaction no-ops while waiting for input.
+No ambient claim is minted at activation and no synthetic input exists:
+an empty inbox leaves the session suspended, and each drained real entry
+claims its own turn at the drain with the token adopted into the journal
+cell. `Session.CurrentTurnId` plus the turn row own execution, suspension,
+resume, restart, takeover, and settlement through the existing claim-token
+fence with the #363 committed outcome; execution journal events carry the
+real `TurnId`. Reply entries carry the default sentinel and resume the
+suspended real turn with attempt+1, never starting one. Crash-path terminal
+writes for interrupted turns stay claim-fenced for the same reason: only
+the token proves the writer is no takeover loser. Suspension is not idle
+authority: a suspended turn still owns the history, so on-demand compaction
+no-ops while waiting for input. Crash recovery renews genuine authority
+for the interrupted entry through control-target recovery (#374) instead
+of re-priming; an Idle row with an empty inbox and an unterminated marker
+stays quiet with the turn preserved until the dispatcher's orphan sweep
+settles it.
 
 ### Store contracts
 

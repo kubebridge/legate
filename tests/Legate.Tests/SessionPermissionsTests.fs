@@ -33,7 +33,7 @@ open Xunit
 let tenant = TenantId.Create "permissions-pipeline"
 
 /// An empty store pair over one database: the session store and the fenced
-/// journal share claim state, so the factory-primed token fences for real.
+/// journal share claim state, so the drain-claimed token fences for real.
 let private createStores (clock: TimeProvider) : ISessionStore * ISessionEventStore =
     let database = InMemoryDatabase(clock)
     InMemorySessionStore(database) :> ISessionStore, InMemorySessionEventStore(database) :> ISessionEventStore
@@ -429,8 +429,8 @@ let ``AllowForSession grants survive restart through the session store`` () =
     finally
         stopService service1
 
-    // Restart past the primed lease: the new child primes a fresh token
-    // and reloads the persisted grants instead of re-asking the policy.
+    // Restart past the old lease: the new child claims a fresh token
+    // at its drain and reloads the persisted grants instead of re-asking the policy.
     clock.Advance(TimeSpan.FromMinutes 10.0)
 
     let invocations2 = ref []

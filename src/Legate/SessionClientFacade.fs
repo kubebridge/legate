@@ -57,15 +57,15 @@ type SessionClientOptions() =
     /// no explicit timeout. Must be positive. Defaults to five minutes.
     member val DefaultWaitBound: TimeSpan = TimeSpan.FromMinutes 5.0 with get, set
 
-    /// The claim owner identity the journal prime claims under. Must be a
+    /// The claim owner identity drain claims use. Must be a
     /// non-empty string. Defaults to "legate-session-facade".
     member val ClaimOwner: string = "legate-session-facade" with get, set
 
-    /// How long the primed journal claim lasts. Must be positive. Defaults
+    /// How long a drain-claimed lease lasts. Must be positive. Defaults
     /// to one hour, covering the AskTimeout window for interactive hosts.
-    /// Prime-only (issue 375): the spawn-time journal prime claims under
-    /// this duration, while production renewals grant the Sessions lease
-    /// duration (60 s by default) through ClaimHeartbeat.fromSessions.
+    /// Drain-only (issue 400): each drain claims under this duration, while
+    /// production renewals grant the Sessions lease duration (60 s by
+    /// default) through ClaimHeartbeat.fromSessions.
     member val LeaseDuration: TimeSpan = TimeSpan.FromHours 1.0 with get, set
 
     /// The default model reference (provider/model) the on-demand
@@ -538,7 +538,7 @@ type SessionClientOperations =
         | _ -> raise (ArgumentException("The journal carries an unknown event kind.", nameof event))
 
     /// Opens a session: creates the Idle row and eagerly resolves its actor
-    /// while the row exists, so the journal prime claims a live token.
+    /// while the row exists, so the first drain claims a live token.
     /// The resolve is best-effort: when the local actor system has not
     /// started yet the row still opens and the actor resolves lazily on
     /// the first prompt.
@@ -1122,8 +1122,8 @@ type SessionClientOperations =
                 // version stamp. No inbox append, no ClaimNextTurn, no
                 // SettleTurn for the copy: the fork carries no turn claim
                 // and no lease state, so it opens Idle with an empty inbox
-                // and real prompts drain first. The actor prime on Resolve
-                // below stays exactly as before for future execution.
+                // and real prompts drain first. The actor claims on drain
+                // below exactly as before for future execution.
                 let rekeyed =
                     prefix
                     |> Seq.map (SessionClientOperations.RekeyForFork created.Id)
@@ -2193,7 +2193,7 @@ module internal SessionClientWiring =
 
         // Renewal tuning derives from Sessions (60 s lease renewed every
         // 15 s by default, under-half bound re-checked at use), never from
-        // SessionClientOptions.LeaseDuration, which stays prime-only.
+        // SessionClientOptions.LeaseDuration, which stays drain-only.
         let heartbeatOptions = ClaimHeartbeat.fromSessions sessionsSnapshot
 
         // A complete execution binding always owns a chat client.  Startup

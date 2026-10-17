@@ -134,13 +134,13 @@ module ControlActorProtocolTests =
                 TaskCompletionSource<unit>().Task :> Task
         }
 
-    let private prime (store: ISessionStore) sid =
+    let private seedClaim (store: ISessionStore) sid =
         task {
             let! _ =
                 store.AppendInboxMessage(
                     tenant,
                     sid,
-                    UserMessagePayload(UserMessage.Text "prime"),
+                    UserMessagePayload(UserMessage.Text "seed"),
                     DeliveryMode.Queue,
                     ct
                 )
@@ -150,7 +150,7 @@ module ControlActorProtocolTests =
             return
                 match lease with
                 | :? TurnLeaseRenewed as lease -> lease.Claim
-                | _ -> failwith "No genuine prime"
+                | _ -> failwith "No genuine claim"
         }
 
     let private factoryActor (system: ActorSystem) factory (sid: SessionId) =
@@ -264,7 +264,7 @@ module ControlActorProtocolTests =
     [<InlineData(true, "lost-decision")>]
     [<InlineData(false, "retire-fault")>]
     [<InlineData(true, "retire-fault")>]
-    let ``issue415 atomic crash failure publishes only committed winner and cleans genuine prime`` sqlite mode =
+    let ``issue415 atomic crash failure publishes only committed winner and cleans genuine claim`` sqlite mode =
         task {
             let clock = TestClock()
             let path = SqliteTestFixture.tempDatabasePath ()
@@ -303,7 +303,7 @@ module ControlActorProtocolTests =
 
                 options.CompletionDestinationId <- "crash-receiver"
                 let! created = store.CreateSession(tenant, session options, ct)
-                let! old = prime store created.Id
+                let! old = seedClaim store created.Id
 
                 let! entry =
                     store.AppendInboxMessage(
@@ -435,10 +435,10 @@ module ControlActorProtocolTests =
                         Delay = delay
                         AskTimeout = bound
                         JournalToken = claim.Token
-                        PrimeClaim = Some claim
+                        ClaimOwner = "survivor"
+                        ClaimLease = TimeSpan.FromMinutes 5.0
                         Recovery = recovery
                         RunSuspendable = fun _ _ _ _ _ _ _ _ _ _ _ -> failwith "FailAttempt never executes the original"
-                        ReprimeJournal = None
                         RefreshCompact = None
                         AgentStore = null
                         EraMarked = fun _ _ _ -> Task.FromResult false
@@ -610,7 +610,7 @@ module ControlActorProtocolTests =
                     | None -> store :?> ISessionSettlementStore
 
                 let! created = store.CreateSession(tenant, session (SessionOptions(OnCrashResume = policy)), ct)
-                let! oldClaim = prime store created.Id
+                let! oldClaim = seedClaim store created.Id
 
                 let! entry =
                     store.AppendInboxMessage(
@@ -798,7 +798,7 @@ module ControlActorProtocolTests =
                 let store = SqliteStoreFactory.sessionStore db
                 let options = SessionOptions(OnCrashResume = policy)
                 let! created = store.CreateSession(tenant, session options, ct)
-                let! oldClaim = prime store created.Id
+                let! oldClaim = seedClaim store created.Id
 
                 let! entry =
                     store.AppendInboxMessage(
@@ -903,7 +903,7 @@ module ControlActorProtocolTests =
                 let db = SqliteDatabase.Open(path, clock)
                 let store = SqliteStoreFactory.sessionStore db
                 let! created = store.CreateSession(tenant, session (SessionOptions()), ct)
-                let! oldClaim = prime store created.Id
+                let! oldClaim = seedClaim store created.Id
 
                 let! entry =
                     store.AppendInboxMessage(
@@ -1053,7 +1053,7 @@ module ControlActorProtocolTests =
                 let! snapshot = child.Ask<obj>(SessionActor.SuspendableGetSnapshot, bound)
                 Assert.IsNotType<CompletionRoutingRefused>(snapshot)
 
-                // Work is refused before any prime, bootstrap, or claim.
+                // Work is refused before any bootstrap or claim.
                 let! refusal =
                     child.Ask<obj>(
                         SessionActor.SuspendableQueuePrompt(
@@ -1119,7 +1119,6 @@ module ControlActorProtocolTests =
         let created =
             inner.CreateSession(tenant, session options, ct).GetAwaiter().GetResult()
 
-        let claim = (prime inner created.Id).GetAwaiter().GetResult()
         let system = ActorSystem.Create("control-" + Guid.NewGuid().ToString("N"))
 
         let runner: SessionActor.SuspendableRunner =
@@ -1154,11 +1153,11 @@ module ControlActorProtocolTests =
                 EventStore = journal
                 Delay = delay
                 AskTimeout = TimeSpan.FromMinutes 1.0
-                JournalToken = claim.Token
-                PrimeClaim = Some claim
+                JournalToken = Guid.NewGuid().ToString("N")
+                ClaimOwner = "original-owner"
+                ClaimLease = TimeSpan.FromMinutes 5.0
                 Recovery = null
                 RunSuspendable = runner
-                ReprimeJournal = None
                 RefreshCompact = None
                 AgentStore = null
                 EraMarked = (fun _ _ _ -> Task.FromResult false)
@@ -1169,7 +1168,6 @@ module ControlActorProtocolTests =
         member _.Store = inner
         member _.Control = inner :?> ISessionAbortControlStore
         member _.Session = created.Id
-        member _.Claim = claim
         member _.Clock = clock
         member _.Runs = runs
         member _.Observed = observed
@@ -1219,7 +1217,7 @@ module ControlActorProtocolTests =
     let ``genuine actor mandatory failures retain barrier and never drain`` failure =
         task {
             use rig = new Rig(true)
-            let! entry = rig.Prompt "current"
+            let! _ = rig.Prompt "current"
             let! queued = rig.Prompt "unrelated"
             rig.Proxy.Failure <- failure
             rig.Proxy.Effects.Clear()
@@ -1242,7 +1240,11 @@ module ControlActorProtocolTests =
             Assert.Contains(pending, fun row -> row.Position = queued.Position)
 
             if failure <> "retire" then
-                Assert.Contains(pending, fun row -> row.Position = entry.Position)
+                // The failed entry stays consumed by the fenced drain; its
+                // retry path is the preserved recovery entry, not the
+                // pending inbox. Only the queued entry pends.
+                Assert.Single(pending) |> ignore
+                Assert.Equal(queued.Position, pending[0].Position)
                 Assert.Empty rig.Observed
                 Assert.Empty rig.Sinks
                 Assert.DoesNotContain("EnqueueCompletionOutbox", rig.Proxy.Effects)
@@ -1321,7 +1323,7 @@ module ControlActorProtocolTests =
         }
 
     [<Fact>]
-    let ``genuine two entry chain keeps shared prime and ignores late old report`` () =
+    let ``genuine two entry chain claims per turn and ignores late old report`` () =
         task {
             use rig = new Rig(false)
             let! first = rig.Prompt "first"
@@ -1333,8 +1335,6 @@ module ControlActorProtocolTests =
             Assert.Equal(2, rig.Runs.Count)
             let _, newTurn, _ = rig.Runs.ToArray()[1]
             Assert.NotEqual(oldTurn, newTurn)
-            let! held = rig.Store.VerifyClaim(tenant, rig.Claim, ct)
-            Assert.IsType<TurnLeaseHeld>(held) |> ignore
 
             rig.Actor.Tell(
                 SessionActor.SuspendableFinished(
@@ -1367,7 +1367,7 @@ module ControlActorProtocolTests =
     let ``genuine takeover rejects old actor report with zero terminal effects`` () =
         task {
             use rig = new Rig(true)
-            let! entry = rig.Prompt "original"
+            let! _ = rig.Prompt "original"
             let! queued = rig.Prompt "unrelated"
             let _, turn, _ = rig.Runs.ToArray()[0]
             rig.Clock.Advance(TimeSpan.FromMinutes 6.0)
@@ -1379,8 +1379,11 @@ module ControlActorProtocolTests =
             rig.Finish(0, completed)
             do! rig.Proxy.DecisionEntered.Task.WaitAsync bound
             let! pending = rig.Store.ReadPendingInbox(tenant, rig.Session, ct)
-            Assert.Contains(pending, fun row -> row.Position = entry.Position)
-            Assert.Contains(pending, fun row -> row.Position = queued.Position)
+            // The loser's drain consumed the original entry; its retry path
+            // is the winner's recovery entry, not the pending inbox. Only
+            // the unrelated entry pends.
+            Assert.Single(pending) |> ignore
+            Assert.Equal(queued.Position, pending[0].Position)
             Assert.Empty rig.Observed
             Assert.Empty rig.Sinks
             Assert.Single(rig.Runs) |> ignore
@@ -1390,4 +1393,52 @@ module ControlActorProtocolTests =
             | claim ->
                 let! held = rig.Store.VerifyClaim(tenant, claim, ct)
                 Assert.IsType<TurnLeaseHeld>(held) |> ignore
+        }
+
+    [<Fact>]
+    let ``activation mints no synthetic input or claim and leaves empty inbox idle`` () =
+        task {
+            let database = InMemoryDatabase()
+            let store = InMemoryStoreFactory.sessionStore database
+            let journal = InMemoryStoreFactory.eventStore database
+            let! created = store.CreateSession(tenant, session (SessionOptions()), ct)
+
+            // No inbox entries appended: activation must mint none.
+
+            let runner: SessionActor.SuspendableRunner =
+                fun _ _ _ _ _ _ _ _ _ _ _ -> failwith "No turn must start without input."
+
+            let factory =
+                SessionActor.spawnSuspendFactory
+                    store
+                    tenant
+                    journal
+                    delay
+                    (TimeSpan.FromMinutes 1.0)
+                    "owner-a"
+                    (TimeSpan.FromMinutes 5.0)
+                    runner
+                    (fun _ _ -> None)
+                    null
+                    (fun _ _ _ -> Task.FromResult(false))
+                    None
+
+            use system = ActorSystem.Create("activate-" + Guid.NewGuid().ToString("N"))
+            let! child = factoryActor system factory created.Id
+
+            // The child answers: activation succeeded without authority.
+            let! _ = child.Ask<obj>(SessionActor.SuspendableGetSnapshot, bound)
+
+            // Empty inbox stays empty: no synthetic bootstrap was minted.
+            let! pending = store.ReadPendingInbox(tenant, created.Id, ct)
+            Assert.Empty(pending)
+
+            // No ambient claim was acquired: the row carries no live turn.
+            let! row = store.GetSession(tenant, created.Id, ct)
+
+            match row with
+            | null -> failwith "No session"
+            | row ->
+                Assert.Equal(SessionState.Idle, row.State)
+                Assert.False(row.CurrentTurnId.HasValue)
         }

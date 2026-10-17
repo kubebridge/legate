@@ -22,7 +22,7 @@ type internal ControlContext =
         SessionId: SessionId
         Lifecycle: SessionState
         Now: DateTimeOffset
-        Prime: TurnClaim option
+        LiveClaim: TurnClaim option
         Entries: Map<int64, bool>
     }
 
@@ -193,9 +193,9 @@ module internal ControlTargetProtocol =
 
     let authority (context: ControlContext) (claim: TurnClaim) =
         if isNull (box claim) then
-            raise (ArgumentNullException("capturedPrimeClaim"))
+            raise (ArgumentNullException("capturedClaim"))
 
-        match context.Prime with
+        match context.LiveClaim with
         | Some live ->
             live.TurnId = claim.TurnId
             && live.Token = claim.Token
@@ -221,9 +221,9 @@ module internal ControlTargetProtocol =
         state.Decisions |> Array.tryFind (fun decision -> decision.TurnId = turn)
 
     /// Whether a decided-but-unretired control verdict still owns the entry
-    /// (issue 363): the actor's retireControl must run before the prime is
-    /// released, so a quiescent terminal settlement defers prime release
-    /// while this holds and the existing retire-then-prime-settle order is
+    /// (issue 363): the actor's retireControl must run before the claim is
+    /// released, so a quiescent terminal settlement defers claim release
+    /// while this holds and the existing retire-then-settle order is
     /// preserved. Pure: never touches the store.
     /// <param name="state">The decoded control state.</param>
     /// <param name="position">The settling inbox entry position.</param>
@@ -267,7 +267,7 @@ module internal ControlTargetProtocol =
                 InvalidSessionStateException(
                     context.SessionId,
                     "controlPending",
-                    "Control retirement committed but the running lifecycle has not reached its next boundary; fresh activation cannot prime or infer new work."
+                    "Control retirement committed but the running lifecycle has not reached its next boundary; fresh activation cannot claim or infer new work."
                 )
             )
         | null when context.Lifecycle = SessionState.Running ->
@@ -293,7 +293,7 @@ module internal ControlTargetProtocol =
                 Stop = receipt target.TurnId state |> Option.toObj
             }
 
-    // Recovery changes only the existing prime fence. It never binds a new target,
+    // Recovery changes only the existing claim fence. It never binds a new target,
     // selects another entry, or treats a stop receipt as authority to settle.
     let recover context state turn owner leaseDuration =
         targetId turn
@@ -312,15 +312,15 @@ module internal ControlTargetProtocol =
         | target when target.State <> ControlTargetState.Active || not (isNull (box target.Stop)) ->
             ControlOperationOutcome.Stopped, None
         | _ ->
-            match context.Prime with
-            | Some prime when prime.ExpiresAt <= context.Now ->
+            match context.LiveClaim with
+            | Some live when live.ExpiresAt <= context.Now ->
                 ControlOperationOutcome.Applied,
                 Some
-                    { prime with
+                    { live with
                         Token = Guid.NewGuid().ToString("N")
                         Owner = owner
                         ExpiresAt = context.Now + leaseDuration
-                        Attempt = prime.Attempt + 1
+                        Attempt = live.Attempt + 1
                     }
             | _ -> ControlOperationOutcome.LostAuthority, None
 

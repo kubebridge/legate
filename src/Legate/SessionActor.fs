@@ -1586,8 +1586,8 @@ module internal SessionActor =
             // The host fence stamp for the idle compact (issue 373): read
             // before the summariser call. A concurrent idle writer moves
             // the stamp and the host append below fences as CompactFenced.
-            // A missing row falls back to the primed token sink, so the
-            // compact stays fenced either way; the prime itself is untouched.
+            // A missing row falls back to the seed token sink, so the
+            // compact stays fenced either way; the live claim itself is untouched.
             // Any read failure reads as no stamp, exactly like before.
             startPipedWait
                 starter
@@ -3483,9 +3483,9 @@ module internal SessionActor =
     /// What a suspendable session actor is built from: the base actor
     /// dependencies plus the journal, the AskTimeout seam, the journal
     /// token, and the suspendable runner. The journal token fences journal
-    /// appends; tests prime it with ISessionStore.ClaimNextTurn so the
-    /// in-memory journal lands, and a takeover re-claims so the loser
-    /// appends nothing. The heartbeat is not cancelled on suspend: renewal
+    /// appends; drain claims adopt the live claim token through
+    /// ISessionStore.ClaimNextTurn so the in-memory journal lands, and a
+    /// takeover re-claims so the loser appends nothing. The heartbeat is not cancelled on suspend: renewal
     /// continues while suspended under the same claim, bounded by lease
     /// expiry and AskTimeout. The behavior copies the token into a mutable
     /// cell a SetAgent swap replaces, so every journal write below reads
@@ -3500,24 +3500,14 @@ module internal SessionActor =
             AskTimeout: TimeSpan
             /// The claim token fencing journal appends.
             JournalToken: string
-            /// Genuine captured journal-prime authority. None only for internal unclaimed test shells.
-            PrimeClaim: TurnClaim option
+            /// The claim owner identity drain claims use. Must not be null or whitespace.
+            ClaimOwner: string
+            /// How long a drain-claimed lease lasts. Must be positive.
+            ClaimLease: TimeSpan
             /// Provider-fenced original entry for unstopped current-format recovery; null on fresh activation.
             Recovery: ControlTargetRecovery | null
             /// Runs one suspendable attempt. Never null.
             RunSuspendable: SuspendableRunner
-            /// Re-primes the journal after the actor settles its primed
-            /// claim: appends a bootstrap entry and claims it, returning the
-            /// live claim, or None when no turn is claimable (a live claim
-            /// is held) or the prime failed. The task starts without
-            /// blocking the caller (issue 390): the loop pipes the wait
-            /// instead of awaiting it. The SetAgent swap calls it after
-            /// settling the old prime and again to restore the live prime;
-            /// a quiescent boundary that finds a recorded rebind retries
-            /// through it until it succeeds. None when the host never
-            /// re-primes (direct test constructions): a recorded rebind
-            /// then stays pending.
-            ReprimeJournal: (unit -> Task<TurnClaim option>) option
             /// Rebuilds the on-demand compaction wiring for a fresh journal
             /// token after a SetAgent swap, or None when the host drives
             /// Compact directly. The factory supplies the spawn-time
@@ -4221,6 +4211,12 @@ module internal SessionActor =
         if isNull (box suspend.JournalToken) then
             raise (ArgumentNullException(nameof suspend))
 
+        if String.IsNullOrWhiteSpace suspend.ClaimOwner then
+            raise (ArgumentException("SuspendDeps.ClaimOwner must be a non-empty string.", nameof suspend))
+
+        if suspend.ClaimLease <= TimeSpan.Zero then
+            raise (ArgumentOutOfRangeException(nameof suspend, "SuspendDeps.ClaimLease must be positive."))
+
         if isNull (box suspend.RunSuspendable) then
             raise (ArgumentNullException(nameof suspend))
 
@@ -4258,17 +4254,26 @@ module internal SessionActor =
                 session.Options.OnCrashResume
 
         // The journal token fencing this actor's journal appends: the
-        // spawn-primed token at first, replaced by the SetAgent swap with
-        // each re-prime. Every journal write below reads this cell, never
-        // SuspendDeps.JournalToken, so post-swap writes stay live. A cell
+        // spawn seed token at first, replaced by each drain-claim adoption.
+        // Every journal write below reads this cell, never
+        // SuspendDeps.JournalToken, so post-adoption writes stay live. A cell
         // rather than a loop parameter, like pendingStop below.
         let mutable journalToken = suspend.JournalToken
-        let mutable controlPrime = suspend.PrimeClaim
+
+        // The live drain-claimed authority (issue 400): genuine #374
+        // recovery at seed, else None until the first drain claim adopts.
+        // Every admission, settlement, renewal, and journal fallback below
+        // reads this cell, never ambient authority.
+        let mutable liveClaim: TurnClaim option =
+            match suspend.Recovery with
+            | null -> None
+            | recovery -> recovery.Claim |> Option.ofObj
+
         let controlReports = Dictionary<int64, TurnId * TurnClaim * string>()
         let completedControlReports = HashSet<string>()
 
         // Production turn-ownership heartbeat (issue 375): the actor-owned
-        // per-attempt renewal over the spawn-time prime. The view backs the
+        // per-attempt renewal over the adopted live claim. The view backs the
         // ambient LeaseAdmission scope the runner reads; the CTS cancels on
         // every terminal path. Suspended renewal survives WaitingForInput
         // under the same claim without consuming replies or resuming work.
@@ -4288,7 +4293,7 @@ module internal SessionActor =
             | None -> ()
 
         /// Starts the production heartbeat for one attempt over its bound
-        /// prime claim: fire-and-forget renewal that never touches inbox or
+        /// live claim: fire-and-forget renewal that never touches inbox or
         /// lifecycle state, so detached or terminal loops stay inert. Loss
         /// pipes back through the existing SuspendableFaulted path with the
         /// lease-loss cause. The actor thread never awaits the loop.
@@ -4337,11 +4342,13 @@ module internal SessionActor =
                             | _ -> ())
                     |> ignore
 
+        // Activation already requires the abort-control capability for
+        // production sessions, so its absence here only marks direct test
+        // constructions without control targets.
         let controlStore =
             match props.Store with
             | :? ISessionAbortControlStore as control -> Some control
-            | _ when suspend.PrimeClaim.IsNone -> None
-            | _ -> raise (InvalidOperationException("ISessionAbortControlStore is required."))
+            | _ -> None
 
         let controlAdmission turn position claim () =
             match controlStore with
@@ -4454,7 +4461,7 @@ module internal SessionActor =
 
         // The on-demand compaction wiring the Idle compact path runs: the
         // spawn wiring at first, refreshed by the SetAgent swap with each
-        // re-prime, so later Compacts journal under the live token.
+        // drain-claim adoption, so later Compacts journal under the live token.
         let mutable currentCompact = props.Compact
 
         // The turn id the running attempt executes as (issue 289): set by
@@ -4476,22 +4483,31 @@ module internal SessionActor =
             with _ ->
                 None
 
-        /// Re-primes the journal through the spawn wiring: a fresh bootstrap
-        /// plus ClaimNextTurn, or None when the host never re-primes, the
-        /// prime fails, or a live claim is held (takeover, or a restart
-        /// inside the old prime's lease). Total: a throwing prime reads as
-        /// None and the recorded rebind retries at the next boundary.
-        /// Entry-recovery only: the loop pipes ReprimeJournal through
-        /// withReprime instead of blocking on it.
+        /// Claims the next turn at a drain boundary through the spawn
+        /// wiring: a plain ClaimNextTurn under the drain owner and lease, or
+        /// None when no turn is claimable, the claim is held elsewhere, or
+        /// the claim fails. Total: a throwing claim reads as None and the
+        /// caller stays quiet for the next boundary.
         /// <returns>The live claim, or None.</returns>
-        let reprimeNow () : TurnClaim option =
-            match suspend.ReprimeJournal with
-            | None -> None
-            | Some reprime ->
-                try
-                    awaitTask (reprime ())
-                with _ ->
-                    None
+        let claimDrainNow () : TurnClaim option =
+            try
+                match
+                    awaitTask (
+                        props.Store.ClaimNextTurn(
+                            props.Tenant,
+                            props.SessionId,
+                            suspend.ClaimOwner,
+                            suspend.ClaimLease,
+                            CancellationToken.None
+                        )
+                    )
+                with
+                | :? TurnLeaseRenewed as renewed when not (isNull (box renewed)) -> Some renewed.Claim
+                | :? TurnLeaseHeld as held when not (isNull (box held)) -> Some held.Claim
+                | :? TurnLeaseExpiring as expiring when not (isNull (box expiring)) -> Some expiring.Claim
+                | _ -> None
+            with _ ->
+                None
 
         /// Settles a claim Completed with a null outcome, best-effort: the
         /// first settle wins and a retry of the same outcome observes it, so
@@ -4536,7 +4552,7 @@ module internal SessionActor =
             with _ ->
                 ()
 
-        /// Startup failure uses the same original association and renewed prime
+        /// Startup failure uses the same original association and renewed claim
         /// as resume. No fault or refusal permits the legacy cleanup path.
         let failRecoveredTurn (entry: InboxEntry) : SessionSettlementOutcome =
             let refuse () =
@@ -4698,7 +4714,7 @@ module internal SessionActor =
                     )
 
                 // A lost response may conceal a commit. Retry only this exact
-                // request, once, while the captured prime still holds authority.
+                // request, once, while the captured claim still holds authority.
                 let outcome =
                     try
                         awaitTask (capable.SettleExecution(props.Tenant, request, CancellationToken.None))
@@ -4728,7 +4744,7 @@ module internal SessionActor =
                     | _, null -> ()
                     | _, logger -> logger.LogWarning("Crash settlement committed without its optional journal event.")
 
-                // Settlement keeps the decided prime until retirement. A read
+                // Settlement keeps the decided claim until retirement. A read
                 // of a receipt alone never authorizes this cleanup.
                 let retired =
                     safe (fun () ->
@@ -4762,7 +4778,7 @@ module internal SessionActor =
                                 )
                             ))
                     with
-                    | :? TurnSettled -> controlPrime <- None
+                    | :? TurnSettled -> liveClaim <- None
                     | _ -> refuse ()
 
                 outcome
@@ -4883,10 +4899,10 @@ module internal SessionActor =
             // The crash-path terminal (issue 289): the CurrentTurnId
             // snapshot the crash path never ran a loop for. Fenced under
             // the live journal token; a settled-NULL turn (None) journals
-            // nothing. Stays on the prime (issue 373): the write terminates
+            // nothing. Runs on the live claim (issue 400): the write terminates
             // an execution turn, so only the claim fence proves the writer
             // is no takeover loser; the host path cannot tell a stale
-            // generation from the live one. Re-anchoring belongs to #400.
+            // generation from the live one.
             match liveId with
             | Some _ when fenced -> ()
             | Some turnId ->
@@ -4926,10 +4942,10 @@ module internal SessionActor =
         /// appends. A failed replay reads as no marker, so the probe stays
         /// quiet.
         ///
-        /// The fallback exists because a winning prime replaces the row's
-        /// turn id: after the dispatcher's poke-claim (or the spawn prime)
-        /// wins post-expiry, CurrentTurnId names the prime, never the
-        /// orphan, so marker-for-live-id alone would stay quiet forever.
+        /// The fallback exists because a winning claim replaces the row's
+        /// turn id: after the dispatcher's poke-claim (or the recovered
+        /// claim) wins post-expiry, CurrentTurnId names the winner, never
+        /// the orphan, so marker-for-live-id alone would stay quiet forever.
         /// The orphan id survives only in the journal.
         /// <param name="liveId">The live turn to inspect.</param>
         /// <param name="cancellationToken">Token that abandons the replay.</param>
@@ -4994,15 +5010,14 @@ module internal SessionActor =
 
         /// Reads whether the live turn is an orphan (issue 289), in order:
         /// the settling id (the live id when its marker stands unterminated,
-        /// else the journal-derived orphan the prime replaced), an
-        /// era-marked session, and a won re-prime (a live lease held
-        /// elsewhere reads quiet). The won claim's token is adopted into
-        /// the journal cell so fenced writes land; the caller settles the
-        /// prime quietly after failing the orphan (a never-ran prime
-        /// journals nothing).
+        /// else the journal-derived orphan id), an era-marked session, and a
+        /// won drain claim (a live lease held elsewhere reads quiet). The
+        /// won claim's token is adopted into the journal cell so fenced
+        /// writes land; the caller settles the claim quietly after failing
+        /// the orphan (a never-ran claim journals nothing).
         /// <param name="liveId">The live turn to probe.</param>
         /// <param name="cancellationToken">Token that abandons the journal probe.</param>
-        /// <returns>The settling turn id with the won prime claim, or None when the session stays quiet.</returns>
+        /// <returns>The settling turn id with the won drain claim, or None when the session stays quiet.</returns>
         let probeOrphanTurn (liveId: TurnId) (cancellationToken: CancellationToken) : (TurnId * TurnClaim) option =
             let marker, terminal, fallback = journalOrphanState liveId cancellationToken
 
@@ -5020,12 +5035,12 @@ module internal SessionActor =
                 if not marked then
                     None
                 else
-                    match reprimeNow () with
+                    match claimDrainNow () with
                     | None -> None
-                    | Some prime ->
-                        journalToken <- prime.Token
-                        controlPrime <- Some prime
-                        Some(settlingId, prime)
+                    | Some claim ->
+                        journalToken <- claim.Token
+                        liveClaim <- Some claim
+                        Some(settlingId, claim)
 
         let originalRecoveryEntry () =
             match suspend.Recovery with
@@ -5039,7 +5054,7 @@ module internal SessionActor =
             | recovery -> recovery.Entry |> Option.ofObj
 
         let initialRecovered: SessionState * RebuiltPending option * InboxEntry option =
-            match controlStore, controlPrime with
+            match controlStore, liveClaim with
             | Some control, Some _ ->
                 match awaitTask (control.ReadAbortTarget(props.Tenant, props.SessionId, CancellationToken.None)) with
                 | null -> ()
@@ -5080,7 +5095,7 @@ module internal SessionActor =
                             InvalidSessionStateException(
                                 props.SessionId,
                                 "controlPending",
-                                "Persisted attribution blocks fresh recovery; no synthetic prime or settlement is authorized."
+                                "Persisted attribution blocks fresh recovery; no synthetic authority or settlement is authorized."
                             )
                         )
             | _ -> ()
@@ -5110,14 +5125,6 @@ module internal SessionActor =
                         | Some entry when not (isNull (box suspend.Recovery)) ->
                             let committed = failRecoveredTurn entry
                             committed.State, None, (committed.Following |> Option.ofObj)
-                        | _ when suspend.PrimeClaim.IsSome ->
-                            raise (
-                                InvalidSessionStateException(
-                                    props.SessionId,
-                                    "recoveryAssociationUnavailable",
-                                    "Crash settlement requires its original provider association."
-                                )
-                            )
                         | Some _ ->
                             failInterruptedTurn liveId drainable
                             SessionState.Idle, None, None
@@ -5126,8 +5133,8 @@ module internal SessionActor =
                             // consumed the inbox before the mid-LLM-call
                             // kill, so no drainable remains but the journal
                             // tail shows an unterminated turn. Fail fenced
-                            // under the fresh primed token. An empty tail
-                            // (no TurnStarted) idles instead of failing
+                            // under the fresh drain-claimed token. An empty
+                            // tail (no TurnStarted) idles instead of failing
                             // spuriously.
                             let orphaned =
                                 try
@@ -5201,14 +5208,17 @@ module internal SessionActor =
                     // Live-turn orphan probe (issue 289): an Idle row still
                     // carrying a live turn whose journal holds an
                     // unterminated marker — for the live id itself, or for
-                    // the orphan id a won prime replaced (the marker is the
+                    // the journal-derived orphan id (the marker is the
                     // only surviving record of it) — on an era-marked
                     // session with no live lease elsewhere, enters the
                     // Running-branch shape so entity start runs the
-                    // journal-tail recovery. Settled-NULL, terminated,
-                    // empty-tail, live-lease, and pre-era sessions all stay
-                    // quiet with the turn preserved; the losing branch
-                    // journals nothing (loser-zero-effects).
+                    // journal-tail recovery. An empty inbox stays quiet
+                    // with the turn preserved — no entry is claimable, so
+                    // the dispatcher's orphan sweep owns the settle.
+                    // Settled-NULL, terminated, empty-tail, live-lease, and
+                    // pre-era sessions all stay quiet with the turn
+                    // preserved; the losing branch journals nothing
+                    // (loser-zero-effects).
                     if session.CurrentTurnId.HasValue then
                         let liveId = session.CurrentTurnId.Value
 
@@ -5224,7 +5234,7 @@ module internal SessionActor =
 
                         match orphan with
                         | None -> SessionState.Idle, None, None
-                        | Some(settlingId, prime) ->
+                        | Some(settlingId, claim) ->
                             let drainable =
                                 try
                                     let pending =
@@ -5245,7 +5255,7 @@ module internal SessionActor =
                                 SessionState.Running, None, Some entry
                             | _ ->
                                 failInterruptedTurn (Some settlingId) drainable
-                                settleTurnQuiet prime |> ignore
+                                settleTurnQuiet claim |> ignore
                                 SessionState.Idle, None, None
                     else
                         SessionState.Idle, None, None
@@ -5280,7 +5290,14 @@ module internal SessionActor =
                             Cursor = None
                             Rebuilt = Some rebuilt
                             Allowed = readGrantsNow ()
-                            Attempt = controlPrime |> Option.map _.Attempt |> Option.defaultValue 1
+                            // The parked attempt is the suspended attempt:
+                            // the reply path retries with attempt plus one.
+                            // A renewed recovery claim already carries the
+                            // resume attempt, so it reads one back.
+                            Attempt =
+                                liveClaim
+                                |> Option.map (fun claim -> max 1 (claim.Attempt - 1))
+                                |> Option.defaultValue 1
                             TimeoutCts = new CancellationTokenSource()
                         }
                 | None -> None
@@ -5405,7 +5422,7 @@ module internal SessionActor =
 
         /// Journals an authority refusal as nothing (issue 289): the runner
         /// never ran, so no turn id ever existed for the entry and
-        /// borrowing the prime id would misattribute. The entry is
+        /// borrowing a claim id would misattribute. The entry is
         /// consumed, the session returns Idle, and the absent marker keeps
         /// the orphan trigger quiet. Kept as a named step so the refusal
         /// path reads explicitly.
@@ -5456,7 +5473,7 @@ module internal SessionActor =
         /// <param name="fresh">The live journal claim to adopt.</param>
         let swapJournal (fresh: TurnClaim) : unit =
             journalToken <- fresh.Token
-            controlPrime <- Some fresh
+            liveClaim <- Some fresh
 
             match suspend.RefreshCompact with
             | Some refresh ->
@@ -5480,7 +5497,7 @@ module internal SessionActor =
         /// Reads the agent the session converses with now, for the switch
         /// Resolves the captured claim authority one suspendable entry
         /// executes under (issue 363): the per-entry bound claim when the
-        /// control target bound it, else the primed claim. Local
+        /// control target bound it, else the live claim. Local
         /// correlation only; the store validates it as durable authority.
         /// <param name="entry">The entry the attempt executed.</param>
         /// <returns>The captured claim, or None for unclaimed shells.</returns>
@@ -5488,7 +5505,7 @@ module internal SessionActor =
             match controlReports.TryGetValue entry.Position with
             | true, (_, claim, _) when not (isNull (box claim)) -> Some claim
             | _ ->
-                match controlPrime with
+                match liveClaim with
                 | Some claim when not (isNull (box claim)) -> Some claim
                 | _ -> None
 
@@ -5568,7 +5585,7 @@ module internal SessionActor =
             (args: SuspendLoopArgs)
             (pipe: SuspendPipe)
             : Cont<SuspendableActorMessage, unit> =
-            match controlStore, controlPrime with
+            match controlStore, liveClaim with
             | Some control, Some _ ->
                 startPipedWait
                     starter
@@ -5822,61 +5839,6 @@ module internal SessionActor =
                 args
                 pipe
 
-        /// Settles the primed journal claim the spawn (or a re-prime)
-        /// holds, piped and best-effort: synthesizes the claim from the
-        /// row's CurrentTurnId stamp plus the token cell. Every failure is
-        /// swallowed, exactly like before.
-        /// <param name="cont">Continues once the settle attempt finished.</param>
-        /// <param name="suspendWith">Re-enters the loop with the state current at each wait's start.</param>
-        /// <param name="args">The current loop state.</param>
-        /// <param name="pipe">The current pipe state.</param>
-        /// <returns>The actor computation.</returns>
-        let withSettlePrimed
-            (cont: unit -> SuspendCont)
-            (suspendWith: SuspendCont)
-            (args: SuspendLoopArgs)
-            (pipe: SuspendPipe)
-            : Cont<SuspendableActorMessage, unit> =
-            startPipedWait
-                starter
-                (fun () -> props.Store.GetSession(props.Tenant, props.SessionId, CancellationToken.None))
-                "settle-primed/read"
-                (fun args2 pipe2 ->
-                    function
-                    | Ok session ->
-                        match session with
-                        | null -> cont () args2 pipe2
-                        | s when not s.CurrentTurnId.HasValue -> cont () args2 pipe2
-                        | s ->
-                            let claim =
-                                {
-                                    TurnId = s.CurrentTurnId.Value
-                                    Token = journalToken
-                                    Owner = ""
-                                    ExpiresAt = DateTimeOffset.MinValue
-                                    Attempt = 1
-                                }
-
-                            startPipedWait
-                                starter
-                                (fun () ->
-                                    props.Store.SettleTurn(
-                                        props.Tenant,
-                                        claim,
-                                        TurnStatus.Completed,
-                                        null,
-                                        CancellationToken.None
-                                    ))
-                                "settle-primed/settle"
-                                (fun args3 pipe3 _ -> cont () args3 pipe3)
-                                suspendWith
-                                args2
-                                pipe2
-                    | Error _ -> cont () args2 pipe2)
-                suspendWith
-                args
-                pipe
-
         /// Settles a claim Completed with a null outcome, piped and
         /// best-effort: the first settle wins and a retry of the same
         /// outcome observes it; a rejected or faulted settle reads as
@@ -5909,54 +5871,90 @@ module internal SessionActor =
                 args
                 pipe
 
-        /// Re-primes the journal through the spawn wiring, piped: a fresh
-        /// bootstrap plus ClaimNextTurn, or None when the host never
-        /// re-primes, the prime fails, or a live claim is held. The
-        /// pending-count cache refreshes exactly when the trailing read
-        /// lands.
+        /// Releases the live drain claim quietly when one is held, piped
+        /// and best-effort: the first settle wins and a retry of the same
+        /// outcome observes it. A settled cell clears so later drains adopt
+        /// fresh. The rebind outcome (not the release) decides.
+        /// <param name="cont">Continues once the release attempt finished.</param>
+        /// <param name="suspendWith">Re-enters the loop with the state current at each wait's start.</param>
+        /// <param name="args">The current loop state.</param>
+        /// <param name="pipe">The current pipe state.</param>
+        /// <returns>The actor computation.</returns>
+        let withReleaseLiveQuiet
+            (cont: unit -> SuspendCont)
+            (suspendWith: SuspendCont)
+            (args: SuspendLoopArgs)
+            (pipe: SuspendPipe)
+            : Cont<SuspendableActorMessage, unit> =
+            match liveClaim with
+            | None -> cont () args pipe
+            | Some claim ->
+                withSettleTurnQuiet
+                    claim
+                    (fun settled args2 pipe2 ->
+                        if settled then
+                            liveClaim <- None
+
+                        cont () args2 pipe2)
+                    suspendWith
+                    args
+                    pipe
+
+        /// Claims the next turn at a drain boundary, piped (issue 400): a
+        /// plain ClaimNextTurn under the drain owner and lease, or None when
+        /// no turn is claimable, the claim is held elsewhere, or the claim
+        /// fails. The pending-count cache refreshes exactly when the
+        /// trailing read lands.
         /// <param name="cont">Continues with the live claim (or None) plus the refreshed count (or None).</param>
         /// <param name="suspendWith">Re-enters the loop with the state current at each wait's start.</param>
         /// <param name="args">The current loop state.</param>
         /// <param name="pipe">The current pipe state.</param>
         /// <returns>The actor computation.</returns>
-        let withReprime
+        let withDrainClaim
             (cont: TurnClaim option -> int option -> SuspendCont)
             (suspendWith: SuspendCont)
             (args: SuspendLoopArgs)
             (pipe: SuspendPipe)
             : Cont<SuspendableActorMessage, unit> =
-            match suspend.ReprimeJournal with
-            | None -> cont None (Some args.PendingCount) args pipe
-            | Some reprime ->
-                startPipedWait
-                    starter
-                    (fun () -> reprime ())
-                    "reprime-journal"
-                    (fun args2 pipe2 ->
-                        function
-                        | Error _ -> cont None None args2 pipe2
-                        | Ok fresh ->
-                            startPipedWait
-                                starter
-                                (fun () ->
-                                    props.Store.ReadPendingInbox(
-                                        props.Tenant,
-                                        props.SessionId,
-                                        CancellationToken.None
-                                    ))
-                                "reprime-refresh"
-                                (fun args3 pipe3 ->
-                                    function
-                                    | Ok pending when not (isNull (box pending)) ->
-                                        cont fresh (Some pending.Count) args3 pipe3
-                                    | Ok _ -> cont fresh (Some 0) args3 pipe3
-                                    | Error _ -> cont fresh None args3 pipe3)
-                                suspendWith
-                                args2
-                                pipe2)
-                    suspendWith
-                    args
-                    pipe
+            startPipedWait
+                starter
+                (fun () ->
+                    props.Store.ClaimNextTurn(
+                        props.Tenant,
+                        props.SessionId,
+                        suspend.ClaimOwner,
+                        suspend.ClaimLease,
+                        CancellationToken.None
+                    ))
+                "drain-claim"
+                (fun args2 pipe2 ->
+                    function
+                    | Error _ -> cont None None args2 pipe2
+                    | Ok lease ->
+                        let fresh =
+                            match lease with
+                            | :? TurnLeaseRenewed as renewed when not (isNull (box renewed)) -> Some renewed.Claim
+                            | :? TurnLeaseHeld as held when not (isNull (box held)) -> Some held.Claim
+                            | :? TurnLeaseExpiring as expiring when not (isNull (box expiring)) -> Some expiring.Claim
+                            | _ -> None
+
+                        startPipedWait
+                            starter
+                            (fun () ->
+                                props.Store.ReadPendingInbox(props.Tenant, props.SessionId, CancellationToken.None))
+                            "drain-claim-refresh"
+                            (fun args3 pipe3 ->
+                                function
+                                | Ok pending when not (isNull (box pending)) ->
+                                    cont fresh (Some pending.Count) args3 pipe3
+                                | Ok _ -> cont fresh (Some 0) args3 pipe3
+                                | Error _ -> cont fresh None args3 pipe3)
+                            suspendWith
+                            args2
+                            pipe2)
+                suspendWith
+                args
+                pipe
 
         /// Reads whether the session's pending inbox is empty, piped. A
         /// missing row or a store failure reads as non-empty, so a recorded
@@ -6002,8 +6000,8 @@ module internal SessionActor =
             (args: SuspendLoopArgs)
             (pipe: SuspendPipe)
             : Cont<SuspendableActorMessage, unit> =
-            // The host fence reads the version stamp after the re-prime
-            // (settle and claim both stamp the row), so the exact
+            // The host fence reads the version stamp after the live-claim
+            // settle (settle and claim both stamp the row), so the exact
             // equality compares against the current row.
             startPipedWait
                 starter
@@ -6038,12 +6036,14 @@ module internal SessionActor =
                 args
                 pipe
 
-        /// Applies the recorded agent rebind through the 6-step quiescent
-        /// protocol, piped: settle the primed claim, re-prime, journal the
-        /// switch under the fresh token, settle the fresh claim, rebind the
-        /// row, re-prime to restore the live prime. Every write stays
-        /// claim-checked last-moment by the stores. A throwing apply reads
-        /// as not landed, exactly like before.
+        /// Applies the recorded agent rebind at a quiescent boundary, piped:
+        /// release the live claim best-effort, journal the switch under the
+        /// host path, rebind the row. Nothing is re-acquired: the next drain
+        /// claims fresh. A parked suspension short-circuits with the rebind
+        /// still pending (no settle, no journal), so the suspension survives
+        /// and the switch journals exactly once post-resume. Every write
+        /// stays claim-checked last-moment by the stores. A throwing apply
+        /// reads as not landed, exactly like before.
         /// <param name="target">The agent the session converses with from now on.</param>
         /// <param name="cont">Continues with whether the rebind landed.</param>
         /// <param name="suspendWith">Re-enters the loop with the state current at each wait's start.</param>
@@ -6057,125 +6057,63 @@ module internal SessionActor =
             (args: SuspendLoopArgs)
             (pipe: SuspendPipe)
             : Cont<SuspendableActorMessage, unit> =
-            withSettlePrimed
-                (fun () args2 pipe2 ->
-                    withReprime
-                        (fun fresh count args3 pipe3 ->
-                            let args3c =
-                                match count with
-                                | Some c -> { args3 with PendingCount = c }
-                                | None -> args3
+            // A parked suspension short-circuits with the rebind still
+            // pending: settling or journaling here would end the suspended
+            // turn or duplicate the switch event. The post-resume boundary
+            // retries.
+            match args.Suspended with
+            | Some _ -> cont false args pipe
+            | None ->
+                withReleaseLiveQuiet
+                    (fun () args2 pipe2 ->
+                        withPreviousAgent
+                            target
+                            (fun previous args3 pipe3 ->
+                                let switched =
+                                    AgentSwitchedEvent(
+                                        props.SessionId,
+                                        Unchecked.defaultof<TurnId>,
+                                        Unchecked.defaultof<Nullable<int64>>,
+                                        DateTimeOffset.UtcNow,
+                                        previous,
+                                        target
+                                    )
+                                    :> SessionEvent
 
-                            match fresh with
-                            | None -> cont false args3c pipe3
-                            | Some live ->
-                                swapJournal live
+                                let batch = ResizeArray<SessionEvent>([| switched |]) :> IReadOnlyList<SessionEvent>
 
-                                withPreviousAgent
-                                    target
-                                    (fun previous args4 pipe4 ->
-                                        let switched =
-                                            AgentSwitchedEvent(
-                                                props.SessionId,
-                                                Unchecked.defaultof<TurnId>,
-                                                Unchecked.defaultof<Nullable<int64>>,
-                                                DateTimeOffset.UtcNow,
-                                                previous,
-                                                target
-                                            )
-                                            :> SessionEvent
-
-                                        let batch =
-                                            ResizeArray<SessionEvent>([| switched |]) :> IReadOnlyList<SessionEvent>
-
-                                        withExpectedStampAndJournal
-                                            batch
-                                            (fun hostOutcome args5 pipe5 ->
-                                                match hostOutcome with
-                                                | Some(JournalWriter.JournalAppended _) ->
-                                                    withSettleTurnQuiet
-                                                        live
-                                                        (fun settled args6 pipe6 ->
-                                                            if not settled then
-                                                                cont false args6 pipe6
-                                                            else
-                                                                startPipedWaitUnit
-                                                                    starter
-                                                                    (fun () ->
-                                                                        props.Store.SetSessionAgent(
-                                                                            props.Tenant,
-                                                                            props.SessionId,
-                                                                            target,
-                                                                            CancellationToken.None
-                                                                        ))
-                                                                    "apply-agent/rebind"
-                                                                    (fun args7 pipe7 ->
-                                                                        function
-                                                                        | Ok() ->
-                                                                            withReprime
-                                                                                (fun restored count args8 pipe8 ->
-                                                                                    let args8c =
-                                                                                        match count with
-                                                                                        | Some c ->
-                                                                                            { args8 with
-                                                                                                PendingCount = c
-                                                                                            }
-                                                                                        | None -> args8
-
-                                                                                    match restored with
-                                                                                    | Some fresh2 ->
-                                                                                        swapJournal fresh2
-                                                                                        cont true args8c pipe8
-                                                                                    | None ->
-                                                                                        cont false args8c pipe8)
-                                                                                suspendWith
-                                                                                args7
-                                                                                pipe7
-                                                                        | Error _ ->
-                                                                            withReprime
-                                                                                (fun restored count args8 pipe8 ->
-                                                                                    let args8c =
-                                                                                        match count with
-                                                                                        | Some c ->
-                                                                                            { args8 with
-                                                                                                PendingCount = c
-                                                                                            }
-                                                                                        | None -> args8
-
-                                                                                    match restored with
-                                                                                    | Some fresh2 ->
-                                                                                        swapJournal fresh2
-                                                                                    | None -> ()
-
-                                                                                    cont false args8c pipe8)
-                                                                                suspendWith
-                                                                                args7
-                                                                                pipe7)
-                                                                    suspendWith
-                                                                    args6
-                                                                    pipe6)
-                                                        suspendWith
-                                                        args5
-                                                        pipe5
-                                                | _ ->
-                                                    withSettleTurnQuiet
-                                                        live
-                                                        (fun _ args6 pipe6 -> cont false args6 pipe6)
-                                                        suspendWith
-                                                        args5
-                                                        pipe5)
-                                            suspendWith
-                                            args4
-                                            pipe4)
+                                withExpectedStampAndJournal
+                                    batch
+                                    (fun hostOutcome args4 pipe4 ->
+                                        match hostOutcome with
+                                        | Some(JournalWriter.JournalAppended _) ->
+                                            startPipedWaitUnit
+                                                starter
+                                                (fun () ->
+                                                    props.Store.SetSessionAgent(
+                                                        props.Tenant,
+                                                        props.SessionId,
+                                                        target,
+                                                        CancellationToken.None
+                                                    ))
+                                                "apply-agent/rebind"
+                                                (fun args5 pipe5 ->
+                                                    function
+                                                    | Ok() -> cont true args5 pipe5
+                                                    | Error _ -> cont false args5 pipe5)
+                                                suspendWith
+                                                args4
+                                                pipe4
+                                        | _ -> cont false args4 pipe4)
                                     suspendWith
-                                    args3c
+                                    args3
                                     pipe3)
-                        suspendWith
-                        args2
-                        pipe2)
-                suspendWith
-                args
-                pipe
+                            suspendWith
+                            args2
+                            pipe2)
+                    suspendWith
+                    args
+                    pipe
 
         /// Applies the recorded agent rebind when the inbox is empty, piped.
         /// The caller guarantees no live turn task. A throwing apply keeps
@@ -6216,54 +6154,6 @@ module internal SessionActor =
                     args
                     pipe
 
-        /// Restores the live journal prime when quiescence settled it
-        /// (issue 313), piped: the fresh turn re-primes while the inbox is
-        /// still empty, adopting the fresh token before appending. Skips
-        /// when a live turn is snapshotted, when the inbox is non-empty,
-        /// and when the re-prime fails, exactly like before.
-        /// <param name="cont">Continues once the prime check finished.</param>
-        /// <param name="suspendWith">Re-enters the loop with the state current at each wait's start.</param>
-        /// <param name="args">The current loop state.</param>
-        /// <param name="pipe">The current pipe state.</param>
-        /// <returns>The actor computation.</returns>
-        let withEnsurePrimed
-            (cont: unit -> SuspendCont)
-            (suspendWith: SuspendCont)
-            (args: SuspendLoopArgs)
-            (pipe: SuspendPipe)
-            : Cont<SuspendableActorMessage, unit> =
-            withCurrentTurnSnapshot
-                (fun snapshot args2 pipe2 ->
-                    match snapshot with
-                    | Some _ -> cont () args2 pipe2
-                    | None ->
-                        withInboxEmpty
-                            (fun empty args3 pipe3 ->
-                                if not empty then
-                                    cont () args3 pipe3
-                                else
-                                    withReprime
-                                        (fun fresh count args4 pipe4 ->
-                                            let args4c =
-                                                match count with
-                                                | Some c -> { args4 with PendingCount = c }
-                                                | None -> args4
-
-                                            match fresh with
-                                            | None -> cont () args4c pipe4
-                                            | Some live ->
-                                                swapJournal live
-                                                cont () args4c pipe4)
-                                        suspendWith
-                                        args3
-                                        pipe3)
-                            suspendWith
-                            args2
-                            pipe2)
-                suspendWith
-                args
-                pipe
-
         /// Binds one entry's execution to its control target, piped:
         /// the durable TurnId stamped at accept owns execution. A refused
         /// bind or a failed wait reports through onError, exactly like the
@@ -6283,7 +6173,7 @@ module internal SessionActor =
             (args: SuspendLoopArgs)
             (pipe: SuspendPipe)
             : Cont<SuspendableActorMessage, unit> =
-            match controlStore, controlPrime with
+            match controlStore, liveClaim with
             | Some control, Some claim ->
                 // Real-turn identity (issue 374): the durable TurnId stamped
                 // at accept owns execution; the in-memory report reuses it so
@@ -6395,7 +6285,7 @@ module internal SessionActor =
         /// <param name="args">The current loop state.</param>
         /// <param name="pipe">The current pipe state.</param>
         /// <returns>The actor computation.</returns>
-        let withStartSuspendable
+        let withStartSuspendableClaimed
             (entry: InboxEntry)
             (attempt: int)
             (allowed: HashSet<string>)
@@ -6475,7 +6365,7 @@ module internal SessionActor =
                             match controlReports.TryGetValue entry.Position with
                             | true, (_, claim, _) when not (isNull (box claim)) -> FencedClaimScope.enter (Some claim)
                             | _ ->
-                                match controlPrime with
+                                match liveClaim with
                                 | Some claim when not (isNull (box claim)) -> FencedClaimScope.enter (Some claim)
                                 | _ -> FencedClaimScope.enter None
 
@@ -6563,14 +6453,14 @@ module internal SessionActor =
                 let proceed (argsX: SuspendLoopArgs) (pipeX: SuspendPipe) : Cont<SuspendableActorMessage, unit> =
                     runningTurnId <- Some runTurnId
 
-                    // Production heartbeat (issue 375): renew the bound prime
+                    // Production heartbeat (issue 375): renew the bound claim
                     // in place for the whole attempt.
                     match controlReports.TryGetValue entry.Position with
                     | true, (_, boundClaim, _) when not (isNull (box boundClaim)) ->
                         startHeartbeat entry attempt runTurnId boundClaim
                     | _ ->
-                        match controlPrime with
-                        | Some prime when not (isNull (box prime)) -> startHeartbeat entry attempt runTurnId prime
+                        match liveClaim with
+                        | Some live when not (isNull (box live)) -> startHeartbeat entry attempt runTurnId live
                         | _ -> ()
 
                     startRunner runTurnId argsX pipeX
@@ -6579,7 +6469,7 @@ module internal SessionActor =
                     match controlReports.TryGetValue entry.Position with
                     | true, (_, claim, _) when not (isNull (box claim)) -> Some claim
                     | _ ->
-                        match controlPrime with
+                        match liveClaim with
                         | Some claim when not (isNull (box claim)) -> Some claim
                         | _ -> None
 
@@ -6642,6 +6532,62 @@ module internal SessionActor =
                 args
                 pipe
 
+        /// Starts one suspendable attempt, claiming first when no live
+        /// claim is held (issue 400): the start never runs unfenced. A held
+        /// claim proceeds at once; otherwise the drain claims the head
+        /// entry and adopts it. A failed claim reports through onError, so
+        /// the entry stays pending for the next boundary instead of
+        /// starting without authority.
+        /// <param name="entry">The entry the attempt executes.</param>
+        /// <param name="attempt">The 1-based attempt the run executes as.</param>
+        /// <param name="allowed">The tool names the runner may call.</param>
+        /// <param name="seed">The crash seed, or None.</param>
+        /// <param name="cont">Continues once the runner started.</param>
+        /// <param name="onError">Continues when the start chain refuses or fails.</param>
+        /// <param name="suspendWith">Re-enters the loop with the state current at each wait's start.</param>
+        /// <param name="args">The current loop state.</param>
+        /// <param name="pipe">The current pipe state.</param>
+        /// <returns>The actor computation.</returns>
+        let withStartSuspendable
+            (entry: InboxEntry)
+            (attempt: int)
+            (allowed: HashSet<string>)
+            (seed: IList<ChatMessage> option)
+            (cont: unit -> SuspendCont)
+            (onError: exn -> SuspendCont)
+            (suspendWith: SuspendCont)
+            (args: SuspendLoopArgs)
+            (pipe: SuspendPipe)
+            : Cont<SuspendableActorMessage, unit> =
+            match liveClaim with
+            | Some _ -> withStartSuspendableClaimed entry attempt allowed seed cont onError suspendWith args pipe
+            | None ->
+                withDrainClaim
+                    (fun fresh count args2 pipe2 ->
+                        let args2c =
+                            match count with
+                            | Some c -> { args2 with PendingCount = c }
+                            | None -> args2
+
+                        match fresh with
+                        | Some live ->
+                            swapJournal live
+
+                            withStartSuspendableClaimed
+                                entry
+                                attempt
+                                allowed
+                                seed
+                                cont
+                                onError
+                                suspendWith
+                                args2c
+                                pipe2
+                        | None -> onError (TurnLoop.TurnLeaseLostException()) args2c pipe2)
+                    suspendWith
+                    args
+                    pipe
+
         /// Resumes one parked turn for a reply, piped: admits the resume
         /// through its control target, then invokes the runner
         /// fire-and-forget exactly like before. The runner outcome pipes
@@ -6687,7 +6633,7 @@ module internal SessionActor =
                     match controlReports.TryGetValue parked.Entry.Position with
                     | true, (_, claim, _) when not (isNull (box claim)) -> FencedClaimScope.enter (Some claim)
                     | _ ->
-                        match controlPrime with
+                        match liveClaim with
                         | Some claim when not (isNull (box claim)) -> FencedClaimScope.enter (Some claim)
                         | _ -> FencedClaimScope.enter None
 
@@ -7026,7 +6972,7 @@ module internal SessionActor =
                         argsX
                         pipeX
 
-            match controlStore, controlPrime with
+            match controlStore, liveClaim with
             | Some control, Some _ ->
                 startPipedWait
                     starter
@@ -7129,7 +7075,7 @@ module internal SessionActor =
                             argsX
                             pipeX
 
-            match controlStore, controlPrime with
+            match controlStore, liveClaim with
             | Some control, Some _ ->
                 startPipedWait
                     starter
@@ -7519,52 +7465,48 @@ module internal SessionActor =
                 args
                 pipe
 
-        /// Settles the primed journal claim at quiescence for a Completed
-        /// turn, piped and best-effort (issue 313): every failure reads as
-        /// unsettled, exactly like before.
+        /// Settles the live drain claim at quiescence for a Completed turn,
+        /// piped and best-effort (issue 400): settles the adopted claim, not
+        /// a synthesized one. Every failure reads as unsettled, exactly like
+        /// before. A settled cell clears so later drains adopt fresh.
         /// <param name="cont">Continues once the settle attempt finished.</param>
         /// <param name="suspendWith">Re-enters the loop with the state current at each wait's start.</param>
         /// <param name="args">The current loop state.</param>
         /// <param name="pipe">The current pipe state.</param>
         /// <returns>The actor computation.</returns>
-        let withSettleCompletedPrime
+        let withSettleCompletedClaim
             (cont: unit -> SuspendCont)
             (suspendWith: SuspendCont)
             (args: SuspendLoopArgs)
             (pipe: SuspendPipe)
             : Cont<SuspendableActorMessage, unit> =
-            withCurrentTurnSnapshot
-                (fun snapshot args2 pipe2 ->
-                    match snapshot with
-                    | None -> cont () args2 pipe2
-                    | Some turnId ->
-                        let claim =
-                            {
-                                TurnId = turnId
-                                Token = journalToken
-                                Owner = ""
-                                ExpiresAt = DateTimeOffset.MinValue
-                                Attempt = 1
-                            }
-
-                        startPipedWait
-                            starter
-                            (fun () ->
-                                ClaimFence.settleTurnAsync
-                                    props.Store
-                                    props.Tenant
-                                    claim
-                                    TurnStatus.Completed
-                                    null
-                                    CancellationToken.None)
-                            "settle-completed-prime"
-                            (fun args3 pipe3 _ -> cont () args3 pipe3)
-                            suspendWith
-                            args2
-                            pipe2)
-                suspendWith
-                args
-                pipe
+            match liveClaim with
+            | None -> cont () args pipe
+            | Some claim ->
+                startPipedWait
+                    starter
+                    (fun () ->
+                        ClaimFence.settleTurnAsync
+                            props.Store
+                            props.Tenant
+                            claim
+                            TurnStatus.Completed
+                            null
+                            CancellationToken.None)
+                    "settle-completed-claim"
+                    (fun args2 pipe2 ->
+                        function
+                        | Ok(Some(:? TurnSettled)) ->
+                            liveClaim <- None
+                            cont () args2 pipe2
+                        | Ok(Some(:? TurnAlreadySettled)) ->
+                            liveClaim <- None
+                            cont () args2 pipe2
+                        | Ok _ -> cont () args2 pipe2
+                        | Error _ -> cont () args2 pipe2)
+                    suspendWith
+                    args
+                    pipe
 
         /// Resolves the settling turn id, piped (issue 289): the
         /// completion-carried id, then the running attempt's cell, then the
@@ -8008,8 +7950,8 @@ module internal SessionActor =
                 pipe
 
         /// Runs one Idle prompt arm end to end, piped (route already
-        /// validated by the caller): applies a recorded rebind, restores
-        /// the prime, appends, drains tier-first, and gates authority.
+        /// validated by the caller): applies a recorded rebind, appends,
+        /// drains tier-first, and gates authority. The drain claims fresh.
         /// Authorized entries start (the session returns to Running);
         /// refused ones settle Failed and the drain moves on.
         /// <param name="payload">What the entry carries.</param>
@@ -8036,89 +7978,93 @@ module internal SessionActor =
             // sees only real entries.
             withTryApplyPendingWhenIdle
                 (fun () args3 pipe3 ->
-                    // A prime settled at quiescence is restored before
-                    // appending (issue 313): the fresh turn re-primes
-                    // while the inbox is still empty, so its marker and
-                    // suspend/resolve writes fence live.
-                    withEnsurePrimed
-                        (fun () args4 pipe4 ->
-                            withAppendInbox
-                                payload
-                                delivery
+                    // Nothing is restored at quiescence (issue 400): the
+                    // drain below claims the appended entry fresh, so its
+                    // marker and suspend/resolve writes fence live.
+                    withAppendInbox
+                        payload
+                        delivery
+                        cancellationToken
+                        (fun appended args4 pipe4 ->
+                            withReadPending
                                 cancellationToken
-                                (fun appended args5 pipe5 ->
-                                    withReadPending
-                                        cancellationToken
-                                        (fun pending args6 pipe6 ->
-                                            let first =
-                                                selectDrainableEntries pending
-                                                |> List.tryHead
-                                                |> Option.defaultValue appended
+                                (fun pending args5 pipe5 ->
+                                    let first =
+                                        selectDrainableEntries pending
+                                        |> List.tryHead
+                                        |> Option.defaultValue appended
 
-                                            // The per-turn authority gate runs at this fresh-turn
-                                            // boundary only: authorized entries run, refused ones
-                                            // settle Failed without ever invoking the runner and
-                                            // the drain moves on.
-                                            withCheckAgentAuthority
-                                                (fun authority args7 pipe7 ->
-                                                    match authority with
-                                                    | None when args7.Closing <> [] ->
-                                                        // A requested close owns the session now:
-                                                        // the appended entry stays durable, but no
-                                                        // turn starts into the close.
-                                                        sender <! PromptAccepted appended
-                                                        suspendWith args7 pipe7
-                                                    | None ->
-                                                        withReadGrants
-                                                            (fun grants args8 pipe8 ->
-                                                                withStartSuspendable
-                                                                    first
-                                                                    1
-                                                                    grants
-                                                                    None
-                                                                    (fun () args9 pipe9 ->
-                                                                        sender <! PromptAccepted appended
+                                    // The per-turn authority gate runs at this fresh-turn
+                                    // boundary only: authorized entries run, refused ones
+                                    // settle Failed without ever invoking the runner and
+                                    // the drain moves on.
+                                    withCheckAgentAuthority
+                                        (fun authority args6 pipe6 ->
+                                            match authority with
+                                            | None when args6.Closing <> [] ->
+                                                // A requested close owns the session now:
+                                                // the appended entry stays durable, but no
+                                                // turn starts into the close.
+                                                sender <! PromptAccepted appended
+                                                suspendWith args6 pipe6
+                                            | None ->
+                                                withReadGrants
+                                                    (fun grants args7 pipe7 ->
+                                                        withStartSuspendable
+                                                            first
+                                                            1
+                                                            grants
+                                                            None
+                                                            (fun () args8 pipe8 ->
+                                                                sender <! PromptAccepted appended
 
-                                                                        suspendWith
-                                                                            { args9 with
-                                                                                State = SessionState.Running
-                                                                                Suspended = None
-                                                                            }
-                                                                            pipe9)
-                                                                    (fun error args9 pipe9 ->
-                                                                        sender <! Status.Failure(error)
-                                                                        suspendWith args9 pipe9)
-                                                                    suspendWith
-                                                                    args8
+                                                                suspendWith
+                                                                    { args8 with
+                                                                        State = SessionState.Running
+                                                                        Suspended = None
+                                                                    }
                                                                     pipe8)
+                                                            (fun error args8 pipe8 ->
+                                                                match error with
+                                                                | :? TurnLoop.TurnLeaseLostException ->
+                                                                    // No authority right now (a takeover
+                                                                    // holds the lease): the appended entry
+                                                                    // stays pending for a later boundary,
+                                                                    // so acknowledge acceptance instead of
+                                                                    // failing the prompt.
+                                                                    sender <! PromptAccepted appended
+                                                                    suspendWith args8 pipe8
+                                                                | _ ->
+                                                                    sender <! Status.Failure(error)
+                                                                    suspendWith args8 pipe8)
                                                             suspendWith
                                                             args7
-                                                            pipe7
-                                                    | Some(failure, reason) ->
-                                                        withSettleAuthorityRefusal
-                                                            first
-                                                            failure
-                                                            reason
-                                                            (fun () args8 pipe8 ->
-                                                                withDrainAfterRefusal
-                                                                    (fun next args9 pipe9 ->
-                                                                        sender <! PromptAccepted appended
+                                                            pipe7)
+                                                    suspendWith
+                                                    args6
+                                                    pipe6
+                                            | Some(failure, reason) ->
+                                                withSettleAuthorityRefusal
+                                                    first
+                                                    failure
+                                                    reason
+                                                    (fun () args7 pipe7 ->
+                                                        withDrainAfterRefusal
+                                                            (fun next args8 pipe8 ->
+                                                                sender <! PromptAccepted appended
 
-                                                                        suspendWith
-                                                                            { args9 with
-                                                                                State = next
-                                                                                Suspended = None
-                                                                            }
-                                                                            pipe9)
-                                                                    suspendWith
-                                                                    args8
+                                                                suspendWith
+                                                                    { args8 with
+                                                                        State = next
+                                                                        Suspended = None
+                                                                    }
                                                                     pipe8)
                                                             suspendWith
                                                             args7
                                                             pipe7)
-                                                suspendWith
-                                                args6
-                                                pipe6)
+                                                    suspendWith
+                                                    args6
+                                                    pipe6)
                                         suspendWith
                                         args5
                                         pipe5)
@@ -8173,7 +8119,7 @@ module internal SessionActor =
                                 // boundary already consumed the entry, chose
                                 // the lifecycle disposition and the queued
                                 // candidate, enqueued the completion under
-                                // the stable key, and released the prime at
+                                // the stable key, and released the claim at
                                 // quiescence. Publish only this winner:
                                 // observe once, journal the terminal event
                                 // best-effort, then drain the authoritative
@@ -8197,7 +8143,7 @@ module internal SessionActor =
                                                     withTryApplyPendingWhenIdle
                                                         (fun () args6 pipe6 ->
                                                             if decided.Status = TurnStatus.Completed then
-                                                                withSettleCompletedPrime
+                                                                withSettleCompletedClaim
                                                                     (fun () args7 pipe7 ->
                                                                         cont SessionState.Idle args7 pipe7)
                                                                     suspendWith
@@ -8214,14 +8160,14 @@ module internal SessionActor =
                                                 // The settled entry is consumed: an empty
                                                 // inbox is quiescent, so a recorded
                                                 // rebind applies before resting, and the
-                                                // Completed-turn prime settle below keeps
-                                                // the facade prime releasable. The
+                                                // Completed-turn claim settle below keeps
+                                                // the facade claim releasable. The
                                                 // lifecycle write already landed in the
                                                 // atomic boundary.
                                                 withTryApplyPendingWhenIdle
                                                     (fun () args6 pipe6 ->
                                                         if decided.Status = TurnStatus.Completed then
-                                                            withSettleCompletedPrime
+                                                            withSettleCompletedClaim
                                                                 (fun () args7 pipe7 ->
                                                                     cont SessionState.Idle args7 pipe7)
                                                                 suspendWith
@@ -8239,7 +8185,7 @@ module internal SessionActor =
                                 // Terminal completion event (issue 289):
                                 // verdict-first (the committed settle above
                                 // decided the terminal kind), journaled
-                                // best-effort under the live token. A prime
+                                // best-effort under the live token. A claim
                                 // that never ran never reaches here, and a
                                 // fault before any mint (None) journals
                                 // nothing.
@@ -8451,14 +8397,14 @@ module internal SessionActor =
                                                                                 args8
                                                                                 pipe8
                                                                         | [] ->
-                                                                            // Completed-turn prime settle (issue
-                                                                            // 313): release the facade prime exactly
+                                                                            // Completed-turn claim settle (issue
+                                                                            // 400): release the live claim exactly
                                                                             // once at quiescence through the fenced
                                                                             // settle, so a later prompt (or a
-                                                                            // respawn prime after a restart) claims
-                                                                            // anew instead of observing
+                                                                            // fresh activation after a restart)
+                                                                            // claims anew instead of observing
                                                                             // TurnLeaseMissing. Aborted and Failed
-                                                                            // results keep their prime, like the
+                                                                            // results keep their claim, like the
                                                                             // fault path; a stale (taken-over) token
                                                                             // settles nothing. The terminal event
                                                                             // above already journaled under the live
@@ -8466,7 +8412,7 @@ module internal SessionActor =
                                                                             if
                                                                                 decided.Status = TurnStatus.Completed
                                                                             then
-                                                                                withSettleCompletedPrime
+                                                                                withSettleCompletedClaim
                                                                                     (fun () args9 pipe9 ->
                                                                                         idleWrite args9 pipe9)
                                                                                     suspendWith
@@ -8503,7 +8449,7 @@ module internal SessionActor =
                                                     // Terminal completion event (issue 289):
                                                     // verdict-first (the store-first settle above
                                                     // decided the terminal kind), journaled
-                                                    // best-effort under the live token. A prime
+                                                    // best-effort under the live token. A claim
                                                     // that never ran never reaches here, and a
                                                     // fault before any mint (None) journals
                                                     // nothing.
@@ -9172,7 +9118,7 @@ module internal SessionActor =
                                                         // boundary already consumed the entry, chose the
                                                         // lifecycle disposition and the queued candidate,
                                                         // enqueued the completion under the stable key,
-                                                        // and released the prime at quiescence. Publish
+                                                        // and released the claim at quiescence. Publish
                                                         // only this winner: observe once, journal the
                                                         // terminal event best-effort, then drain the
                                                         // authoritative following entry or rest at
@@ -10006,16 +9952,18 @@ module internal SessionActor =
 
                                             match selectDrainableEntries pending with
                                             | first :: _ ->
-                                                // A settled Idle child has released its prime. Claim
-                                                // the pending entry through the existing provider path,
-                                                // retaining this original envelope for the start below.
-                                                let reprimeThenStart args4 pipe4 =
+                                                // A settled Idle child holds no live claim. The
+                                                // snapshot below claims the pending entry through
+                                                // the existing provider path, retaining this
+                                                // original envelope for the start below.
+                                                let claimThenStart args4 pipe4 =
                                                     withCheckAgentAuthority
                                                         (fun authority args5 pipe5 ->
                                                             match authority with
-                                                            | None when
-                                                                suspend.ReprimeJournal.IsSome && controlPrime.IsNone
-                                                                ->
+                                                            | None when liveClaim.IsNone ->
+                                                                // Authorized but no live claim (the drain
+                                                                // claim lost): stay quiet for the next
+                                                                // boundary instead of starting unfenced.
                                                                 loop args5 pipe5
                                                             | None ->
                                                                 startPipedWaitUnit
@@ -10086,29 +10034,30 @@ module internal SessionActor =
                                                         args4
                                                         pipe4
 
-                                                withCurrentTurnSnapshot
-                                                    (fun snapshot args4 pipe4 ->
-                                                        match snapshot with
-                                                        | None when suspend.ReprimeJournal.IsSome ->
-                                                            withReprime
-                                                                (fun fresh count args5 pipe5 ->
-                                                                    let args5c =
-                                                                        match count with
-                                                                        | Some c -> { args5 with PendingCount = c }
-                                                                        | None -> args5
+                                                match liveClaim with
+                                                | Some _ -> claimThenStart args3c pipe3
+                                                | None ->
+                                                    // No live claim: claim the drainable entry
+                                                    // fresh (issue 400) and adopt the token
+                                                    // before starting. A live lease held
+                                                    // elsewhere reads as no claim, so the
+                                                    // gate below stays quiet instead of
+                                                    // starting unfenced.
+                                                    withDrainClaim
+                                                        (fun fresh count args5 pipe5 ->
+                                                            let args5c =
+                                                                match count with
+                                                                | Some c -> { args5 with PendingCount = c }
+                                                                | None -> args5
 
-                                                                    match fresh with
-                                                                    | Some live -> swapJournal live
-                                                                    | None -> ()
+                                                            match fresh with
+                                                            | Some live -> swapJournal live
+                                                            | None -> ()
 
-                                                                    reprimeThenStart args5c pipe5)
-                                                                suspendWith
-                                                                args4
-                                                                pipe4
-                                                        | _ -> reprimeThenStart args4 pipe4)
-                                                    suspendWith
-                                                    args3c
-                                                    pipe3
+                                                            claimThenStart args5c pipe5)
+                                                        suspendWith
+                                                        args3c
+                                                        pipe3
                                             | [] -> loop args3c pipe3)
                                     suspendWith
                                     args2
@@ -10137,7 +10086,7 @@ module internal SessionActor =
                 Some(entry, 1, readGrantsNow (), None)
             | SessionState.Running, Some entry ->
                 // Crash resume: the interrupted turn restarts as a new attempt
-                // under the fresh spawn-primed journal token (old-attempt events
+                // under the genuine recovered claim token (old-attempt events
                 // stay since the journal is append-only). The rehydrated history
                 // seeds the resumed run's runner input in-memory (never
                 // journaled, so replay cursors stay untouched); a rehydration
@@ -10164,12 +10113,7 @@ module internal SessionActor =
                     with _ ->
                         None
 
-                Some(
-                    entry,
-                    (controlPrime |> Option.map _.Attempt |> Option.defaultValue 2),
-                    (readGrantsNow ()),
-                    crashSeed
-                )
+                Some(entry, (liveClaim |> Option.map _.Attempt |> Option.defaultValue 2), (readGrantsNow ()), crashSeed)
             | _ -> None
 
         let initialArgs: SuspendLoopArgs =
@@ -10730,33 +10674,32 @@ module internal SessionActor =
     /// <see cref="T:Legate.IPermissionPolicy" />: the caller builds it (see
     /// SessionPermissions.createRunner) with the policy the container
     /// resolved, and this factory threads it into every child it spawns.
-    /// The journal token is primed per session at spawn: when the session
-    /// row exists the factory appends a bootstrap inbox entry and claims it,
-    /// so the suspend and resolve journal writes fence on a live claim
-    /// (mirroring the harness prime); the bootstrap entry is consumed by the
-    /// claim, so real prompts still drain first. When the row is missing the
-    /// child starts as an empty Idle shell over a fallback token and the
+    /// No journal claim is acquired per session at spawn (issue 400): the
+    /// actor claims each real entry at its drain, so the suspend and
+    /// resolve journal writes fence on the adopted live claim and real
+    /// prompts drain first with no bootstrap entry. When the row is missing
+    /// the child starts as an empty Idle shell over a fallback token and the
     /// client boundary rejects its mutations, exactly like the base shell.
     /// Claim renewal while suspended belongs to the dispatcher and heartbeat
-    /// cycle: the primed lease covers the configured AskTimeout window, and
+    /// cycle: the drain lease covers the configured AskTimeout window, and
     /// a lapsed lease settles the turn Failed with the typed reason instead
     /// of journaling half a suspension. The on-demand compaction wiring
-    /// comes from compactFor per spawned child, sharing the primed token.
+    /// comes from compactFor per spawned child, sharing the adopted token.
     /// <param name="store">The durable store session actors persist through.</param>
     /// <param name="tenant">The tenant router-spawned sessions belong to.</param>
     /// <param name="eventStore">The journal suspend and resolve events append to.</param>
     /// <param name="delay">The seam the AskTimeout deadline fires off.</param>
     /// <param name="askTimeout">How long a suspension waits for its Reply before settling Failed. Must be positive.</param>
-    /// <param name="claimOwner">The claim owner identity the journal prime claims under. Must not be null.</param>
-    /// <param name="leaseDuration">How long the primed journal claim lasts. Must be positive.</param>
+    /// <param name="claimOwner">The claim owner identity drain claims use. Must not be null.</param>
+    /// <param name="leaseDuration">How long a drain-claimed lease lasts. Must be positive.</param>
     /// <param name="runSuspendable">Runs one suspendable attempt, bound to the DI-resolved policy. Never null.</param>
-    /// <param name="compactFor">Builds the on-demand compaction wiring for one session from its primed journal token, or None when the host compacts nothing. Must not be null; return None to answer CompactNotNeeded.</param>
+    /// <param name="compactFor">Builds the on-demand compaction wiring for one session from its adopted journal token, or None when the host compacts nothing. Must not be null; return None to answer CompactNotNeeded.</param>
     /// <param name="agentStore">The agent catalog the per-turn authority gate reads, or null when the host runs without one: the gate is skipped then.</param>
     /// <param name="eraMarked">Reads the completion era the entity-start probe consults (issue 289). Never null.</param>
     /// <param name="settlement">The container-registered atomic settlement capability the suspendable settle commits through, or None when the host registered none: the actor then falls back to the store itself when it implements the capability, else the legacy store-first path. Split compositions (SQLite, Postgres) must pass theirs, or receipt-bound waits never observe a committed winner.</param>
     /// <returns>A factory mapping a session id string to a suspendable child spawn.</returns>
     /// Where one suspendable activation stands (issue 390): the
-    /// validate/recover/prime chain runs piped before the real behavior
+    /// validate/recover chain runs piped before the real behavior
     /// starts, and everything received meanwhile waits bounded behind it
     /// in arrival order.
     type private ActivationStep =
@@ -10764,8 +10707,6 @@ module internal SessionActor =
         | ValidateRouteStep
         /// The route validated: the control-target recovery read is outstanding.
         | RecoverTargetStep
-        /// The recovery resolved: the journal prime is outstanding.
-        | PrimeClaimStep of ControlTargetRecovery option
 
     /// The activation-loop state: which chain step is outstanding.
     type private ActivationArgs =
@@ -10786,7 +10727,7 @@ module internal SessionActor =
     /// including throws), otherwise an activating actor pipes the same
     /// task without blocking the spawning thread.
     type private ActivationOutcome =
-        /// The session validated, recovered, and primed: the routed
+        /// The session validated and recovered: the routed
         /// behavior's dependencies plus its row checker.
         | Activated of props: SessionActorProps * suspend: SuspendDeps * checkRoute: (Session -> unit)
         /// The route refused: the session answers the refusal.
@@ -10842,78 +10783,6 @@ module internal SessionActor =
             Task.FromException<TurnResult>(
                 InvalidOperationException("A suspendable session actor never runs its base turn runner.")
             )
-
-        /// Primes the journal claim for one session, started without
-        /// blocking the caller (issue 390): appends a bootstrap entry and
-        /// claims it, returning the live claim. A missing session row, a
-        /// validation or route refusal, or any prime failure primes
-        /// nothing. The loop pipes the returned task instead of awaiting
-        /// it, so the dispatcher thread never blocks on the prime.
-        /// <param name="id">The session to prime.</param>
-        /// <returns>The live claim, or None.</returns>
-        let primeClaimTask (id: SessionId) : Task<TurnClaim option> =
-            task {
-                try
-                    let! found = store.GetSession(tenant, id, CancellationToken.None)
-
-                    match found with
-                    | null -> return None
-                    | session when isNull (box session.Options) ->
-                        raise (
-                            CompletionRoutingException(
-                                Nullable tenant,
-                                Nullable id,
-                                null,
-                                CompletionRoutingReason.UnsupportedFormat
-                            )
-                        )
-
-                        return None
-                    | session ->
-                        session.Options.ValidatePersistence()
-
-                        match routes, session.Options.CompletionDestinationId with
-                        | Some registry, _ -> registry.Validate session
-                        | None, null -> ()
-                        | None, routeId ->
-                            raise (
-                                CompletionRoutingException(
-                                    Nullable tenant,
-                                    Nullable id,
-                                    routeId,
-                                    CompletionRoutingReason.Unknown
-                                )
-                            )
-
-                        let bootstrap =
-                            UserMessagePayload(UserMessage.Text "legate journal prime") :> InboxPayload
-
-                        let! pending = store.ReadPendingInbox(tenant, id, CancellationToken.None)
-
-                        if isNull (box pending) || pending.Count = 0 then
-                            let! _ =
-                                store.AppendInboxMessage(
-                                    tenant,
-                                    id,
-                                    bootstrap,
-                                    DeliveryMode.Queue,
-                                    CancellationToken.None
-                                )
-
-                            ()
-
-                        let! claimed =
-                            store.ClaimNextTurn(tenant, id, claimOwner, leaseDuration, CancellationToken.None)
-
-                        match claimed with
-                        | :? TurnLeaseRenewed as renewed when not (isNull (box renewed)) -> return Some renewed.Claim
-                        | :? TurnLeaseHeld as held when not (isNull (box held)) -> return Some held.Claim
-                        | :? TurnLeaseExpiring as expiring when not (isNull (box expiring)) ->
-                            return Some expiring.Claim
-                        | _ -> return None
-                with _ ->
-                    return None
-            }
 
         /// Checks one session row for route activation, synchronously
         /// (pure validation, never a wait): raises the routing refusal the
@@ -11049,68 +10918,59 @@ module internal SessionActor =
 
             loopB () (LifecyclePipe.empty ())
 
-        /// Runs the validate/recover/prime activation chain once, without
+        /// Runs the validate/recover activation chain once, without
         /// blocking the caller (issue 390): every wait is an async task
-        /// the caller pipes instead of awaiting. A synchronously completed
-        /// chain interprets inline through the historical synchronous
-        /// factory behavior.
+        /// the caller pipes instead of awaiting. No synthetic input is
+        /// minted and no ambient claim is acquired (issue 400): a recovery
+        /// carries its genuine #374 claim for the token seed, while a fresh
+        /// activation seeds an inert token the first drain claim replaces.
+        /// A synchronously completed chain interprets inline through the
+        /// historical synchronous factory behavior.
         /// <param name="captured">The session to activate.</param>
         /// <returns>The activation outcome.</returns>
         let runActivationChainAsync (captured: SessionId) : Task<ActivationOutcome> =
-            let primeBranch (recovery: ControlTargetRecovery | null) : Task<ActivationOutcome> =
+            let activateBranch (recovery: ControlTargetRecovery | null) : Task<ActivationOutcome> =
                 task {
                     try
-                        let! primed =
+                        let token =
                             match recovery with
-                            | null -> primeClaimTask captured
-                            | r -> Task.FromResult(r.Claim |> Option.ofObj)
-
-                        if primed.IsNone then
-                            return
-                                Failed(
-                                    InvalidSessionStateException(
-                                        captured,
-                                        "executionAuthorityUnavailable",
-                                        "Activation acquired no genuine prime authority; no runner may start."
-                                    )
-                                )
-                        else
-                            let token =
-                                match primed with
+                            | null -> Guid.NewGuid().ToString("N")
+                            | r ->
+                                match r.Claim |> Option.ofObj with
                                 | Some claim -> claim.Token
                                 | None -> Guid.NewGuid().ToString("N")
 
-                            let props: SessionActorProps =
-                                {
-                                    Store = store
-                                    Settlement = settlement
-                                    Tenant = tenant
-                                    SessionId = captured
-                                    RunTurn = unusedRunTurn
-                                    OnTurnSettled =
-                                        Some(fun result -> PromptWaitHubs.ObserveSettledScoped tenant captured result)
-                                    OnInjectJournaled = None
-                                    Compact = compactFor captured token
-                                    Logger = null
-                                    StorePipe = None
-                                }
+                        let props: SessionActorProps =
+                            {
+                                Store = store
+                                Settlement = settlement
+                                Tenant = tenant
+                                SessionId = captured
+                                RunTurn = unusedRunTurn
+                                OnTurnSettled =
+                                    Some(fun result -> PromptWaitHubs.ObserveSettledScoped tenant captured result)
+                                OnInjectJournaled = None
+                                Compact = compactFor captured token
+                                Logger = null
+                                StorePipe = None
+                            }
 
-                            let suspend: SuspendDeps =
-                                {
-                                    EventStore = eventStore
-                                    Delay = delay
-                                    AskTimeout = askTimeout
-                                    JournalToken = token
-                                    PrimeClaim = primed
-                                    Recovery = recovery
-                                    RunSuspendable = runSuspendable
-                                    ReprimeJournal = Some(fun () -> primeClaimTask captured)
-                                    RefreshCompact = Some(compactFor captured)
-                                    AgentStore = agentStore
-                                    EraMarked = eraMarked
-                                }
+                        let suspend: SuspendDeps =
+                            {
+                                EventStore = eventStore
+                                Delay = delay
+                                AskTimeout = askTimeout
+                                JournalToken = token
+                                ClaimOwner = claimOwner
+                                ClaimLease = leaseDuration
+                                Recovery = recovery
+                                RunSuspendable = runSuspendable
+                                RefreshCompact = Some(compactFor captured)
+                                AgentStore = agentStore
+                                EraMarked = eraMarked
+                            }
 
-                            return Activated(props, suspend, checkRoute captured)
+                        return Activated(props, suspend, checkRoute captured)
                     with ex ->
                         return Failed ex
                 }
@@ -11150,8 +11010,8 @@ module internal SessionActor =
 
                                     match target with
                                     | null ->
-                                        let! rejected = primeBranch null
-                                        return rejected
+                                        let! fresh = activateBranch null
+                                        return fresh
                                     | t when t.State = ControlTargetState.Active && isNull (box t.Stop) ->
                                         try
                                             let! result =
@@ -11180,7 +11040,7 @@ module internal SessionActor =
                                                         )
                                                     )
                                             else
-                                                let! recovered = primeBranch result
+                                                let! recovered = activateBranch result
                                                 return recovered
                                         with ex ->
                                             return Failed ex

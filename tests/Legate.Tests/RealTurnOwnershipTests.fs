@@ -9,14 +9,14 @@ open Legate
 open Legate.Storage.InMemory
 open Xunit
 
-// Issue 374: production ownership binds to the real durable turn alongside
-// the intact prime. Every accepted user message carries a stable durable
-// TurnId tied to its inbox entry; Session.CurrentTurnId plus the turn row own
-// execution, suspension, resume, restart, takeover, and settlement through
-// the existing claim-token fence with the #363 committed outcome. Execution
-// events journal the real TurnId; the #373 AppendHostEvents host path with
-// the default-TurnId sentinel stays unchanged. Prime wiring is untouched as
-// the handoff for #400.
+// Issue 374: production ownership binds to the real durable turn. Every
+// accepted user message carries a stable durable TurnId tied to its inbox
+// entry; Session.CurrentTurnId plus the turn row own execution, suspension,
+// resume, restart, takeover, and settlement through the existing
+// claim-token fence with the #363 committed outcome. Execution events
+// journal the real TurnId; the #373 AppendHostEvents host path with the
+// default-TurnId sentinel stays unchanged. Issue 400 re-anchored execution
+// onto these real-turn claims with no ambient authority.
 
 let private tenant = TenantId.Create "acme"
 

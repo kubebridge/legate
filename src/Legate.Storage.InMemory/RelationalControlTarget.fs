@@ -73,7 +73,7 @@ module internal RelationalControlTarget =
                 InvalidSessionStateException(
                     sessionId,
                     "controlPending",
-                    "Retire current control work before changing prime ownership or lifecycle."
+                    "Retire current control work before changing claim ownership or lifecycle."
                 )
             )
 
@@ -117,7 +117,7 @@ module internal RelationalControlTarget =
 
         let state = load connection transaction controlTable tenant sessionId
 
-        let prime =
+        let live =
             match current with
             | None -> None
             | Some turn ->
@@ -200,7 +200,7 @@ module internal RelationalControlTarget =
                 SessionId = sessionId
                 Lifecycle = lifecycle
                 Now = utcNow ()
-                Prime = prime
+                LiveClaim = live
                 Entries = entries
             }
 
@@ -331,7 +331,7 @@ module internal RelationalControlTarget =
                             command
                                 connection
                                 transaction
-                                $"UPDATE {turnsTable} SET claim_token=@token,claim_owner=@owner,claim_expires_at=@expiry,attempt=@attempt WHERE tenant=@t AND session_id=@sid AND turn_id=@prime"
+                                $"UPDATE {turnsTable} SET claim_token=@token,claim_owner=@owner,claim_expires_at=@expiry,attempt=@attempt WHERE tenant=@t AND session_id=@sid AND turn_id=@turn"
                                 tenant
                                 sessionId
 
@@ -341,7 +341,7 @@ module internal RelationalControlTarget =
                                 "owner", box claim.Owner
                                 "expiry", box (claim.ExpiresAt.ToString("O", CultureInfo.InvariantCulture))
                                 "attempt", box claim.Attempt
-                                "prime", box (claim.TurnId.ToString())
+                                "turn", box (claim.TurnId.ToString())
                             ] do
                             let parameter = update.CreateParameter()
                             parameter.ParameterName <- name
@@ -351,7 +351,7 @@ module internal RelationalControlTarget =
                         ct.ThrowIfCancellationRequested()
 
                         if update.ExecuteNonQuery() <> 1 then
-                            raise (InvalidOperationException("Recovery lost its existing prime row."))
+                            raise (InvalidOperationException("Recovery lost its existing claim row."))
 
                         {
                             Outcome = outcome

@@ -176,8 +176,8 @@ type InMemorySessionStore(database: InMemoryDatabase) =
 
     /// Whether a decided-but-unretired control verdict still owns the entry
     /// (issue 363 plus #393): while this holds the quiescent settlement keeps
-    /// the prime so the actor's retireControl still has authority, and the
-    /// existing prime settle releases it afterwards exactly as before.
+    /// the claim so the actor's retireControl still has authority, and the
+    /// existing claim settle releases it afterwards exactly as before.
     /// Missing control state reads as nothing pending; an undecodable row
     /// reads the same (every control operation would already have refused
     /// it before settlement runs).
@@ -195,7 +195,7 @@ type InMemorySessionStore(database: InMemoryDatabase) =
         let session = requireSession tenant sessionId
         session.Options.ValidatePersistence()
 
-        let prime =
+        let live =
             match database.LiveClaims.TryGetValue((tenant, sessionId)) with
             | true, claim -> Some claim
             | _ -> None
@@ -215,7 +215,7 @@ type InMemorySessionStore(database: InMemoryDatabase) =
             SessionId = sessionId
             Lifecycle = session.State
             Now = database.UtcNow
-            Prime = prime
+            LiveClaim = live
             Entries = entries
         }
 
@@ -245,7 +245,7 @@ type InMemorySessionStore(database: InMemoryDatabase) =
                 InvalidSessionStateException(
                     sessionId,
                     "controlPending",
-                    "Current control work must be retired before changing prime ownership or lifecycle."
+                    "Current control work must be retired before changing claim ownership or lifecycle."
                 )
             )
 
@@ -536,12 +536,12 @@ type InMemorySessionStore(database: InMemoryDatabase) =
 
                                 database.UsageCheckpoints[(tenant, sessionId, claim.TurnId)] <- result.Usage
 
-                                // Quiescent release (issue 363): the prime and
+                                // Quiescent release (issue 363): the claim and
                                 // its turn tracking clear only here. While a
                                 // decided-but-unretired control verdict still
-                                // owns the entry (#393), the prime stays so
+                                // owns the entry (#393), the claim stays so
                                 // the actor's retireControl keeps authority;
-                                // the existing prime settle releases it
+                                // the existing claim settle releases it
                                 // afterwards exactly as before.
                                 if
                                     state <> SessionState.Running

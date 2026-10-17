@@ -338,10 +338,12 @@ let ``Takeover loser journals nothing and never reaches the provider`` () : Task
                 task {
                     let! created = openSmoke client
 
-                    // Lapse the spawn-primed claim, then take over from the
-                    // side: the actor cell still holds the primed token, so
-                    // the next turn runs as the loser. The dummy entry is
-                    // consumed by the takeover claim and never runs as a turn.
+                    // Take over from the side while the actor holds no
+                    // claim: the dummy entry is consumed by the takeover
+                    // claim and never runs as a turn. The prompted turn
+                    // cannot claim while the takeover lease is live, so it
+                    // stays pending with zero effects instead of running
+                    // unfenced.
                     do! Task.Delay(TimeSpan.FromMilliseconds 500.0)
 
                     let! _ =
@@ -362,17 +364,14 @@ let ``Takeover loser journals nothing and never reaches the provider`` () : Task
                             CancellationToken.None
                         )
 
-                    let! refused =
-                        Assert.ThrowsAsync<InvalidSessionStateException>(fun () ->
-                            SessionClientOperations.PromptAsync(
-                                client,
-                                created.Id,
-                                UserMessage.Text "loser turn",
-                                DeliveryMode.Queue,
-                                CancellationToken.None
-                            ))
-
-                    Assert.Equal("executionAuthorityUnavailable", refused.CurrentState)
+                    let! _ =
+                        SessionClientOperations.PromptAsync(
+                            client,
+                            created.Id,
+                            UserMessage.Text "loser turn",
+                            DeliveryMode.Queue,
+                            CancellationToken.None
+                        )
 
                     let settled =
                         waitFor (TimeSpan.FromSeconds 10.0) (fun () ->
@@ -386,11 +385,12 @@ let ``Takeover loser journals nothing and never reaches the provider`` () : Task
                             | null -> false
                             | live -> live.State = SessionState.Idle)
 
-                    Assert.True(settled, "The loser turn should settle back to Idle.")
+                    Assert.True(settled, "The session should stay Idle while the takeover holds the lease.")
 
-                    // The fence held: no marker row, no provider call, no
-                    // observed settle. The faulted settle consumes and idles
-                    // without observing, so the hub stays empty.
+                    // The fence held: the turn never started, so no marker
+                    // row, no provider call, and no observed settle exist.
+                    // The pending entry waits for a later boundary while the
+                    // hub stays empty.
                     let! journal = collectJournal client created.Id
                     journal |> should be Empty
 

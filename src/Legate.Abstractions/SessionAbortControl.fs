@@ -18,7 +18,7 @@ type HostAbortOutcome =
     /// A control verdict was committed before this request.
     | AlreadyTerminal = 4
 
-/// State of a real entry's control attribution, independent of its prime lease.
+/// State of a real entry's control attribution, independent of its claim lease.
 type ControlTargetState =
     /// Execution may be admitted while there is no accepted stop.
     | Active = 0
@@ -35,7 +35,7 @@ type AbortTarget =
         FormatVersion: int
         /// Session containing the original entry.
         SessionId: SessionId
-        /// Stable real-entry identity, distinct from the journal prime.
+        /// Stable real-entry identity, distinct from the journal claim.
         TurnId: TurnId
         /// Original inbox position, retained after consumption.
         InboxPosition: int64
@@ -76,7 +76,7 @@ type ControlOperationOutcome =
     | AlreadyRetired = 2
     /// The original entry is not provably consumed.
     | NotReady = 3
-    /// The captured prime no longer grants execution authority.
+    /// The captured claim no longer grants execution authority.
     | LostAuthority = 4
     /// The exact target/position association does not match.
     | TargetChanged = 5
@@ -131,28 +131,28 @@ type ControlOperationResult =
         Decision: ControlTargetDecision | null
     }
 
-/// Result of recovering one unstopped current-format entry under a newly fenced existing prime.
+/// Result of recovering one unstopped current-format entry under a newly fenced existing claim.
 /// No entry is selected from the queue or consumed, and no independent turn lease is created.
 [<CLIMutable; NoComparison>]
 type ControlTargetRecovery =
     {
-        /// Applied grants the returned genuine prime; all refusals grant no authority.
+        /// Applied grants the returned genuine claim; all refusals grant no authority.
         Outcome: ControlOperationOutcome
         /// Exact preserved target, or null when absent.
         Target: AbortTarget | null
-        /// Newly persisted prime claim, present only on Applied.
+        /// Newly persisted claim, present only on Applied.
         Claim: TurnClaim | null
         /// The original associated entry, including its existing consumed disposition.
         Entry: InboxEntry | null
     }
 
 /// Required capability on the configured session store. Every operation is tenant-scoped
-/// and serialized with prime claims, current binding and lifecycle competitors.
+/// and serialized with live claims, current binding and lifecycle competitors.
 /// Host acceptance never activates actors, acquires claims, consumes entries or settles work.
 /// Cancellation after commit can leave acceptance uncertain: retry the same target.
 type ISessionAbortControlStore =
-    /// Recovers only an unstopped Active binding after its existing prime expires.
-    /// Atomically re-fences that same prime and returns the original entry without consuming
+    /// Recovers only an unstopped Active binding after its existing claim expires.
+    /// Atomically re-fences that same claim and returns the original entry without consuming
     /// it or unrelated inbox work. A live owner, accepted stop or pending verdict refuses.
     abstract TryRecoverControlTarget:
         tenant: TenantId *
@@ -179,27 +179,27 @@ type ISessionAbortControlStore =
         cancellationToken: CancellationToken ->
             Task<HostAbortReceipt>
 
-    /// Installs a real-entry target under the actual captured prime, never replacing an unresolved binding.
+    /// Installs a real-entry target under the actual captured claim, never replacing an unresolved binding.
     abstract BindControlTarget:
         tenant: TenantId *
         sessionId: SessionId *
         targetTurnId: TurnId *
         inboxPosition: int64 *
-        capturedPrimeClaim: TurnClaim *
+        capturedClaim: TurnClaim *
         cancellationToken: CancellationToken ->
             Task<ControlOperationResult>
 
-    /// Checks actual prime authority, exact association and durable stop before execution admission.
+    /// Checks actual claim authority, exact association and durable stop before execution admission.
     abstract CheckControlTarget:
         tenant: TenantId *
         sessionId: SessionId *
         targetTurnId: TurnId *
         inboxPosition: int64 *
-        capturedPrimeClaim: TurnClaim *
+        capturedClaim: TurnClaim *
         cancellationToken: CancellationToken ->
             Task<ControlOperationResult>
 
-    /// Commits a small canonical control verdict, retaining the prime and pending binding.
+    /// Commits a small canonical control verdict, retaining the claim and pending binding.
     /// An earlier accepted host stop selects Aborted; an earlier verdict prevents acceptance.
     /// Same id/content retries return original evidence, not execution authority.
     abstract TryDecideControlTarget:
@@ -207,7 +207,7 @@ type ISessionAbortControlStore =
         sessionId: SessionId *
         targetTurnId: TurnId *
         inboxPosition: int64 *
-        capturedPrimeClaim: TurnClaim *
+        capturedClaim: TurnClaim *
         decisionId: string *
         proposedTerminalStatus: TurnStatus *
         proposedCause: Nullable<StopCause> *
@@ -216,13 +216,13 @@ type ISessionAbortControlStore =
             Task<ControlOperationResult>
 
     /// Retires only the exact pending binding under genuine authority after provable entry consumption.
-    /// It never consumes an entry or releases a prime. Duplicate retirement authorizes no drain.
+    /// It never consumes an entry or releases a claim. Duplicate retirement authorizes no drain.
     abstract RetireControlTarget:
         tenant: TenantId *
         sessionId: SessionId *
         targetTurnId: TurnId *
         inboxPosition: int64 *
-        capturedPrimeClaim: TurnClaim *
+        capturedClaim: TurnClaim *
         decisionId: string *
         cancellationToken: CancellationToken ->
             Task<ControlOperationResult>

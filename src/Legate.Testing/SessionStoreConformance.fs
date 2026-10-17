@@ -63,7 +63,7 @@ type SessionStoreConformance(store: ISessionStore, clock: TestClock, tenant: Ten
             PermissionGrants = ResizeArray<string>() :> IReadOnlyList<string>
         }
 
-    /// Establishes a genuine prime and a separately bound real-entry control target.
+    /// Establishes a genuine claim and a separately bound real-entry control target.
     member this.ControlWork() =
         task {
             let control = store :?> ISessionAbortControlStore
@@ -73,7 +73,7 @@ type SessionStoreConformance(store: ISessionStore, clock: TestClock, tenant: Ten
                 store.AppendInboxMessage(
                     tenant,
                     session.Id,
-                    UserMessagePayload(UserMessage.Text "prime"),
+                    UserMessagePayload(UserMessage.Text "seed"),
                     DeliveryMode.Queue,
                     CancellationToken.None
                 )
@@ -90,7 +90,7 @@ type SessionStoreConformance(store: ISessionStore, clock: TestClock, tenant: Ten
             let claim =
                 match lease with
                 | :? TurnLeaseRenewed as lease -> lease.Claim
-                | _ -> failwith "Prime not established."
+                | _ -> failwith "Claim not established."
 
             let! entry =
                 store.AppendInboxMessage(
@@ -219,12 +219,12 @@ type SessionStoreConformance(store: ISessionStore, clock: TestClock, tenant: Ten
             Assert.Equal(HostAbortOutcome.TargetChanged, stale.Outcome)
         }
 
-    /// All terminal statuses retire one entry while retaining the genuine shared prime.
+    /// All terminal statuses retire one entry while retaining the genuine shared claim.
     [<Theory>]
     [<InlineData(TurnStatus.Completed)>]
     [<InlineData(TurnStatus.Failed)>]
     [<InlineData(TurnStatus.Aborted)>]
-    member this.``control retirement isolates two real entries sharing a prime``(status: TurnStatus) =
+    member this.``control retirement isolates two real entries sharing a claim``(status: TurnStatus) =
         task {
             let! control, session, entry, turn, claim = this.ControlWork()
 
@@ -450,7 +450,7 @@ type SessionStoreConformance(store: ISessionStore, clock: TestClock, tenant: Ten
 
     /// Fencing and cancellation refuse before any new control evidence is committed.
     [<Fact>]
-    member this.``control rejects wrong prime association cancellation and invalid arguments``() =
+    member this.``control rejects wrong claim association cancellation and invalid arguments``() =
         task {
             let! control, session, entry, turn, claim = this.ControlWork()
             let stale = { claim with Owner = "not the owner" }
@@ -1079,7 +1079,7 @@ type SessionStoreConformance(store: ISessionStore, clock: TestClock, tenant: Ten
 
             let claim = (claimed :?> TurnLeaseRenewed).Claim
 
-            // The primed claim stamps CurrentTurnId, so the rebind is
+            // The live claim stamps CurrentTurnId, so the rebind is
             // blocked while it is held: the actor settles before rebinding.
             Assert.Throws<InvalidSessionStateException>(fun () ->
                 store
@@ -1820,7 +1820,7 @@ type SessionStoreConformance(store: ISessionStore, clock: TestClock, tenant: Ten
                     store.AppendInboxMessage(
                         tenant,
                         id,
-                        UserMessagePayload(UserMessage.Text "prime"),
+                        UserMessagePayload(UserMessage.Text "seed"),
                         DeliveryMode.Queue,
                         CancellationToken.None
                     )
@@ -1839,7 +1839,7 @@ type SessionStoreConformance(store: ISessionStore, clock: TestClock, tenant: Ten
                 store.AppendInboxMessage(
                     tenant,
                     tail,
-                    UserMessagePayload(UserMessage.Text "prime"),
+                    UserMessagePayload(UserMessage.Text "seed"),
                     DeliveryMode.Queue,
                     CancellationToken.None
                 )
