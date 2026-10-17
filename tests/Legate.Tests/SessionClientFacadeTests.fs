@@ -577,9 +577,9 @@ let ``A settled turn can be prompted again without restarting the host`` () : Ta
             let! actor = client.Resolve(created.Id, CancellationToken.None)
             let! _ = SessionActor.getSuspendSnapshotAsync actor CancellationToken.None
 
-            // The Completed-to-Idle settle released the prime, so the
-            // respawn below primes anew instead of falling back to a dead
-            // token against the still-live prime.
+            // The Completed-to-Idle settle released the live claim, so the
+            // respawn below claims anew instead of falling back to a dead
+            // token against the still-live lease.
             let! stored = storedOf client created.Id
             stored.CurrentTurnId.HasValue |> should equal false
 
@@ -2878,7 +2878,7 @@ let ``Public DI abort accepts without a started actor system or any route resolu
             client.Store.AppendInboxMessage(
                 client.Tenant,
                 session.Id,
-                UserMessagePayload(UserMessage.Text "prime"),
+                UserMessagePayload(UserMessage.Text "seed"),
                 DeliveryMode.Queue,
                 CancellationToken.None
             )
@@ -2895,7 +2895,7 @@ let ``Public DI abort accepts without a started actor system or any route resolu
         let claim =
             match lease with
             | :? TurnLeaseRenewed as lease -> lease.Claim
-            | _ -> failwith "No prime"
+            | _ -> failwith "No claim"
 
         let! entry =
             client.Store.AppendInboxMessage(

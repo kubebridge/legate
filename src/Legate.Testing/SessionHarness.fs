@@ -308,17 +308,13 @@ type SessionHarness
             | Some violation ->
                 raise (ArgumentException($"The harness ask-user policy is invalid: {violation}", nameof options))
 
-    /// Extracts the journal claim token from a granted claim.
-    static let claimTokenOf (claim: TurnLeaseState) : string =
-        match claim with
-        | :? TurnLeaseHeld as held when not (isNull (box held)) -> held.Claim.Token
-        | :? TurnLeaseRenewed as renewed when not (isNull (box renewed)) -> renewed.Claim.Token
-        | :? TurnLeaseExpiring as expiring when not (isNull (box expiring)) -> expiring.Claim.Token
-        | _ -> raise (InvalidOperationException("The harness could not claim the session turn."))
-
     /// Opens a scripted session: in-memory stores on the harness clock, a
-    /// local actor system, the session row, the journal claim, and the
-    /// suspendable actor wired to the scripted client and static tools.
+    /// local actor system, the session row, and the suspendable actor wired
+    /// to the scripted client and static tools. The actor claims each real
+    /// entry at its drain (issue 400): no bootstrap entry is appended and no
+    /// claim is pre-held, so real prompts stay pending for the turn. The
+    /// frozen harness clock holds each drain lease until the test advances
+    /// past it.
     /// <param name="client">The scripted chat client the turns run against. Must not be null.</param>
     /// <param name="tools">The static tool source the turns resolve. Must not be null.</param>
     /// <param name="options">The harness options, or null for defaults.</param>
@@ -401,73 +397,7 @@ type SessionHarness
 
                 let! created = store.CreateSession(resolved.Tenant, session, cancellationToken)
 
-                // The journal fence needs a live claim, and claiming
-                // consumes the head inbox entry: prime it with a bootstrap
-                // message the actor never runs, so real prompts stay
-                // pending for the turn. The frozen harness clock holds the
-                // lease until the test advances past it.
-                let bootstrap =
-                    UserMessagePayload(UserMessage.Text "harness bootstrap") :> InboxPayload
-
-                let! _ =
-                    store.AppendInboxMessage(
-                        resolved.Tenant,
-                        created.Id,
-                        bootstrap,
-                        DeliveryMode.Queue,
-                        cancellationToken
-                    )
-
-                let! claimed =
-                    store.ClaimNextTurn(
-                        resolved.Tenant,
-                        created.Id,
-                        "harness",
-                        TimeSpan.FromHours 1.0,
-                        cancellationToken
-                    )
-
-                let token = claimTokenOf claimed
                 let toolsDict = tools.AsDictionary()
-
-                // The SetAgent re-prime: a fresh bootstrap plus ClaimNextTurn
-                // under the harness owner and lease, mirroring the spawn
-                // prime. The claim consumes the bootstrap, so real prompts
-                // still drain first; a held live claim (or any prime
-                // failure) reads as None and the recorded rebind retries at
-                // the next quiescent boundary.
-                let reprime () : Task<TurnClaim option> =
-                    task {
-                        try
-                            let fresh = UserMessagePayload(UserMessage.Text "harness bootstrap") :> InboxPayload
-
-                            let! _ =
-                                store.AppendInboxMessage(
-                                    resolved.Tenant,
-                                    created.Id,
-                                    fresh,
-                                    DeliveryMode.Queue,
-                                    CancellationToken.None
-                                )
-
-                            match!
-                                store.ClaimNextTurn(
-                                    resolved.Tenant,
-                                    created.Id,
-                                    "harness",
-                                    TimeSpan.FromHours 1.0,
-                                    CancellationToken.None
-                                )
-                            with
-                            | :? TurnLeaseRenewed as renewed when not (isNull (box renewed)) ->
-                                return Some renewed.Claim
-                            | :? TurnLeaseHeld as held when not (isNull (box held)) -> return Some held.Claim
-                            | :? TurnLeaseExpiring as expiring when not (isNull (box expiring)) ->
-                                return Some expiring.Claim
-                            | _ -> return None
-                        with _ ->
-                            return None
-                    }
 
                 let noDrain () : IReadOnlyList<InboxEntry> =
                     ResizeArray<InboxEntry>() :> IReadOnlyList<InboxEntry>
@@ -595,15 +525,11 @@ type SessionHarness
                         EventStore = journal
                         Delay = askDelay
                         AskTimeout = resolved.AskTimeout
-                        JournalToken = token
-                        PrimeClaim =
-                            match claimed with
-                            | :? TurnLeaseRenewed as lease -> Some lease.Claim
-                            | :? TurnLeaseHeld as lease -> Some lease.Claim
-                            | _ -> None
+                        JournalToken = Guid.NewGuid().ToString("N")
+                        ClaimOwner = "harness"
+                        ClaimLease = TimeSpan.FromHours 1.0
                         Recovery = null
                         RunSuspendable = runner
-                        ReprimeJournal = Some reprime
                         RefreshCompact = None
                         AgentStore = null
                         // Completion era (issue 289): the live reader over

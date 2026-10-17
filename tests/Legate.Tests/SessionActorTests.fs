@@ -1121,8 +1121,10 @@ type private ScriptSuspendRunner(first: TurnLoop.TurnLoopCompletion, second: Tur
     /// Replies in call order.
     member _.Replies = replies :> IReadOnlyList<Reply option>
 
-/// Spawns a suspendable session actor on a test system.
-let private spawnSuspendable
+/// Spawns a suspendable session actor on a test system, with an explicit
+/// recovery association for crash-restart facts that rebuild through #374
+/// attribution (null for fresh starts).
+let private spawnSuspendableWithRecovery
     (system: ActorSystem)
     (store: ISessionStore)
     (journal: RecordingEventStore)
@@ -1131,7 +1133,16 @@ let private spawnSuspendable
     (sessionId: SessionId)
     (runner: ScriptSuspendRunner)
     (settled: ResizeArray<TurnResult>)
+    (recovery: ControlTargetRecovery | null)
     : IActorRef =
+    let token =
+        match recovery with
+        | null -> "test-token"
+        | r ->
+            match r.Claim |> Option.ofObj with
+            | Some claim -> claim.Token
+            | None -> "test-token"
+
     let baseProps: SessionActorProps =
         {
             Store = store
@@ -1151,17 +1162,30 @@ let private spawnSuspendable
             EventStore = journal :> ISessionEventStore
             Delay = delay
             AskTimeout = askTimeout
-            JournalToken = "test-token"
-            PrimeClaim = None
-            Recovery = null
+            JournalToken = token
+            ClaimOwner = "owner-a"
+            ClaimLease = TimeSpan.FromMinutes 5.0
+            Recovery = recovery
             RunSuspendable = runner.Func
-            ReprimeJournal = None
             RefreshCompact = None
             AgentStore = null
             EraMarked = preEra
         }
 
     spawn system $"suspend-{Guid.NewGuid():N}" (SessionActor.behaviorWithSuspend baseProps deps)
+
+/// Spawns a suspendable session actor on a test system.
+let private spawnSuspendable
+    (system: ActorSystem)
+    (store: ISessionStore)
+    (journal: RecordingEventStore)
+    (delay: ILlmDelay)
+    (askTimeout: TimeSpan)
+    (sessionId: SessionId)
+    (runner: ScriptSuspendRunner)
+    (settled: ResizeArray<TurnResult>)
+    : IActorRef =
+    spawnSuspendableWithRecovery system store journal delay askTimeout sessionId runner settled null
 
 /// Prompts a suspendable actor, blocking for the ack.
 let private promptSuspendable (store: ISessionStore) (sessionId: SessionId) (session: IActorRef) (text: string) =
@@ -1524,7 +1548,9 @@ let ``AskTimeout settles Failed with TurnFailed`` () =
 
 [<Fact>]
 let ``Crash rebuilds the pending request from the journal and resumes`` () =
-    let store = createStore ()
+    let clock = TestClock()
+    let database = InMemoryDatabase(clock :> TimeProvider)
+    let store = InMemorySessionStore(database) :> ISessionStore
     let journal = RecordingEventStore()
     let created = createSession store
     let cursor = suspendCursor "req-6" "exec" "c1" TurnLoop.PermissionSuspension
@@ -1558,12 +1584,41 @@ let ``Crash rebuilds the pending request from the journal and resumes`` () =
     finally
         stopSystem firstSystem
 
-    // Crash: a fresh actor over the same store and journal rebuilds the
-    // pending request and resumes from the same tool call under attempt 2.
+    // Crash: the drain lease lapses, so a fresh actor over the same
+    // store and journal renews genuine authority for the suspended turn
+    // through #374 attribution, rebuilds the pending request, and resumes
+    // from the same tool call under attempt 2.
+    clock.Advance(TimeSpan.FromMinutes 6.0)
+
+    let suspendedTurn =
+        journal.Appended
+        |> Seq.choose (function
+            | :? PermissionRequestedEvent as asked when asked.RequestId = "req-6" -> Some asked.TurnId
+            | _ -> None)
+        |> Seq.tryHead
+
+    let control = store :?> ISessionAbortControlStore
+
+    let recovery =
+        match suspendedTurn with
+        | None -> failwith "Expected the suspend event in the journal."
+        | Some turn ->
+            control.TryRecoverControlTarget(
+                tenant,
+                created.Id,
+                turn,
+                "survivor",
+                TimeSpan.FromMinutes 5.0,
+                CancellationToken.None
+            )
+            |> fun task -> task.GetAwaiter().GetResult()
+
+    recovery.Outcome |> should equal ControlOperationOutcome.Applied
+
     use secondSystem = createSystem ()
 
     let second =
-        spawnSuspendable
+        spawnSuspendableWithRecovery
             secondSystem
             store
             journal
@@ -1572,6 +1627,7 @@ let ``Crash rebuilds the pending request from the journal and resumes`` () =
             created.Id
             runner
             settled
+            recovery
 
     try
         let rebuilt =
@@ -3486,10 +3542,10 @@ let private spawnSuspendableOver
             Delay = (TurnLoopTests.NeverDelay() :> ILlmDelay)
             AskTimeout = TimeSpan.FromMinutes 5.0
             JournalToken = token
-            PrimeClaim = None
+            ClaimOwner = "owner-a"
+            ClaimLease = TimeSpan.FromMinutes 5.0
             Recovery = null
             RunSuspendable = runner.Func
-            ReprimeJournal = None
             RefreshCompact = None
             AgentStore = null
             EraMarked = preEra
@@ -3657,7 +3713,9 @@ let ``Running with ResumeAttempt auto-resumes as attempt 2`` () =
 
 [<Fact>]
 let ``Crash rebuilds a pending question and Reply resumes it`` () =
-    let store = createStore ()
+    let clock = TestClock()
+    let database = InMemoryDatabase(clock :> TimeProvider)
+    let store = InMemorySessionStore(database) :> ISessionStore
     let journal = RecordingEventStore()
     let created = createSession store
 
@@ -3693,10 +3751,41 @@ let ``Crash rebuilds a pending question and Reply resumes it`` () =
     finally
         stopSystem firstSystem
 
+    // Crash: the drain lease lapses, so a fresh actor over the same
+    // store and journal renews genuine authority for the suspended turn
+    // through #374 attribution, rebuilds the pending question, and resumes
+    // on the reply under attempt 2.
+    clock.Advance(TimeSpan.FromMinutes 6.0)
+
+    let suspendedTurn =
+        journal.Appended
+        |> Seq.choose (function
+            | :? QuestionAskedEvent as asked when asked.QuestionId = "q-9" -> Some asked.TurnId
+            | _ -> None)
+        |> Seq.tryHead
+
+    let control = store :?> ISessionAbortControlStore
+
+    let recovery =
+        match suspendedTurn with
+        | None -> failwith "Expected the suspend event in the journal."
+        | Some turn ->
+            control.TryRecoverControlTarget(
+                tenant,
+                created.Id,
+                turn,
+                "survivor",
+                TimeSpan.FromMinutes 5.0,
+                CancellationToken.None
+            )
+            |> fun task -> task.GetAwaiter().GetResult()
+
+    recovery.Outcome |> should equal ControlOperationOutcome.Applied
+
     use secondSystem = createSystem ()
 
     let second =
-        spawnSuspendable
+        spawnSuspendableWithRecovery
             secondSystem
             store
             journal
@@ -3705,6 +3794,7 @@ let ``Crash rebuilds a pending question and Reply resumes it`` () =
             created.Id
             runner
             settled
+            recovery
 
     try
         let rebuilt =
@@ -3736,20 +3826,17 @@ let ``Kill mid-turn restarts exactly once with the journal prefix intact`` () =
     let journal = InMemorySessionEventStore(database) :> ISessionEventStore
     let created = createSession store
 
-    let bootstrap = UserMessagePayload(UserMessage.Text "prime") :> InboxPayload
+    // Seed a journal prefix under a setup claim, then release the stamp so
+    // the first actor drain-claims the run entry fresh.
+    appendStored store created.Id "marker-seed" |> ignore
 
-    store.AppendInboxMessage(tenant, created.Id, bootstrap, DeliveryMode.Queue, CancellationToken.None)
-    |> fun task -> task.GetAwaiter().GetResult()
-    |> ignore
-
-    let tokenA =
+    let setupClaim =
         match
-            store.ClaimNextTurn(tenant, created.Id, "owner-a", TimeSpan.FromHours 1.0, CancellationToken.None)
+            store.ClaimNextTurn(tenant, created.Id, "owner-a", TimeSpan.FromMinutes 5.0, CancellationToken.None)
             |> fun task -> task.GetAwaiter().GetResult()
         with
-        | :? TurnLeaseRenewed as renewed -> renewed.Claim.Token
-        | :? TurnLeaseHeld as held -> held.Claim.Token
-        | _ -> failwith "Expected the prime claim."
+        | :? TurnLeaseRenewed as renewed -> renewed.Claim
+        | _ -> failwith "Expected the setup claim."
 
     let markerTurn = TurnId.New()
 
@@ -3760,7 +3847,7 @@ let ``Kill mid-turn restarts exactly once with the journal prefix intact`` () =
         journal.Append(
             tenant,
             created.Id,
-            tokenA,
+            setupClaim.Token,
             (ResizeArray<SessionEvent>([| marker |]) :> IReadOnlyList<SessionEvent>),
             CancellationToken.None
         )
@@ -3769,7 +3856,14 @@ let ``Kill mid-turn restarts exactly once with the journal prefix intact`` () =
     | :? EventAppended -> ()
     | _ -> failwith "Expected the marker append."
 
-    ignore (appendStored store created.Id "run")
+    match
+        store.SettleTurn(tenant, setupClaim, TurnStatus.Completed, null, CancellationToken.None)
+        |> fun task -> task.GetAwaiter().GetResult()
+    with
+    | :? TurnSettled -> ()
+    | other -> failwithf "Expected the setup claim to settle, got %O." other
+
+    let runEntry = appendStored store created.Id "run"
 
     store.UpdateSessionState(tenant, created.Id, SessionState.Running, CancellationToken.None).GetAwaiter().GetResult()
     |> ignore
@@ -3777,10 +3871,12 @@ let ``Kill mid-turn restarts exactly once with the journal prefix intact`` () =
     // One shared runner across both actors: the first invocation blocks in
     // flight (the genuine mid-turn kill point), the post-restart invocation
     // settles. Releasing the loser afterwards must produce zero effects.
+    // Both actors drain-claim real entries; the restart renews genuine
+    // authority for the interrupted entry through #374 attribution.
     let runner = GatedSuspendRunner(settledCompletion "recovered")
     let settled = ResizeArray<TurnResult>()
 
-    let spawnOver (system: ActorSystem) (token: string) : IActorRef =
+    let spawnOver (system: ActorSystem) (token: string) (recovery: ControlTargetRecovery | null) : IActorRef =
         let baseProps: SessionActorProps =
             {
                 Store = store
@@ -3801,10 +3897,10 @@ let ``Kill mid-turn restarts exactly once with the journal prefix intact`` () =
                 Delay = (TurnLoopTests.NeverDelay() :> ILlmDelay)
                 AskTimeout = TimeSpan.FromMinutes 5.0
                 JournalToken = token
-                PrimeClaim = None
-                Recovery = null
+                ClaimOwner = "owner-a"
+                ClaimLease = TimeSpan.FromMinutes 5.0
+                Recovery = recovery
                 RunSuspendable = runner.Func
-                ReprimeJournal = None
                 RefreshCompact = None
                 AgentStore = null
                 EraMarked = preEra
@@ -3813,7 +3909,7 @@ let ``Kill mid-turn restarts exactly once with the journal prefix intact`` () =
         spawn system $"kill-{Guid.NewGuid():N}" (SessionActor.behaviorWithSuspend baseProps deps)
 
     use firstSystem = createSystem ()
-    spawnOver firstSystem tokenA |> ignore
+    spawnOver firstSystem "token-a" null |> ignore
 
     try
         let inFlight =
@@ -3824,10 +3920,27 @@ let ``Kill mid-turn restarts exactly once with the journal prefix intact`` () =
     finally
         stopSystem firstSystem
 
-    tokenA |> should not' (equal "token-b")
+    // The drain lease lapses: the restart renews genuine authority for the
+    // interrupted entry through #374 attribution.
+    clock.Advance(TimeSpan.FromMinutes 6.0)
+
+    let control = store :?> ISessionAbortControlStore
+
+    let recovery =
+        control.TryRecoverControlTarget(
+            tenant,
+            created.Id,
+            runEntry.TurnId,
+            "survivor",
+            TimeSpan.FromMinutes 5.0,
+            CancellationToken.None
+        )
+        |> fun task -> task.GetAwaiter().GetResult()
+
+    recovery.Outcome |> should equal ControlOperationOutcome.Applied
 
     use secondSystem = createSystem ()
-    spawnOver secondSystem "token-b" |> ignore
+    spawnOver secondSystem "token-b" recovery |> ignore
 
     try
         let resumed =
@@ -3878,7 +3991,7 @@ let ``Running with empty inbox and marker-only journal settles Failed instead of
         with
         | :? TurnLeaseRenewed as renewed -> renewed.Claim.Token
         | :? TurnLeaseHeld as held -> held.Claim.Token
-        | _ -> failwith "Expected the prime claim."
+        | _ -> failwith "Expected the drain claim."
 
     store.UpdateSessionState(tenant, created.Id, SessionState.Running, CancellationToken.None).GetAwaiter().GetResult()
     |> ignore
@@ -3928,10 +4041,10 @@ let ``Running with empty inbox and marker-only journal settles Failed instead of
             Delay = (TurnLoopTests.NeverDelay() :> ILlmDelay)
             AskTimeout = TimeSpan.FromMinutes 5.0
             JournalToken = token
-            PrimeClaim = None
+            ClaimOwner = "owner-a"
+            ClaimLease = TimeSpan.FromMinutes 5.0
             Recovery = null
             RunSuspendable = runner.Func
-            ReprimeJournal = None
             RefreshCompact = None
             AgentStore = null
             EraMarked = preEra
@@ -4025,7 +4138,7 @@ let ``Orphan fail takeover loser journals nothing under the fresh token`` () =
         with
         | :? TurnLeaseRenewed as renewed -> renewed.Claim.Token
         | :? TurnLeaseHeld as held -> held.Claim.Token
-        | _ -> failwith "Expected the prime claim."
+        | _ -> failwith "Expected the drain claim."
 
     let winnerMarkerTurn = TurnId.New()
 
@@ -4087,10 +4200,10 @@ let ``Orphan fail takeover loser journals nothing under the fresh token`` () =
                 Delay = (TurnLoopTests.NeverDelay() :> ILlmDelay)
                 AskTimeout = TimeSpan.FromMinutes 5.0
                 JournalToken = token
-                PrimeClaim = None
+                ClaimOwner = "owner-a"
+                ClaimLease = TimeSpan.FromMinutes 5.0
                 Recovery = null
                 RunSuspendable = runner.Func
-                ReprimeJournal = None
                 RefreshCompact = None
                 AgentStore = null
                 EraMarked = preEra
@@ -4125,7 +4238,7 @@ let ``Orphan fail takeover loser journals nothing under the fresh token`` () =
     finally
         stopSystem winnerSystem
 
-    // Fenced loser: lapse the prime claim, take over with a fresh token,
+    // Fenced loser: lapse the live claim, take over with a fresh token,
     // then run the loser on the stale token. The loser journals nothing.
     let loserDatabase = InMemoryDatabase()
     let loserStore = InMemorySessionStore(loserDatabase) :> ISessionStore
@@ -4146,7 +4259,7 @@ let ``Orphan fail takeover loser journals nothing under the fresh token`` () =
         with
         | :? TurnLeaseRenewed as renewed -> renewed.Claim.Token
         | :? TurnLeaseHeld as held -> held.Claim.Token
-        | _ -> failwith "Expected the prime claim."
+        | _ -> failwith "Expected the drain claim."
 
     let loserMarkerTurn = TurnId.New()
 
@@ -4221,13 +4334,12 @@ let ``Orphan fail takeover loser journals nothing under the fresh token`` () =
 // Fork and SetAgent (issue 123)
 //
 // The actor half of the repaired plan: every rebind routes through the
-// actor as SuspendableSetAgent and applies through the 6-step quiescent
-// protocol (settle, re-prime, journal the switch, settle, rebind,
-// re-prime with the token swap). Quiescence means no live turn task and an
+// actor as SuspendableSetAgent and applies through the quiescent
+// protocol (settle the live claim, journal the switch, rebind the row;
+// the next drain claims fresh). Quiescence means no live turn task and an
 // empty pending inbox: a parked suspension keeps its entry pending, so a
 // Waiting session applies at the post-resume settle boundary, never
-// mid-suspension (claiming there would steal the parked entry and leak the
-// protocol bootstrap as a turn).
+// mid-suspension (claiming there would steal the parked entry).
 
 /// Rebinds through the actor boundary, blocking.
 let private setAgent
@@ -4302,37 +4414,9 @@ let private blockingTool (entered: ManualResetEventSlim) (release: TaskCompletio
     AIFunctionFactory.Create(method, "gated", Unchecked.defaultof<string>, Unchecked.defaultof<JsonSerializerOptions>)
     :> AITool
 
-/// Re-primes a directly constructed suspendable actor's journal: a fresh
-/// bootstrap plus ClaimNextTurn, mirroring the spawn prime.
-let private reprimeFor
-    (store: ISessionStore)
-    (tenantId: TenantId)
-    (sessionId: SessionId)
-    (owner: string)
-    ()
-    : Task<TurnClaim option> =
-    task {
-        try
-            let bootstrap =
-                UserMessagePayload(UserMessage.Text "legate journal prime") :> InboxPayload
-
-            let! _ =
-                store.AppendInboxMessage(tenantId, sessionId, bootstrap, DeliveryMode.Queue, CancellationToken.None)
-
-            match!
-                store.ClaimNextTurn(tenantId, sessionId, owner, TimeSpan.FromSeconds 120.0, CancellationToken.None)
-            with
-            | :? TurnLeaseRenewed as renewed when not (isNull (box renewed)) -> return Some renewed.Claim
-            | :? TurnLeaseHeld as held when not (isNull (box held)) -> return Some held.Claim
-            | :? TurnLeaseExpiring as expiring when not (isNull (box expiring)) -> return Some expiring.Claim
-            | _ -> return None
-        with _ ->
-            return None
-    }
-
-/// Spawns a suspendable actor with a live re-prime, for SetAgent protocol
+/// Spawns a suspendable actor with drain-claim wiring, for SetAgent protocol
 /// tests that drive the runner directly.
-let private spawnReprimeable
+let private spawnClaimable
     (system: ActorSystem)
     (store: ISessionStore)
     (tenantId: TenantId)
@@ -4364,10 +4448,10 @@ let private spawnReprimeable
             Delay = (TurnLoopTests.NeverDelay() :> ILlmDelay)
             AskTimeout = TimeSpan.FromMinutes 5.0
             JournalToken = token
-            PrimeClaim = None
+            ClaimOwner = "owner-a"
+            ClaimLease = TimeSpan.FromMinutes 5.0
             Recovery = null
             RunSuspendable = runner.Func
-            ReprimeJournal = Some(reprimeFor store tenantId sessionId "owner-a")
             RefreshCompact = refresh
             AgentStore = null
             EraMarked = preEra
@@ -4478,7 +4562,7 @@ let ``SetAgent while Running defers to the quiescent boundary without stealing``
         let! _ = SessionActor.getSuspendSnapshotAsync harness.Actor CancellationToken.None
 
         // Both prompts ran, in order: the queued entry was never stolen by
-        // the protocol's re-prime claims.
+        // the protocol's drain claims.
         harness.SettledResults.Count |> should equal 2
         harness.SettledResults[0].AssistantText |> should equal "first"
         harness.SettledResults[1].AssistantText |> should equal "second"
@@ -4667,9 +4751,21 @@ let ``Compact after SetAgent journals under host authority`` () =
     use system = createSystem ()
     let store, journal = createJournalStores ()
     let created = createSession store
-    appendStored store created.Id "prime" |> ignore
-    let primed = claimTurn store created.Id "owner-a"
-    seedJournal journal created.Id primed.Token (overThresholdTexts ())
+    appendStored store created.Id "seed" |> ignore
+    appendStored store created.Id "work" |> ignore
+
+    // Seed the journal under a setup claim, then release the stamp so the
+    // actor starts unencumbered: the drain claims the work entry fresh
+    // below.
+    let setup = claimTurn store created.Id "owner-a"
+    seedJournal journal created.Id setup.Token (overThresholdTexts ())
+
+    match
+        store.SettleTurn(tenant, setup, TurnStatus.Completed, null, CancellationToken.None)
+        |> fun task -> task.GetAwaiter().GetResult()
+    with
+    | :? TurnSettled -> ()
+    | other -> failwithf "Expected the setup claim to settle, got %O." other
 
     let summariser =
         new ScriptedChatClient(
@@ -4682,8 +4778,12 @@ let ``Compact after SetAgent journals under host authority`` () =
 
     let force = Compaction.CompactForce()
 
+    // Inert wiring token: the drain adoption refreshes it onto the live
+    // claim before the compact runs.
+    let inert = Guid.NewGuid().ToString("N")
+
     let wiring =
-        compactDeps (summariser :> IChatClient) Unchecked.defaultof<IModelPolicy> journal primed.Token force
+        compactDeps (summariser :> IChatClient) Unchecked.defaultof<IModelPolicy> journal inert force
 
     let runner =
         ScriptSuspendRunner(settledCompletion "unused", settledCompletion "unused")
@@ -4694,16 +4794,27 @@ let ``Compact after SetAgent journals under host authority`` () =
         Some(compactDeps (summariser :> IChatClient) Unchecked.defaultof<IModelPolicy> journal token force)
 
     let session =
-        spawnReprimeable system store tenant journal created.Id primed.Token runner settled (Some wiring) (Some refresh)
+        spawnClaimable system store tenant journal created.Id inert runner settled (Some wiring) (Some refresh)
 
     try
+        // Run the work entry so the actor adopts a live drain claim (and
+        // refreshes the compact wiring onto it), then settles to Idle.
+        SessionActor.checkInboxAsync store tenant created.Id session CancellationToken.None
+        |> fun task -> task.GetAwaiter().GetResult()
+
+        let ran =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () ->
+                settled.Count = 1 && (storedOf store created.Id).State = SessionState.Idle)
+
+        ran |> should equal true
+
         let target = AgentId.New()
         let rebound = setAgent store tenant created.Id session target
         rebound.AgentId |> should equal target
 
         // The idle compact rides the host lifecycle fence (issue 373), not
         // any journal token: completing proves the rebind converged and the
-        // host path fenced live. The prime stays for execution either way.
+        // host path fenced live. The live claim stays for execution either way.
         match compactSuspendable store created.Id session with
         | CompactCompleted(beforeEstimate, afterEstimate) -> (beforeEstimate > afterEstimate) |> should equal true
         | reply -> failwith $"Expected CompactCompleted, observed %O{reply}."
@@ -4729,10 +4840,10 @@ let ``Compact after SetAgent journals under host authority`` () =
 // with no terminal row for that turn id, on an era-marked session with no
 // live lease elsewhere, settles fenced at entity start; every other shape
 // stays quiet. Settled turns journal exactly one terminal event under the
-// run's turn id; primes, suspensions, and authority refusals journal none.
+// run's turn id; unrun claims, suspensions, and authority refusals journal none.
 
-/// Spawns a suspendable actor with an explicit journal token, re-prime,
-/// and era reader for the probe facts.
+/// Spawns a suspendable actor with an explicit journal token and era
+/// reader for the probe facts.
 let private spawnProbe
     (system: ActorSystem)
     (store: ISessionStore)
@@ -4740,7 +4851,6 @@ let private spawnProbe
     (sessionId: SessionId)
     (token: string)
     (runner: SessionActor.SuspendableRunner)
-    (reprime: (unit -> Task<TurnClaim option>) option)
     (era: TenantId -> SessionId -> CancellationToken -> Task<bool>)
     (settled: ResizeArray<TurnResult>)
     : IActorRef =
@@ -4764,10 +4874,10 @@ let private spawnProbe
             Delay = (TurnLoopTests.NeverDelay() :> ILlmDelay)
             AskTimeout = TimeSpan.FromMinutes 5.0
             JournalToken = token
-            PrimeClaim = None
+            ClaimOwner = "owner-a"
+            ClaimLease = TimeSpan.FromMinutes 5.0
             Recovery = null
             RunSuspendable = runner
-            ReprimeJournal = reprime
             RefreshCompact = None
             AgentStore = null
             EraMarked = era
@@ -4784,7 +4894,7 @@ let private claimProbeTurn (store: ISessionStore) (sessionId: SessionId) (lease:
     with
     | :? TurnLeaseRenewed as renewed -> renewed.Claim.TurnId, renewed.Claim.Token
     | :? TurnLeaseHeld as held -> held.Claim.TurnId, held.Claim.Token
-    | _ -> failwith "Expected the prime claim."
+    | _ -> failwith "Expected the drain claim."
 
 /// Appends one marker row for the turn id under the given token, blocking.
 let private appendMarker (journal: ISessionEventStore) (sessionId: SessionId) (turnId: TurnId) (token: string) : unit =
@@ -4853,11 +4963,17 @@ let private openOrphaned () : TestClock * ISessionStore * ISessionEventStore * S
     clock, store, journal, created, turnId, token
 
 [<Fact>]
-let ``Idle orphan with marker-only journal settles Failed and clears the live turn`` () =
+let ``Idle orphan with marker-only journal stays quiet without a drainable entry`` () =
+    // Production shape (issue 289): the victim's lease lapsed and the
+    // journal holds an unterminated marker, but the inbox is empty so no
+    // turn is claimable. The entity-start probe stays quiet with the turn
+    // preserved; the dispatcher's orphan sweep owns the settle (covered by
+    // the dispatcher sweep facts).
     let clock, store, journal, created, orphanId, token = openOrphaned ()
     appendMarker journal created.Id orphanId token
 
-    // The victim's lease lapses: the probe's re-prime must win.
+    // The victim's lease lapses: nothing holds the turn, yet no entry can
+    // be claimed.
     clock.Advance(TimeSpan.FromMinutes 6.0)
 
     let runner =
@@ -4867,49 +4983,41 @@ let ``Idle orphan with marker-only journal settles Failed and clears the live tu
 
     use system = createSystem ()
 
-    spawnProbe
-        system
-        store
-        journal
-        created.Id
-        token
-        runner.Func
-        (Some(reprimeFor store tenant created.Id "owner-probe"))
-        markedEra
-        settled
-    |> ignore
+    let probe =
+        spawnProbe system store journal created.Id token runner.Func markedEra settled
 
     try
-        let failed =
-            waitFor (TimeSpan.FromSeconds 10.0) (fun () ->
-                settled.Count = 1 && (storedOf store created.Id).State = SessionState.Idle)
+        // A snapshot round-trip proves the actor processed the start: it
+        // stays Idle with nothing settled and the live turn preserved.
+        SessionActor.getSuspendSnapshotAsync probe CancellationToken.None
+        |> fun task -> task.GetAwaiter().GetResult()
+        |> ignore
 
-        failed |> should equal true
-        settled[0].Status |> should equal TurnStatus.Failed
-
-        match settled[0].Outcome with
-        | :? TurnFailed as outcome -> outcome.Reason |> should equal SessionActor.CrashFailReason
-        | _ -> failwith "Expected a TurnFailed outcome."
-
-        // The orphan settled and the won prime settled quietly: no live
-        // turn remains and the runner never ran.
-        (storedOf store created.Id).CurrentTurnId.HasValue |> should equal false
+        (storedOf store created.Id).State |> should equal SessionState.Idle
+        settled.Count |> should equal 0
+        (storedOf store created.Id).CurrentTurnId.Value |> should equal orphanId
         runner.Attempts.Count |> should equal 0
         (pendingOf store created.Id).Count |> should equal 0
 
+        // Still quiet after more time passes with no lease anywhere: the
+        // journal still holds only the marker.
+        clock.Advance(TimeSpan.FromHours 1.0)
+
+        (storedOf store created.Id).State |> should equal SessionState.Idle
+        settled.Count |> should equal 0
+        (storedOf store created.Id).CurrentTurnId.Value |> should equal orphanId
+
         let collected = replayAll journal created.Id
-        collected.Length |> should equal 2
+        collected.Length |> should equal 1
         collected[0] |> should be ofExactType<TurnStartedEvent>
-        collected[1] |> should be ofExactType<TurnFailedEvent>
         collected[0].TurnId |> should equal orphanId
-        collected[1].TurnId |> should equal orphanId
     finally
         stopSystem system
 
 [<Fact>]
-let ``Idle probe settles the journal-derived orphan after a prime replaced the live turn`` () =
-    // Production shape (issue 289): a won prime (the dispatcher's poke or
-    // the spawn prime) replaces the row's turn id after the victim's lease
+let ``Idle probe leaves the journal-derived orphan quiet without a drainable entry`` () =
+    // Production shape (issue 289): a won claim (the dispatcher's poke or
+    // a drain claim) replaces the row's turn id after the victim's lease
     // lapses, so marker-for-live-id alone would stay quiet forever. The
     // marker is the only surviving record of the orphan id.
     let clock, store, journal, created, orphanId, token = openOrphaned ()
@@ -4929,7 +5037,10 @@ let ``Idle probe settles the journal-derived orphan after a prime replaced the l
 
     (storedOf store created.Id).CurrentTurnId.Value |> should equal pokeId
 
-    // The poke lease lapses too: the probe's re-prime must win.
+    // The poke lease lapses too, leaving no lease anywhere — yet the
+    // inbox is empty, so the probe still cannot claim and stays quiet
+    // with the poke turn preserved. The dispatcher's orphan sweep owns
+    // the settle (covered by the dispatcher sweep facts).
     clock.Advance(TimeSpan.FromMinutes 6.0)
 
     let runner =
@@ -4939,41 +5050,27 @@ let ``Idle probe settles the journal-derived orphan after a prime replaced the l
 
     use system = createSystem ()
 
-    spawnProbe
-        system
-        store
-        journal
-        created.Id
-        token
-        runner.Func
-        (Some(reprimeFor store tenant created.Id "owner-probe"))
-        markedEra
-        settled
-    |> ignore
+    let probe =
+        spawnProbe system store journal created.Id token runner.Func markedEra settled
 
     try
-        let failed =
-            waitFor (TimeSpan.FromSeconds 10.0) (fun () ->
-                settled.Count = 1 && (storedOf store created.Id).State = SessionState.Idle)
+        // A snapshot round-trip proves the actor processed the start: it
+        // stays Idle with nothing settled and the poke turn preserved.
+        SessionActor.getSuspendSnapshotAsync probe CancellationToken.None
+        |> fun task -> task.GetAwaiter().GetResult()
+        |> ignore
 
-        failed |> should equal true
-        settled[0].Status |> should equal TurnStatus.Failed
-
-        match settled[0].Outcome with
-        | :? TurnFailed as outcome -> outcome.Reason |> should equal SessionActor.CrashFailReason
-        | _ -> failwith "Expected a TurnFailed outcome."
-
-        // The orphan settled under its own id (not the prime's) and the
-        // won prime settled quietly: no live turn remains.
-        (storedOf store created.Id).CurrentTurnId.HasValue |> should equal false
+        (storedOf store created.Id).State |> should equal SessionState.Idle
+        settled.Count |> should equal 0
+        (storedOf store created.Id).CurrentTurnId.Value |> should equal pokeId
         runner.Attempts.Count |> should equal 0
 
+        // The journal still holds only the orphan marker: no terminal row
+        // was fabricated for either turn.
         let collected = replayAll journal created.Id
-        collected.Length |> should equal 2
+        collected.Length |> should equal 1
         collected[0] |> should be ofExactType<TurnStartedEvent>
-        collected[1] |> should be ofExactType<TurnFailedEvent>
         collected[0].TurnId |> should equal orphanId
-        collected[1].TurnId |> should equal orphanId
     finally
         stopSystem system
 
@@ -4991,16 +5088,7 @@ let ``Idle orphan with a terminal row stays quiet with the turn preserved`` () =
 
     use system = createSystem ()
 
-    spawnProbe
-        system
-        store
-        journal
-        created.Id
-        token
-        runner.Func
-        (Some(reprimeFor store tenant created.Id "owner-probe"))
-        markedEra
-        settled
+    spawnProbe system store journal created.Id token runner.Func markedEra settled
     |> ignore
 
     try
@@ -5029,16 +5117,7 @@ let ``Idle orphan on a pre-era session stays quiet with the turn preserved`` () 
 
     use system = createSystem ()
 
-    spawnProbe
-        system
-        store
-        journal
-        created.Id
-        token
-        runner.Func
-        (Some(reprimeFor store tenant created.Id "owner-probe"))
-        preEra
-        settled
+    spawnProbe system store journal created.Id token runner.Func preEra settled
     |> ignore
 
     try
@@ -5059,7 +5138,7 @@ let ``Idle orphan with a live lease stays quiet with loser-zero-effects`` () =
     let _, store, journal, created, orphanId, token = openOrphaned ()
     appendMarker journal created.Id orphanId token
 
-    // No advance: the victim's lease is live, so the probe's re-prime
+    // No advance: the victim's lease is live, so the probe's drain claim
     // loses and nothing is journaled or settled.
     let runner =
         ScriptSuspendRunner(settledCompletion "never", settledCompletion "never")
@@ -5068,16 +5147,7 @@ let ``Idle orphan with a live lease stays quiet with loser-zero-effects`` () =
 
     use system = createSystem ()
 
-    spawnProbe
-        system
-        store
-        journal
-        created.Id
-        token
-        runner.Func
-        (Some(reprimeFor store tenant created.Id "owner-probe"))
-        markedEra
-        settled
+    spawnProbe system store journal created.Id token runner.Func markedEra settled
     |> ignore
 
     try
@@ -5106,16 +5176,7 @@ let ``Idle session with no live turn stays quiet`` () =
 
     use system = createSystem ()
 
-    spawnProbe
-        system
-        store
-        (journal :> ISessionEventStore)
-        created.Id
-        "test-token"
-        runner.Func
-        (Some(reprimeFor store tenant created.Id "owner-probe"))
-        markedEra
-        settled
+    spawnProbe system store (journal :> ISessionEventStore) created.Id "test-token" runner.Func markedEra settled
     |> ignore
 
     try
@@ -5164,7 +5225,7 @@ let ``Settled Completed turn journals one terminal event with the run turn id`` 
     use system = createSystem ()
 
     let session =
-        spawnProbe system store (journal :> ISessionEventStore) created.Id "test-token" runner.Func None preEra settled
+        spawnProbe system store (journal :> ISessionEventStore) created.Id "test-token" runner.Func preEra settled
 
     try
         promptSuspendable store created.Id session "run" |> ignore
@@ -5210,7 +5271,7 @@ let ``Settled Failed turn journals one terminal event with the run turn id`` () 
     use system = createSystem ()
 
     let session =
-        spawnProbe system store (journal :> ISessionEventStore) created.Id "test-token" runner.Func None preEra settled
+        spawnProbe system store (journal :> ISessionEventStore) created.Id "test-token" runner.Func preEra settled
 
     try
         promptSuspendable store created.Id session "run" |> ignore
@@ -5263,7 +5324,7 @@ let ``Faulted turn journals one terminal event and settles Idle`` () =
     use system = createSystem ()
 
     let session =
-        spawnProbe system store (journal :> ISessionEventStore) created.Id "test-token" runner None preEra settled
+        spawnProbe system store (journal :> ISessionEventStore) created.Id "test-token" runner preEra settled
 
     try
         promptSuspendable store created.Id session "first" |> ignore
@@ -5337,7 +5398,7 @@ let ``Suspended turn journals nothing until the resumed turn settles under the o
     use system = createSystem ()
 
     let session =
-        spawnProbe system store (journal :> ISessionEventStore) created.Id "test-token" runner None preEra settled
+        spawnProbe system store (journal :> ISessionEventStore) created.Id "test-token" runner preEra settled
 
     try
         promptSuspendable store created.Id session "run" |> ignore
@@ -5388,15 +5449,15 @@ let ``Suspended turn journals nothing until the resumed turn settles under the o
         stopSystem system
 
 // ──────────────────────────────────────────────────────────────────────────
-// Completed-turn prime settle (issue 313)
+// Completed-turn claim settle (issue 400)
 //
-// A prompt turn completing to Idle releases the facade prime claim through
+// A prompt turn completing to Idle releases the live drain claim through
 // the fenced settle, so a later prompt — in-process or after a restart —
-// claims anew instead of observing TurnLeaseMissing while the prime lease
+// claims anew instead of observing TurnLeaseMissing while the old lease
 // is still live.
 
 [<Fact>]
-let ``Completed prompt turn settles the prime claim so the session prompts again`` () : Task =
+let ``Completed prompt turn settles the live claim so the session prompts again`` () : Task =
     task {
         let client =
             suspendScripted
@@ -5411,10 +5472,10 @@ let ``Completed prompt turn settles the prime claim so the session prompts again
         first.Status |> should equal TurnStatus.Completed
         first.AssistantText |> should equal "first"
 
-        // The Completed-to-Idle settle released the prime: the row carries
-        // no live turn, so a later prime (a respawn after a restart, or the
-        // next prompt's re-prime) claims anew instead of observing a
-        // TurnLeaseMissing against the still-live prime.
+        // The Completed-to-Idle settle released the live claim: the row
+        // carries no live turn, so a later drain (a respawn after a
+        // restart, or the next prompt) claims anew instead of observing a
+        // TurnLeaseMissing against the still-live lease.
         let! stored = harness.GetSessionAsync(CancellationToken.None)
         stored.State |> should equal SessionState.Idle
         stored.CurrentTurnId.HasValue |> should equal false
@@ -5436,21 +5497,18 @@ let ``Completed prompt turn settles the prime claim so the session prompts again
     }
 
 [<Fact>]
-let ``Completed settle with a stale prime token settles nothing`` () =
-    // The takeover edge for the quiescence settle (issue 313): the prime
-    // lapses, a rival wins the turn, and the loser still completes its
-    // in-flight turn. The fenced settle verifies the stale token out, so
-    // the winner's claim and turn survive with zero loser effects, while
-    // the loser still reports its own verdict.
+let ``Stale loser never starts while the winner holds the lease`` () =
+    // The takeover edge for the quiescence settle (issue 400): a rival
+    // wins a turn and holds its lease while a late prompt arrives. The
+    // loser cannot claim, so it never starts: nothing settles and the
+    // winner's claim and turn survive with zero loser effects. Once the
+    // rival lease lapses, the pending entry drains normally.
     let clock = TestClock()
     let database = InMemoryDatabase(clock)
     let store = InMemorySessionStore(database) :> ISessionStore
     let journal = InMemorySessionEventStore(database) :> ISessionEventStore
     let created = createSession store
-    appendStored store created.Id "prime" |> ignore
-
-    let _primeTurn, primeToken =
-        claimProbeTurn store created.Id (TimeSpan.FromMinutes 5.0)
+    appendStored store created.Id "seed" |> ignore
 
     let runner = EchoTurnRunner(completed "done")
     let settled = ResizeArray<TurnResult>()
@@ -5458,13 +5516,11 @@ let ``Completed settle with a stale prime token settles nothing`` () =
     use system = createSystem ()
 
     let session =
-        spawnProbe system store journal created.Id primeToken runner.Func None preEra settled
+        spawnProbe system store journal created.Id (Guid.NewGuid().ToString("N")) runner.Func preEra settled
 
     try
-        // The prime lapses and the rival wins the turn under a fresh id.
-        clock.Advance(TimeSpan.FromHours 1.0)
-        appendStored store created.Id "rival" |> ignore
-
+        // The rival wins the seed turn and holds its lease: the actor can
+        // claim nothing while it stays live.
         let rival =
             match
                 store.ClaimNextTurn(tenant, created.Id, "owner-b", TimeSpan.FromMinutes 5.0, CancellationToken.None)
@@ -5473,21 +5529,21 @@ let ``Completed settle with a stale prime token settles nothing`` () =
             | :? TurnLeaseRenewed as renewed -> renewed.Claim
             | _ -> failwith "Expected the rival claim."
 
-        // The loser runs under the winner's turn id with its stale token
-        // and completes: the terminal journal write fences out and the
-        // quiescence settle verifies out, leaving the winner intact.
+        // The late prompt is accepted and stays pending: no authority
+        // means no start.
         promptSuspendable store created.Id session "loser" |> ignore
 
-        let finished =
-            waitFor (TimeSpan.FromSeconds 10.0) (fun () ->
-                settled.Count = 1 && (storedOf store created.Id).State = SessionState.Idle)
+        SessionActor.getSuspendSnapshotAsync session CancellationToken.None
+        |> fun task -> task.GetAwaiter().GetResult()
+        |> ignore
 
-        finished |> should equal true
-        settled[0].Status |> should equal TurnStatus.Completed
+        runner.Seen.Count |> should equal 0
+        settled.Count |> should equal 0
+        (storedOf store created.Id).State |> should equal SessionState.Idle
+        (pendingOf store created.Id).Count |> should equal 1
 
-        // The winner's turn and lease survived the loser's settle: the row
-        // still names the rival turn and the rival claim still verifies
-        // live.
+        // The winner's turn and lease survived: the row still names the
+        // rival turn and the rival claim still verifies live.
         (storedOf store created.Id).CurrentTurnId.Value |> should equal rival.TurnId
 
         match
@@ -5508,5 +5564,19 @@ let ``Completed settle with a stale prime token settles nothing`` () =
                     || event :? TurnAbortedEvent))
 
         terminals.Length |> should equal 0
+
+        // Once the rival lease lapses, a check-inbox wake drains the
+        // pending entry normally and it settles.
+        clock.Advance(TimeSpan.FromMinutes 10.0)
+
+        SessionActor.checkInboxAsync store tenant created.Id session CancellationToken.None
+        |> fun task -> task.GetAwaiter().GetResult()
+
+        let finished =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () ->
+                settled.Count = 1 && (storedOf store created.Id).State = SessionState.Idle)
+
+        finished |> should equal true
+        settled[0].Status |> should equal TurnStatus.Completed
     finally
         stopSystem system

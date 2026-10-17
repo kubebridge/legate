@@ -82,7 +82,7 @@ type InMemoryDatabase(timeProvider: TimeProvider, options: InMemoryStoreOptions)
     // Atomic terminal settlement receipts per (tenant, session id, inbox
     // position): the narrow provider-supported settlement bookkeeping
     // (issue 363). Keyed by immutable entry position because multiple real
-    // entries share one prime; identical retry returns AlreadyApplied with
+    // entries share one claim; identical retry returns AlreadyApplied with
     // the recorded result and key, conflicting verdict rejects.
     let executionAdmissions = Dictionary<(TenantId * SessionId * int64), TurnClaim>()
 

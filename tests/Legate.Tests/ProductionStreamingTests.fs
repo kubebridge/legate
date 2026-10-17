@@ -513,11 +513,11 @@ let private claimOf (state: TurnLeaseState) : TurnClaim =
     | :? TurnLeaseExpiring as expiring when not (isNull (box expiring)) -> expiring.Claim
     | other -> failwithf "Expected a granted claim, got %O." other
 
-/// Primes genuine journal authority the way the spawn factory does:
-/// appends a bootstrap entry, then claims the turn.
-let private primeClaim (store: ISessionStore) (sessionId: SessionId) (owner: string) : TurnClaim =
+/// Seeds genuine journal authority for direct journal writes:
+/// appends a seed entry, then claims the turn.
+let private seedClaim (store: ISessionStore) (sessionId: SessionId) (owner: string) : TurnClaim =
     let bootstrap =
-        UserMessagePayload(UserMessage.Text "legate journal prime") :> InboxPayload
+        UserMessagePayload(UserMessage.Text "legate seed entry") :> InboxPayload
 
     store
         .AppendInboxMessage(journalTenant, sessionId, bootstrap, DeliveryMode.Queue, CancellationToken.None)
@@ -691,7 +691,7 @@ let ``runSuspendableAsync falls back to a single delta per kind`` () =
 let ``coalesced short stream lands one bounded append`` () =
     let store, journal = createJournalStores ()
     let created = createJournalSession store
-    let claim = primeClaim store created.Id "owner-a"
+    let claim = seedClaim store created.Id "owner-a"
     let turnId = TurnId.New()
 
     let streamer =
@@ -738,7 +738,7 @@ let ``coalesced short stream lands one bounded append`` () =
 let ``large buffer splits at batch chars across bounded appends`` () =
     let store, journal = createJournalStores ()
     let created = createJournalSession store
-    let claim = primeClaim store created.Id "owner-a"
+    let claim = seedClaim store created.Id "owner-a"
 
     let bounds: SessionStreaming.StreamingBounds =
         {
@@ -785,7 +785,7 @@ let ``empty chunks and empty flushes cost zero storage ops`` () =
     let counting = CountingEventStore(inner)
     let store = InMemorySessionStore(database) :> ISessionStore
     let created = createJournalSession store
-    let claim = primeClaim store created.Id "owner-a"
+    let claim = seedClaim store created.Id "owner-a"
 
     let streamer =
         SessionStreaming.StreamingJournaler(
@@ -810,7 +810,7 @@ let ``empty chunks and empty flushes cost zero storage ops`` () =
 let ``pending caps force mid-stream flushes under sustained production`` () =
     let store, journal = createJournalStores ()
     let created = createJournalSession store
-    let claim = primeClaim store created.Id "owner-a"
+    let claim = seedClaim store created.Id "owner-a"
 
     let bounds: SessionStreaming.StreamingBounds =
         {
@@ -851,7 +851,7 @@ let ``pending caps force mid-stream flushes under sustained production`` () =
 let ``content safety redacts secrets before the journal`` () =
     let store, journal = createJournalStores ()
     let created = createJournalSession store
-    let claim = primeClaim store created.Id "owner-a"
+    let claim = seedClaim store created.Id "owner-a"
 
     let streamer =
         SessionStreaming.StreamingJournaler(
@@ -894,9 +894,9 @@ let ``stale token rejects with zero writes and zero publication`` () =
 
     use _subscription = observePublished created.Id published
 
-    let prime owner lease =
+    let claimFor owner lease =
         let payload =
-            UserMessagePayload(UserMessage.Text "legate journal prime") :> InboxPayload
+            UserMessagePayload(UserMessage.Text "legate seed entry") :> InboxPayload
 
         store
             .AppendInboxMessage(journalTenant, created.Id, payload, DeliveryMode.Queue, CancellationToken.None)
@@ -907,7 +907,7 @@ let ``stale token rejects with zero writes and zero publication`` () =
         store.ClaimNextTurn(journalTenant, created.Id, owner, lease, CancellationToken.None).GetAwaiter().GetResult()
         |> claimOf
 
-    let loser = prime "owner-a" (TimeSpan.FromMinutes 1.0)
+    let loser = claimFor "owner-a" (TimeSpan.FromMinutes 1.0)
 
     // Preliminary verification passes while the loser still owns the turn.
     let live =
@@ -929,9 +929,9 @@ let ``stale token rejects with zero writes and zero publication`` () =
     loserJournaler.AppendText("buffered")
 
     // Takeover past the lease between verification and the flush: the
-    // winner primes under a fresh token while the loser goes stale.
+    // winner claims under a fresh token while the loser goes stale.
     clock.Advance(TimeSpan.FromMinutes 10.0)
-    prime "owner-b" (TimeSpan.FromMinutes 1.0) |> ignore
+    claimFor "owner-b" (TimeSpan.FromMinutes 1.0) |> ignore
 
     (fun () -> loserJournaler.FlushAsync().GetAwaiter().GetResult())
     |> should throw typeof<TurnLoop.TurnLeaseLostException>
@@ -949,9 +949,9 @@ let ``stale token rejects with zero writes and zero publication`` () =
     lock published (fun () -> published.Count) |> should equal 0
 
     // Prior authorized commits stay truthful evidence: the winner lands
-    // after its own prime once the previous claim lapses.
+    // after its own claim once the previous claim lapses.
     clock.Advance(TimeSpan.FromMinutes 10.0)
-    let winner = prime "owner-c" (TimeSpan.FromMinutes 1.0)
+    let winner = claimFor "owner-c" (TimeSpan.FromMinutes 1.0)
 
     let winnerJournaler =
         SessionStreaming.StreamingJournaler(
@@ -985,7 +985,7 @@ let ``exhausted retries raise typed failure with zero publication`` () =
     let failing = FailingEventStore(inner) :> ISessionEventStore
     let store = InMemorySessionStore(database) :> ISessionStore
     let created = createJournalSession store
-    let claim = primeClaim store created.Id "owner-a"
+    let claim = seedClaim store created.Id "owner-a"
     let published = ResizeArray<SessionEvent>()
 
     use _subscription = observePublished created.Id published
@@ -1793,7 +1793,7 @@ let ``runner losing the claim journals zero streaming writes`` () =
 
     live |> should equal true
 
-    // Takeover past the lease: the winner primes under a fresh token.
+    // Takeover past the lease: the winner claims under a fresh token.
     clock.Advance(TimeSpan.FromMinutes 10.0)
     bootstrap "winner" |> ignore
 

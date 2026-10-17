@@ -234,8 +234,7 @@ and [<Sealed>] ReplyPayload(reply: Reply) =
 /// readers never observe two entries with the same position in one
 /// session. TurnId is the stable durable identity of the real turn this
 /// entry runs as, assigned once at accept for user messages: distinct queued
-/// user messages never share an identity, including the synthetic journal
-/// prime bootstrap. Reply entries carry the default (unstamped) TurnId
+/// user messages never share an identity. Reply entries carry the default (unstamped) TurnId
 /// sentinel and never start a turn; they resume the suspended real turn.
 /// Legacy rows without a stamped identity read as the default sentinel and
 /// are bound on first claim without rewriting history. Consumed entries stay

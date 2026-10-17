@@ -26,15 +26,15 @@ open Microsoft.Extensions.Options
 // fencing stay with the actor's start path. A second internal sweep (issue
 // 289) covers live-turn orphans: Idle sessions still carrying a live turn
 // with a consumed inbox, whose journal holds an unterminated marker — for
-// the live turn id itself, or for the orphan id a won prime replaced (the
+// the live turn id itself, or for the orphan id a won claim replaced (the
 // marker is the only surviving record of it) — on an era-marked session,
 // which the pending sweep above can never list.
-// Each orphan candidate is lease-gated through an atomic priming claim (a
+// Each orphan candidate is lease-gated through an atomic claiming poke (a
 // live owner wins, the poke loses silently and re-consumes its bootstrap)
 // and a winner settles directly inside the sweep: it journals the fenced
 // TurnFailedEvent for the orphan id under the won poke token and settles
-// the prime quietly, with no entity involvement. Every settle effect stays
-// fenced under the fresh primed claim token. No external services: only
+// the claim quietly, with no entity involvement. Every settle effect stays
+// fenced under the fresh claimed token. No external services: only
 // ISessionStore, the TimeProvider clock, and the ILlmDelay seam, so Legate
 // still builds and tests with no Redis, Docker, Postgres, or Kubernetes.
 
@@ -72,13 +72,13 @@ module internal Dispatcher =
             QueuedAgent = 0
         }
 
-    /// The claim owner identity the orphan poke primes under: distinct
-    /// from the facade prime owner, so forensics tell a poke-won claim
-    /// from an entity-start prime.
+    /// The claim owner identity the orphan poke claims under: distinct
+    /// from the facade claim owner, so forensics tell a poke-won claim
+    /// from an entity-start claim.
     let private orphanPokeOwner = "legate-dispatcher-orphan-poke"
 
-    /// The bootstrap text the orphan poke appends before its priming
-    /// claim: always consumed by a winning claim or re-consumed on a
+    /// The bootstrap text the orphan poke appends before its claiming
+    /// poke: always consumed by a winning claim or re-consumed on a
     /// loss, so it never drains as a turn.
     let private orphanPokeText = "legate orphan poke"
 
@@ -91,9 +91,9 @@ module internal Dispatcher =
     /// appends. A failed replay reads as no marker, so the candidate
     /// stays skipped.
     ///
-    /// The fallback exists because a winning prime replaces the row's
+    /// The fallback exists because a winning claim replaces the row's
     /// turn id: after a poke-claim wins post-expiry, CurrentTurnId names
-    /// the prime, never the orphan, so marker-for-live-id alone would
+    /// the winner, never the orphan, so marker-for-live-id alone would
     /// stay quiet forever. The orphan id survives only in the journal.
     /// <param name="eventStore">The journal to replay.</param>
     /// <param name="tenant">The tenant the session belongs to.</param>
@@ -171,9 +171,9 @@ module internal Dispatcher =
     /// Idle sessions still carrying a live turn with an empty inbox page
     /// through ListSessions; each candidate must also hold an unterminated
     /// marker — for the live turn id itself, or for the orphan id a won
-    /// prime replaced (the journal-derived fallback, mirroring the
+    /// claim replaced (the journal-derived fallback, mirroring the
     /// entity-side probe) — on an era-marked session before it lease-gates
-    /// through an atomic priming claim, so a live owner always wins and
+    /// through an atomic claiming poke, so a live owner always wins and
     /// the poke loses silently while an expired or missing lease lets the
     /// poke win and settle directly inside the sweep. Orphan pokes check
     /// the capacity gate but never consume it and never count as queued.
@@ -359,9 +359,9 @@ module internal Dispatcher =
             // live turn with a fully consumed inbox never appear in the
             // pending sweep above, yet their journal may hold an
             // unterminated marker — for the live turn id itself, or for
-            // the orphan id a won prime replaced (the marker is the only
+            // the orphan id a won claim replaced (the marker is the only
             // surviving record of it) — on an era-marked session. Each
-            // candidate lease-gates through an atomic priming claim: a
+            // candidate lease-gates through an atomic claiming poke: a
             // live owner makes the claim the missing branch, so the poke
             // loses silently and re-consumes its bootstrap, while an
             // expired or missing lease lets the poke win and settle
@@ -371,7 +371,7 @@ module internal Dispatcher =
             // sweep, and a tripped capacity gate skips the poke silently:
             // orphans are recovery probes, not dispatch demand, so they
             // never consume the gate and never count as queued. Bounded
-            // to MaxBatchSize primes per pass, following the ListSessions
+            // to MaxBatchSize pokes per pass, following the ListSessions
             // continuation like the HasMore paging above.
             let mutable orphanBudget = maxBatch
             let mutable orphanContinuation: string | null = null
@@ -407,7 +407,7 @@ module internal Dispatcher =
                                             InvalidSessionStateException(
                                                 candidateId,
                                                 "controlPending",
-                                                "Dispatcher orphan prime is forbidden for unresolved control work."
+                                                "Dispatcher orphan poke is forbidden for unresolved control work."
                                             )
                                         )
                                 | _ -> ()
@@ -439,7 +439,7 @@ module internal Dispatcher =
                                             // Completion-row-aware plus era-gated candidate (issue 289):
                                             // the settling id is the live turn id when its marker
                                             // stands unterminated, else the journal-derived orphan
-                                            // the prime replaced, on an era-marked session.
+                                            // the winner replaced, on an era-marked session.
                                             // Terminated tails, settled rows, empty tails, and
                                             // pre-era sessions never consume the orphan budget.
                                             let liveOpt =

@@ -6,9 +6,9 @@ open System.Collections.Generic
 open System.Threading
 open System.Threading.Tasks
 
-/// A terminal settlement request for one accepted inbox entry, fenced by its captured prime claim.
+/// A terminal settlement request for one accepted inbox entry, fenced by its captured live claim.
 /// The store validates captured claim authority and commits terminal consumption, lifecycle and
-/// prime disposition, completion deduplication and outbox, and settlement bookkeeping under the
+/// claim disposition, completion deduplication and outbox, and settlement bookkeeping under the
 /// same takeover-serializing transaction or critical section. Observers and delivery follow a
 /// committed winning outcome, never a preliminary liveness check.
 [<Sealed>]
@@ -26,7 +26,7 @@ type SessionSettlementRequest
     /// The session containing the accepted entry.
     member _.SessionId = sessionId
 
-    /// The immutable inbox entry position, not the shared prime turn id.
+    /// The immutable inbox entry position, not the shared claim turn id.
     member _.Position = position
 
     /// The authority captured when execution was admitted.

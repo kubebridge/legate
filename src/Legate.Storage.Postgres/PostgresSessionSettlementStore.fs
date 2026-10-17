@@ -12,7 +12,7 @@ open Npgsql
 open PostgresSql
 
 /// The PostgreSQL atomic terminal settlement capability (issue 363): validates captured claim
-/// authority and commits terminal consumption, lifecycle and prime disposition, completion
+/// authority and commits terminal consumption, lifecycle and claim disposition, completion
 /// deduplication and outbox, and settlement bookkeeping under one database-serialized
 /// transaction with row locks, never only a process-local lock. The terminal journal append
 /// rides the same transaction with savepoint isolation. A separate VerifyClaim followed by
@@ -48,14 +48,14 @@ type PostgresSessionSettlementStore(options: PostgresOptions, timeProvider: Time
         else
             unbox<'T> boxed
 
-    /// Releases the prime turn row and current-turn tracking for a quiescent
+    /// Releases the claim turn row and current-turn tracking for a quiescent
     /// terminal settlement (issue 363): stamps the turn terminal and clears
     /// its claim plus the session's current turn. Queued chains and pending
-    /// control retirements skip this and keep the prime: chains settle next
+    /// control retirements skip this and keep the claim: chains settle next
     /// under the same authority, and a pending control retirement keeps
-    /// authority for the actor's retireControl with the existing prime settle
+    /// authority for the actor's retireControl with the existing claim settle
     /// releasing afterwards, exactly as before.
-    member private this.ReleasePrime
+    member private this.ReleaseClaim
         (
             connection: NpgsqlConnection,
             transaction: NpgsqlTransaction,
@@ -542,7 +542,7 @@ type PostgresSessionSettlementStore(options: PostgresOptions, timeProvider: Time
 
                                         // A decided-but-unretired control verdict still owns
                                         // the entry (issue 363 plus #393): the actor's
-                                        // retireControl must run before the prime is
+                                        // retireControl must run before the claim is
                                         // released, so the quiescent release below defers
                                         // while this holds. Missing state reads as
                                         // nothing pending.
@@ -707,18 +707,18 @@ type PostgresSessionSettlementStore(options: PostgresOptions, timeProvider: Time
                                                     outboxInsert.ExecuteNonQuery() |> ignore
                                                     payload
 
-                                        // Prime release (issue 363): the turn row is stamped
+                                        // Claim release (issue 363): the turn row is stamped
                                         // terminal and its claim plus the session's
                                         // current turn clear only at quiescence with no
                                         // control retirement pending. Queued chains keep
-                                        // the prime for the next admit and settle; a
+                                        // the claim for the next admit and settle; a
                                         // pending control retirement keeps the row
                                         // pristine for the actor's retireControl and the
-                                        // existing prime settle, exactly as before. (A
+                                        // existing claim settle, exactly as before. (A
                                         // stamped-terminal row resolves as Absent, so a
-                                        // partial stamp would strand the prime.)
+                                        // partial stamp would strand the claim.)
                                         if nextState <> SessionState.Running && not controlPending then
-                                            this.ReleasePrime(
+                                            this.ReleaseClaim(
                                                 connection,
                                                 transaction,
                                                 claim,

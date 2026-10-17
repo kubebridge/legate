@@ -19,7 +19,7 @@ open Xunit
 // lifecycle fence, sentinel default TurnId attribution) journals idle
 // compacts, rebinds, and fork-prefix copies; stale execution cannot borrow
 // it to consume input, alter lifecycle/agent, or close the session. The
-// ambient prime stays for execution until #400.
+// execution runs under per-turn drain claims (#400).
 
 // ──────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -459,9 +459,9 @@ let ``Idle rebind journals the sentinel switch and keeps quiescence`` () : Task 
         switches[0].NewAgentId |> should equal target
         (isSentinel switches[0]) |> should equal true
 
-        // Quiescence: no inbox entries and still Idle. The ambient spawn
-        // prime (kept until #400) still holds its claim; it owns no turn
-        // input and the switch rode the host path, not the token.
+        // Quiescence: no inbox entries and still Idle. No claim is held
+        // (nothing is pre-claimed at spawn); the switch rode the host path,
+        // not the token.
         pendingCount harness.Store harness.Tenant harness.SessionId |> should equal 0
 
         let! stored = harness.GetSessionAsync(CancellationToken.None)

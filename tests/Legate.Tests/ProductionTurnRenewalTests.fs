@@ -175,7 +175,7 @@ let ``LeaseAdmission defaults true and scopes the live view`` () =
     LeaseAdmission.check () |> should equal true
 
 [<Fact>]
-let ``prime stays one hour while renewals grant the Sessions duration`` () =
+let ``drain lease stays one hour while renewals grant the Sessions duration`` () =
     let clientOptions = SessionClientOptions()
     clientOptions.LeaseDuration |> should equal (TimeSpan.FromHours 1.0)
 
@@ -237,7 +237,7 @@ let ``long execution renews under configured settings without wall-clock sleeps`
 
         renewed |> should equal true
 
-        // Still running under the same prime: no settle yet.
+        // Still running under the same claim: no settle yet.
         (storedOf store created.Id).State |> should equal SessionState.Running
 
         release ()
@@ -339,7 +339,7 @@ let ``expired claim renews to lease loss and the view flips invalid`` () =
     let store, _journal = createStores clock
     let created = createSession store
 
-    let payload = UserMessagePayload(UserMessage.Text "prime") :> InboxPayload
+    let payload = UserMessagePayload(UserMessage.Text "seed") :> InboxPayload
 
     store.AppendInboxMessage(tenant, created.Id, payload, DeliveryMode.Queue, CancellationToken.None)
     |> fun t -> t.GetAwaiter().GetResult() |> ignore

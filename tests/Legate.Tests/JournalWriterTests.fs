@@ -974,10 +974,10 @@ let private spawnWriterActor
             Delay = TurnLoopTests.NeverDelay() :> ILlmDelay
             AskTimeout = TimeSpan.FromMinutes 5.0
             JournalToken = token
-            PrimeClaim = None
+            ClaimOwner = "owner-a"
+            ClaimLease = TimeSpan.FromMinutes 5.0
             Recovery = null
             RunSuspendable = runner
-            ReprimeJournal = None
             RefreshCompact = None
             AgentStore = null
             EraMarked = (fun _ _ _ -> Task.FromResult false)
@@ -991,16 +991,17 @@ let ``Suspended turn journals the redacted suspend event`` () =
     let _, store, journal = createStores ()
     let session = createSession store
     appendUser store session.Id "first"
-    let claim = claimTurn store session.Id "owner-a"
     let settled = ResizeArray<TurnResult>()
 
+    // No pre-claim: the actor drain-claims the head entry and the suspend
+    // journals under the adopted live token.
     let actor =
         spawnWriterActor
             system
             store
             journal
             session.Id
-            claim.Token
+            (Guid.NewGuid().ToString("N"))
             (suspendedOn (testCursor "req-live" "Which region? api_key=hunter2"))
             settled
 
@@ -1040,15 +1041,14 @@ let ``Suspended turn journals the redacted suspend event`` () =
         stopSystem system
 
 [<Fact>]
-let ``Takeover loser suspends with zero journal effects and a typed failure`` () =
+let ``Takeover lease held elsewhere never starts the turn`` () =
     use system = createSystem ()
-    let clock, store, journal = createStores ()
+    let _, store, journal = createStores ()
     let session = createSession store
     appendUser store session.Id "first"
-    appendUser store session.Id "second"
 
-    let loser = claimTurn store session.Id "owner-a"
-    clock.Advance(TimeSpan.FromSeconds 121.0)
+    // The winner holds the only live claim: the actor can claim nothing,
+    // so the prompted turn never starts.
     let _winner = claimTurn store session.Id "owner-b"
 
     let settled = ResizeArray<TurnResult>()
@@ -1059,11 +1059,13 @@ let ``Takeover loser suspends with zero journal effects and a typed failure`` ()
             store
             journal
             session.Id
-            loser.Token
+            (Guid.NewGuid().ToString("N"))
             (suspendedOn (testCursor "req-loser" "Which region?"))
             settled
 
     try
+        // The prompt is accepted and stays pending: no authority means no
+        // start, so nothing journals and nothing settles.
         SessionActor.promptSuspendableAsync
             store
             tenant
@@ -1074,20 +1076,16 @@ let ``Takeover loser suspends with zero journal effects and a typed failure`` ()
         |> fun task -> task.GetAwaiter().GetResult()
         |> ignore
 
-        // The settle observes first, then consumes and idles on the same
-        // actor thread: wait for both, so neither the result nor the
-        // state is observed mid-flight.
-        let finished =
+        let quiet =
             waitUntil (TimeSpan.FromSeconds 10.0) (fun () ->
-                (lock settled (fun () -> settled.Count) = 1)
-                && storedState store session.Id = SessionState.Idle)
+                storedState store session.Id = SessionState.Idle && settled.Count = 0)
 
-        finished |> should equal true
-        settled[0].Status |> should equal TurnStatus.Failed
+        quiet |> should equal true
 
-        match settled[0].Outcome with
-        | :? TurnFailed as failed -> failed.Reason |> should equal "The journal append was rejected: staleClaim."
-        | _ -> failwith "Expected the typed TurnFailed outcome."
+        let pending =
+            store.ReadPendingInbox(tenant, session.Id, CancellationToken.None).GetAwaiter().GetResult()
+
+        pending.Count |> should equal 1
 
         let replay =
             journal.Replay(tenant, session.Id, 0L, 10, CancellationToken.None).GetAwaiter().GetResult()
@@ -1095,7 +1093,7 @@ let ``Takeover loser suspends with zero journal effects and a typed failure`` ()
         match replay with
         | :? EventReplayEndOfStream -> ()
         | :? EventReplayPage as page when page.Events.Count = 0 -> ()
-        | _ -> failwith "Expected an empty journal after the loser's suspend."
+        | _ -> failwith "Expected an empty journal while the takeover holds the lease."
     finally
         stopSystem system
 

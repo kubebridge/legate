@@ -36,7 +36,7 @@ change the target or create control authority.
 
 ## Runtime control attribution
 
-The journal prime is retained as the execution authority. Each selected real inbox
+The live drain claim is the execution authority. Each selected real inbox
 entry gets a separate stable control target and retains its original inbox position
 through suspension and consumption. It has no separate lease or heartbeat.
 
@@ -45,10 +45,10 @@ retirement. A host stop committed before `TryDecideControlTarget` selects Aborte
 even if a previously admitted call reports success. A decision committed first is
 retained and subsequent host requests observe AlreadyTerminal. Decision identifiers
 provide idempotency, never authority. Retirement requires the exact decision,
-genuine current prime authority and provably consumed original entry.
+genuine current claim authority and provably consumed original entry.
 
 An accepted target or a TerminalPendingRetirement target found after restart remains
-blocked before any prime, recovery reset, model call or queue drain. Restoring the
+blocked before any drain claim, recovery reset, model call or queue drain. Restoring the
 execution configuration alone does not resume it. Mandatory decision, consume or
 retirement failure preserves the control barrier. Complete atomic terminal cleanup
 and publication are separate work; a control verdict must not be used to infer
@@ -56,7 +56,7 @@ that downstream effects happened or to replay them after a crash.
 
 Actual model/tool admission checks honor durable stop alongside claim fencing.
 Unstopped Active targets are not control barriers. `TryRecoverControlTarget` can
-re-fence their expired existing prime, preserving the same target and original entry,
+re-fence their expired existing claim, preserving the same target and original entry,
 including consumed entries. A live owner refuses takeover. Recovery never consumes
 queued work to acquire authority; both crash policies and suspended Reply recovery
 use the original association. Accepted stops and pending terminal verdicts cannot

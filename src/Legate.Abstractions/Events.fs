@@ -659,12 +659,12 @@ and [<Sealed>] AgentInvalidEvent
     member _.Reason = reason
 
 /// The session was rebound to another agent (issue 123): the actor journals
-/// one of these per applied SetAgent through its 6-step quiescent protocol,
+/// one of these per applied SetAgent through its quiescent protocol,
 /// carrying the rebound turn's id. The transcript fold derives one System
 /// cell per matching-turn event, carrying the previous and new agent in
 /// metadata. Agent ids are durable identifiers, never secrets.
 /// <param name="sessionId">The session that was rebound.</param>
-/// <param name="turnId">The journaling prime's turn the switch was journaled under.</param>
+/// <param name="turnId">The journaling claim's turn the switch was journaled under.</param>
 /// <param name="sequence">The event's per-session sequence number, or empty while in flight.</param>
 /// <param name="timestamp">When the switch applied.</param>
 /// <param name="previousAgentId">The agent the session conversed with before the switch.</param>

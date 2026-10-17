@@ -248,10 +248,10 @@ let private spawnGated
             Delay = TurnLoopTests.NeverDelay() :> ILlmDelay
             AskTimeout = TimeSpan.FromMinutes 5.0
             JournalToken = "test-token"
-            PrimeClaim = None
+            ClaimOwner = "owner-a"
+            ClaimLease = TimeSpan.FromMinutes 5.0
             Recovery = null
             RunSuspendable = runner
-            ReprimeJournal = None
             RefreshCompact = None
             AgentStore = agents
             EraMarked = (fun _ _ _ -> Task.FromResult false)

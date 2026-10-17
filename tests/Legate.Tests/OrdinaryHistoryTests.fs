@@ -1264,7 +1264,7 @@ let ``Unsupported old persistence rejects with a clean-start requirement`` () =
 let private runnerLease = TimeSpan.FromMinutes 5.0
 
 /// An empty store pair over one database: the session store and the fenced
-/// journal share claim state, so primed tokens fence for real.
+/// journal share claim state, so adopted tokens fence for real.
 let private createRunnerStores (clock: TimeProvider) : ISessionStore * ISessionEventStore =
     let database = InMemoryDatabase(clock)
     InMemorySessionStore(database) :> ISessionStore, InMemorySessionEventStore(database) :> ISessionEventStore
