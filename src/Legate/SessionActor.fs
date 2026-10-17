@@ -5871,23 +5871,23 @@ module internal SessionActor =
                 args
                 pipe
 
-        /// Settles the live drain claim quietly when one is held, piped and
-        /// best-effort: the first settle wins and a retry of the same
+        /// Releases the live drain claim quietly when one is held, piped
+        /// and best-effort: the first settle wins and a retry of the same
         /// outcome observes it. A settled cell clears so later drains adopt
-        /// fresh; anything else leaves the cell for the next boundary.
-        /// <param name="cont">Continues with whether the held claim settled (true when none was held).</param>
+        /// fresh. The rebind outcome (not the release) decides.
+        /// <param name="cont">Continues once the release attempt finished.</param>
         /// <param name="suspendWith">Re-enters the loop with the state current at each wait's start.</param>
         /// <param name="args">The current loop state.</param>
         /// <param name="pipe">The current pipe state.</param>
         /// <returns>The actor computation.</returns>
-        let withSettleLiveQuiet
-            (cont: bool -> SuspendCont)
+        let withReleaseLiveQuiet
+            (cont: unit -> SuspendCont)
             (suspendWith: SuspendCont)
             (args: SuspendLoopArgs)
             (pipe: SuspendPipe)
             : Cont<SuspendableActorMessage, unit> =
             match liveClaim with
-            | None -> cont true args pipe
+            | None -> cont () args pipe
             | Some claim ->
                 withSettleTurnQuiet
                     claim
@@ -5895,7 +5895,7 @@ module internal SessionActor =
                         if settled then
                             liveClaim <- None
 
-                        cont settled args2 pipe2)
+                        cont () args2 pipe2)
                     suspendWith
                     args
                     pipe
@@ -6037,10 +6037,13 @@ module internal SessionActor =
                 pipe
 
         /// Applies the recorded agent rebind at a quiescent boundary, piped:
-        /// settle the live claim, journal the switch under the host path,
-        /// rebind the row. Nothing is re-acquired: the next drain
-        /// claims fresh. Every write stays claim-checked last-moment by the
-        /// stores. A throwing apply reads as not landed, exactly like before.
+        /// release the live claim best-effort, journal the switch under the
+        /// host path, rebind the row. Nothing is re-acquired: the next drain
+        /// claims fresh. A parked suspension short-circuits with the rebind
+        /// still pending (no settle, no journal), so the suspension survives
+        /// and the switch journals exactly once post-resume. Every write
+        /// stays claim-checked last-moment by the stores. A throwing apply
+        /// reads as not landed, exactly like before.
         /// <param name="target">The agent the session converses with from now on.</param>
         /// <param name="cont">Continues with whether the rebind landed.</param>
         /// <param name="suspendWith">Re-enters the loop with the state current at each wait's start.</param>
@@ -6054,11 +6057,15 @@ module internal SessionActor =
             (args: SuspendLoopArgs)
             (pipe: SuspendPipe)
             : Cont<SuspendableActorMessage, unit> =
-            withSettleLiveQuiet
-                (fun settled args2 pipe2 ->
-                    if not settled then
-                        cont false args2 pipe2
-                    else
+            // A parked suspension short-circuits with the rebind still
+            // pending: settling or journaling here would end the suspended
+            // turn or duplicate the switch event. The post-resume boundary
+            // retries.
+            match args.Suspended with
+            | Some _ -> cont false args pipe
+            | None ->
+                withReleaseLiveQuiet
+                    (fun () args2 pipe2 ->
                         withPreviousAgent
                             target
                             (fun previous args3 pipe3 ->
@@ -6104,9 +6111,9 @@ module internal SessionActor =
                             suspendWith
                             args2
                             pipe2)
-                suspendWith
-                args
-                pipe
+                    suspendWith
+                    args
+                    pipe
 
         /// Applies the recorded agent rebind when the inbox is empty, piped.
         /// The caller guarantees no live turn task. A throwing apply keeps

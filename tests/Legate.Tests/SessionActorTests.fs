@@ -4506,6 +4506,60 @@ let ``SetAgent on Idle applies at once and journals the switch`` () : Task =
     }
 
 [<Fact>]
+let ``SetAgent after a failed turn applies at once`` () =
+    // The failed turn released its stamp: the rebind lands at once on the
+    // released row instead of sticking pending on the stale live claim.
+    use system = createSystem ()
+    let store = createStore ()
+    let journal = RecordingEventStore()
+    let created = createSession store
+
+    let failedCompletion: TurnLoop.TurnLoopCompletion =
+        {
+            Result =
+                {
+                    AssistantText = ""
+                    Status = TurnStatus.Failed
+                    Iterations = 1
+                    Usage = { InputTokens = 0L; OutputTokens = 0L }
+                    Outcome = TurnFailed("boom") :> TurnOutcome
+                }
+            TurnId = Unchecked.defaultof<TurnId>
+            HasPendingInjects = false
+            Suspension = None
+        }
+
+    let runner = ScriptSuspendRunner(failedCompletion, settledCompletion "unused")
+    let settled = ResizeArray<TurnResult>()
+
+    let session =
+        spawnSuspendable
+            system
+            store
+            journal
+            (TurnLoopTests.NeverDelay() :> ILlmDelay)
+            (TimeSpan.FromMinutes 5.0)
+            created.Id
+            runner
+            settled
+
+    try
+        promptSuspendable store created.Id session "run" |> ignore
+
+        let failed =
+            waitFor (TimeSpan.FromSeconds 10.0) (fun () ->
+                settled.Count = 1 && (storedOf store created.Id).State = SessionState.Idle)
+
+        failed |> should equal true
+        settled[0].Status |> should equal TurnStatus.Failed
+
+        let target = AgentId.New()
+        let rebound = setAgent store tenant created.Id session target
+        rebound.AgentId |> should equal target
+    finally
+        stopSystem system
+
+[<Fact>]
 let ``SetAgent while Running defers to the quiescent boundary without stealing`` () : Task =
     task {
         use entered = new ManualResetEventSlim(false)
