@@ -84,6 +84,9 @@ dotnet fsi build.fsx -- -t Test         # Build -> dotnet test Legate.slnx (all 
 dotnet fsi build.fsx -- -t Format       # Fantomas 7.0.0 over src, tests, samples, build.fsx (writes)
 dotnet fsi build.fsx -- -t CheckFormat  # same scope, non-mutating; exit 99 on drift (CI gate)
 dotnet fsi build.fsx -- -t Pack         # Release NuGet packages into ./artifacts
+dotnet fsi build.fsx -- -t Docs         # Release build + pinned DocFX -> Docs/_site
+dotnet fsi build.fsx -- -t CheckPages   # composition/source-policy regressions; requires Docs output
+dotnet fsi build.fsx -- -t ComposePages # site/ + Docs/_site -> clean artifacts/pages
 dotnet build Legate.slnx                # plain build without the FAKE chain
 dotnet test Legate.slnx                 # plain test run
 ```
@@ -146,22 +149,50 @@ dotnet test Legate.slnx                 # plain test run
 they exist, the `samples/` hosts run locally (`dotnet run --project samples/<Name>`).
 Default QA target: the test suite.
 
+Public static site: `https://legate.kubebridge.com/` is the showcase;
+`/docs/` is generated DocFX. `.github/workflows/pages.yml` is the sole
+publisher for qualifying main changes, manual dispatch on main, and version
+tag pushes. Its non-cancelling `pages` lock covers source resolution through
+deployment. Every publication rebuilds both sections from pinned current
+remote main (showcase/orchestration) and the highest qualifying release tag
+(docs, DLL/XML metadata, SDK and tools), selected by descending Git version
+order with `versionsort.suffix=-`, stable above its suffixed variants.
+Backfilled tags and delayed requests do not downgrade documentation. No eligible
+tag or incomplete output fails before upload; the last successful site remains.
+`PAGES_DOCS` selects prebuilt tagged DocFX output for CheckPages/ComposePages;
+CI defaults to its own `Docs/_site`. ResolvePages fetches current remote sources
+and emits pinned SHAs for the publisher, not an offline validation target.
+Composition also reads generated `Docs/api/*.yml` alongside the selected
+`_site` to identify declared namespaces. Only confirmed absent, undeclared
+intermediate API Namespace breadcrumb anchors become text in the publication
+copy; valid links and labels are preserved, all other files are byte-identical,
+and the original generated output is untouched. Strict final-copy link/resource
+and `/docs/` confinement checks still fail on any other missing target.
+Do not rerun historical pre-fix publishers; dispatch current main. Before the
+first corrected deployment, finish/verify old Pages and release-docs runs.
+Post-merge rollout must verify complete artifacts, sequential main/manual and
+tag-equivalent requests in both orders, real overlapping lock behavior and
+failure preservation, plus browser deep links, `/docs` redirect, TOC/search and
+resource loading. A manual existing-release exercise is not an actual tag run;
+never publish a package or create a tag solely for this validation.
+
 Releases: pushing a tag `vX.Y.Z[-suffix]` runs `.github/workflows/release.yml`,
 which tests, packs with that version, and publishes to nuget.org
 (`https://api.nuget.org/v3/index.json`) with the `NUGET_API_KEY` secret.
-The release workflow has not yet been exercised by a real tag.
+Package publication remains independent of Pages publication.
 
 ## Branch Map
 
 | Branch | Role | CI workflow |
 |--------|------|-------------|
 | `main` | working branch; PR base; protected by CI | `.github/workflows/ci.yml` (push to `main`, pull requests, manual) |
-| `v*` tags | releases | `.github/workflows/release.yml` |
+| `v*` tags | releases + complete static site | `.github/workflows/release.yml`, `.github/workflows/pages.yml` |
 
 - `ci.yml` is the gate for pull requests and `main`: `Restore`,
   `CheckFormat`, `CheckHeaders`, `Test`, and `Pack` via `build.fsx` on Ubuntu and Windows.
-- Merging to `main` deploys nothing. Reviewer auto-merge is safe whenever CI
-  is green; releases are an explicit tag push.
+- Qualifying `main` site/build/publication changes deploy the complete static
+  site through `pages.yml`; they publish no packages. Releases are an explicit
+  tag push. Manual Pages redeploys are supported only from current `main`.
 - Never implement or commit directly on `main` or the user's active working
   branch; `dev-cycle` branches are `issue-<number>-<short-slug>` based on
   `origin/main`. Squash-merge PRs and delete the branch afterwards.

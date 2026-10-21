@@ -1,14 +1,18 @@
 name: Pages
 
-# Publishes the static showcase site in site/ to GitHub Pages
-# (https://kubebridge.github.io/legate/). Runs on GitHub-hosted
-# infrastructure: no secrets, no self-hosted runner needed.
+# Sole publisher: current main showcase at /, latest released DocFX at /docs/.
 on:
   push:
     branches: [main]
+    tags: ["v*"]
     paths:
       - site/**
+      - .build/**
+      - build.fsx
+      - global.json
+      - .config/dotnet-tools.json
       - .github/workflows/pages.yml
+      - .github/workflows/release.yml
   workflow_dispatch:
 
 permissions:
@@ -16,24 +20,109 @@ permissions:
   pages: write
   id-token: write
 
+# Includes checkout/source resolution, build, upload and atomic deployment.
+# Pending runs need not be FIFO: each resolves current sources after admission.
 concurrency:
   group: pages
-  cancel-in-progress: true
+  cancel-in-progress: false
+
+env:
+  DOTNET_NOLOGO: "1"
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+  DOTNET_INSTALL_DIR: /home/runner/.dotnet
 
 jobs:
   deploy:
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]
     steps:
+      - name: Validate publication request
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REQUEST_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == push && "$REQUEST_REF" == refs/tags/* ]]; then
+            [[ "$REQUEST_REF" =~ ^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
+          else
+            [[ "$REQUEST_REF" == refs/heads/main ]]
+          fi
+
+      # Deliberately not the queued event SHA. All executable orchestration is
+      # trusted main code; no pull_request trigger is supported here.
       - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - name: Resolve current publication sources under lock
+        id: sources
+        run: dotnet fsi build.fsx -- -t ResolvePages
+
+      - name: Pin showcase and orchestration
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.sources.outputs.MAIN_SHA }}
+
+      - name: Pin released documentation
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.sources.outputs.DOCS_SHA }}
+          path: .tmp-pages-docs
+          persist-credentials: false
+
+      - name: Install documentation source SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: .tmp-pages-docs/global.json
+
+      - name: Build released documentation with its pinned tools
+        working-directory: .tmp-pages-docs
+        run: dotnet fsi build.fsx -- -t Docs
+
+      - name: Install publication SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - name: Validate and compose both sections
+        env:
+          PAGES_DOCS: .tmp-pages-docs/Docs/_site
+        run: |
+          dotnet fsi build.fsx -- -t CheckPages
+          dotnet fsi build.fsx -- -t ComposePages
 
       - uses: actions/configure-pages@v5
 
-      - uses: actions/upload-pages-artifact@v3
+      - name: Upload complete Pages artifact
+        id: artifact
+        uses: actions/upload-pages-artifact@v3
         with:
-          path: site
+          path: artifacts/pages
 
       - id: deployment
         uses: actions/deploy-pages@v4
+
+      - name: Record publication provenance
+        if: always()
+        env:
+          MAIN_SHA: ${{ steps.sources.outputs.MAIN_SHA }}
+          DOCS_TAG: ${{ steps.sources.outputs.DOCS_TAG }}
+          DOCS_SHA: ${{ steps.sources.outputs.DOCS_SHA }}
+          ARTIFACT_ID: ${{ steps.artifact.outputs.artifact_id }}
+          PAGE_URL: ${{ steps.deployment.outputs.page_url }}
+        run: |
+          set -euo pipefail
+          {
+            printf '## Complete Pages publication\n\n'
+            printf 'Showcase/main SHA: %s\n\nDocs tag: %s\n\nDocs SHA: %s\n\n' "$MAIN_SHA" "$DOCS_TAG" "$DOCS_SHA"
+            printf '[Artifact](%s/%s/actions/runs/%s/artifacts/%s)\n\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$ARTIFACT_ID"
+            printf '[Deployment](%s)\n' "$PAGE_URL"
+          } >> "$GITHUB_STEP_SUMMARY"

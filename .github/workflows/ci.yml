@@ -72,6 +72,18 @@ jobs:
       - name: Build docs
         run: dotnet fsi build.fsx -- -t Docs
 
+      - name: Check complete Pages composition and regressions (no deployment)
+        run: |
+          dotnet fsi build.fsx -- -t CheckPages
+          dotnet fsi build.fsx -- -t ComposePages
+
+      - name: Upload checked site for inspection
+        uses: actions/upload-artifact@v4
+        with:
+          name: complete-site-check
+          path: artifacts/pages
+          if-no-files-found: error
+
       - name: Upload packages
         uses: actions/upload-artifact@v4
         with:
