@@ -133,7 +133,7 @@ var result = observation.Result!;</code></pre>
     <div class="card"><h3><span class="dsq" style="background:var(--a)" aria-hidden="true"></span>Hosted services</h3><p>Use Postgres for shared session state and events. Add S3 for blobs and agent packages, and Docker workspaces when tool execution needs container isolation.</p></div>
     <div class="card"><h3><span class="dsq" style="background:var(--vb)" aria-hidden="true"></span>Tests and experiments</h3><p>Use in-memory stores and a process workspace. This configuration requires no database server or container runtime. Its session data lasts for the process lifetime.</p></div>
   </div>
-  <p class="body-copy">Local mode is the default. Cluster mode rejects the adapter's implicit local stores and workspace. Every node needs explicitly registered, compatible session and journal stores, a chosen execution runtime, and symmetric trusted tenant bindings, models, tools, and policies. Your deployment supplies genuinely shared durable storage; startup verifies wiring and atomic settlement compatibility, not backend durability or topology. Clustering does not automatically distribute local data or LLM admission. Redis is needed only when distributed admission is enabled. The <a href="https://github.com/kubebridge/legate/blob/main/Docs/getting-started-hosted.md">hosted-service guide</a> and <a href="https://github.com/kubebridge/legate/tree/main/samples/CSharpWebHost/cluster">adapter cluster sample</a> cover these choices.</p>
+  <p class="body-copy">Local mode is the default. Cluster mode rejects the adapter's implicit local stores and workspace. Every node needs explicitly registered, compatible session and journal stores, a chosen execution runtime, and symmetric trusted tenant bindings, models, tools, and policies. Your deployment supplies genuinely shared durable storage; startup verifies wiring and atomic settlement compatibility, not backend durability or topology. Clustering does not automatically distribute local data or LLM admission. Redis is needed only when distributed admission is enabled. The <a href="https://legate.kubebridge.com/docs/getting-started-hosted.html">hosted-service guide</a> and <a href="https://github.com/kubebridge/legate/tree/main/samples/CSharpWebHost/cluster">adapter cluster sample</a> cover these choices.</p>
 </div></section>
 
 <section class="block" aria-labelledby="policies"><div class="wrap">
@@ -156,7 +156,7 @@ var result = observation.Result!;</code></pre>
   </div>
   <div class="content-stack">
     <p class="body-copy">Register a workspace through <code>IWorkspaceRuntime</code> for the execution environment chosen above. Use <code>ISessionCompletionSink</code> for completion notifications and <code>IArtifactQuota</code> for artifact quotas.</p>
-    <p class="body-copy">Legate reports token counts for application metering or billing. See the <a href="https://github.com/kubebridge/legate/blob/main/Docs/configuration.md">configuration reference</a> for host options.</p>
+    <p class="body-copy">Legate reports token counts for application metering or billing. See the <a href="https://legate.kubebridge.com/docs/configuration.html">configuration reference</a> for host options.</p>
   </div>
 </div></section>
 
@@ -209,7 +209,7 @@ var result = observation.Result!;</code></pre>
       <p class="body-copy">From a repository checkout with the .NET 10 SDK installed, run the scripted C# host. It uses local model responses without provider keys or network calls.</p>
 <pre class="code" tabindex="0" aria-label="Run the C# host sample"><code>dotnet run --project samples/CSharpWebHost -- --urls http://127.0.0.1:5080
 dotnet run --project samples/CSharpHost -- --scripted</code></pre>
-      <p class="body-copy">For an HTTP host, follow the <a href="https://github.com/kubebridge/legate/blob/main/Docs/getting-started-hosted.md">hosted-service guide</a>. For an interactive terminal, follow the <a href="https://github.com/kubebridge/legate/blob/main/Docs/getting-started-cli.md">CLI guide</a>.</p>
+      <p class="body-copy">For an HTTP host, follow the <a href="https://legate.kubebridge.com/docs/getting-started-hosted.html">hosted-service guide</a>. For an interactive terminal, follow the <a href="https://legate.kubebridge.com/docs/getting-started-cli.html">CLI guide</a>.</p>
     </div>
   </details>
 </div></section>
@@ -225,9 +225,9 @@ dotnet fsi build.fsx -- -t Test
 dotnet fsi build.fsx -- -t CheckFormat</code></pre>
   <p class="body-copy">Legate is currently on the <code>0.x</code> release line. Public APIs may change between releases.</p>
   <div class="resource-links">
-    <a href="https://github.com/kubebridge/legate/blob/main/Docs/getting-started-cli.md">CLI guide</a>
-    <a href="https://github.com/kubebridge/legate/blob/main/Docs/getting-started-hosted.md">Hosted-service guide</a>
-    <a href="https://github.com/kubebridge/legate/blob/main/Docs/configuration.md">Configuration reference</a>
+    <a href="https://legate.kubebridge.com/docs/getting-started-cli.html">CLI guide</a>
+    <a href="https://legate.kubebridge.com/docs/getting-started-hosted.html">Hosted-service guide</a>
+    <a href="https://legate.kubebridge.com/docs/configuration.html">Configuration reference</a>
     <a href="https://github.com/kubebridge/legate">GitHub</a>
   </div>
   <div class="pager">

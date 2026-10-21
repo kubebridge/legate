@@ -6,6 +6,8 @@ open Fake.Core
 open Fake.IO
 
 #load ".build/Helpers.fs"
+#load ".build/Pages.fs"
+
 open Helpers
 
 initializeContext ()
@@ -33,6 +35,7 @@ let fantomasPaths =
         "tests"
         "samples"
         "build.fsx"
+        ".build/Pages.fs"
     ]
 
 let existingFantomasPaths () =
@@ -458,6 +461,21 @@ Target.create "Docs" (fun _ ->
     run dotnet [ "docfx"; "Docs/docfx.json" ] rootPath)
 
 open Fake.Core.TargetOperators
+
+// Publication inputs are explicit; CI can reuse its own Docs output without
+// fetching tags. Production resolves released sources separately under the lock.
+let pagesDocs () =
+    match System.Environment.GetEnvironmentVariable "PAGES_DOCS" with
+    | null
+    | "" -> Path.combine rootPath "Docs/_site"
+    | path -> System.IO.Path.GetFullPath path
+
+Target.create "ResolvePages" (fun _ -> Pages.resolve rootPath)
+
+Target.create "ComposePages" (fun _ ->
+    Pages.compose (Path.combine rootPath "site") (pagesDocs ()) (Path.combine rootPath "artifacts/pages"))
+
+Target.create "CheckPages" (fun _ -> Pages.regress rootPath (pagesDocs ()))
 
 "Clean" ==> "Restore" ==> "Build" ==> "Test"
 
