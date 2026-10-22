@@ -10,6 +10,8 @@
   const label = document.getElementById('population-label');
   const phaseLabel = document.querySelector('.population-phase');
   const steps = Array.from(document.querySelectorAll('.story-step'));
+  const copy = document.querySelector('.story-copy');
+  const sticky = document.querySelector('.population-sticky');
   const toggle = document.querySelector('.motion-toggle');
   if (!heroCanvas || !populationCanvas) return;
   const heroContext = heroCanvas.getContext('2d');
@@ -52,6 +54,14 @@
   function measure() {
     heroSize = resize(heroCanvas, heroContext);
     populationSize = resize(populationCanvas, populationContext);
+    if (innerWidth > 640) {
+      const bounds = copy.getBoundingClientRect();
+      const height = sticky.getBoundingClientRect().height;
+      // The illustration enters and leaves beside the text, not the section padding.
+      sticky.style.setProperty('--population-height', `${height}px`);
+      sticky.style.setProperty('--population-start', `${contentCenter(steps[0]) - bounds.top - height / 2}px`);
+      sticky.style.setProperty('--population-end', `${bounds.bottom - contentCenter(steps[steps.length - 1]) - height / 2}px`);
+    }
     updatePhase();
     requestDraw();
   }
@@ -115,10 +125,19 @@
     populationContext.globalAlpha = 1;
   }
 
+  function contentCenter(step) {
+    return (step.firstElementChild.getBoundingClientRect().top + step.lastElementChild.getBoundingClientRect().bottom) / 2;
+  }
+
   function updatePhase() {
-    const line = innerWidth <= 640 ? innerHeight * .73 : innerHeight * .55;
+    const bounds = sticky.getBoundingClientRect();
+    const line = innerWidth <= 640 ? innerHeight * .73 : bounds.top + bounds.height / 2;
     let next = 0;
-    steps.forEach((step, index) => { if (step.getBoundingClientRect().top < line) next = index; });
+    let closest = Infinity;
+    steps.forEach((step, index) => {
+      const distance = Math.abs(contentCenter(step) - line);
+      if (distance < closest) { closest = distance; next = index; }
+    });
     if (next !== phase) {
       phase = next;
       targetDensity = [0, .24, 1][phase];
@@ -185,8 +204,11 @@
     else { lastTime = 0; requestDraw(); }
   });
   window.addEventListener('scroll', requestDraw, { passive: true });
-  new ResizeObserver(measure).observe(document.querySelector('.scale-story'));
+  const layout = new ResizeObserver(measure);
+  layout.observe(copy);
+  layout.observe(sticky);
   window.addEventListener('resize', measure, { passive: true });
+  document.fonts.ready.then(measure);
   readColors();
   measure();
   syncMotion();
