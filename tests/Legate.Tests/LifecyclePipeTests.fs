@@ -706,10 +706,9 @@ let ``an abort is answered while a settle wait is outstanding and the winner sta
         let factory = LifecyclePipeActors.spawnImmediateFactory store journal entered
         let! child = LifecyclePipeActors.factoryActor system factory created.Id
 
-        let! entry = LifecyclePipeActors.prompt store child created.Id "settling work"
-
-        // The turn finished; its settle admission pends behind a closed gate.
+        // Install the gate before the immediate runner can reach settle admission.
         let admitGate = proxy.Gate($"AdmitExecution:{created.Id}")
+        let! entry = LifecyclePipeActors.prompt store child created.Id "settling work"
 
         let admitted =
             LifecyclePipeActors.waitFor (TimeSpan.FromSeconds 10.0) (fun () ->
@@ -735,9 +734,12 @@ let ``an abort is answered while a settle wait is outstanding and the winner sta
 
         admitGate.SetResult() |> ignore
 
+        // The store becomes Idle before the piped terminal journal append completes.
         let settled =
             LifecyclePipeActors.waitFor (TimeSpan.FromSeconds 10.0) (fun () ->
-                LifecyclePipeActors.storedState store created.Id = SessionState.Idle)
+                LifecyclePipeActors.storedState store created.Id = SessionState.Idle
+                && (LifecyclePipeActors.settledJournal journal created.Id
+                    |> List.exists (fun event -> event :? TurnCompletedEvent || event :? TurnAbortedEvent)))
 
         Assert.True(settled)
 
