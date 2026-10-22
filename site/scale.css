@@ -55,7 +55,7 @@
 .story-step .story-aside { font-size: 13px; border-left: 2px solid var(--line-soft); padding-left: 16px; margin-top: 20px; }
 .story-code { display: block; padding: 14px 18px; margin-top: 22px; border: 1px solid var(--line); border-radius: 5px; color: var(--c); font-size: 13px; background: var(--panel2); }
 .story-link { display: inline-flex; gap: 20px; font-size: 13px; margin-top: 25px; font-weight: 600; }
-.population-sticky { position: sticky; top: calc(50vh - 220px); align-self: start; margin-top: 85px; }
+.population-sticky { position: sticky; top: max(84px, calc((100vh - var(--population-height, 440px)) / 2)); align-self: start; margin: var(--population-start, 85px) 0 var(--population-end, 0px); }
 .population-panel { background: var(--panel2); border: 1px solid var(--line-soft); border-radius: 8px; padding: 22px; overflow: hidden; }
 .population-top { display: flex; justify-content: space-between; gap: 8px; color: var(--f3); font-size: 8px; }
 .population-top > span:first-child { display: inline-flex; align-items: center; gap: 8px; }
@@ -126,7 +126,7 @@ html[data-motion="paused"] *, html[data-motion="paused"] *::after { animation: n
   .foundation-strip { font-size: 8px; }
   .foundation-strip ul { gap: 30px; }
   .scale-story { grid-template-columns: 1fr; padding-top: 0; padding-bottom: 48px; gap: 0; }
-  .population-sticky { grid-row: 1; position: sticky; top: 112px; margin-top: 24px; z-index: 2; background: var(--bg); padding-bottom: 12px; }
+  .population-sticky { grid-row: 1; position: sticky; top: 112px; margin: 24px 0 0; z-index: 2; background: var(--bg); padding-bottom: 12px; }
   .population-panel { padding: 12px 15px; display: grid; grid-template-columns: 1fr 1.3fr; gap: 8px 15px; }
   .population-top { grid-column: 1 / -1; flex-wrap: nowrap; }
   .population-count { margin: 14px 0; align-self: center; font-size: 31px; }
