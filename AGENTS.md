@@ -165,7 +165,16 @@ and emits pinned SHAs for the publisher, not an offline validation target.
 Composition also reads generated `Docs/api/*.yml` alongside the selected
 `_site` to identify declared namespaces. Only confirmed absent, undeclared
 intermediate API Namespace breadcrumb anchors become text in the publication
-copy; valid links and labels are preserved, all other files are byte-identical,
+copy. The classic root `toc.html` publication copy also promotes the three
+Getting started links to top level, removing only their non-link group and
+expand stub; unexpected nested shapes fail closed. One deterministic block
+is appended to the copied, already-loaded `styles/main.css`, using existing
+navbar/TOC collapse controls and normal-flow layout at 768 <= width < 1200px.
+At >=1200px, ID-bearing content headings use the template's 120px clearance
+as native scroll margin; existing JS coordinate scrolling remains unchanged.
+Existing CSS bytes are preserved; identical reapplication is a no-op and
+duplicate/conflicting markers fail closed. Valid links, labels and attributes
+are preserved, the separate API TOC and all other files are byte-identical,
 and the original generated output is untouched. Strict final-copy link/resource
 and `/docs/` confinement checks still fail on any other missing target.
 Do not rerun historical pre-fix publishers; dispatch current main. Before the
